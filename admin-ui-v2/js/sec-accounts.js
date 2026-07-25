@@ -1580,16 +1580,17 @@
         : (parsed && typeof parsed === 'object') ? [parsed] : null;
       if (!list || !list.length) { api.toast(t('imp.badJson'), 'error'); return; }
 
-      // 逐条串行「添加 → 验活 → 过滤」:
+      // 逐条串行「去重 → 添加 → 验活 → 过滤」:
       //   1) 走单条 /credentials 添加(每个请求都小,不受批量体积上限影响,保留 profileArn 等完整字段);
-      //   2) 略等 ~0.9s 后查该账号余额(getUsageLimits 真打上游)= 验活:能查到=活,报错=死;
+      //      后端按 refreshToken 去重——已存在则回 duplicate,不新增(避免两条抢同一轮换令牌、增风控);
+      //   2) 新增的略等 ~0.9s 后查该账号余额(getUsageLimits 真打上游)= 验活:能查到=活,报错=死;
       //   3) 死号回滚删除(过滤失效账号),活号保留。逐条韧性——单条失败不阻断其余;串行 + 间隔限速。
       run.disabled = true;
       var origLabel = run.textContent;
-      var alive = 0, dead = 0, failed = 0, i = 0, total = list.length;
+      var alive = 0, dead = 0, dup = 0, failed = 0, i = 0, total = list.length;
       function done() {
         run.textContent = origLabel; run.disabled = false;
-        api.toast(t('imp.resultVerify', { alive: alive, dead: dead, failed: failed, total: total }),
+        api.toast(t('imp.resultVerify', { alive: alive, dead: dead, dup: dup, failed: failed, total: total }),
           (dead || failed) ? 'info' : 'success');
         m.close(); loadAccounts();
       }
@@ -1600,6 +1601,7 @@
         var payload = toAddPayload(list[idx]);
         if (!payload) { failed++; step(); return; }        // 无有效 refreshToken → 跳过
         api.post('/credentials', payload).then(function (r) {
+          if (r && r.duplicate) { dup++; step(); return; }  // 已存在池中 → 跳过,不验活
           var id = r && (r.credentialId != null ? r.credentialId : r.id);
           if (id == null) { failed++; step(); return; }
           // 略等后验活(限速,避免连续打上游触发风控)。

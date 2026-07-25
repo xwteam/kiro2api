@@ -453,6 +453,19 @@ impl Pool {
         (max + 1).to_string()
     }
 
+    /// 池中是否已存在相同 `refresh_token` 的凭据(导入去重用);命中返回其 id。
+    /// refresh_token 是账号的唯一稳定标识——同一 token 重复导入会产生两条抢同一轮换令牌的
+    /// 凭据(刷新时互相作废、浪费配额、增加上游风控),故导入前据此跳过已存在账号。
+    pub fn find_id_by_refresh_token(&self, refresh_token: &str) -> Option<String> {
+        if refresh_token.is_empty() {
+            return None;
+        }
+        self.entries
+            .iter()
+            .find(|e| e.cred.refresh_token == refresh_token)
+            .map(|e| e.cred.id.clone())
+    }
+
     /// 新增一个凭据到活池:分配新数值 id(忽略入参 `cred.id`)、以默认健康态入池。
     /// 返回 (新 id, email);不落盘(调用方用 `snapshot_credentials` 落盘)。
     pub fn add_credential(&mut self, mut cred: Credential) -> (String, Option<String>) {

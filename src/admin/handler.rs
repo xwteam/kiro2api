@@ -2195,6 +2195,9 @@ pub struct AddCredentialResponse {
     pub credential_id: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    /// 该 refreshToken 已存在池中 → 未新增(去重跳过);`credential_id` 为既有账号 id。
+    #[serde(default)]
+    pub duplicate: bool,
 }
 
 /// `PUT /api/admin/credentials/{id}` 请求体,对齐前端 `UpdateCredentialRequest`。
@@ -2276,16 +2279,28 @@ fn parse_auth_method(s: Option<&str>) -> AuthMethod {
 /// [`persist_pool_credentials`] 在共享 `persist_lock` 下重新快照 + 原子落盘。所有凭据
 /// 落盘(admin CRUD + 刷新写回)共用同一把锁,序列化写盘、且各自落最新池状态,消除
 /// 「慢的旧快照覆盖新状态」竞态。
+/// 入活池 + 落盘,**自带去重**:池锁内先查同 `refresh_token` 是否已存在(原子,防 TOCTOU),
+/// 已存在则不重复添加、不落盘,返回既有 id + `is_duplicate=true`;新增则返回新 id + `false`。
+/// 返回元组第三位为「是否重复」。
 pub async fn add_credential_to_pool_and_persist(
     state: &MessagesState,
     cred: Credential,
-) -> anyhow::Result<(String, Option<String>)> {
-    let (id, email) = {
+) -> anyhow::Result<(String, Option<String>, bool)> {
+    let (id, email, is_duplicate) = {
         let mut pool = state.pool.lock().await;
-        pool.add_credential(cred)
+        match pool.find_id_by_refresh_token(&cred.refresh_token) {
+            Some(existing_id) => (existing_id, cred.email.clone(), true),
+            None => {
+                let (id, email) = pool.add_credential(cred);
+                (id, email, false)
+            }
+        }
     };
-    persist_pool_credentials(state).await?;
-    Ok((id, email))
+    // 仅新增才落盘;重复导入不改动池,无需写盘。
+    if !is_duplicate {
+        persist_pool_credentials(state).await?;
+    }
+    Ok((id, email, is_duplicate))
 }
 
 /// 经共享 `persist_lock` 序列化落盘活池凭据。全部 admin 凭据写盘的单一入口,与刷新路径
@@ -2350,11 +2365,16 @@ pub async fn add_credential(
     };
 
     match add_credential_to_pool_and_persist(&state, cred).await {
-        Ok((id, email)) => Json(AddCredentialResponse {
+        Ok((id, email, is_duplicate)) => Json(AddCredentialResponse {
             success: true,
-            message: "credential added".into(),
+            message: if is_duplicate {
+                "credential already exists".into()
+            } else {
+                "credential added".into()
+            },
             credential_id: id_as_number(&id),
             email,
+            duplicate: is_duplicate,
         })
         .into_response(),
         Err(e) => persist_failed(&e),
@@ -2589,6 +2609,8 @@ pub struct BatchImportResponse {
     pub message: String,
     pub total: usize,
     pub added: usize,
+    /// 因 refreshToken 已存在池中而被去重跳过的条数(未新增)。
+    pub duplicate: usize,
     pub failed: usize,
     pub results: Vec<BatchImportItemResult>,
 }
@@ -2612,6 +2634,7 @@ pub async fn import_credentials_batch(
     let total = items.len();
     let mut results: Vec<BatchImportItemResult> = Vec::with_capacity(total);
     let mut added = 0usize;
+    let mut duplicate = 0usize;
     let mut failed = 0usize;
 
     for (i, raw) in items.iter().enumerate() {
@@ -2705,15 +2728,26 @@ pub async fn import_credentials_batch(
 
         // 4) 入池落盘(逐项韧性:某条落盘失败仅该条判失败,继续下条)。
         match add_credential_to_pool_and_persist(&state, cred).await {
-            Ok((id, email)) => {
-                added += 1;
-                results.push(BatchImportItemResult {
-                    index,
-                    status: "added".into(),
-                    credential_id: Some(id_as_number(&id)),
-                    email,
-                    error: None,
-                });
+            Ok((id, email, is_dup)) => {
+                if is_dup {
+                    duplicate += 1;
+                    results.push(BatchImportItemResult {
+                        index,
+                        status: "duplicate".into(),
+                        credential_id: Some(id_as_number(&id)),
+                        email,
+                        error: None,
+                    });
+                } else {
+                    added += 1;
+                    results.push(BatchImportItemResult {
+                        index,
+                        status: "added".into(),
+                        credential_id: Some(id_as_number(&id)),
+                        email,
+                        error: None,
+                    });
+                }
             }
             Err(e) => {
                 failed += 1;
@@ -2730,9 +2764,12 @@ pub async fn import_credentials_batch(
 
     Json(BatchImportResponse {
         success: failed == 0,
-        message: format!("imported {added} of {total} credential(s), {failed} failed"),
+        message: format!(
+            "imported {added} of {total} credential(s), {duplicate} duplicate, {failed} failed"
+        ),
         total,
         added,
+        duplicate,
         failed,
         results,
     })
@@ -2878,7 +2915,7 @@ pub async fn login_builderid_poll(
         Ok(minted) => {
             let cred = minted_to_credential(minted, now);
             match add_credential_to_pool_and_persist(&state, cred).await {
-                Ok((id, email)) => {
+                Ok((id, email, _is_dup)) => {
                     state.builderid_sessions.remove(&req.session_id);
                     Json(BuilderIdPollResponse {
                         success: true,
@@ -3006,11 +3043,16 @@ pub async fn login_iam_sso_complete(
         Ok(minted) => {
             let cred = minted_to_credential(minted, now);
             match add_credential_to_pool_and_persist(&state, cred).await {
-                Ok((id, email)) => Json(AddCredentialResponse {
+                Ok((id, email, is_dup)) => Json(AddCredentialResponse {
                     success: true,
-                    message: "credential added".into(),
+                    message: if is_dup {
+                        "credential already exists".into()
+                    } else {
+                        "credential added".into()
+                    },
                     credential_id: id_as_number(&id),
                     email,
+                    duplicate: is_dup,
                 })
                 .into_response(),
                 Err(e) => persist_failed(&e),
