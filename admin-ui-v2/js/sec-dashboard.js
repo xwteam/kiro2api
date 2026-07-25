@@ -380,103 +380,170 @@
     // Up to date → success toast; new release → modal with the update command + notes.
     var cuBtn = host.querySelector('#dashCheckUpdateBtn');
     if (cuBtn) cuBtn.addEventListener('click', function () { runCheckUpdate(cuBtn); });
+    autoCheckUpdate();   // gemini2api 同款:加载即静默自检,有更新按钮变绿「更新到 vX」
 
     // re-apply i18n to the freshly injected static markup
     if (K.i18n) K.i18n.apply(host);
-    // uptime string is composed in JS (localized units) — recompose on lang change
-    window.addEventListener('langchange', function () { paintUptime(); });
+    // uptime string is composed in JS (localized units) — recompose on lang change;
+    // 按钮的动态「更新到 vX」文案也随语言重绘
+    window.addEventListener('langchange', function () { paintUptime(); paintUpdateBtn(lastUpdate); });
 
     inited = true;
   }
 
-  // ---- check for updates (GitHub Releases, via backend) ----
-  function runCheckUpdate(btn) {
-    if (btn) btn.disabled = true;
-    var restore = function () { if (btn) btn.disabled = false; };
+  // ---- check for updates (GitHub Releases, via backend) — gemini2api 同款流程 ----
+  // 仪表盘加载即静默自检:有更新则「检查更新」按钮变实心翡翠绿、文案「更新到 vX」;
+  // 点击 → 有更新弹出「更新服务」卡片(含当前语言的更新内容),否则重查 / 提示已是最新。
+  function autoCheckUpdate() {
     K.api.get('/check-update').then(function (d) {
-      d = d || {};
-      var cur = String(d.current || lastVersion || '?').replace(/^v/, '');
-      var latest = String(d.latest || cur).replace(/^v/, '');
-      if (!d.hasUpdate) {
-        K.api.toast(t('dash.upToDate', { version: cur }), 'success');
-        restore();
-        return;
-      }
-      // new version → fetch the update command then show a modal (command optional)
-      K.api.post('/update').then(function (u) {
-        showUpdateModal(cur, latest, (u && u.command) || '', d.updateUrl || '', d.releaseNotes || '');
-      }).catch(function () {
-        showUpdateModal(cur, latest, '', d.updateUrl || '', d.releaseNotes || '');
-      }).then(restore);
-    }).catch(function (e) {
-      K.api.toast((e && e.message) || t('dash.checkFailed'), 'error');
-      restore();
-    });
+      lastUpdate = d || {};
+      paintUpdateBtn(lastUpdate);
+    }).catch(function () { /* 自检失败保持按钮原样,不打扰 */ });
   }
 
-  // gemini2api 同款「更新服务」弹窗:居中卡片 + 顶部图标圆圈 + 居中标题 + 版本徽标
-  // (v当前 → v最新)+ 说明文案 + 命令块(可复制)+ 双按钮(打开 Release / 确认更新)。
-  // 弃用旧的左对齐 header/body/footer 版式与截断的 notes 文本块(改由「打开 Release」看全文)。
-  function showUpdateModal(current, latest, command, url, notes) {
+  function paintUpdateBtn(d) {
+    var btn = document.getElementById('dashCheckUpdateBtn');
+    if (!btn) return;
+    if (d && d.hasUpdate) {
+      var latest = String(d.latest || '').replace(/^v/, '');
+      btn.classList.remove('btn-outline');
+      btn.classList.add('btn-primary');        // 实心翡翠绿=有更新(对齐 gemini2api 的 btn-success)
+      btn.removeAttribute('data-i18n');         // 文案改为动态「更新到 vX」,别被 i18n.apply 覆盖
+      btn.textContent = t('dash.updateTo', { latest: latest });
+    } else {
+      btn.classList.remove('btn-primary');
+      btn.classList.add('btn-outline');
+      btn.setAttribute('data-i18n', 'dash.checkUpdate');
+      btn.textContent = t('dash.checkUpdate');
+    }
+  }
+
+  function runCheckUpdate(btn) {
+    // 已知有更新(自检过)→ 直接弹窗,不再请求(对齐 gemini2api)。
+    if (lastUpdate && lastUpdate.hasUpdate) { openUpdateModal(lastUpdate); return; }
+    if (btn) btn.disabled = true;
+    K.api.get('/check-update').then(function (d) {
+      lastUpdate = d || {};
+      paintUpdateBtn(lastUpdate);
+      if (lastUpdate.hasUpdate) {
+        openUpdateModal(lastUpdate);
+      } else {
+        var cur = String(lastUpdate.current || lastVersion || '?').replace(/^v/, '');
+        K.api.toast(t('dash.upToDate', { version: cur }), 'success');
+      }
+    }).catch(function (e) {
+      K.api.toast((e && e.message) || t('dash.checkFailed'), 'error');
+    }).then(function () { if (btn) btn.disabled = false; });
+  }
+
+  function openUpdateModal(d) {
+    var cur = String(d.current || lastVersion || '').replace(/^v/, '');
+    var latest = String(d.latest || cur).replace(/^v/, '');
+    showUpdateModal(cur, latest, 'docker compose pull && docker compose up -d', d.releaseNotes || '');
+  }
+
+  // 从发布说明正文抽出「当前 UI 语言」那一段(对齐 gemini2api 的 extractLocalizedNotes)。
+  // kiro2api 发布说明按 "### <国旗> <语言名>" 分节;取当前语言那段的正文,到下一小节止,
+  // 并去掉 markdown 强调符(**、`)让展示更干净。
+  function extractLocalizedNotes(body) {
+    if (!body) return '';
+    var lang = (K.i18n && K.i18n.getLang) ? K.i18n.getLang() : 'zh-CN';
+    var names = { 'zh-CN': '简体中文', 'zh-TW': '繁體中文', 'en': 'English', 'ja': '日本語', 'ko': '한국어' };
+    var lines = String(body).replace(/\r/g, '').split('\n');
+    function sliceByName(name) {
+      var start = -1, i;
+      for (i = 0; i < lines.length; i++) {
+        if (/^#{1,4}\s/.test(lines[i]) && lines[i].indexOf(name) !== -1) { start = i + 1; break; }
+      }
+      if (start === -1) return '';
+      var out = [];
+      for (i = start; i < lines.length; i++) {
+        if (/^#{1,4}\s/.test(lines[i])) break;   // 下一小节(其它语言或「升级」)即止
+        out.push(lines[i]);
+      }
+      return out.join('\n').trim();
+    }
+    var sec = sliceByName(names[lang] || '简体中文');
+    if (!sec) sec = sliceByName('English');
+    if (!sec) sec = String(body).replace(/^#.*$/gm, '').replace(/```[\s\S]*?```/g, '').trim().split('\n').slice(0, 10).join('\n').trim();
+    return sec.replace(/\*\*/g, '').replace(/`/g, '');   // 去掉 **粗体** 与 `代码` 标记
+  }
+
+  // gemini2api 同款「更新服务」弹窗(app.js handleCheckUpdate 1:1):
+  // 图标圆圈 → 标题「更新服务 v最新」→ 可滚动的本地化更新内容框 → 命令说明 →
+  // 命令行(内嵌复制按钮,复制后变对勾)→ 底部单个「取消」按钮。
+  function showUpdateModal(current, latest, command, notes) {
+    var cmd = command || 'docker compose pull && docker compose up -d';
+    var localized = extractLocalizedNotes(notes);
     var root = document.getElementById('modalRoot') || document.body;
     var overlay = document.createElement('div'); overlay.className = 'modal-overlay active';
     var modal = document.createElement('div'); modal.className = 'modal';
-    modal.style.cssText = 'max-width:440px;text-align:center;';
+    modal.style.cssText = 'max-width:460px;text-align:center;';
 
-    var body = document.createElement('div'); body.style.cssText = 'padding:2rem 2rem 1.25rem;';
+    var body = document.createElement('div'); body.style.cssText = 'padding:1.5rem 2rem;';
 
-    // 顶部图标圆圈(翡翠绿 cloud-download,与 gemini2api 的居中图标一致)
+    // 图标圆圈
     var ic = document.createElement('div');
     ic.style.cssText = 'width:56px;height:56px;border-radius:50%;background:var(--primary-soft);color:var(--primary);display:inline-flex;align-items:center;justify-content:center;margin-bottom:1rem;';
     ic.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 13v8"/><path d="m8 17 4 4 4-4"/><path d="M4.393 15.269A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.436 8.284"/></svg>';
     body.appendChild(ic);
 
+    // 标题:更新服务 v最新
     var h3 = document.createElement('h3');
-    h3.textContent = t('dash.updateService');
-    h3.style.cssText = 'margin:0 0 0.6rem;font-size:1.125rem;font-weight:700;color:var(--text-primary);';
+    h3.textContent = t('dash.updateService') + ' v' + latest;
+    h3.style.cssText = 'margin:0 0 0.5rem;font-size:1.125rem;font-weight:700;color:var(--text-primary);';
     body.appendChild(h3);
 
-    // 版本徽标:v当前 →(翡翠绿)v最新
-    var vr = document.createElement('div');
-    vr.style.cssText = 'display:inline-flex;align-items:center;gap:0.5rem;margin:0 0 1rem;font-size:0.9rem;';
-    var cv = document.createElement('span'); cv.textContent = 'v' + current; cv.style.cssText = 'color:var(--text-secondary);';
-    var ar = document.createElement('span'); ar.textContent = '→'; ar.style.cssText = 'color:var(--text-secondary);';
-    var lv = document.createElement('span'); lv.textContent = 'v' + latest; lv.style.cssText = 'color:var(--primary);font-weight:700;';
-    vr.appendChild(cv); vr.appendChild(ar); vr.appendChild(lv);
-    body.appendChild(vr);
+    // 本地化更新内容(可滚动框)= 核心:展示更新内容,对齐 gemini2api
+    if (localized) {
+      var nb = document.createElement('div');
+      nb.style.cssText = 'max-height:140px;overflow-y:auto;text-align:left;padding:0.75rem;margin:0.75rem 0;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:var(--radius-lg,10px);font-size:0.8rem;color:var(--text-secondary);line-height:1.55;white-space:pre-wrap;';
+      nb.textContent = localized;
+      body.appendChild(nb);
+    }
 
+    // 命令说明
     var msg = document.createElement('p');
     msg.textContent = t('dash.updateCommand');
-    msg.style.cssText = 'margin:0 0 0.75rem;color:var(--text-secondary);font-size:0.85rem;line-height:1.5;';
+    msg.style.cssText = 'margin:0.75rem 0 0.5rem;color:var(--text-secondary);font-size:0.85rem;';
     body.appendChild(msg);
 
-    if (command) {
-      var wrap = document.createElement('div'); wrap.className = 'int-codewrap'; wrap.style.textAlign = 'left';
-      var cbtn = document.createElement('button'); cbtn.className = 'btn btn-outline btn-sm int-copy'; cbtn.type = 'button'; cbtn.textContent = t('common.copy');
-      cbtn.addEventListener('click', function () {
-        try { navigator.clipboard.writeText(command).then(function () { K.api.toast(t('common.copied'), 'success'); }); } catch (e) {}
-      });
-      var pre = document.createElement('pre'); pre.className = 'int-code';
-      var code = document.createElement('code'); code.textContent = command; pre.appendChild(code);
-      wrap.appendChild(cbtn); wrap.appendChild(pre); body.appendChild(wrap);
-    }
+    // 命令行 + 内嵌复制按钮(复制后图标变对勾)
+    var cmdRow = document.createElement('div');
+    cmdRow.style.cssText = 'display:flex;align-items:center;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:var(--radius-lg,10px);padding:0.6rem 1rem;margin:0.5rem 0;';
+    var code = document.createElement('code');
+    code.textContent = cmd;
+    code.style.cssText = 'flex:1;font-size:0.8rem;color:var(--text-primary);font-family:monospace;word-break:break-all;text-align:left;';
+    var copyBtn = document.createElement('button');
+    copyBtn.type = 'button'; copyBtn.title = t('common.copy');
+    copyBtn.style.cssText = 'flex-shrink:0;margin-left:0.5rem;background:none;border:none;color:var(--text-secondary);cursor:pointer;padding:0.25rem;border-radius:4px;display:inline-flex;';
+    var SVG_COPY = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
+    var SVG_CHECK = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+    copyBtn.innerHTML = SVG_COPY;
+    copyBtn.addEventListener('click', function () {
+      var okCopy = function () {
+        copyBtn.innerHTML = SVG_CHECK; copyBtn.style.color = 'var(--primary)';
+        K.api.toast(t('common.copied'), 'success');
+        setTimeout(function () { copyBtn.innerHTML = SVG_COPY; copyBtn.style.color = 'var(--text-secondary)'; }, 1500);
+      };
+      try { navigator.clipboard.writeText(cmd).then(okCopy, function () {}); } catch (e) {}
+    });
+    cmdRow.appendChild(code); cmdRow.appendChild(copyBtn); body.appendChild(cmdRow);
     modal.appendChild(body);
 
+    // 底部单个「取消」按钮(对齐 gemini2api)
     var foot = document.createElement('div');
-    foot.style.cssText = 'display:flex;gap:0.75rem;padding:0 2rem 2rem;justify-content:center;';
-    // 仅接受 http(s) 链接(纵深防御:防远端返回 javascript:/data: 之类的伪 href)。
-    if (url && /^https?:\/\//i.test(url)) {
-      var a = document.createElement('a'); a.className = 'btn btn-outline'; a.style.flex = '1'; a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer'; a.textContent = t('dash.openRelease');
-      foot.appendChild(a);
-    }
-    var ok = document.createElement('button'); ok.className = 'btn btn-primary'; ok.style.flex = '1'; ok.type = 'button'; ok.textContent = t('dash.confirmUpdate');
-    foot.appendChild(ok); modal.appendChild(foot);
+    foot.style.cssText = 'display:flex;gap:0.75rem;padding:0 2rem 1.5rem;justify-content:center;';
+    var cancel = document.createElement('button');
+    cancel.type = 'button'; cancel.className = 'btn btn-outline'; cancel.style.flex = '1';
+    cancel.textContent = t('common.cancel');
+    foot.appendChild(cancel); modal.appendChild(foot);
 
     overlay.appendChild(modal); root.appendChild(overlay);
     function done() { document.removeEventListener('keydown', onKey, true); overlay.remove(); }
     function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); done(); } }
     document.addEventListener('keydown', onKey, true);
-    ok.addEventListener('click', done);
+    cancel.addEventListener('click', done);
     overlay.addEventListener('click', function (e) { if (e.target === overlay) done(); });
   }
 
@@ -525,6 +592,7 @@
   // ---------------- data render ----------------
   var lastCreds = null;
   var lastVersion = null;
+  var lastUpdate = null;   // 缓存 /check-update 结果(自检+点击共用,对齐 gemini2api)
 
   async function render() {
     if (!inited) init();
