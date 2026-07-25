@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="../logo.png" width="128" height="128" alt="kiro2api">
+
 <h1>kiro2api</h1>
 <h3>マルチプロトコル AI 中継 · Kiro バックエンド</h3>
 <p>単一コードベースで OpenAI / Anthropic / OpenAI-Responses / Gemini の 4 大 AI SDK に同時対応、Kiro（CodeWhisperer）バックエンドが Claude 系モデルを統一提供、純非同期 Rust アーキテクチャ、Docker で高速デプロイ。</p>

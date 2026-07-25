@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="../logo.png" width="128" height="128" alt="kiro2api">
+
 <h1>kiro2api</h1>
 <h3>Multi-Protocol AI Relay · Kiro Backend</h3>
 <p>Single codebase compatible with OpenAI / Anthropic / OpenAI-Responses / Gemini SDKs, backed by a Kiro (CodeWhisperer) account pool that serves Claude-family models, pure async Rust architecture, Docker quick deployment.</p>

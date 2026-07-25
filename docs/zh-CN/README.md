@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="../logo.png" width="128" height="128" alt="kiro2api">
+
 <h1>kiro2api</h1>
 <h3>多协议 AI 中转 · Kiro 后端</h3>
 <p>一套代码同时兼容 OpenAI / Anthropic / OpenAI-Responses / Gemini 四大 AI SDK，由 Kiro（CodeWhisperer）后端统一提供 Claude 系模型，纯异步 Rust 架构，Docker 快速部署。</p>
