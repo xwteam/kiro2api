@@ -4,7 +4,7 @@
 //! 时统一返回 503。鉴权由挂载处的 admin `require_api_key` 闸完成——原生 EventSource 无法设自定义
 //! 头,故用 URL query `?api_key=`(或历史 `?token=`)携带 key,闸的 [`query_param_key`] 已支持。
 //!
-//! 前端契约(`admin-ui/src/hooks/use-log-stream.ts`):
+//! 前端契约(admin-ui-v2 的日志页 `js/sec-logs.js`):
 //! - `GET /api/admin/logs/stream`:SSE。首个具名事件 `history`(data = LogEntry JSON 数组),
 //!   其后每条新记录一个具名事件 `log`(data = 单个 LogEntry JSON);带周期心跳防代理断流。
 //! - `GET /api/admin/logs/snapshot`:JSON,返回当前历史环形缓冲的 LogEntry 数组。

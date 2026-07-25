@@ -7,8 +7,6 @@ data
 config.json
 credentials.json
 node_modules
-admin-ui/node_modules
 user-ui/node_modules
 
-admin-ui/dist
 user-ui/dist

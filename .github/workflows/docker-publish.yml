@@ -36,3 +36,6 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # 跨构建复用层缓存(依赖编译产物等),后续构建更快。
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
