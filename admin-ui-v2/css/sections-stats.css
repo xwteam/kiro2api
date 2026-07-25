@@ -1,0 +1,678 @@
+/* kiro2api Admin UI v2 — sections-stats.css
+   Styles OWNED by the Dashboard (#sec-dashboard) and Usage Stats (#sec-usage)
+   sections. Reuses shared primitives from base.css (.stats-grid, .stat-card,
+   .card, .data-table, .badge, .btn) and only adds what those two sections need.
+   Every color references a base.css CSS variable so both themes work. */
+
+/* ============================================================
+   Shared: section title + toolbar row
+   ============================================================ */
+.stats-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.5rem;
+}
+.stats-head h2 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin: 0;
+}
+.stats-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+/* A muted inline loading / empty line reused across panels. */
+.stats-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  min-height: 120px;
+  color: var(--text-tertiary);
+  font-size: 0.9rem;
+}
+.stats-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--border-color);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: stats-spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes stats-spin { to { transform: rotate(360deg); } }
+
+/* ============================================================
+   Dashboard — overview stat cards: FIVE in a single row
+   ============================================================ */
+/* The 5 overview cards (accounts / today credits / today cost / global credits
+   / model count) must sit in ONE row on desktop rather than the base.css
+   auto-fit grid wrapping the 5th card onto a second line. Force an explicit
+   5-column track scoped to the dashboard, and shrink each card slightly
+   (padding + icon + value font) so all five fit comfortably at ~1280px.
+   On narrower viewports we relax to auto-fit so cards wrap gracefully. */
+#sec-dashboard .stats-grid {
+  grid-template-columns: repeat(5, 1fr);
+  gap: 1rem;
+}
+/* Slightly more compact cards so 5 fit on a ~1280px canvas. */
+#sec-dashboard .stats-grid .stat-card {
+  padding: 1.1rem;
+  gap: 0.75rem;
+}
+/* Below ~1200px, five equal columns get too cramped — fall back to auto-fit
+   so cards wrap onto additional rows instead of overflowing. */
+@media (max-width: 1200px) {
+  #sec-dashboard .stats-grid {
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  }
+}
+
+/* ============================================================
+   Dashboard — stat cards accent + icon tint
+   ============================================================ */
+/* The dashboard stat icon reuses .stat-card from base; give the emoji glyph a
+   soft tinted chip so it reads as an icon rather than loose text. Sized down a
+   touch to help all five cards share one row. */
+.dash-stat-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius-lg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.35rem;
+  line-height: 1;
+  background: var(--primary-10);
+  flex-shrink: 0;
+}
+.dash-stat-icon.tint-blue    { background: var(--info-10); }
+.dash-stat-icon.tint-amber   { background: var(--warning-15); }
+.dash-stat-icon.tint-green   { background: var(--success-10); }
+.dash-stat-icon.tint-red     { background: var(--danger-10); }
+
+.dash-stat-body { min-width: 0; }
+.dash-stat-value {
+  font-size: 1.6rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.1;
+  margin: 0 0 0.15rem 0;
+  word-break: break-word;
+}
+.dash-stat-label {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+/* Inline "refresh" button living inside a stat card label (global credits). */
+.btn-xs {
+  padding: 0.1rem 0.5rem;
+  font-size: 0.7rem;
+  line-height: 1.4;
+}
+.dash-gc-btn { flex-shrink: 0; }
+
+/* Subtle cache-basis meta under the global-credits value: "基于 X/N 个已缓存
+   账号 · 更新于 X 前". Reads the SHARED balance cache (zero upstream). Muted and
+   small so it reads as secondary provenance, not a primary stat. Collapses when
+   empty (no cache yet) so it doesn't reserve blank space. */
+.dash-gc-meta {
+  color: var(--text-tertiary, var(--text-secondary));
+  font-size: 0.68rem;
+  line-height: 1.3;
+  margin: 0.2rem 0 0 0;
+  opacity: 0.85;
+}
+.dash-gc-meta:empty { display: none; }
+
+/* ============================================================
+   Dashboard — system-info panel (reference-style key/value grid)
+   ============================================================ */
+/* Elevated info panel (gemini2api .system-info-panel uses --shadow-md at rest
+   and lifts on hover for a tactile, refined feel). */
+.dash-sysinfo {
+  box-shadow: var(--shadow-md);
+  transition: var(--transition);
+}
+.dash-sysinfo:hover {
+  box-shadow: var(--shadow-lg);
+  border-color: var(--primary-20);
+}
+.dash-sysinfo .card-header {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+/* Push the "check update" button to the far right of the panel header. */
+.dash-sysinfo .card-header .dash-check-update { margin-left: auto; }
+/* Version now lives ONLY in the panel title, appended after "系统信息". */
+.dash-sysinfo-ver {
+  color: var(--text-secondary);
+  font-weight: 600;
+  font-size: 0.85em;
+}
+/* Live rotation-strategy badge (replaces the old duplicate version badge). */
+.dash-rotation-badge {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.3rem;
+  padding: 0.15rem 0.6rem;
+  background: var(--primary-10);
+  color: var(--primary);
+  border-radius: var(--radius-md);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+.dash-rotation-value { font-weight: 700; }
+
+/* gemini2api parity: the system-info grid is a fixed 4-per-row × 2-rows layout
+   (8 fields: 版本号/Rust版本/服务器时间/操作系统/内存/CPU/运行模式/PID). On narrow
+   viewports it collapses to 2 columns (≤1024px) then 1 column (≤768px), matching
+   gemini2api's .info-grid media queries. */
+.dash-info-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1.1rem 1.25rem;
+}
+.dash-info-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-width: 0;
+}
+/* gemini2api .info-label: an icon chip + label text on one line, value below. */
+.dash-info-label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  font-weight: 500;
+}
+.dash-info-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--primary);
+  line-height: 0;
+  flex-shrink: 0;
+}
+.dash-info-icon svg { display: block; }
+.dash-info-value {
+  color: var(--text-primary);
+  font-size: 1rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ============================================================
+   Dashboard — uptime widget (left) + QR row (right)
+   gemini2api-style: a dedicated live-ticking uptime card sits to the LEFT of the
+   community/sponsor QR cards in a single flex row. On narrow screens the row
+   stacks and the uptime card drops its min-width.
+   ============================================================ */
+.dash-uptime-row {
+  display: flex;
+  gap: 1.25rem;
+  align-items: stretch;
+  margin-bottom: 1.5rem;
+}
+.dash-uptime-card {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-sm);
+  padding: 2rem 2.5rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  min-width: 260px;
+  flex-shrink: 0;
+  transition: var(--transition);
+}
+.dash-uptime-card:hover {
+  transform: translateY(-4px);
+  box-shadow: var(--shadow-lg);
+  border-color: var(--primary-20);
+}
+.dash-uptime-icon {
+  color: var(--primary);
+  line-height: 0;
+}
+.dash-uptime-value {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  white-space: nowrap;
+  text-align: center;
+}
+.dash-uptime-label {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+/* The QR cards live to the right of the uptime card and share the remaining
+   width, side by side (reusing .dash-qr-card visuals below). */
+.dash-qr-cards {
+  display: flex;
+  gap: 1.25rem;
+  flex: 1;
+  min-width: 0;
+}
+.dash-qr-cards .dash-qr-card { flex: 1; min-width: 0; }
+
+/* ============================================================
+   Dashboard — community / sponsor placeholder cards (QR row)
+   Two side-by-side cards; each holds a dashed placeholder box (emoji + text)
+   in place of a real QR image.
+   ============================================================ */
+.dash-qr-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 1.25rem;
+  margin-bottom: 1.5rem;
+}
+.dash-qr-card {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-sm);
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  transition: var(--transition);
+}
+.dash-qr-card:hover {
+  transform: translateY(-4px);
+  box-shadow: var(--shadow-lg);
+  border-color: var(--primary-20);
+}
+.dash-qr-box {
+  width: 120px;
+  height: 120px;
+  border: 2px dashed var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  margin-bottom: 0.75rem;
+  padding: 0.5rem;
+}
+.dash-qr-box .dash-qr-emoji { font-size: 1.75rem; line-height: 1; }
+.dash-qr-box .dash-qr-hint {
+  font-size: 0.65rem;
+  color: var(--text-tertiary);
+  line-height: 1.3;
+}
+.dash-qr-title {
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0 0 0.25rem 0;
+  font-size: 0.9rem;
+}
+.dash-qr-desc {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  line-height: 1.4;
+  margin: 0;
+}
+
+/* ============================================================
+   Usage Stats — faithful port of the reference usage-stats styling
+   (summary stat cards + chart panel with controls + daily table + drill).
+   ============================================================ */
+
+/* Section title row (reference layout .section-header / .section-title) */
+.usage-summary-grid { margin-bottom: 2rem; }
+
+/* --- 6 summary cards in ONE ROW ---
+   The 6 metric cards (requests/cost/credits/errorRate/avgLatency/rotationSuccess)
+   must share a single row at desktop width (~1280px) instead of wrapping onto two
+   rows. Force an explicit 6-column track and shrink each card (tighter padding +
+   gap, smaller icon, smaller value/label font) so all six fit comfortably.
+   On narrower viewports we relax to auto-fit so cards wrap gracefully. */
+#sec-usage .usage-summary-grid {
+  grid-template-columns: repeat(6, 1fr);
+  gap: 0.75rem;
+}
+#sec-usage .usage-summary-grid .stat-card {
+  padding: 0.85rem;
+  gap: 0.6rem;
+}
+/* Compact icon chip so six cards share one row. */
+#sec-usage .usage-summary-grid .stat-icon {
+  width: 40px;
+  height: 40px;
+  font-size: 1.1rem;
+}
+/* Smaller value + label so the numbers don't force a wrap. */
+#sec-usage .usage-summary-grid .stat-info h3 {
+  font-size: 1.15rem;
+  margin: 0 0 0.1rem 0;
+}
+#sec-usage .usage-summary-grid .stat-info p {
+  font-size: 0.72rem;
+}
+/* Below ~1200px, six equal columns get too cramped — fall back to auto-fit so
+   cards wrap onto additional rows instead of overflowing. */
+@media (max-width: 1200px) {
+  #sec-usage .usage-summary-grid {
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  }
+}
+
+#sec-usage .section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.5rem;
+}
+#sec-usage .section-title {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+/* --- summary stat cards: tinted icon chips like reference layout --- */
+#sec-usage .stat-icon {
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-lg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.5rem;
+  line-height: 1;
+  flex-shrink: 0;
+  background: var(--primary-10);
+  color: var(--primary);
+}
+#sec-usage .stat-icon.primary { background: var(--primary-10); }
+#sec-usage .stat-icon.warning { background: var(--warning-15); }
+#sec-usage .stat-icon.info    { background: var(--info-10); }
+#sec-usage .stat-icon.success { background: var(--success-10); }
+#sec-usage .stat-icon.danger  { background: var(--danger-10); }
+
+#sec-usage .stat-info { flex: 1; min-width: 0; }
+#sec-usage .stat-info h3 {
+  font-size: 2rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.1;
+  margin: 0 0 0.25rem 0;
+  word-break: break-word;
+}
+#sec-usage .stat-info p {
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+/* ============================================================
+   Chart panel (reference layout .usage-chart-panel)
+   ============================================================ */
+.usage-chart-panel {
+  background: var(--bg-primary);
+  border-radius: var(--radius-xl);
+  padding: 1.5rem;
+  margin-bottom: 1.5rem;
+  border: 1px solid var(--border-color);
+  box-shadow: var(--shadow-sm);
+  transition: var(--transition);
+}
+.usage-chart-panel:hover {
+  box-shadow: var(--shadow-md);
+  border-color: var(--primary-20);
+}
+
+.chart-controls {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+.control-group {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.control-group label {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.chart-controls .btn-group {
+  display: flex;
+  gap: 0.25rem;
+}
+.chart-controls .btn-group .btn.active {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
+}
+
+/* Long-window daily-fallback caveat: a soft muted note above the chart, shown
+   only when the summary endpoint sets dailyFallbackApplied (token totals for
+   long ranges reflect surviving raw records only). */
+.usage-fallback-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.4rem;
+  margin-bottom: 0.85rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-md);
+  background: var(--warning-15);
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+.usage-fallback-note::before {
+  content: 'ℹ️';
+  flex-shrink: 0;
+  line-height: 1.4;
+}
+
+.chart-container {
+  width: 100%;
+  min-height: 320px;
+  position: relative;
+}
+.chart-container svg {
+  width: 100%;
+  height: auto;
+  min-height: 320px;
+  display: block;
+}
+
+/* inline loading line for chart / drill / table body */
+.chart-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 200px;
+  color: var(--text-secondary);
+  gap: 0.5rem;
+}
+
+/* empty state (reference layout .empty-chart): large glyph + caption */
+.empty-chart {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 200px;
+  color: var(--text-secondary);
+  gap: 0.75rem;
+}
+.empty-chart .empty-chart-icon {
+  font-size: 2rem;
+  opacity: 0.5;
+  line-height: 1;
+}
+.empty-chart p { margin: 0; }
+
+/* SVG chart primitives (theme-var driven so both themes work) */
+.usage-chart-bar {
+  fill: var(--primary);
+  fill-opacity: 0.7;
+  transition: fill-opacity 0.15s ease;
+  cursor: pointer;
+}
+.usage-chart-bar:hover { fill-opacity: 1; }
+.usage-chart-gridline {
+  stroke: var(--border-color);
+  stroke-width: 1;
+  stroke-dasharray: 2 2;
+}
+.usage-chart-label,
+.usage-chart-ylabel {
+  fill: var(--text-secondary);
+  font-size: 10px;
+}
+
+/* floating tooltip for chart bars */
+.usage-tooltip {
+  position: fixed;
+  z-index: 40;
+  pointer-events: none;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  padding: 0.55rem 0.75rem;
+  font-size: 0.8rem;
+  color: var(--text-primary);
+  max-width: 240px;
+  display: none;
+}
+.usage-tooltip.show { display: block; }
+.usage-tooltip .tt-date { font-weight: 700; margin-bottom: 0.3rem; }
+.usage-tooltip .tt-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  color: var(--text-secondary);
+}
+.usage-tooltip .tt-row b { color: var(--text-primary); font-weight: 600; }
+
+/* ============================================================
+   Daily breakdown table panel (reference layout card look)
+   ============================================================ */
+.usage-table-panel {
+  background: var(--bg-primary);
+  border-radius: var(--radius-xl);
+  padding: 1.5rem;
+  margin-bottom: 1.5rem;
+  border: 1px solid var(--border-color);
+  box-shadow: var(--shadow-sm);
+  transition: var(--transition);
+}
+.usage-table-panel:hover {
+  box-shadow: var(--shadow-md);
+  border-color: var(--primary-20);
+}
+.usage-panel-title {
+  margin: 0 0 1rem 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.usage-table-wrap { width: 100%; overflow-x: auto; }
+.usage-daily-table tbody tr { cursor: pointer; }
+.usage-daily-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.usage-daily-table th.num { text-align: right; }
+.usage-daily-table .drill-cell { text-align: right; }
+
+/* Drill-down records (inline panel under a day) */
+.usage-drill { margin-top: 1.25rem; }
+.usage-drill-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+}
+.usage-drill-head h3 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+}
+.usage-records-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.usage-records-table th.num { text-align: right; }
+.usage-records-table td.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+}
+
+/* Pagination bar for drill records */
+.usage-pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  margin-top: 0.9rem;
+}
+.usage-pager .page-info {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+}
+
+/* System-info grid collapses 4→2 columns on tablets (gemini2api @1024px). */
+@media (max-width: 1024px) {
+  .dash-info-grid { grid-template-columns: repeat(2, 1fr); }
+}
+
+/* Uptime row: stack the uptime card above the QR cards, and let the QR cards
+   themselves wrap, once the row can no longer hold everything side by side.
+   The system-info grid drops to a single column here (gemini2api @768px). */
+@media (max-width: 768px) {
+  .dash-uptime-row { flex-direction: column; }
+  .dash-uptime-card { min-width: 0; }
+  .dash-qr-cards { flex-direction: column; }
+  .dash-info-grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 640px) {
+  .stats-head h2 { font-size: 1.25rem; }
+  #sec-usage .section-title { font-size: 1.25rem; }
+  .chart-controls { gap: 1rem; }
+}
+
+/* 远程二维码图片 (gemini2api: zoom-in cursor + subtle scale on hover) */
+.dash-qr-img {
+  width: 148px;
+  height: 148px;
+  object-fit: contain;
+  border-radius: var(--radius-md);
+  background: #fff;
+  cursor: zoom-in;
+  transition: transform 0.2s ease;
+}
+.dash-qr-img:hover { transform: scale(1.05); }

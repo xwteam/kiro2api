@@ -1,0 +1,11 @@
+/* kiro2api Admin UI v2 — sections.css
+   Entry stylesheet for the per-section styles. The actual section rules live in
+   the section-scoped files loaded after this one:
+     - sections-manage.css  (Accounts, API Keys, Settings, Models)
+     - sections-stats.css   (Dashboard, Usage Stats)
+     - sections-tools.css   (Model Test / Playground, Live Logs)
+   Shared component primitives (.card, .btn, .badge, .modal, .data-table,
+   .form-*, tokens) live in base.css. This file intentionally holds no rules so
+   the section files remain the single source of truth for their surfaces (the
+   dark-surface .logs-console, for example, is fully defined in
+   sections-tools.css with the refined --radius-xl + --shadow-sm treatment). */

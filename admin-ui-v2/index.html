@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN" data-lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#059669">
+  <base href="/admin/">
+  <title>kiro2api Admin</title>
+  <link rel="icon" type="image/png" href="logo.png">
+  <link rel="apple-touch-icon" href="logo.png">
+  <link rel="stylesheet" href="css/base.css">
+  <link rel="stylesheet" href="css/sections.css">
+  <link rel="stylesheet" href="css/sections-manage.css">
+  <link rel="stylesheet" href="css/sections-stats.css">
+  <link rel="stylesheet" href="css/sections-tools.css">
+  <!-- sync (no defer): apply saved theme + language before the body paints -->
+  <script src="js/boot.js"></script>
+</head>
+<body>
+  <div class="container">
+    <!-- ===== header ===== -->
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-mark">
+          <img class="brand-img" src="logo.png" alt="" aria-hidden="true">
+        </span>
+        <span>kiro2api</span>
+      </div>
+      <div class="header-spacer"></div>
+      <div class="header-actions">
+        <!-- running status -->
+        <span id="serverStatus" class="status-badge" title="运行状态" data-i18n-title="header.status">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span class="status-text" data-i18n="header.statusRunning">运行中</span>
+        </span>
+        <!-- github -->
+        <a id="githubLink" class="icon-btn" href="https://github.com/xwteam/kiro2api" target="_blank" rel="noopener noreferrer" title="GitHub" aria-label="GitHub">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49 0-.24-.01-.87-.01-1.71-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.49-1.11-1.49-.91-.64.07-.63.07-.63 1 .07 1.53 1.06 1.53 1.06.89 1.56 2.34 1.11 2.91.85.09-.66.35-1.11.63-1.37-2.22-.26-4.56-1.14-4.56-5.06 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05a9.36 9.36 0 0 1 2.5-.34c.85 0 1.71.12 2.5.34 1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.93-2.35 4.79-4.58 5.05.36.32.68.94.68 1.9 0 1.37-.01 2.47-.01 2.81 0 .27.18.6.69.49A10.04 10.04 0 0 0 22 12.25C22 6.58 17.52 2 12 2z"></path>
+          </svg>
+        </a>
+        <!-- restart -->
+        <button id="restartBtn" class="icon-btn" type="button" title="重启服务" data-i18n-title="header.restart">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M23 4v6h-6"></path>
+            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+          </svg>
+          <span data-i18n="header.restart">重启</span>
+        </button>
+        <!-- language -->
+        <div class="lang-wrap">
+          <button id="langBtn" class="icon-btn" type="button" data-i18n-title="header.language" aria-haspopup="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="2" y1="12" x2="22" y2="12"></line>
+              <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+            </svg>
+            <span class="lang-label">简体中文</span>
+          </button>
+          <div id="langMenu" class="lang-menu"></div>
+        </div>
+        <!-- theme -->
+        <button id="themeToggleBtn" class="icon-btn theme-toggle" type="button" data-i18n-title="header.theme">
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4"></circle>
+            <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path>
+          </svg>
+          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="display:none">
+            <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path>
+          </svg>
+        </button>
+        <!-- logout -->
+        <button id="logoutBtn" class="icon-btn" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+            <polyline points="16 17 21 12 16 7"></polyline>
+            <line x1="21" y1="12" x2="9" y2="12"></line>
+          </svg>
+          <span data-i18n="nav.logout">退出登录</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- ===== main: sidebar + content ===== -->
+    <div class="main-content">
+      <aside id="sidebar" class="sidebar">
+        <nav>
+          <div class="nav-item active" data-section="dashboard">
+            <span class="nav-icon" aria-hidden="true">📊</span><span data-i18n="nav.dashboard">仪表盘</span>
+          </div>
+          <div class="nav-item" data-section="accounts">
+            <span class="nav-icon" aria-hidden="true">👤</span><span data-i18n="nav.accounts">账号管理</span>
+          </div>
+          <div class="nav-item" data-section="models">
+            <span class="nav-icon" aria-hidden="true">🤖</span><span data-i18n="nav.models">支持模型</span>
+          </div>
+          <div class="nav-item" data-section="apikeys">
+            <span class="nav-icon" aria-hidden="true">🔑</span><span data-i18n="nav.apikeys">API管理</span>
+          </div>
+          <div class="nav-item" data-section="modeltest">
+            <span class="nav-icon" aria-hidden="true">🧪</span><span data-i18n="nav.modeltest">模型测试</span>
+          </div>
+          <div class="nav-item" data-section="usage">
+            <span class="nav-icon" aria-hidden="true">📈</span><span data-i18n="nav.usage">使用统计</span>
+          </div>
+          <div class="nav-item" data-section="logs">
+            <span class="nav-icon" aria-hidden="true">📜</span><span data-i18n="nav.logs">实时日志</span>
+          </div>
+          <div class="nav-item" data-section="settings">
+            <span class="nav-icon" aria-hidden="true">⚙️</span><span data-i18n="nav.settings">设置</span>
+          </div>
+        </nav>
+      </aside>
+
+      <main id="content" class="content">
+        <!-- Section stubs. Each sec-*.js populates and refreshes its own node.
+             Do not remove or rename the ids — the router keys off sec-<name>. -->
+        <section id="sec-dashboard" class="section active"></section>
+        <section id="sec-accounts" class="section"></section>
+        <section id="sec-models" class="section"></section>
+        <section id="sec-apikeys" class="section"></section>
+        <section id="sec-modeltest" class="section"></section>
+        <section id="sec-usage" class="section"></section>
+        <section id="sec-logs" class="section"></section>
+        <section id="sec-settings" class="section"></section>
+      </main>
+    </div>
+  </div>
+
+  <!-- mobile sidebar toggle + backdrop -->
+  <div id="sidebarBackdrop" class="sidebar-backdrop"></div>
+  <button id="sidebarToggle" class="sidebar-toggle" type="button" data-i18n-title="nav.menu">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <line x1="3" y1="6" x2="21" y2="6"></line>
+      <line x1="3" y1="12" x2="21" y2="12"></line>
+      <line x1="3" y1="18" x2="21" y2="18"></line>
+    </svg>
+  </button>
+
+  <!-- ===== login gate overlay ===== -->
+  <div id="loginOverlay" class="login-overlay">
+    <div class="login-card">
+      <div class="login-brand">
+        <span class="brand-mark">
+          <img class="brand-img" src="logo.png" alt="" aria-hidden="true">
+        </span>
+        <span>kiro2api</span>
+      </div>
+      <div class="login-title" data-i18n="login.title">登录</div>
+      <div class="form-group">
+        <input id="loginKeyInput" class="form-control" type="password" autocomplete="off"
+               data-i18n-ph="login.keyPlaceholder" placeholder="输入管理员 API 密钥">
+        <div id="loginError" class="login-error" data-i18n="login.error">管理员密钥无效</div>
+      </div>
+      <button id="loginSubmitBtn" class="btn btn-primary btn-block btn-lg" type="button" data-i18n="login.submit">进入</button>
+      <div class="login-hint" data-i18n="login.hint">使用配置中的管理员 API 密钥</div>
+    </div>
+  </div>
+
+  <!-- toast + generic modal mount -->
+  <div id="toastContainer" class="toast-container"></div>
+  <div id="modalRoot"></div>
+
+  <!-- ===== scripts (classic, shared window.K namespace) ===== -->
+  <script src="js/i18n-dict.js"></script>   <!-- defines window.I18N (dictionary agent) -->
+  <script src="js/i18n.js"></script>
+  <script src="js/theme.js"></script>
+  <script src="js/api.js"></script>
+  <script src="js/sec-dashboard.js"></script>
+  <script src="js/sec-accounts.js"></script>
+  <script src="js/sec-models.js"></script>
+  <script src="js/sec-apikeys.js"></script>
+  <script src="js/sec-modeltest.js"></script>
+  <script src="js/sec-usage.js"></script>
+  <script src="js/sec-logs.js"></script>
+  <script src="js/sec-settings.js"></script>
+  <script src="js/app.js"></script>          <!-- last: wires shell, runs login gate -->
+</body>
+</html>

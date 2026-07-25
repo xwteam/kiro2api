@@ -1,0 +1,2108 @@
+//! `POST /v1/messages` 处理器:Anthropic 请求 → Kiro 数据面 → Anthropic 响应(非流式文本 MVP)。
+//!
+//! 流程:解析 [`MessagesRequest`] → [`anthropic_to_kiro`] → 从池选账号 → 即将过期则内存刷新
+//! (不写盘)→ 打 Kiro(生产走端点回退 `call_with_fallback`;测试/代理可用 `endpoint_override`
+//! 指定单一 base)→ 读 body → 事件流解码 → [`kiro_events_to_anthropic`] → `Json` 返回。
+//!
+//! 时钟以 `now_unix` 注入 [`relay_core`],axum handler 计算真实 now 再委托,保持全仓一致的注入纪律。
+
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::sync::Arc;
+
+use axum::Json;
+use axum::Router;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::sse::{Event, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use tokio::sync::Mutex;
+
+use crate::apikey::ApiKeyStore;
+use crate::config::Config;
+use crate::kiro::convert::{ConvertError, anthropic_to_kiro, kiro_events_to_anthropic};
+use crate::kiro::endpoint::Endpoint;
+use crate::kiro::eventstream::decoder::StreamDecoder;
+use crate::kiro::login::LoginError;
+use crate::kiro::machine_id;
+use crate::kiro::pool::FailureKind;
+use crate::kiro::pool::{Pool, classify_with_body};
+use crate::kiro::provider::{self, Impersonation};
+use crate::protocol::anthropic::stream;
+use crate::protocol::anthropic::types::{
+    AnthropicModel, AnthropicModelList, CountTokensResponse, MessagesRequest, MessagesResponse,
+};
+use crate::server::auth::ApiKeyId;
+use crate::stats::StatsManager;
+
+/// 选账号后,离过期不足此秒数即先内存刷新(仅内存,不写盘)。
+const REFRESH_MARGIN_SECS: u64 = 300;
+
+/// 从请求头或连接对端地址提取客户端真实 IP(CDN 无关)。
+///
+/// 优先级:`CF-Connecting-IP` / `True-Client-IP`(Cloudflare/Akamai 边缘写入,不可伪造)
+/// → `X-Forwarded-For` 首跳(通用反代 / EdgeOne)→ `X-Real-IP`(nginx 等)
+/// → socket 对端地址(`peer.ip()`,直连公网时即真实客户端)。
+/// 经 Docker `-p` 端口映射且无反代时,本机回环请求的对端会被改写为 docker 网关(172.x),
+/// 属预期(改用 host 网络或经 CDN/反代注入上述头即可拿到真实客户端 IP)。IP 非机密,可安全落库/展示。
+pub(crate) fn extract_client_ip(
+    headers: &axum::http::HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+) -> Option<String> {
+    // CDN 边缘设置的权威真实客户端头(由边缘写入,客户端无法伪造),优先级最高。
+    // - Cloudflare:`CF-Connecting-IP`;
+    // - Akamai / Cloudflare 企业版:`True-Client-IP`。
+    // 放在 XFF 之前,避免"客户端伪造 XFF 首跳、CDN 只在其后追加真实 IP"导致取到伪造值。
+    for h in ["cf-connecting-ip", "true-client-ip"] {
+        if let Some(s) = headers.get(h).and_then(|v| v.to_str().ok()) {
+            let ip = s.trim();
+            if !ip.is_empty() {
+                return Some(ip.to_string());
+            }
+        }
+    }
+    // X-Forwarded-For 首跳(最左 = 最原始客户端;通用反代 / 腾讯 EdgeOne 默认形态)。
+    if let Some(val) = headers.get("x-forwarded-for")
+        && let Ok(s) = val.to_str()
+    {
+        let ip = s.split(',').next().unwrap_or("").trim();
+        if !ip.is_empty() {
+            return Some(ip.to_string());
+        }
+    }
+    // X-Real-IP(nginx / 部分反代注入的直连客户端)。
+    if let Some(val) = headers.get("x-real-ip")
+        && let Ok(s) = val.to_str()
+    {
+        let ip = s.trim();
+        if !ip.is_empty() {
+            return Some(ip.to_string());
+        }
+    }
+    // 无任何反代头 → socket 对端(直连公网时即真实客户端 IP)。
+    peer.map(|addr| addr.ip().to_string())
+}
+
+/// `/v1/messages` 处理器共享状态。
+///
+/// 池以 `Arc<tokio::sync::Mutex<Pool>>` 持有(非 parking_lot):handler 在 `call_with_fallback`
+/// 内的网络 `.await` 期间持有 `&mut Pool`,若用同步锁跨 `.await` 持锁是 bug。用异步锁串行化池访问
+/// 是本 MVP 的可接受取舍(单请求整条链路串行占锁,后续可细化为更短临界区)。
+#[derive(Clone)]
+pub struct MessagesState {
+    pub pool: Arc<Mutex<Pool>>,
+    pub client: reqwest::Client,
+    /// 控制面(一问一答)出站客户端:令牌刷新 / 余额(getUsageLimits)/ 模型清单等短小请求走此
+    /// 客户端。由 `crate::http::unary()` 构造,带 connect_timeout + 整请求 timeout(硬顶),使任何
+    /// 环节卡死都在上限内失败。数据面(relay)不消费此字段——它需容忍长流,不能加整请求超时。
+    pub control_client: reqwest::Client,
+    pub cfg: Arc<Config>,
+    /// 运行期可变配置(auth key / RPM / 负载均衡模式)。admin 设置端点写入并落盘,
+    /// auth 闸读当前 key 使轮换即时生效。与 `cfg`(不可变启动值)分离,改动面最小。
+    pub runtime_cfg: crate::config::SharedRuntimeConfig,
+    /// 数据面基址覆盖(合法用途:自建代理/网关或测试 mock)。
+    /// `Some(url)` → 直接 POST 到该 URL 并自行反馈池;`None` → 走生产端点回退。
+    pub endpoint_override: Option<String>,
+    /// 统计持久化层(Phase 1)。relay 在数据面记录用量/失败/限流;admin 只读查询。
+    /// 记录经异步/批量存储,不在热路径做 I/O、不跨池锁调用。
+    pub stats: Arc<StatsManager>,
+    /// API-KEY 存储(P2)。auth 闸校验 store key、relay 归属用量、admin/user handler
+    /// 增删改查与用量查询共用同一 `Arc<ApiKeyStore>`。本阶段仅接线到 state,
+    /// 消费方(auth/relay 归属/admin/user)由后续阶段接入。
+    pub api_keys: Arc<ApiKeyStore>,
+    /// 余额缓存(Phase 4)。admin `GET /api/admin/credentials/{id}/balance` 查询上游剩余额度
+    /// (getUsageLimits)时读缓存(5 分钟 TTL);miss/过期则实拉上游并回填。relay 热路径不消费。
+    pub balance: Arc<crate::balance::BalanceCache>,
+    /// 动态模型清单缓存(FIX 1)。admin `GET /api/admin/models` 汇总各账号上游
+    /// `ListAvailableModels` 的并集(TTL 内命中缓存);空时回落静态 17 模型目录。
+    /// 刷新端点按需实拉并回填。relay 热路径不消费。
+    pub models_cache: Arc<crate::models_cache::ModelsCache>,
+    /// Builder-ID 设备码登录会话中转态(Phase 3)。`/login/builderid/start` 放入待批准态并回
+    /// sessionId,`/login/builderid/poll` 反复非消费读取直到终态。~600s TTL、注入时钟。
+    /// admin 独占消费;relay 热路径不接触。
+    pub builderid_sessions:
+        crate::admin::login_session::LoginSessions<crate::admin::login_session::BuilderIdSession>,
+    /// IAM SSO 授权码登录会话中转态(Phase 3)。`/login/iam-sso/start` 放入 AuthStart(含 PKCE
+    /// verifier + state)并回 sessionId,`/login/iam-sso/complete` 消费取出换 token。~600s TTL。
+    pub iam_sso_sessions:
+        crate::admin::login_session::LoginSessions<crate::admin::login_session::IamSsoSession>,
+    /// 实时日志捕获器(Phase 6)。`Some` 时 admin 日志端点(stream/snapshot/download)
+    /// 从中读取历史环形缓冲并订阅广播;`None`(log_capacity=0 或未接线)时端点返回 503。
+    /// relay 热路径不消费;捕获经全局 tracing 层完成,与业务解耦。
+    pub log_capture: Option<Arc<crate::logcap::LogCapture>>,
+    /// 令牌刷新上下文(单飞协调器 + credentials.json 路径 + 落盘锁)。
+    /// relay/balance/models 三方经 [`crate::kiro::ensure_fresh`] 刷新时共用同一份:
+    /// per-credential 单飞锁避免并发刷新同一凭据的级联 401(Bug A);刷新成功后原子落盘
+    /// credentials.json,防止重启加载已轮换作废的旧 refresh_token(Bug B)。
+    pub refresh_ctx: crate::kiro::ensure_fresh::RefreshCtx,
+}
+
+/// 中转失败原因,携带对外可见的 HTTP 语义。
+#[derive(Debug)]
+pub enum RelayError {
+    /// 请求无法转换为 Kiro 请求(含未映射模型)→ 400。
+    Convert(ConvertError),
+    /// 池中无可用账号 → 503。
+    NoAccount,
+    /// 刷新或上游调用失败 → 502。
+    Upstream(String),
+    /// 确定性请求错误:上游明确拒绝该请求(如 `INVALID_MODEL_ID` —— 所请求的模型对当前
+    /// 账号档位不可用)→ 400,携带对客户端可见的说明(换账号重试无用,故不重试)。
+    InvalidModel(String),
+}
+
+impl RelayError {
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            RelayError::Convert(_) => StatusCode::BAD_REQUEST,
+            RelayError::NoAccount => StatusCode::SERVICE_UNAVAILABLE,
+            RelayError::Upstream(_) => StatusCode::BAD_GATEWAY,
+            RelayError::InvalidModel(_) => StatusCode::BAD_REQUEST,
+        }
+    }
+    /// 对外错误类型串(不泄露内部细节/令牌)。
+    fn err_type(&self) -> &'static str {
+        match self {
+            RelayError::Convert(_) => "invalid_request_error",
+            RelayError::NoAccount => "overloaded_error",
+            RelayError::Upstream(_) => "api_error",
+            RelayError::InvalidModel(_) => "invalid_request_error",
+        }
+    }
+    /// 对外错误消息(粗粒度,不含令牌/内部堆栈)。
+    fn message(&self) -> String {
+        match self {
+            RelayError::Convert(e) => e.to_string(),
+            RelayError::NoAccount => "no available upstream account".to_string(),
+            RelayError::Upstream(_) => "upstream request failed".to_string(),
+            // 清晰的不可用说明(确定性、可安全外露):把"该模型不可用、请换一个"透传给客户端。
+            RelayError::InvalidModel(msg) => msg.clone(),
+        }
+    }
+}
+
+impl IntoResponse for RelayError {
+    fn into_response(self) -> Response {
+        let body = serde_json::json!({
+            "type": "error",
+            "error": { "type": self.err_type(), "message": self.message() },
+        });
+        (self.status(), Json(body)).into_response()
+    }
+}
+
+/// 由选中的凭据构造伪装身份(machine_id 优先取显式、否则由 refresh_token 派生)。
+fn impersonation_for(
+    cfg: &Config,
+    refresh_token: &str,
+    explicit_machine_id: Option<&str>,
+) -> Impersonation {
+    Impersonation {
+        machine_id: machine_id::resolve(explicit_machine_id, refresh_token),
+        kiro_version: cfg.kiro_version.clone(),
+        agent_mode: "vibe".to_string(),
+        system_version: cfg.system_version.clone(),
+        node_version: cfg.node_version.clone(),
+    }
+}
+
+/// 选-调成功的产物:上游响应 + 选中凭据的数值 id(供统计层记录用量,已在池锁外)。
+pub(crate) struct CallOutcome {
+    pub resp: reqwest::Response,
+    /// 选中凭据的数值 id(`Credential.id` 解析为 u32;非数值/缺失回落 0)。
+    pub credential_id: u32,
+}
+
+/// 把 `Credential.id`(内部 String,磁盘上多为整数)解析为统计层用的 u32;非数值回落 0。
+fn credential_id_num(id: &str) -> u32 {
+    id.parse::<u32>().unwrap_or(0)
+}
+
+/// 把一次分类失败落进统计层(池锁必须已释放)。热路径 fire-and-forget:
+/// Auth(401/403)→ 失败日志;Quota(429)→ 限流日志;Transient 不落(非账号级凭据事件)。
+/// `now_unix` 为 u64 秒,转成统计层的 i64;`request_type` 恒 "api"(Phase 1 无 MCP 区分)。
+async fn record_classified_failure(
+    stats: &StatsManager,
+    credential_id: u32,
+    kind: FailureKind,
+    status: u16,
+    now_unix: u64,
+) {
+    // 生命周期日志(#7):上游/账号级失败,带分类与 HTTP 状态码(不含响应体/令牌)。
+    // WARN 级别:比每请求 INFO 更醒目,便于在实时日志页快速定位账号问题。
+    tracing::warn!(
+        event = "upstream_failure",
+        account_id = credential_id,
+        kind = ?kind,
+        status = status,
+        "上游请求失败"
+    );
+    let now_i64 = now_unix as i64;
+    match kind {
+        // 两类鉴权失败(永久失效 / 歧义冷却)恒来自 401/403,均落失败日志。
+        FailureKind::AuthInvalid | FailureKind::AuthAmbiguous => {
+            // Auth 分类恒来自 401/403;status 为 0(无从解析)时回落 401 以满足模型语义。
+            let code = if status == 401 || status == 403 {
+                status
+            } else {
+                401
+            };
+            stats
+                .record_failure(credential_id, "api", code, "", now_i64)
+                .await;
+        }
+        FailureKind::Quota => {
+            stats
+                .record_throttle(credential_id, "api", "", now_i64)
+                .await;
+        }
+        FailureKind::Transient => { /* 瞬时错误不落账号级事件日志 */ }
+        // 确定性请求错误(INVALID_MODEL_ID 等):非账号故障,不落账号级失败日志。
+        // (上层会在反馈池前短路,一般不会带此类走到这里;此 arm 仅为防御性穷尽。)
+        FailureKind::InvalidRequest => {}
+    }
+}
+
+/// 跨账号重试的上限(自适应,见 [`select_and_call_with_retry`])。
+///
+/// 采用 spec 的 `N = min(pool_size, 3)`(最多试 3 个不同账号即放弃,随池大小自然缩放),
+/// 再叠加一个防御性硬顶,避免超大池上重试放飞。取值理由:3 是常见默认,足以覆盖"选中的
+/// 账号偶发失败、换一个就好"的绝大多数场景,又不至于把一次请求拖成对全池的串行扫描。
+const DEFAULT_MAX_CROSS_ACCOUNT_ATTEMPTS: usize = 3;
+/// 跨账号重试的硬顶(防御性):即便池很大,单请求最多也只试这么多个账号。
+const MAX_CROSS_ACCOUNT_ATTEMPTS_HARD_CAP: usize = 5;
+
+/// 由池大小计算本请求的跨账号重试上限:`min(pool_size, 3)`,再叠加防御性硬顶。
+/// 空池按 1 处理(仍走一次选择以产出 `NoAccount` 的既有语义)。
+/// 有效上界取默认值与硬顶的较小者,`clamp` 的下界为 1(至少试一次)。
+fn cross_account_attempts(pool_size: usize) -> usize {
+    let ceiling = DEFAULT_MAX_CROSS_ACCOUNT_ATTEMPTS.min(MAX_CROSS_ACCOUNT_ATTEMPTS_HARD_CAP);
+    pool_size.clamp(1, ceiling)
+}
+
+/// 跨账号重试包装:在账号级数据面失败时换下一个未试过的健康账号重试,直到成功或用尽
+/// `min(pool_size, 3)` 次尝试;请求级致命错误(`Convert`/400)不重试、立即返回。
+///
+/// 与既有的每账号内重试正交、且在其外层组合:
+/// - 每账号内:端点回退(`provider::call_with_fallback`)、403 强制刷新令牌重试一次、ensure_fresh——
+///   这些都发生在 [`select_and_call_once`] 之内,本层只看其"最终成败"。
+/// - 冷却/禁用跳过:失败账号照常经 `report_failure` 反馈池,下一次选择自动跳过它;
+///   已试过的 id 还会显式排除,确保每次重试都换一个不同账号。
+///
+/// 关键:整个重试循环在**任何响应体被消费/流式转发之前**完成——`relay_core` 与 `relay_stream`
+/// 都先拿到本函数返回的成功 `CallOutcome` 才开始读 body / 建 SSE,故失败账号的响应永不会开始下发。
+///
+/// 池锁纪律:选择/反馈池均为短临界区,绝不跨网络 `.await` 持锁(见 [`select_and_call_once`])。
+pub(crate) async fn select_and_call_with_retry(
+    state: &MessagesState,
+    req: &MessagesRequest,
+    now_unix: u64,
+) -> Result<CallOutcome, RelayError> {
+    let pool_size = { state.pool.lock().await.len() };
+    let max_attempts = cross_account_attempts(pool_size);
+
+    let mut tried_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut last_err: Option<RelayError> = None;
+
+    for _attempt in 0..max_attempts {
+        match select_and_call_once(state, req, now_unix, &tried_ids).await {
+            // 成功:直接返回(响应体尚未开始消费)。
+            Ok((outcome, _tried_id)) => return Ok(outcome),
+            // 请求级致命错误:任何账号上都会同样失败,不重试。
+            // - Convert:请求无法转换(含未映射模型);
+            // - InvalidModel:上游确定性拒绝(INVALID_MODEL_ID:该模型对当前档位不可用)。
+            Err((e @ (RelayError::Convert(_) | RelayError::InvalidModel(_)), _)) => return Err(e),
+            // 池级:已无可选账号(可能是所有健康账号都被本请求试过了)。
+            // 首个尝试就 NoAccount → 池确实空/全不可用,返回 NoAccount;
+            // 非首个尝试 NoAccount → 说明前面的账号已试尽,返回上一次真实的账号级错误。
+            Err((RelayError::NoAccount, _)) => {
+                return Err(last_err.unwrap_or(RelayError::NoAccount));
+            }
+            // 账号级失败(Auth/Quota/Transient):记下已试账号,换下一个重试。
+            Err((e @ RelayError::Upstream(_), tried_id)) => {
+                if let Some(id) = tried_id {
+                    tried_ids.insert(id);
+                }
+                last_err = Some(e);
+                // 生命周期日志(#7):账号级失败,即将跨账号换下一个健康账号重试。
+                // 仅当还有下一轮才算真正"跨账号重试"。不含令牌/密钥/提示词。
+                if tried_ids.len() < max_attempts {
+                    tracing::info!(
+                        event = "cross_account_retry",
+                        model = %req.model,
+                        tried_accounts = tried_ids.len(),
+                        max_attempts = max_attempts,
+                        "账号级失败,跨账号重试"
+                    );
+                }
+                // 还有下一轮就继续;这是最后一轮则落到循环外返回 last_err。
+                continue;
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or(RelayError::Upstream("all accounts exhausted".to_string())))
+}
+
+/// 选账号→(即将过期则内存刷新)→转换→调用 Kiro→反馈池,返回上游响应 + 凭据 id。
+/// 整条选-调链路串行占池锁,网络发出后即释放(见 [`MessagesState`] 说明)。
+/// 分类失败(401/403/429)在池锁释放后落进统计层(不阻塞、不跨锁)。
+///
+/// 单次选-调(可排除已试账号)。返回 `Ok((outcome, tried_id))` 或 `Err((error, tried_id))`,
+/// `tried_id` 为本次实际选中的凭据 id(选择即失败=`NoAccount` 时为 `None`,供跨账号重试跟踪)。
+///
+/// `exclude_ids`:本请求已试过的凭据 id,选择时跳过(除既有 disabled/冷却/RPM 纪律外再叠加)。
+pub(crate) async fn select_and_call_once(
+    state: &MessagesState,
+    req: &MessagesRequest,
+    now_unix: u64,
+    exclude_ids: &std::collections::HashSet<String>,
+) -> Result<(CallOutcome, String), (RelayError, Option<String>)> {
+    // 1) 选账号(整条链路串行占锁,见 MessagesState 说明);排除本请求已试过的账号。
+    let mut pool = state.pool.lock().await;
+    let mut cred = pool
+        .select_with_exclude(now_unix, exclude_ids)
+        .ok_or((RelayError::NoAccount, None))?;
+
+    // 2) 即将过期 → 集中刷新并写回活池(不各自反复轮换令牌;见 kiro::ensure_fresh)。
+    //    ensure_fresh 内部先释放再重取池锁,不跨网络 .await 持锁;这里为避免持有本
+    //    handler 的池锁(会与 ensure_fresh 内的重取死锁)先释放,刷新后再重新占锁。
+    // 本次实际选中的凭据 id(供跨账号重试跟踪;从此处起任何 Err 都带上它)。
+    let tried_id = cred.id.clone();
+
+    // 生命周期日志(#7):账号已选中。只记数值 id/model/是否为重试选择,不含令牌/密钥/提示词。
+    tracing::info!(
+        event = "account_selected",
+        account_id = credential_id_num(&cred.id),
+        model = %req.model,
+        excluded = exclude_ids.len(),
+        "已选中账号"
+    );
+
+    if cred.expires_soon(now_unix, REFRESH_MARGIN_SECS) {
+        // 生命周期日志(#7):令牌即将过期,触发主动刷新(控制面)。不含任何令牌明文。
+        tracing::info!(
+            event = "token_refresh",
+            account_id = credential_id_num(&cred.id),
+            reason = "expires_soon",
+            "令牌即将过期,刷新中"
+        );
+        let cred_id = cred.id.clone();
+        drop(pool);
+        cred = crate::kiro::ensure_fresh::ensure_fresh(
+            &state.pool,
+            &cred_id,
+            // #7:令牌刷新走**控制面**硬超时客户端(connect + 整请求 timeout),而非数据面流式
+            // 客户端(无整请求超时)。避免上游刷新挂死拖垮 relay 热路径;与 balance/models 同设计。
+            &state.control_client,
+            now_unix,
+            REFRESH_MARGIN_SECS,
+            Some(&state.refresh_ctx),
+        )
+        .await
+        .map_err(|e| {
+            (
+                RelayError::Upstream(format!("ensure_fresh: {e}")),
+                Some(tried_id.clone()),
+            )
+        })?;
+        pool = state.pool.lock().await;
+    }
+    let credential_id = credential_id_num(&cred.id);
+
+    // 3) 转换请求体(未映射模型/空消息 → 400)。Convert 为请求级致命错误,不触发跨账号重试。
+    let kiro_req = anthropic_to_kiro(req, cred.profile_arn.as_deref())
+        .map_err(|e| (RelayError::Convert(e), Some(tried_id.clone())))?;
+    let body = serde_json::to_vec(&kiro_req).map_err(|e| {
+        (
+            RelayError::Upstream(format!("encode: {e}")),
+            Some(tried_id.clone()),
+        )
+    })?;
+
+    // 4) 构造伪装身份并调用 Kiro。
+    //    这里先释放池锁:数据面调用**不持锁**发出(force_refresh 内部要重取池锁,持锁会死锁),
+    //    调用返回后再短暂重取锁反馈成败。
+    let imp = impersonation_for(&state.cfg, &cred.refresh_token, cred.machine_id.as_deref());
+    drop(pool);
+
+    // 一次数据面尝试:成功→Ok(Response);失败→Err((kind, status))。**不反馈池**,由本函数
+    // 在决定是否重试后统一反馈,避免首个 Auth 失败就把可刷新自愈的好账号立即禁用。
+    let attempt = call_data_plane(state, &cred, &imp, &body).await;
+
+    // 5) 数据面 401/403(Auth)→ 强制刷新该账号令牌、用新令牌重试一次;仅重试仍失败才反馈池。
+    //    重试至多一次(无循环),不会成环。
+    let outcome = match attempt {
+        Ok(r) => Ok(r),
+        // 两类鉴权失败(永久失效 / 歧义冷却)都先强制刷新令牌重试一次:AuthAmbiguous 常为
+        // 令牌抖动/过期,刷新后即自愈;AuthInvalid 刷新多半也失败,回落原失败交由反馈池禁用。
+        Err((orig_kind @ (FailureKind::AuthInvalid | FailureKind::AuthAmbiguous), status)) => {
+            // 生命周期日志(#7):数据面鉴权失败,触发强制换新令牌重试一次。含 HTTP 状态码,无令牌明文。
+            tracing::info!(
+                event = "token_refresh",
+                account_id = credential_id,
+                reason = "auth_failure",
+                status = status,
+                "鉴权失败,强制刷新令牌后重试"
+            );
+            // 强制换新令牌(无条件刷新并写回活池)。刷新失败(refresh_token 也失效)→ 视作真失败。
+            match crate::kiro::ensure_fresh::force_refresh(
+                &state.pool,
+                &cred.id,
+                // #7:403 后的强制换新令牌同样走控制面硬超时客户端,防上游刷新挂死拖垮 relay。
+                &state.control_client,
+                now_unix,
+                Some(&state.refresh_ctx),
+            )
+            .await
+            {
+                Ok(fresh) => {
+                    let imp2 = impersonation_for(
+                        &state.cfg,
+                        &fresh.refresh_token,
+                        fresh.machine_id.as_deref(),
+                    );
+                    // 用刷新后的凭据重试一次(仍不反馈池)。
+                    call_data_plane(state, &fresh, &imp2, &body).await
+                }
+                // 刷新失败:回落到**原**鉴权失败类别,交由下方反馈池/禁用(保留 Invalid/Ambiguous 语义)。
+                Err(_) => Err((orig_kind, 0u16)),
+            }
+        }
+        Err(other) => Err(other),
+    };
+
+    // 5.5) 确定性请求错误(如上游 INVALID_MODEL_ID:该模型对当前账号档位不可用):
+    //      **非账号故障** —— 换任何同档账号都会同样失败。故此处**不反馈池**(不冷却/不禁用/
+    //      不累计 strike)、**不落账号级失败日志**,直接返回 [`RelayError::InvalidModel`],
+    //      由 [`select_and_call_with_retry`] 当作致命错误**不重试**、以 400 把清晰的不可用说明回客户端。
+    if let Err((FailureKind::InvalidRequest, _)) = &outcome {
+        let msg = format!(
+            "Invalid model '{}': not available for the current account. Please select a different model to continue.",
+            req.model
+        );
+        return Err((RelayError::InvalidModel(msg), Some(tried_id)));
+    }
+
+    // 6) 依最终结果反馈池(短暂持锁)。分类失败随后在池锁释放外落统计。
+    let failure_to_record: Option<(FailureKind, u16)> = {
+        let mut pool = state.pool.lock().await;
+        match &outcome {
+            Ok(_) => {
+                pool.report_success(&cred.id);
+                None
+            }
+            Err((kind, status)) => {
+                pool.report_failure(&cred.id, *kind, now_unix);
+                Some((*kind, *status))
+            }
+        }
+    };
+
+    // 分类失败落库(池锁已释放,fire-and-forget,不阻塞热路径的其它请求)。
+    if let Some((kind, status)) = failure_to_record {
+        record_classified_failure(&state.stats, credential_id, kind, status, now_unix).await;
+        return Err((
+            RelayError::Upstream("data-plane request failed".to_string()),
+            Some(tried_id),
+        ));
+    }
+
+    let resp = outcome.expect("resp 存在当且仅当无失败记录");
+    Ok((
+        CallOutcome {
+            resp,
+            credential_id,
+        },
+        tried_id,
+    ))
+}
+
+/// 数据面调用的有效 region:优先取 profileArn 里编码的 region(账号真实 region),
+/// 回落到 `cred.region`,再回落到 `us-east-1`。
+///
+/// 动机(#9):非 us-east-1 账号的 profileArn ARN 段带真实 region;若只看 `cred.region`
+/// (默认 us-east-1)会把请求发到 us-east-1 主机 → 403/400。ARN 解析在
+/// [`crate::kiro::endpoint::region_from_profile_arn`]。
+fn effective_region(cred: &crate::kiro::credential::Credential) -> String {
+    cred.profile_arn
+        .as_deref()
+        .and_then(crate::kiro::endpoint::region_from_profile_arn)
+        .or_else(|| {
+            let r = cred.region.trim();
+            if r.is_empty() {
+                None
+            } else {
+                Some(r.to_string())
+            }
+        })
+        .unwrap_or_else(|| "us-east-1".to_string())
+}
+
+/// 发一次数据面请求(**不反馈池**)。成功→`Ok(Response)`;失败→`Err((FailureKind, status))`,
+/// status 为可精确解析到的 HTTP 码(端点回退路径无从精确解析时回落 0)。
+///
+/// 覆盖两条路径:`endpoint_override`(代理/mock,单端点直调 [`provider::call`])与生产端点回退
+/// [`provider::call_with_fallback_no_report`]。是否重试/反馈池由调用方 [`select_and_call_with_retry`] 决定。
+///
+/// 分类:override 路径能精确拿到状态码与响应体,故用 [`classify_with_body`] 依响应体升级判定
+/// (真凭据失效才永久禁用);端点回退路径由 provider 内部分类,status 回落 0。
+///
+/// 数据面 region 取自 [`effective_region`](profileArn 优先),而非裸 `cred.region`(#9)。
+async fn call_data_plane(
+    state: &MessagesState,
+    cred: &crate::kiro::credential::Credential,
+    imp: &Impersonation,
+    body: &[u8],
+) -> Result<reqwest::Response, (FailureKind, u16)> {
+    match &state.endpoint_override {
+        Some(url) => {
+            let ep = Endpoint {
+                url: url.clone(),
+                origin: "AI_EDITOR",
+                target: None,
+            };
+            match provider::call(&state.client, &ep, cred, imp, body).await {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    // provider::call 在非 2xx 时读体后返回 `UpstreamHttp{status, body}`
+                    //(见 provider::call 的 #2 body capture):携带**数字状态码**与**真响应体**
+                    // 摘要。把二者一并喂给 body-aware classify_with_body,使真凭据失效信号可达
+                    // AuthInvalid(永久禁用);其余变体(纯传输层 Http / 语义标签 Upstream)无
+                    // HTTP 体可解析,status 回落 0、body 空串 → classify 保守落 AuthAmbiguous/Transient。
+                    let (status, body) = match &e {
+                        LoginError::UpstreamHttp { status, body } => (*status, body.as_str()),
+                        _ => (0u16, ""),
+                    };
+                    Err((classify_with_body(status, body), status))
+                }
+            }
+        }
+        None => provider::call_with_fallback_no_report(
+            &state.client,
+            &effective_region(cred),
+            "auto",
+            true,
+            cred,
+            imp,
+            body,
+        )
+        .await
+        // 生产端点回退路径:`try_endpoints`(provider.rs)在终态(尤其 401/403)已**读响应体**
+        // 并用 body-aware `classify_with_body(status, &body)` 分类,故真凭据失效信号已在此处到达
+        // 分类、AuthInvalid(永久禁用)在生产路径同样可达——`FailureKind` 已反映真响应体。
+        // provider 的这层只回 `FailureKind`(不含原始状态码),故这里由 kind 反推一个代表性状态码
+        // 供统计日志用:Auth→403、Quota→429、Transient→0(record_classified_failure 再兜底)。
+        .map_err(|kind| {
+            let status = match kind {
+                FailureKind::AuthInvalid | FailureKind::AuthAmbiguous => 403u16,
+                FailureKind::Quota => 429u16,
+                FailureKind::Transient => 0u16,
+                FailureKind::InvalidRequest => 400u16,
+            };
+            (kind, status)
+        }),
+    }
+}
+
+/// 可测试内核(非流式):接收注入的 `now_unix`,跑完整条中转链路 → 一个 [`MessagesResponse`]。
+///
+/// 兼容入口:用量记录归属到无 store-key(id=0)。其它协议(openai/gemini/responses)
+/// 复用此签名;需归属 store-key 时用 [`relay_core_attributed`]。
+pub async fn relay_core(
+    state: &MessagesState,
+    req: MessagesRequest,
+    now_unix: u64,
+) -> Result<MessagesResponse, RelayError> {
+    relay_core_attributed(state, req, 0, None, now_unix).await
+}
+
+/// 非流式内核(带 store-key 归属)。`api_key_id` 为鉴权闸解析出的 store-key id
+/// (0 = 全局/开放模式,无归属),用量记录归属到该 key。`client_ip` 为调用方 IP
+/// (由 handler 经 [`extract_client_ip`] 算出;无则 `None`),随用量记录落库。
+pub async fn relay_core_attributed(
+    state: &MessagesState,
+    req: MessagesRequest,
+    api_key_id: u32,
+    client_ip: Option<String>,
+    now_unix: u64,
+) -> Result<MessagesResponse, RelayError> {
+    let started = std::time::Instant::now();
+    // 跨账号重试:账号级失败自动换下一个健康账号,直到成功或用尽自适应上限;
+    // 请求级致命错误(Convert/400)不重试。返回成功前不会开始读 body。
+    let CallOutcome {
+        resp,
+        credential_id,
+    } = select_and_call_with_retry(state, &req, now_unix).await?;
+
+    // 端到端延迟(选账号+跨账号重试+调上游,至上游响应就绪):既用于 INFO 日志,也随用量记录落库
+    // 供 usage-summary 计 avgLatencyMs(与日志的 latency_ms 同源、口径一致)。
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    // 每请求一条 INFO(供 /admin 日志查看器):method/model/account/api-key/status/延迟,
+    // 不含任何 token/密钥/提示词。热路径外、无锁,一行一请求。
+    tracing::info!(
+        method = "messages",
+        model = %req.model,
+        account_id = credential_id,
+        api_key_id = api_key_id,
+        status = "ok",
+        latency_ms = latency_ms,
+        "relay 已处理请求"
+    );
+
+    // 读 body → 解码事件流 → 还原 Anthropic 响应。
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| RelayError::Upstream(format!("read body: {e}")))?;
+    let mut dec = StreamDecoder::new();
+    dec.push(&bytes);
+    let frames = dec.drain();
+    let out = kiro_events_to_anthropic(&frames, &req.model);
+
+    // meteringEvent(若上游发了)带真实积分消耗与缓存 token;无则 credits=None、回退字符估算。
+    let metering = crate::kiro::convert::extract_metering(&frames);
+    let credits = metering.as_ref().map(|m| m.credits);
+    let cache_read = metering.as_ref().and_then(|m| m.cache_read_input_tokens);
+    let cache_creation = metering
+        .as_ref()
+        .and_then(|m| m.cache_creation_input_tokens);
+
+    // 成功中转 → 记录一条用量(池锁已释放,异步/批量存储,不阻塞热路径)。
+    // token 数取自解码后的 usage(input 现为 0 占位、output 为字符估算);credits 取自 meteringEvent。
+    // estimated_cost 按定价表由 token 数换算(USD 等值基线;input=0 时仅反映 output 侧)。
+    let estimated_cost = crate::stats::pricing::calculate_cost(
+        &req.model,
+        out.usage.input_tokens as i32,
+        out.usage.output_tokens as i32,
+    );
+    state
+        .stats
+        .usage
+        .record_usage_full(
+            credential_id,
+            api_key_id,
+            req.model.clone(),
+            out.usage.input_tokens as i32,
+            out.usage.output_tokens as i32,
+            estimated_cost,
+            credits,
+            client_ip,
+            cache_read,
+            cache_creation,
+            Some(latency_ms),
+            now_unix as i64,
+        )
+        .await;
+
+    Ok(out)
+}
+
+/// 流式用量记账哨兵(#18):无论流如何结束(正常收尾 / 客户端断连 / 上游中途出错),
+/// 只要 `stream!` future 被 drop,本哨兵的 [`Drop`] 就会用**当时已累计**的 token/credits 落一条用量,
+/// 避免"记账代码在读循环之后、中途丢弃即漏记"。
+///
+/// 记账本身是异步的(写入经 `.await` 的锁),而 `Drop` 不能 `.await`,故 Drop 里 `tokio::spawn`
+/// 一个短任务完成落库(持 `Arc<UsageTracker>`,与流生命周期解耦)。`recorded` 防重复:正常收尾
+/// 路径显式调 [`StreamUsageGuard::flush`] 立即记一次并置位,Drop 时若已记则不再重复。
+struct StreamUsageGuard {
+    usage: Arc<crate::stats::usage::UsageTracker>,
+    credential_id: u32,
+    api_key_id: u32,
+    /// 调用方 IP(由 handler 经 `extract_client_ip` 算出;无则 `None`),随用量记录落库。
+    client_ip: Option<String>,
+    model: String,
+    now_unix: i64,
+    /// 累计输出字符数(收尾按 ÷4 估算 output_tokens);随流增量更新。
+    total_chars: usize,
+    /// 末次 meteringEvent 的真实计费(有则优先于字符估算)。
+    metering: Option<crate::kiro::convert::MeteringUsage>,
+    /// 已记账标记:避免正常收尾 + Drop 双写。
+    recorded: bool,
+    /// 流建立延迟(毫秒):选账号+跨账号重试+调上游至 SSE 就绪(与流式 INFO 日志 latency_ms 同源)。
+    /// 流式无"整体完成"墙钟(下发时长取决于客户端消费速度),故此处记的是**首字节前**的建立延迟,
+    /// 与非流式 relay_core 的 latency 口径统一(都测选-调至上游响应就绪),供 usage-summary 计 avgLatencyMs。
+    latency_ms: Option<u64>,
+}
+
+impl StreamUsageGuard {
+    /// 本次流是否累计到**有意义的用量**:有输出字符(→ output_tokens>0)或收到过 meteringEvent
+    /// (上游真实计费,可能 output 为 0 但仍有 input/credits/缓存计费)。二者皆无 = 极早取消
+    /// (纯工具轮尚未产出文本、或计量前客户端断连),落库只会写一条零/近零行,应跳过。
+    fn has_meaningful_usage(&self) -> bool {
+        self.total_chars >= CHARS_PER_TOKEN || self.metering.is_some()
+    }
+
+    /// 把当前累计量落一条用量(同步组装参数,异步写库经 `tokio::spawn`)。幂等:仅首次生效。
+    fn flush(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+
+        let output_tokens = (self.total_chars / CHARS_PER_TOKEN) as i32;
+        let credits = self.metering.as_ref().map(|m| m.credits);
+        let cache_read = self
+            .metering
+            .as_ref()
+            .and_then(|m| m.cache_read_input_tokens);
+        let cache_creation = self
+            .metering
+            .as_ref()
+            .and_then(|m| m.cache_creation_input_tokens);
+        // estimated_cost:input 无从取(置 0),output 按定价表换算(见 stats::pricing)。
+        let estimated_cost = crate::stats::pricing::calculate_cost(&self.model, 0, output_tokens);
+
+        let usage = self.usage.clone();
+        let model = self.model.clone();
+        let (credential_id, api_key_id, now_unix) =
+            (self.credential_id, self.api_key_id, self.now_unix);
+        let latency_ms = self.latency_ms;
+        let client_ip = self.client_ip.clone();
+        tokio::spawn(async move {
+            usage
+                .record_usage_full(
+                    credential_id,
+                    api_key_id,
+                    model,
+                    0,
+                    output_tokens,
+                    estimated_cost,
+                    credits,
+                    client_ip,
+                    cache_read,
+                    cache_creation,
+                    latency_ms,
+                    now_unix,
+                )
+                .await;
+        });
+    }
+}
+
+impl Drop for StreamUsageGuard {
+    fn drop(&mut self) {
+        // 正常收尾已显式 flush 过 → recorded=true,此处 flush 立即 no-op(不双写)。
+        // 未收尾即被 drop(客户端中途断连 / 上游中途出错)才走补记:但只在**已累计到有意义
+        // 用量**时补记——极早取消(纯工具轮未产出文本、或计量前断连)只会写零/近零行,直接跳过
+        // (#16)。`recorded` + `has_meaningful_usage` 双闸:正常路径靠前者防双写,补记路径靠后者
+        // 滤零行。
+        if self.recorded {
+            return;
+        }
+        if self.has_meaningful_usage() {
+            self.flush();
+        }
+    }
+}
+
+/// 流式内核:选-调后,把上游事件流增量编码为 Anthropic SSE。
+///
+/// 兼容入口:用量记录归属到无 store-key(id=0)。需归属时用 [`relay_stream_attributed`]。
+pub async fn relay_stream(
+    state: &MessagesState,
+    req: MessagesRequest,
+    now_unix: u64,
+) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>> + use<>>, RelayError> {
+    relay_stream_attributed(state, req, 0, None, now_unix).await
+}
+
+/// 流式内核(带 store-key 归属)。`api_key_id` 同 [`relay_core_attributed`];
+/// `client_ip` 为调用方 IP(由 handler 经 [`extract_client_ip`] 算出),随用量记录落库。
+pub async fn relay_stream_attributed(
+    state: &MessagesState,
+    req: MessagesRequest,
+    api_key_id: u32,
+    client_ip: Option<String>,
+    now_unix: u64,
+) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>> + use<>>, RelayError> {
+    let started = std::time::Instant::now();
+    // 跨账号重试在**流开始之前**完成:拿到成功响应才建 SSE,失败账号的响应永不会开始下发。
+    let CallOutcome {
+        mut resp,
+        credential_id,
+    } = select_and_call_with_retry(state, &req, now_unix).await?;
+    let model = req.model.clone();
+
+    // 流建立延迟(选账号+跨账号重试+调上游至 SSE 就绪):既用于 INFO 日志,也随用量记录落库供
+    // usage-summary 计 avgLatencyMs(与非流式 relay_core 的 latency 口径统一:皆测至上游响应就绪)。
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    // 每请求一条 INFO(供 /admin 日志查看器):流已建立即记,latency = 选账号+调上游耗时。
+    // 只含 method/model/account/api-key/status/延迟,不含任何 token/密钥/提示词。
+    tracing::info!(
+        method = "messages_stream",
+        model = %req.model,
+        account_id = credential_id,
+        api_key_id = api_key_id,
+        status = "streaming",
+        latency_ms = latency_ms,
+        "relay 流已建立"
+    );
+
+    // 统计层用量句柄(Arc,移入哨兵);记账经 Drop 哨兵在流**任意方式结束**时都落一条(#18)。
+    let usage_handle = state.stats.usage.clone();
+    let record_model = req.model.clone();
+
+    // 块索引状态机(照 Anthropic 公开流式规范;Kiro toolUseEvent 帧序照真机观测):
+    // 不变量 = 同一时刻至多一个内容块打开(先关后开);每块分配唯一递增 index;
+    // 工具块按 toolUseId 键控;文本块懒开(首个文本增量到达才发 text 的 content_block_start),
+    // 故纯工具轮不产出空文本块。文本块收到工具块后可重开(index 递增)。
+    let body = async_stream::stream! {
+        let id = crate::kiro::convert::new_message_id();
+        let to_event = |e: stream::SseEvent| Event::default().event(e.event).data(e.data);
+
+        // 用量记账哨兵:累计 token/credits 存于此;正常收尾显式 flush,断连/出错时其 Drop 补记(#18)。
+        // 它必须在读循环之前建立、活到 stream! future 被 drop 为止,故声明在此作用域内。
+        let mut usage_guard = StreamUsageGuard {
+            usage: usage_handle,
+            credential_id,
+            api_key_id,
+            client_ip,
+            model: record_model,
+            now_unix: now_unix as i64,
+            total_chars: 0,
+            metering: None,
+            recorded: false,
+            latency_ms: Some(latency_ms),
+        };
+
+        yield Ok(to_event(stream::message_start(&id, &model, 0)));
+
+        let mut dec = StreamDecoder::new();
+        let mut next_index: u32 = 0;
+        let mut open_block: Option<u32> = None; // 当前打开的块 index
+        let mut text_index: Option<u32> = None; // 当前文本块 index(关闭后置 None 以便重开)
+        let mut tool_index: HashMap<String, u32> = HashMap::new(); // toolUseId → 块 index
+        let mut any_tool = false;
+
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    dec.push(&chunk);
+                    for frame in dec.drain() {
+                        if let Some(t) = crate::kiro::convert::frame_text_delta(&frame) {
+                            // assistantResponseEvent:懒开文本块,再发 text_delta。
+                            if text_index.is_none() {
+                                // 关闭当前工具块(若有);随后无条件开新文本块,故此处不必显式置 None。
+                                if let Some(oi) = open_block {
+                                    yield Ok(to_event(stream::content_block_stop(oi)));
+                                }
+                                let idx = next_index;
+                                next_index += 1;
+                                text_index = Some(idx);
+                                yield Ok(to_event(stream::content_block_start(idx)));
+                                open_block = Some(idx);
+                            }
+                            usage_guard.total_chars += t.chars().count();
+                            yield Ok(to_event(stream::text_delta(text_index.unwrap(), &t)));
+                        } else if let Some(v) = crate::kiro::convert::tool_use_frame(&frame) {
+                            // toolUseEvent:open 帧开新工具块、input 帧发 input_json_delta、stop 帧关块。
+                            let Some(id) = v["toolUseId"].as_str() else { continue };
+                            if !tool_index.contains_key(id) {
+                                // 关闭当前块(若有);随后无条件开新工具块,故此处不必显式置 None。
+                                if let Some(oi) = open_block {
+                                    yield Ok(to_event(stream::content_block_stop(oi)));
+                                    if text_index == Some(oi) {
+                                        text_index = None; // 允许后续文本重开新块
+                                    }
+                                }
+                                let name = v["name"].as_str().unwrap_or("");
+                                let idx = next_index;
+                                next_index += 1;
+                                tool_index.insert(id.to_string(), idx);
+                                yield Ok(to_event(stream::tool_use_start(idx, id, name)));
+                                open_block = Some(idx);
+                                any_tool = true;
+                            }
+                            let idx = tool_index[id];
+                            if let Some(inp) = v["input"].as_str() {
+                                yield Ok(to_event(stream::input_json_delta(idx, inp)));
+                            }
+                            if v["stop"].as_bool() == Some(true) {
+                                yield Ok(to_event(stream::content_block_stop(idx)));
+                                if open_block == Some(idx) {
+                                    open_block = None;
+                                }
+                            }
+                        } else if let Some(m) = crate::kiro::convert::metering_frame(&frame) {
+                            // meteringEvent:记住真实积分消耗(多个则末次覆盖),流收尾时落库。
+                            usage_guard.metering = Some(m);
+                        }
+                        // 忽略 contextUsageEvent / 其它。
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break, // 流中断:尽力收尾
+            }
+        }
+
+        if let Some(oi) = open_block {
+            yield Ok(to_event(stream::content_block_stop(oi)));
+        }
+        let stop_reason = if any_tool { "tool_use" } else { "end_turn" };
+        let output_tokens = (usage_guard.total_chars / CHARS_PER_TOKEN) as u32;
+        yield Ok(to_event(stream::message_delta(stop_reason, output_tokens)));
+        yield Ok(to_event(stream::message_stop()));
+
+        // 流成功收尾 → 立即用当前累计量记一条用量(与非流式一致:input 置 0;output 为字符估算,
+        // credits/缓存取末次 meteringEvent)。flush 幂等并置 recorded,故随后哨兵 Drop 不会重复落库。
+        // 若客户端在收尾前断连/上游中途出错,则本行不执行,由 usage_guard 的 Drop 补记同样的累计量(#18)。
+        usage_guard.flush();
+    };
+
+    Ok(Sse::new(body))
+}
+
+/// axum handler:计算真实 now,按 `stream` 分流到 [`relay_stream`] 或 [`relay_core`]。
+///
+/// 鉴权闸(见 `server::auth`)命中 store key 时会把 [`ApiKeyId`] 塞进请求扩展;
+/// 全局 key/开放模式下扩展缺失,归属 id 记 0。
+pub async fn messages(
+    State(state): State<MessagesState>,
+    connect_info: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    headers: axum::http::HeaderMap,
+    api_key_id: Option<axum::Extension<ApiKeyId>>,
+    Json(req): Json<MessagesRequest>,
+) -> Response {
+    let api_key_id = api_key_id.and_then(|axum::Extension(k)| k.0).unwrap_or(0);
+    // 客户端 IP:优先 X-Forwarded-For/X-Real-IP(反代场景),否则取 socket 对端地址。
+    // ConnectInfo 经 make-service 塞进请求扩展,以 `Option<Extension<..>>` 读取:单测用 oneshot
+    // 不带连接信息,此时为 None、回落到仅头部提取(ConnectInfo 本身在 axum 0.8 无 Option 提取器)。
+    let client_ip = extract_client_ip(&headers, connect_info.map(|axum::Extension(ci)| ci.0));
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if req.stream == Some(true) {
+        match relay_stream_attributed(&state, req, api_key_id, client_ip, now_unix).await {
+            Ok(sse) => sse.into_response(),
+            Err(e) => e.into_response(),
+        }
+    } else {
+        match relay_core_attributed(&state, req, api_key_id, client_ip, now_unix).await {
+            Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+            Err(e) => e.into_response(),
+        }
+    }
+}
+
+/// `created_at` 固定串(非官方数据,仅用于形状对齐 Anthropic 公开模型列表响应)。
+const MODEL_CREATED_AT: &str = "2026-01-01T00:00:00Z";
+
+/// 每张图片的固定 token 估算(#19)。base64 数据面积与其 token 成本无线性关系,直接按
+/// 字符数换算会离谱地高估;取一个保守的每图固定基数(照公开经验值量级)代替。**非官方**。
+const IMAGE_TOKEN_ESTIMATE: usize = 1_600;
+/// 字符→token 的粗略换算基数(英文经验粗估)。
+const CHARS_PER_TOKEN: usize = 4;
+
+/// 估算单条消息 `content` 的可计费字符数:文本块取其字符数;工具调用取其 input 的序列化长度;
+/// 工具结果取其 content 的序列化长度;图片单独按固定 token 计(见 [`IMAGE_TOKEN_ESTIMATE`]),
+/// 这里以等值字符数回抵进字符池,便于末尾统一除以 [`CHARS_PER_TOKEN`]。
+///
+/// 返回 `(chars, image_count)`:`chars` 计入字符池、`image_count` 每张按固定 token 另加。
+fn count_content_chars(content: &crate::protocol::anthropic::types::ContentIn) -> (usize, usize) {
+    use crate::protocol::anthropic::types::{Block, ContentIn};
+    match content {
+        ContentIn::Text(s) => (s.chars().count(), 0),
+        ContentIn::Blocks(blocks) => {
+            let mut chars = 0usize;
+            let mut images = 0usize;
+            for b in blocks {
+                match b {
+                    Block::Text { text } => chars += text.chars().count(),
+                    // 工具调用:name + 序列化后的 input JSON 长度都要计。
+                    Block::ToolUse { name, input, .. } => {
+                        chars += name.chars().count();
+                        chars += serde_json::to_string(input).map(|s| s.len()).unwrap_or(0);
+                    }
+                    // 工具结果:序列化后的 content 长度(字符串/数组/对象皆可)。
+                    Block::ToolResult { content, .. } => {
+                        chars += serde_json::to_string(content).map(|s| s.len()).unwrap_or(0);
+                    }
+                    // 图片:按固定 token 估算,不按 base64 字符数(见 IMAGE_TOKEN_ESTIMATE)。
+                    Block::Image { .. } => images += 1,
+                }
+            }
+            (chars, images)
+        }
+    }
+}
+
+/// `POST /v1/messages/count_tokens`:粗略估算输入 token 数。计入 `system`、每条消息的文本,
+/// **以及 `tools` 定义、`tool_use` 的 input、`tool_result` 的 content、图片**(#19):
+/// 文本/JSON 按字符数 ÷ 4;图片按每张固定 token 估算。下限 1。**非官方 tokenizer**,仅供参考;
+/// 纯函数:不选账号、不打网络。
+pub async fn count_tokens(Json(req): Json<MessagesRequest>) -> Json<CountTokensResponse> {
+    let mut chars = req
+        .system
+        .as_deref()
+        .map(|s| s.chars().count())
+        .unwrap_or(0);
+    let mut images = 0usize;
+
+    // 消息内容:文本 + 工具调用/结果的序列化长度 + 图片计数。
+    for m in &req.messages {
+        let (c, i) = count_content_chars(&m.content);
+        chars += c;
+        images += i;
+    }
+
+    // 工具定义:每个工具的 name + description + input_schema 序列化长度都算进输入预算。
+    if let Some(tools) = &req.tools {
+        for t in tools {
+            chars += t.name.chars().count();
+            chars += t
+                .description
+                .as_deref()
+                .map(|d| d.chars().count())
+                .unwrap_or(0);
+            chars += serde_json::to_string(&t.input_schema)
+                .map(|s| s.len())
+                .unwrap_or(0);
+        }
+    }
+
+    let input_tokens = (chars / CHARS_PER_TOKEN + images * IMAGE_TOKEN_ESTIMATE).max(1) as u32;
+    Json(CountTokensResponse { input_tokens })
+}
+
+/// `GET /claude/v1/models`:固定的 Anthropic 形状模型列表(本中转支持的模型),
+/// 不读时钟、不打网络。
+pub async fn anthropic_models() -> Json<AnthropicModelList> {
+    let data = vec![
+        AnthropicModel {
+            kind: "model".to_string(),
+            id: "claude-sonnet-4.5".to_string(),
+            display_name: "Claude Sonnet 4.5".to_string(),
+            created_at: MODEL_CREATED_AT.to_string(),
+        },
+        AnthropicModel {
+            kind: "model".to_string(),
+            id: "claude-opus-4.6".to_string(),
+            display_name: "Claude Opus 4.6".to_string(),
+            created_at: MODEL_CREATED_AT.to_string(),
+        },
+        AnthropicModel {
+            kind: "model".to_string(),
+            id: "claude-haiku-4.5".to_string(),
+            display_name: "Claude Haiku 4.5".to_string(),
+            created_at: MODEL_CREATED_AT.to_string(),
+        },
+    ];
+    let first_id = data.first().map(|m| m.id.clone());
+    let last_id = data.last().map(|m| m.id.clone());
+    Json(AnthropicModelList {
+        data,
+        has_more: false,
+        first_id,
+        last_id,
+    })
+}
+
+/// 带自身状态的 `/v1/messages` 子路由(供 `build_router` 合并,不影响其它路由的状态类型)。
+///
+/// 同时挂载 `/claude/v1` 前缀的等价变体(供统一鉴权闸按前缀识别 Anthropic 协议),
+/// 以及 `count_tokens` 估算端点与只读的 `GET /claude/v1/models`。
+/// 注意:不挂裸 `/v1/models`——那是 OpenAI 协议的路由,归属另一处。
+pub fn messages_router(state: MessagesState) -> Router {
+    Router::new()
+        .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(count_tokens))
+        .route("/claude/v1/messages", post(messages))
+        .route("/claude/v1/messages/count_tokens", post(count_tokens))
+        .route("/claude/v1/models", axum::routing::get(anthropic_models))
+        .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kiro::credential::{AuthMethod, Credential};
+    use crate::kiro::eventstream::crc::crc32;
+    use crate::kiro::pool::LbMode;
+    use axum::body::Body;
+
+    /// extract_client_ip 优先级:XFF 首跳 → X-Real-IP → socket 对端。
+    #[test]
+    fn extract_client_ip_prefers_forwarded_first_hop() {
+        let peer: std::net::SocketAddr = "10.0.0.9:5555".parse().unwrap();
+
+        // XFF 首跳(最左)优先,忽略后续跳与 X-Real-IP。
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.7, 70.0.0.1".parse().unwrap());
+        h.insert("x-real-ip", "9.9.9.9".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&h, Some(peer)).as_deref(),
+            Some("203.0.113.7")
+        );
+
+        // 无 XFF → X-Real-IP。
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-real-ip", "198.51.100.4".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&h, Some(peer)).as_deref(),
+            Some("198.51.100.4")
+        );
+
+        // 二者皆无 → socket 对端 IP(去端口)。
+        let h = axum::http::HeaderMap::new();
+        assert_eq!(
+            extract_client_ip(&h, Some(peer)).as_deref(),
+            Some("10.0.0.9")
+        );
+
+        // 无头亦无对端(单测 oneshot)→ None。
+        assert_eq!(extract_client_ip(&h, None), None);
+    }
+
+    /// CDN 权威头(CF-Connecting-IP / True-Client-IP)优先级高于 XFF/X-Real-IP,
+    /// 使伪造的 XFF 首跳无法覆盖 Cloudflare 边缘写入的真实访客 IP。
+    #[test]
+    fn extract_client_ip_prefers_cdn_authoritative_headers() {
+        let peer: std::net::SocketAddr = "10.0.0.9:5555".parse().unwrap();
+
+        // CF-Connecting-IP 压过被伪造的 XFF 首跳。
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-forwarded-for", "1.2.3.4, 70.0.0.1".parse().unwrap());
+        h.insert("cf-connecting-ip", "198.51.100.23".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&h, Some(peer)).as_deref(),
+            Some("198.51.100.23")
+        );
+
+        // 无 CF 头时回落到 True-Client-IP(Akamai/CF 企业版)。
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("true-client-ip", "203.0.113.99".parse().unwrap());
+        h.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&h, Some(peer)).as_deref(),
+            Some("203.0.113.99")
+        );
+
+        // 无任何 CDN 权威头 → 仍按 XFF 首跳(EdgeOne/通用反代)。
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.7, 70.0.0.1".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&h, Some(peer)).as_deref(),
+            Some("203.0.113.7")
+        );
+    }
+    use axum::http::Request;
+    use tower::ServiceExt;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// 构造一条合法 AWS 事件流帧:一个 `:event-type` string header + JSON payload。
+    /// (与 `eventstream::frame` 测试同法:大端 prelude + 两处 CRC。)
+    fn event_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
+        let name = ":event-type";
+        let mut headers = Vec::new();
+        headers.push(name.len() as u8);
+        headers.extend_from_slice(name.as_bytes());
+        headers.push(7u8); // string 类型
+        headers.extend_from_slice(&(event_type.len() as u16).to_be_bytes());
+        headers.extend_from_slice(event_type.as_bytes());
+
+        let headers_len = headers.len() as u32;
+        let total_len = 16 + headers_len + payload.len() as u32; // 12 prelude + headers + payload + 4 msg_crc
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&total_len.to_be_bytes());
+        msg.extend_from_slice(&headers_len.to_be_bytes());
+        let prelude_crc = crc32(&msg[0..8]);
+        msg.extend_from_slice(&prelude_crc.to_be_bytes());
+        msg.extend_from_slice(&headers);
+        msg.extend_from_slice(payload);
+        let msg_crc = crc32(&msg);
+        msg.extend_from_slice(&msg_crc.to_be_bytes());
+        msg
+    }
+
+    fn cred() -> Credential {
+        Credential {
+            id: "a".into(),
+            access_token: "AT".into(),
+            refresh_token: "rt".into(),
+            expires_at_unix: u64::MAX, // 永不过期 → 不触发刷新
+            region: "us-east-1".into(),
+            auth: AuthMethod::Social,
+            client_id: None,
+            client_secret: None,
+            profile_arn: None,
+            machine_id: None,
+            email: None,
+            nickname: None,
+            weight: 1,
+            label: None,
+            disabled: false,
+        }
+    }
+
+    fn state(server_uri: &str, creds: Vec<Credential>) -> MessagesState {
+        MessagesState {
+            pool: Arc::new(Mutex::new(Pool::new(creds, LbMode::Priority))),
+            client: reqwest::Client::new(),
+            control_client: reqwest::Client::new(),
+            cfg: Arc::new(Config::default()),
+            runtime_cfg: crate::config::shared_runtime_config(&crate::config::Config::default()),
+            endpoint_override: Some(format!("{server_uri}/generateAssistantResponse")),
+            stats: StatsManager::load_from_dir(&std::env::temp_dir()),
+            api_keys: crate::apikey::ApiKeyStore::load(std::env::temp_dir().join(format!(
+                "kiro2api_anthropic_apikeys_{}.json",
+                std::process::id()
+            ))),
+            balance: crate::balance::BalanceCache::load_from_dir(&std::env::temp_dir()),
+            models_cache: crate::models_cache::ModelsCache::new(),
+            builderid_sessions: crate::admin::login_session::LoginSessions::with_default_ttl(),
+            iam_sso_sessions: crate::admin::login_session::LoginSessions::with_default_ttl(),
+            log_capture: None,
+            refresh_ctx: crate::kiro::ensure_fresh::RefreshCtx::new(
+                std::env::temp_dir()
+                    .join(format!(
+                        "kiro2api_refreshctx_src_protocol_anthropic_handler_rs_{}.json",
+                        std::process::id()
+                    ))
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// 指定 id 的凭据(多账号跨账号重试测试用)。
+    fn cred_id(id: &str) -> Credential {
+        let mut c = cred();
+        c.id = id.into();
+        c
+    }
+
+    // ==================== 跨账号重试(cross-account retry)====================
+
+    /// 跨账号重试:第一个账号 502(瞬时),换第二个账号成功 → 整体请求 200。
+    /// mock:头一次请求回 502(`up_to_n_times(1)` + 高优先级),之后回带 "pong" 的 200。
+    /// Priority 轮转保证两次选到不同账号;断言最终 200 且文本为 "pong"。
+    #[tokio::test]
+    async fn cross_account_first_502_second_succeeds() {
+        let server = MockServer::start().await;
+        // 头一次:502(账号级 Transient 失败)。高优先级 + 只生效一次。
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(502))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        // 其后:200 + pong 事件流帧(默认优先级,兜底)。
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .with_priority(5)
+            .mount(&server)
+            .await;
+
+        let app = messages_router(state(&server.uri(), vec![cred_id("1"), cred_id("2")]));
+        let req_body = r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // 第一个账号 502 → 跨账号换第二个 → 200 pong。
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["content"][0]["text"], "pong");
+    }
+
+    /// 跨账号重试用尽:两个账号全 502 → 最终 502(BAD_GATEWAY)。
+    /// 断言两个账号都被尝试过(各记一次失败)。
+    #[tokio::test]
+    async fn cross_account_all_fail_yields_502() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&server)
+            .await;
+
+        let st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+        let pool = st.pool.clone();
+        let app = messages_router(st);
+        let req_body = r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // 两个账号都被试过:各累计一次失败(Transient 首次不冷却,故仍 active,但 failures==1)。
+        let stats = pool.lock().await.stats(0);
+        let tried: usize = stats.iter().filter(|s| s.failures >= 1).count();
+        assert_eq!(
+            tried, 2,
+            "两个账号都应被尝试并各记一次失败;实际 stats={stats:?}"
+        );
+    }
+
+    /// 请求级致命错误(未映射模型 → Convert/400)不触发跨账号重试:
+    /// 即便池里有多个账号,也不换账号、直接 400,且没有任何账号被打上失败。
+    #[tokio::test]
+    async fn cross_account_convert_error_no_retry() {
+        let server = MockServer::start().await;
+        // 若真去打上游会 200;但 Convert 发生在选账号之后、调用之前,不应命中。
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+
+        let st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+        let pool = st.pool.clone();
+        let app = messages_router(st);
+        // 未映射模型 → anthropic_to_kiro 返回 Convert → 400,不重试。
+        let req_body = r#"{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // Convert 不是账号级失败:不应把任何账号打成 failure。
+        let stats = pool.lock().await.stats(0);
+        assert!(
+            stats.iter().all(|s| s.failures == 0),
+            "Convert 致命错误不应记账号失败;实际 stats={stats:?}"
+        );
+    }
+
+    /// 流式路径同样跨账号重试且在流开始前完成:第一个账号 502、第二个成功 →
+    /// 200 + text/event-stream,不泄露首个失败账号的任何 SSE。
+    #[tokio::test]
+    async fn cross_account_retry_applies_to_stream() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(502))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .with_priority(5)
+            .mount(&server)
+            .await;
+
+        let app = messages_router(state(&server.uri(), vec![cred_id("1"), cred_id("2")]));
+        let req_body =
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.contains("text/event-stream"), "content-type = {ct}");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        // 换到第二个账号后才建流:应出现成功的 pong 文本与完整收尾,无 502 泄露。
+        assert!(
+            s.contains("\"text\":\"pong\""),
+            "SSE 应含成功账号的 pong;实际:\n{s}"
+        );
+        assert!(
+            s.contains("event: message_stop"),
+            "SSE 应正常收尾;实际:\n{s}"
+        );
+    }
+
+    /// 全链路(parse→convert→call→decode→convert):mock Kiro 回 "pong" 事件流帧,
+    /// 经 axum oneshot 打 `/v1/messages`,断言 200 + content[0] 文本为 "pong"。
+    #[tokio::test]
+    async fn full_pipeline_returns_pong() {
+        let server = MockServer::start().await;
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "message");
+        assert_eq!(v["role"], "assistant");
+        assert_eq!(v["content"][0]["type"], "text");
+        assert_eq!(v["content"][0]["text"], "pong");
+    }
+
+    /// 空池 → 503。
+    #[tokio::test]
+    async fn empty_pool_yields_503() {
+        let server = MockServer::start().await;
+        let app = messages_router(state(&server.uri(), vec![]));
+        let req_body = r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// 未映射模型 → 400(契约"未映射→400"在 HTTP 层兑现)。
+    #[tokio::test]
+    async fn unmapped_model_yields_400() {
+        let server = MockServer::start().await;
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// 上游 5xx → 502。
+    #[tokio::test]
+    async fn upstream_error_yields_502() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// 数据面 401/403(裸状态码,无失效信号 → AuthAmbiguous):handler 会尝试 force_refresh +
+    /// 重试一次。测试环境下 force_refresh 打真实 AWS 刷新端点必失败(网络不可达),故重试不成立、
+    /// 回落原 AuthAmbiguous 失败 → 502。**关键**:裸 403 归类 AuthAmbiguous,单次上报只记 1 strike
+    /// (未达 AUTH_AMBIGUOUS_STRIKES=2),**绝不**因裸状态码就永久禁用或冷却,账号仍可用
+    /// (与旧的"一次 Auth 即永久禁用"契约相区分;真机上 refresh_token 有效时会重试成功)。
+    #[tokio::test]
+    async fn data_plane_auth_failure_disables_after_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let st = state(&server.uri(), vec![cred()]);
+        let pool = st.pool.clone();
+        let app = messages_router(st);
+        let req_body = r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // 重试后仍失败 → report_failure(AuthAmbiguous) 记 1 strike(<2),不禁用不冷却,账号仍可用。
+        assert_eq!(pool.lock().await.active_count(0), 1);
+    }
+
+    /// 流式(`stream:true`):按序产出 message_start→content_block_start→若干 text_delta→
+    /// content_block_stop→message_delta→message_stop。
+    #[tokio::test]
+    async fn streaming_emits_ordered_sse() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("assistantResponseEvent", br#"{"content":"po"}"#);
+        body.extend(event_frame(
+            "assistantResponseEvent",
+            br#"{"content":"ng"}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let req_body =
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.contains("text/event-stream"), "content-type = {ct}");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        for needle in [
+            "event: message_start",
+            "event: content_block_start",
+            "\"text\":\"po\"",
+            "\"text\":\"ng\"",
+            "event: content_block_stop",
+            "event: message_delta",
+            "\"stop_reason\":\"end_turn\"",
+            "event: message_stop",
+        ] {
+            assert!(s.contains(needle), "SSE 缺 `{needle}`;实际:\n{s}");
+        }
+        // 顺序:message_start 在 message_stop 之前。
+        assert!(s.find("event: message_start") < s.find("event: message_stop"));
+    }
+
+    /// 流式纯工具轮(`stream:true` + `toolUseEvent` 帧序):按序产出
+    /// message_start→(tool_use 的)content_block_start→若干 input_json_delta→
+    /// content_block_stop→message_delta(stop_reason=tool_use)→message_stop。
+    /// 并断言不先发空文本块(首个 content_block_start 即 tool_use)。
+    #[tokio::test]
+    async fn streaming_tool_use_emits_input_json_delta() {
+        let server = MockServer::start().await;
+        // 探针实测的 6 帧 toolUseEvent 生命周期(open→input×4→stop),toolUseId="tu1"。
+        let mut body = event_frame(
+            "toolUseEvent",
+            br#"{"name":"get_weather","toolUseId":"tu1"}"#,
+        );
+        body.extend(event_frame(
+            "toolUseEvent",
+            br#"{"input":"","name":"get_weather","toolUseId":"tu1"}"#,
+        ));
+        body.extend(event_frame(
+            "toolUseEvent",
+            br#"{"input":"{\"ci","name":"get_weather","toolUseId":"tu1"}"#,
+        ));
+        body.extend(event_frame(
+            "toolUseEvent",
+            br#"{"input":"ty\": \"Paris","name":"get_weather","toolUseId":"tu1"}"#,
+        ));
+        body.extend(event_frame(
+            "toolUseEvent",
+            br#"{"input":"\"}","name":"get_weather","toolUseId":"tu1"}"#,
+        ));
+        body.extend(event_frame(
+            "toolUseEvent",
+            br#"{"name":"get_weather","stop":true,"toolUseId":"tu1"}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"model":"sonnet","messages":[{"role":"user","content":"weather?"}],"tools":[{"name":"get_weather","input_schema":{}}],"stream":true}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.contains("text/event-stream"), "content-type = {ct}");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+
+        for needle in [
+            "event: content_block_start",
+            "\"type\":\"tool_use\"",
+            "\"name\":\"get_weather\"",
+            "\"id\":\"tu1\"",
+            "event: content_block_delta",
+            "\"input_json_delta\"",
+            "event: content_block_stop",
+            "event: message_delta",
+            "\"stop_reason\":\"tool_use\"",
+            "event: message_stop",
+        ] {
+            assert!(s.contains(needle), "SSE 缺 `{needle}`;实际:\n{s}");
+        }
+        // partial_json 片段应跨 delta 出现(累计含 city 的字面片段)。
+        assert!(s.contains("partial_json"), "缺 partial_json;实际:\n{s}");
+        assert!(
+            s.contains("ci") && s.contains("Paris"),
+            "input 片段缺失;实际:\n{s}"
+        );
+
+        // 不先发空文本块:首个 content_block_start 即 tool_use,不应出现 "type":"text" 的块。
+        let tool_pos = s.find("\"type\":\"tool_use\"").expect("应有 tool_use 块");
+        if let Some(text_pos) = s.find("\"type\":\"text\"") {
+            assert!(
+                tool_pos < text_pos,
+                "tool_use 块应先于任何 text 块;实际:\n{s}"
+            );
+        }
+
+        // 顺序:tool_use 的 content_block_start 在 content_block_stop 之前、后者在 message_stop 之前。
+        let start_pos = s.find("event: content_block_start").unwrap();
+        let stop_pos = s.find("event: content_block_stop").unwrap();
+        let msg_stop_pos = s.find("event: message_stop").unwrap();
+        assert!(start_pos < stop_pos && stop_pos < msg_stop_pos);
+    }
+
+    /// `POST /v1/messages/count_tokens`:纯估算,不打网络(空池也应 200)。
+    #[tokio::test]
+    async fn count_tokens_returns_positive_estimate() {
+        let server = MockServer::start().await;
+        let app = messages_router(state(&server.uri(), vec![]));
+        let req_body = r#"{"model":"sonnet","messages":[{"role":"user","content":"hello world"}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages/count_tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let n = v["input_tokens"].as_u64().expect("input_tokens 应为数字");
+        assert!(n > 0, "input_tokens 应 > 0,实际 {n}");
+    }
+
+    /// 更长输入应得到更大的估算值(单调性,而非精确匹配官方 tokenizer)。
+    #[tokio::test]
+    async fn count_tokens_scales_with_input_length() {
+        let server = MockServer::start().await;
+        let app = messages_router(state(&server.uri(), vec![]));
+
+        let short_body = r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages/count_tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(short_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let short_n = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["input_tokens"]
+            .as_u64()
+            .unwrap();
+
+        let long_text = "word ".repeat(200);
+        let long_body = serde_json::json!({
+            "model": "sonnet",
+            "messages": [{"role": "user", "content": long_text}],
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages/count_tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(long_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let long_n = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["input_tokens"]
+            .as_u64()
+            .unwrap();
+
+        assert!(long_n > short_n, "长输入 {long_n} 应大于短输入 {short_n}");
+    }
+
+    /// `GET /claude/v1/models`:固定模型列表,形状照 Anthropic 公开规范。
+    #[tokio::test]
+    async fn claude_models_lists_fixed_models() {
+        let server = MockServer::start().await;
+        let app = messages_router(state(&server.uri(), vec![]));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/claude/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = v["data"].as_array().expect("data 应为数组");
+        assert!(!data.is_empty(), "data 不应为空");
+        for entry in data {
+            assert_eq!(entry["type"], "model");
+            assert!(entry["id"].as_str().is_some_and(|s| !s.is_empty()));
+            assert!(
+                entry["display_name"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+            );
+        }
+        assert_eq!(v["has_more"], false);
+    }
+
+    /// store-key 归属:`relay_core_attributed` 以非 0 的 api_key_id 记录用量,
+    /// 该 key 的 summary 应计入本次请求(全链路 mock Kiro 回 "pong")。
+    #[tokio::test]
+    async fn relay_core_attributes_usage_to_api_key_id() {
+        let server = MockServer::start().await;
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+
+        // 专属 stats 目录,避免与共享 temp_dir 的其它测试记录串扰。
+        let dir = std::env::temp_dir().join(format!("kiro2api_attr_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let stats = StatsManager::load_from_dir(&dir);
+        let st = MessagesState {
+            pool: Arc::new(Mutex::new(Pool::new(vec![cred()], LbMode::Priority))),
+            client: reqwest::Client::new(),
+            control_client: reqwest::Client::new(),
+            cfg: Arc::new(Config::default()),
+            runtime_cfg: crate::config::shared_runtime_config(&crate::config::Config::default()),
+            endpoint_override: Some(format!("{}/generateAssistantResponse", server.uri())),
+            stats: stats.clone(),
+            api_keys: crate::apikey::ApiKeyStore::load(dir.join("api_keys.json")),
+            balance: crate::balance::BalanceCache::load_from_dir(&std::env::temp_dir()),
+            models_cache: crate::models_cache::ModelsCache::new(),
+            builderid_sessions: crate::admin::login_session::LoginSessions::with_default_ttl(),
+            iam_sso_sessions: crate::admin::login_session::LoginSessions::with_default_ttl(),
+            log_capture: None,
+            refresh_ctx: crate::kiro::ensure_fresh::RefreshCtx::new(
+                std::env::temp_dir()
+                    .join(format!(
+                        "kiro2api_refreshctx_src_protocol_anthropic_handler_rs_{}.json",
+                        std::process::id()
+                    ))
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+        };
+
+        let req: MessagesRequest = serde_json::from_str(
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        // 归属到 key id 42。
+        let out = relay_core_attributed(&st, req, 42, None, 1000)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&out.content[0], crate::protocol::anthropic::types::OutBlock::Text { text } if text == "pong")
+        );
+
+        // key 42 的 summary 计入一条;id 7(未用过)为空。
+        let s42 = stats.get_summary_by_api_key(42).await;
+        assert_eq!(s42.total_requests, 1);
+        let s7 = stats.get_summary_by_api_key(7).await;
+        assert_eq!(s7.total_requests, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `messages` handler 从请求扩展读取 `ApiKeyId` 并归属:经真实中间件塞入
+    /// `ApiKeyId(Some(9))`,一次 `/v1/messages` 后 key 9 的 summary 应计入。
+    #[tokio::test]
+    async fn messages_reads_api_key_id_from_extension() {
+        let server = MockServer::start().await;
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+
+        let dir = std::env::temp_dir().join(format!("kiro2api_attr_ext_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let stats = StatsManager::load_from_dir(&dir);
+        let st = MessagesState {
+            pool: Arc::new(Mutex::new(Pool::new(vec![cred()], LbMode::Priority))),
+            client: reqwest::Client::new(),
+            control_client: reqwest::Client::new(),
+            cfg: Arc::new(Config::default()),
+            runtime_cfg: crate::config::shared_runtime_config(&crate::config::Config::default()),
+            endpoint_override: Some(format!("{}/generateAssistantResponse", server.uri())),
+            stats: stats.clone(),
+            api_keys: crate::apikey::ApiKeyStore::load(dir.join("api_keys.json")),
+            balance: crate::balance::BalanceCache::load_from_dir(&std::env::temp_dir()),
+            models_cache: crate::models_cache::ModelsCache::new(),
+            builderid_sessions: crate::admin::login_session::LoginSessions::with_default_ttl(),
+            iam_sso_sessions: crate::admin::login_session::LoginSessions::with_default_ttl(),
+            log_capture: None,
+            refresh_ctx: crate::kiro::ensure_fresh::RefreshCtx::new(
+                std::env::temp_dir()
+                    .join(format!(
+                        "kiro2api_refreshctx_src_protocol_anthropic_handler_rs_{}.json",
+                        std::process::id()
+                    ))
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+        };
+
+        // 用一层中间件把 ApiKeyId(Some(9)) 塞进扩展,模拟鉴权闸命中 store key。
+        let app = messages_router(st).layer(axum::middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                req.extensions_mut().insert(ApiKeyId(Some(9)));
+                next.run(req).await
+            },
+        ));
+
+        let req_body = r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let s9 = stats.get_summary_by_api_key(9).await;
+        assert_eq!(s9.total_requests, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ==================== #9 数据面 region 取自 profileArn ====================
+
+    /// profileArn 里的 region 优先于 `cred.region`:非 us-east-1 账号(ARN 带真实 region)
+    /// 应据 ARN 解析出的 region,而非默认的 cred.region。
+    #[test]
+    fn effective_region_prefers_profile_arn() {
+        let mut c = cred();
+        c.region = "us-east-1".into(); // cred 默认 us-east-1
+        c.profile_arn = Some("arn:aws:codewhisperer:eu-west-1:123456789012:profile/ABC".into());
+        assert_eq!(effective_region(&c), "eu-west-1");
+    }
+
+    /// 无 profileArn → 回落 cred.region。
+    #[test]
+    fn effective_region_falls_back_to_cred_region() {
+        let mut c = cred();
+        c.region = "ap-northeast-1".into();
+        c.profile_arn = None;
+        assert_eq!(effective_region(&c), "ap-northeast-1");
+    }
+
+    /// profileArn 不含合法 region 段 → 回落 cred.region;cred.region 空 → 回落 us-east-1。
+    #[test]
+    fn effective_region_final_fallback_is_us_east_1() {
+        let mut c = cred();
+        c.region = "".into();
+        c.profile_arn = Some("not-an-arn".into());
+        assert_eq!(effective_region(&c), "us-east-1");
+    }
+
+    // ==================== #19 count_tokens 计入 tools/tool_result/图片 ====================
+
+    async fn count_for(body: &str) -> u64 {
+        let req: MessagesRequest = serde_json::from_str(body).unwrap();
+        let Json(resp) = count_tokens(Json(req)).await;
+        resp.input_tokens as u64
+    }
+
+    /// 带 tools 定义的请求估算应显著大于同样文本但无 tools 的请求(工具 schema 计入)。
+    #[tokio::test]
+    async fn count_tokens_includes_tools() {
+        let base = r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#;
+        let with_tools = r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],
+            "tools":[{"name":"get_weather","description":"Get the current weather for a city",
+            "input_schema":{"type":"object","properties":{"city":{"type":"string"},"units":{"type":"string"}},"required":["city"]}}]}"#;
+        assert!(
+            count_for(with_tools).await > count_for(base).await,
+            "tools 应抬高估算"
+        );
+    }
+
+    /// tool_result 内容(块数组)应计入估算,而非被 .text() 丢弃。
+    #[tokio::test]
+    async fn count_tokens_includes_tool_result() {
+        let base = r#"{"model":"sonnet","messages":[{"role":"user","content":[{"type":"text","text":"x"}]}]}"#;
+        let with_tr = r#"{"model":"sonnet","messages":[{"role":"user","content":[
+            {"type":"text","text":"x"},
+            {"type":"tool_result","tool_use_id":"tu1","content":"the weather in Paris is sunny and 24 degrees celsius today"}
+        ]}]}"#;
+        assert!(
+            count_for(with_tr).await > count_for(base).await,
+            "tool_result 应计入估算"
+        );
+    }
+
+    /// 图片块应按固定每图 token 抬高估算(而非被丢弃)。
+    #[tokio::test]
+    async fn count_tokens_includes_images() {
+        let base = r#"{"model":"sonnet","messages":[{"role":"user","content":[{"type":"text","text":"x"}]}]}"#;
+        let with_img = r#"{"model":"sonnet","messages":[{"role":"user","content":[
+            {"type":"text","text":"x"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aaaa"}}
+        ]}]}"#;
+        let n = count_for(with_img).await;
+        assert!(n > count_for(base).await, "图片应抬高估算");
+        assert!(n >= (IMAGE_TOKEN_ESTIMATE as u64), "每图固定估算应生效");
+    }
+
+    /// tool_use 块的 input JSON 应计入估算。
+    #[tokio::test]
+    async fn count_tokens_includes_tool_use_input() {
+        let base = r#"{"model":"sonnet","messages":[{"role":"assistant","content":[{"type":"text","text":"x"}]}]}"#;
+        let with_tu = r#"{"model":"sonnet","messages":[{"role":"assistant","content":[
+            {"type":"text","text":"x"},
+            {"type":"tool_use","id":"tu1","name":"search","input":{"query":"a fairly long search query string here"}}
+        ]}]}"#;
+        assert!(
+            count_for(with_tu).await > count_for(base).await,
+            "tool_use input 应计入估算"
+        );
+    }
+
+    /// `POST /claude/v1/messages`:与裸 `/v1/messages` 行为一致(同一 handler,前缀变体)。
+    #[tokio::test]
+    async fn claude_prefixed_messages_returns_pong() {
+        let server = MockServer::start().await;
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/claude/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["content"][0]["text"], "pong");
+    }
+}

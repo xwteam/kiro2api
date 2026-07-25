@@ -1,0 +1,35 @@
+name: CI
+on:
+  push:
+    branches: [main, "feat/**", "fix/**", "chore/**"]
+  pull_request:
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 构建 user-ui/dist (rust-embed 编译期嵌入;与 Dockerfile 前端阶段一致)
+        run: |
+          npm install -g pnpm@9.15.4
+          cd user-ui
+          pnpm install --frozen-lockfile --ignore-scripts || pnpm install --no-frozen-lockfile --ignore-scripts
+          pnpm build
+      - name: fmt (阻塞)
+        run: cargo fmt --all -- --check
+      - name: clippy (阻塞)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test (阻塞)
+        run: cargo test --all

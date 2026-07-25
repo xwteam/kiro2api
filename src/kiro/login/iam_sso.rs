@@ -1,0 +1,269 @@
+//! IAM Identity Center 登录:授权码(RFC 6749)+ PKCE S256(RFC 7636)+ AWS SSO-OIDC。
+use super::{LoginError, MintedCredential, SCOPES, new_state, pkce_pair, read_upstream_json};
+use serde::Deserialize;
+use url::Url;
+
+const CLIENT_NAME: &str = "Kiro";
+const CLIENT_TYPE: &str = "public";
+const REDIRECT_URI: &str = "http://127.0.0.1/oauth/callback";
+const AUTH_CODE_GRANT: &str = "authorization_code";
+
+/// 注册后待用户授权的态。
+#[derive(Debug, Clone)]
+pub struct AuthStart {
+    pub authorize_url: String,
+    pub verifier: String,
+    pub state: String,
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+#[derive(Deserialize)]
+struct RegisterResp {
+    #[serde(rename = "clientId")]
+    client_id: String,
+    #[serde(rename = "clientSecret")]
+    client_secret: String,
+}
+#[derive(Deserialize)]
+struct TokenResp {
+    #[serde(rename = "accessToken")]
+    access_token: String,
+    /// AWS SSO-OIDC 换 token 会回带 idToken(JWT):IdC 数据面(Amazon Q)认这个 JWT,
+    /// 而非 portal 会话型 accessToken。铸凭据时优先采纳(缺省才回落 accessToken)。
+    #[serde(rename = "idToken", default)]
+    id_token: Option<String>,
+    #[serde(rename = "refreshToken", default)]
+    refresh_token: String,
+    #[serde(rename = "expiresIn", default)]
+    expires_in: u64,
+}
+
+/// 注册客户端并构造 authorize URL。
+pub async fn start(
+    client: &reqwest::Client,
+    base: &str,
+    start_url: &str,
+) -> Result<AuthStart, LoginError> {
+    let resp = client
+        .post(format!("{base}/client/register"))
+        .json(&serde_json::json!({
+            "clientName": CLIENT_NAME, "clientType": CLIENT_TYPE, "scopes": SCOPES,
+            "grantTypes": [AUTH_CODE_GRANT, "refresh_token"],
+            "redirectUris": [REDIRECT_URI], "issuerUrl": start_url,
+        }))
+        .send()
+        .await
+        .map_err(|_| LoginError::Http)?;
+    let reg: RegisterResp = read_upstream_json(resp).await?;
+
+    let (verifier, challenge) = pkce_pair();
+    let state = new_state();
+    let scopes = SCOPES.join(" ");
+    // 用 Url 组装,保证正确编码。
+    let mut u = Url::parse(&format!("{base}/authorize")).map_err(|_| LoginError::Http)?;
+    u.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", &reg.client_id)
+        .append_pair("redirect_uri", REDIRECT_URI)
+        .append_pair("scopes", &scopes)
+        .append_pair("state", &state)
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256");
+
+    Ok(AuthStart {
+        authorize_url: u.to_string(),
+        verifier,
+        state,
+        client_id: reg.client_id,
+        client_secret: reg.client_secret,
+    })
+}
+
+/// 解析用户粘贴的回调 URL:error 优先 → state CSRF → code。
+pub fn parse_callback(pasted_url: &str, expected_state: &str) -> Result<String, LoginError> {
+    let u = Url::parse(pasted_url).map_err(|_| LoginError::BadCallback)?;
+    let mut code = None;
+    let mut state = None;
+    let mut err = None;
+    for (k, v) in u.query_pairs() {
+        match k.as_ref() {
+            "code" => code = Some(v.into_owned()),
+            "state" => state = Some(v.into_owned()),
+            "error" => err = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+    if let Some(e) = err {
+        return Err(match e.as_str() {
+            "access_denied" => LoginError::Denied,
+            other => LoginError::Upstream(other.to_string()),
+        });
+    }
+    if state.as_deref() != Some(expected_state) {
+        return Err(LoginError::BadCallback); // CSRF
+    }
+    code.ok_or(LoginError::BadCallback)
+}
+
+/// 授权码 + verifier 换 token。
+pub async fn complete(
+    client: &reqwest::Client,
+    base: &str,
+    region: &str,
+    s: &AuthStart,
+    code: &str,
+) -> Result<MintedCredential, LoginError> {
+    let resp = client
+        .post(format!("{base}/token"))
+        .json(&serde_json::json!({
+            "clientId": s.client_id, "clientSecret": s.client_secret,
+            "grantType": AUTH_CODE_GRANT, "code": code,
+            "redirectUri": REDIRECT_URI, "codeVerifier": s.verifier,
+        }))
+        .send()
+        .await
+        .map_err(|_| LoginError::Http)?;
+    let t: TokenResp = read_upstream_json(resp).await?;
+    Ok(MintedCredential {
+        // IdC 数据面认 idToken(JWT);缺省才回落 accessToken。
+        access_token: t.id_token.unwrap_or(t.access_token),
+        refresh_token: t.refresh_token,
+        expires_in_secs: t.expires_in,
+        region: region.to_string(),
+        // 首刷走 SSO-OIDC refresh_token 授权须重放这对客户端凭据(auth=Idc)。
+        client_id: s.client_id.clone(),
+        client_secret: s.client_secret.clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn start_builds_authorize_url_with_pkce_and_state() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/client/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "clientId": "cid", "clientSecret": "csec"
+            })))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let s = start(&client, &server.uri(), "https://my.awsapps.com/start")
+            .await
+            .unwrap();
+        assert!(s.authorize_url.contains("code_challenge_method=S256"));
+        assert!(s.authorize_url.contains(&format!("state={}", s.state)));
+        assert!(s.authorize_url.contains("response_type=code"));
+        assert_eq!(s.verifier.len(), 43);
+    }
+
+    #[test]
+    fn parse_callback_checks_state_then_code() {
+        // 正常
+        assert_eq!(
+            parse_callback("http://127.0.0.1/oauth/callback?code=abc&state=S", "S").unwrap(),
+            "abc"
+        );
+        // state 不符 → BadCallback(CSRF)
+        assert_eq!(
+            parse_callback("http://x/?code=abc&state=WRONG", "S"),
+            Err(LoginError::BadCallback)
+        );
+        // 上游 error 优先
+        assert_eq!(
+            parse_callback("http://x/?error=access_denied&state=S", "S"),
+            Err(LoginError::Denied)
+        );
+        // 缺 code
+        assert_eq!(
+            parse_callback("http://x/?state=S", "S"),
+            Err(LoginError::BadCallback)
+        );
+    }
+
+    #[tokio::test]
+    async fn start_maps_non_2xx_to_upstream_http_with_message() {
+        // 上游 400 + AWS 风格 message → UpstreamHttp{400, "..."},不再吞成 Http。
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/client/register"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "message": "issuerUrl is invalid or unreachable"
+            })))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let err = start(&client, &server.uri(), "https://bad/start")
+            .await
+            .unwrap_err();
+        match err {
+            LoginError::UpstreamHttp { status, body } => {
+                assert_eq!(status, 400);
+                assert_eq!(body, "issuerUrl is invalid or unreachable");
+            }
+            other => panic!("expected UpstreamHttp, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_exchanges_code() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accessToken": "atok", "refreshToken": "rtok", "expiresIn": 3600
+            })))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let s = AuthStart {
+            authorize_url: "x".into(),
+            verifier: "ver".into(),
+            state: "S".into(),
+            client_id: "cid".into(),
+            client_secret: "csec".into(),
+        };
+        let cred = complete(&client, &server.uri(), "us-east-1", &s, "code123")
+            .await
+            .unwrap();
+        assert_eq!(cred.access_token, "atok");
+        // 客户端凭据须带出(auth=Idc 首刷依赖)。
+        assert_eq!(cred.client_id, "cid");
+        assert_eq!(cred.client_secret, "csec");
+        assert!(!cred.client_id.is_empty() && !cred.client_secret.is_empty());
+    }
+
+    #[tokio::test]
+    async fn complete_prefers_id_token_for_idc_data_plane() {
+        // IdC 换 token 回带 idToken(JWT):铸凭据须采 idToken,不是 portal accessToken。
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accessToken": "portal-atok", "idToken": "jwt-idtok",
+                "refreshToken": "rtok", "expiresIn": 3600
+            })))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let s = AuthStart {
+            authorize_url: "x".into(),
+            verifier: "ver".into(),
+            state: "S".into(),
+            client_id: "cid".into(),
+            client_secret: "csec".into(),
+        };
+        let cred = complete(&client, &server.uri(), "us-east-1", &s, "code123")
+            .await
+            .unwrap();
+        assert_eq!(cred.access_token, "jwt-idtok"); // 采 idToken
+        assert_eq!(cred.client_id, "cid");
+        assert_eq!(cred.client_secret, "csec");
+    }
+}

@@ -1,0 +1,401 @@
+import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query'
+import {
+  getCredentials,
+  setCredentialDisabled,
+  setCredentialPriority,
+  resetCredentialFailure,
+  getCredentialBalance,
+  addCredential,
+  deleteCredential,
+  updateCredential,
+  getLoadBalancingMode,
+  setLoadBalancingMode,
+  getServerInfo,
+  getApiKeys,
+  createApiKey,
+  updateApiKey,
+  deleteApiKey,
+  getAllUsage,
+  resetKeyUsage,
+  getRpm,
+  getAuthKeys,
+  setAuthKeys,
+  getKeyUsageRecords,
+  getCredentialUsageRecords,
+  getCredentialTodaySummary,
+  getDailyUsage,
+  getDailyUsageRecords,
+  getThrottleLogs,
+  getFailureLogs,
+  getModels,
+  startBuilderIdLogin,
+  pollBuilderIdLogin,
+  startIamSsoLogin,
+  completeIamSsoLogin,
+  importSsoToken,
+} from '@/api/credentials'
+import type {
+  AddCredentialRequest,
+  UpdateCredentialRequest,
+  CreateApiKeyRequest,
+  UpdateApiKeyRequest,
+  BuilderIdStartRequest,
+  BuilderIdPollRequest,
+  IamSsoStartRequest,
+  IamSsoCompleteRequest,
+  SsoTokenImportRequest,
+} from '@/types/api'
+
+// 查询凭据列表
+export function useCredentials() {
+  return useQuery({
+    queryKey: ['credentials'],
+    queryFn: getCredentials,
+    refetchInterval: 30000, // 每 30 秒刷新一次
+  })
+}
+
+// 查询凭据余额
+export function useCredentialBalance(id: number | null) {
+  return useQuery({
+    queryKey: ['credential-balance', id],
+    queryFn: () => getCredentialBalance(id!),
+    enabled: id !== null,
+    retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+  })
+}
+
+// 批量查询多个凭据余额
+export function useCredentialBalances(ids: number[]) {
+  const results = useQueries({
+    queries: ids.map((id) => ({
+      queryKey: ['credential-balance', id],
+      queryFn: () => getCredentialBalance(id),
+      retry: false,
+    })),
+  })
+  const balanceMap = new Map<number, import('@/types/api').BalanceResponse>()
+  ids.forEach((id, i) => {
+    const data = results[i]?.data
+    if (data) balanceMap.set(id, data)
+  })
+  return balanceMap
+}
+
+// 设置禁用状态
+export function useSetDisabled() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, disabled }: { id: number; disabled: boolean }) =>
+      setCredentialDisabled(id, disabled),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 设置优先级
+export function useSetPriority() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, priority }: { id: number; priority: number }) =>
+      setCredentialPriority(id, priority),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 重置失败计数
+export function useResetFailure() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => resetCredentialFailure(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 添加新凭据
+export function useAddCredential() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: AddCredentialRequest) => addCredential(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// ============ 登录向导 Hooks ============
+
+// Builder-ID：启动
+export function useStartBuilderIdLogin() {
+  return useMutation({
+    mutationFn: (req: BuilderIdStartRequest) => startBuilderIdLogin(req),
+  })
+}
+
+// Builder-ID：轮询（completed 时刷新凭据列表）
+export function usePollBuilderIdLogin() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: BuilderIdPollRequest) => pollBuilderIdLogin(req),
+    onSuccess: (data) => {
+      if (data.status === 'completed') {
+        queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      }
+    },
+  })
+}
+
+// IAM SSO：启动
+export function useStartIamSsoLogin() {
+  return useMutation({
+    mutationFn: (req: IamSsoStartRequest) => startIamSsoLogin(req),
+  })
+}
+
+// IAM SSO：完成（落库后刷新凭据列表）
+export function useCompleteIamSsoLogin() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: IamSsoCompleteRequest) => completeIamSsoLogin(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// SSO Token 导入（落库后刷新凭据列表）
+export function useImportSsoToken() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: SsoTokenImportRequest) => importSsoToken(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 删除凭据
+export function useDeleteCredential() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => deleteCredential(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 更新凭据
+export function useUpdateCredential() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, data }: { id: number; data: UpdateCredentialRequest }) =>
+      updateCredential(id, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 获取负载均衡模式
+export function useLoadBalancingMode() {
+  return useQuery({
+    queryKey: ['loadBalancingMode'],
+    queryFn: getLoadBalancingMode,
+  })
+}
+
+// 设置负载均衡模式
+export function useSetLoadBalancingMode() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setLoadBalancingMode,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+// ============ API Key Hooks ============
+
+// 获取服务器信息
+export function useServerInfo() {
+  return useQuery({
+    queryKey: ['serverInfo'],
+    queryFn: getServerInfo,
+  })
+}
+
+// 查询 API Key 列表
+export function useApiKeys() {
+  return useQuery({
+    queryKey: ['apiKeys'],
+    queryFn: getApiKeys,
+  })
+}
+
+// 创建 API Key
+export function useCreateApiKey() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: CreateApiKeyRequest) => createApiKey(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['apiKeys'] })
+    },
+  })
+}
+
+// 更新 API Key
+export function useUpdateApiKey() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, data }: { id: number; data: UpdateApiKeyRequest }) =>
+      updateApiKey(id, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['apiKeys'] })
+    },
+  })
+}
+
+// 删除 API Key
+export function useDeleteApiKey() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => deleteApiKey(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['apiKeys'] })
+    },
+  })
+}
+
+// ============ API Key 用量 Hooks ============
+
+// 查询所有 API Key 用量
+export function useAllUsage() {
+  return useQuery({
+    queryKey: ['apiKeyUsage'],
+    queryFn: getAllUsage,
+    refetchInterval: 60000, // 每 60 秒刷新
+  })
+}
+
+// 重置 API Key 用量
+export function useResetKeyUsage() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => resetKeyUsage(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['apiKeyUsage'] })
+    },
+  })
+}
+
+// 查询单个 API Key 的分页原始记录
+export function useKeyUsageRecords(id: number, page: number, pageSize = 50) {
+  return useQuery({
+    queryKey: ['apiKeyUsageRecords', id, page, pageSize],
+    queryFn: () => getKeyUsageRecords(id, page, pageSize),
+    enabled: id > 0,
+  })
+}
+
+// 查询单个凭据的分页原始记录
+export function useCredentialUsageRecords(id: number, page: number, pageSize = 50) {
+  return useQuery({
+    queryKey: ['credentialUsageRecords', id, page, pageSize],
+    queryFn: () => getCredentialUsageRecords(id, page, pageSize),
+    enabled: id > 0,
+  })
+}
+
+// 查询单账号 CST 今日用量汇总（60s 自动刷新）
+export function useCredentialTodaySummary(id: number) {
+  return useQuery({
+    queryKey: ['credentialTodaySummary', id],
+    queryFn: () => getCredentialTodaySummary(id),
+    enabled: id > 0,
+    refetchInterval: 60000,
+  })
+}
+
+// ============ RPM 监控 Hooks ============
+
+// 查询实时 RPM 数据（每 5 秒刷新）
+export function useRpm() {
+  return useQuery({
+    queryKey: ['rpm'],
+    queryFn: getRpm,
+    refetchInterval: 5000,
+  })
+}
+
+// ============ 认证密钥 Hooks ============
+
+export function useAuthKeys() {
+  return useQuery({
+    queryKey: ['auth-keys'],
+    queryFn: getAuthKeys,
+  })
+}
+
+export function useSetAuthKeys() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: { apiKey?: string; adminApiKey?: string }) => setAuthKeys(payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['auth-keys'] })
+    },
+  })
+}
+
+// ============ 支持的模型 Hooks ============
+
+export function useModels() {
+  return useQuery({
+    queryKey: ['models'],
+    queryFn: getModels,
+  })
+}
+
+// ============ 每日用量统计 Hooks ============
+
+export function useDailyUsage() {
+  return useQuery({
+    queryKey: ['dailyUsage'],
+    queryFn: getDailyUsage,
+    refetchInterval: 60000,
+  })
+}
+
+export function useDailyUsageRecords(date: string, page: number, pageSize = 50) {
+  return useQuery({
+    queryKey: ['dailyUsageRecords', date, page, pageSize],
+    queryFn: () => getDailyUsageRecords(date, page, pageSize),
+    enabled: !!date,
+  })
+}
+
+// ============ 失败日志 Hooks ============
+
+export function useFailureLogs(id: number, page: number, pageSize = 50) {
+  return useQuery({
+    queryKey: ['failureLogs', id, page, pageSize],
+    queryFn: () => getFailureLogs(id, page, pageSize),
+    enabled: id > 0,
+  })
+}
+
+// ============ 限流日志 Hooks ============
+
+export function useThrottleLogs(id: number, page: number, pageSize = 50) {
+  return useQuery({
+    queryKey: ['throttleLogs', id, page, pageSize],
+    queryFn: () => getThrottleLogs(id, page, pageSize),
+    enabled: id > 0,
+  })
+}

@@ -1,0 +1,45 @@
+# kiro2api — Anthropic/OpenAI/Gemini 多协议中转,后端 Kiro。
+# 版本单一真源在 ./VERSION;此处 version 须与之保持一致。
+[package]
+name = "kiro2api"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["xwteam"]
+publish = false
+
+[[bin]]
+name = "kiro2api"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[dependencies]
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "socks", "http2", "charset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+crc = "3"
+getrandom = "0.2"
+hex = "0.4"
+parking_lot = "0.12"
+sha2 = "0.10"
+subtle = "2.6"
+rust-embed = "8"
+mime_guess = "2"
+url = "2"
+async-stream = "0.3"
+futures-core = "0.3"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6"

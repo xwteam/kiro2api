@@ -1,0 +1,1464 @@
+/* kiro2api Admin UI v2 — sections-manage.css
+   Styles for the management sections: Accounts, API Keys, Settings.
+   Uses only the CSS custom properties defined in base.css
+   (--primary, --bg-*, --text-*, --border-color, --radius-*, --shadow-*,
+    --success/-10, --danger/-10, --warning/-15, --info/-10, --transition).
+   No external assets and no remote urls. Shared components (.btn, .badge,
+   .modal, .data-table, .form-*, .card, .toast) come from base.css. */
+
+/* ============================================================
+   Shared: management toolbars, mini utility bits
+   ============================================================ */
+.mng-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.mng-toolbar .mng-spacer { flex: 1 1 auto; }
+
+.mng-search {
+  min-width: 180px;
+  max-width: 280px;
+}
+
+.mng-inline-note {
+  font-size: 0.8rem;
+  color: var(--text-tertiary);
+  margin: 0.25rem 0 0;
+}
+
+/* section heading inside a modal body (e.g. the recent-records heading in the
+   standalone usage dialog) */
+.mng-section-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 1rem 0 0.5rem;
+}
+.mng-section-title:first-child {
+  margin-top: 0;
+}
+
+/* small key/value chip used inside tables & cards */
+.kv-mono {
+  font-family: 'SFMono-Regular', ui-monospace, 'Menlo', 'Consolas', monospace;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+
+/* muted secondary line under a primary label in a table cell */
+.cell-sub {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  margin-top: 0.15rem;
+}
+
+/* health / status dot */
+.status-dot {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  margin-right: 0.35rem;
+  vertical-align: middle;
+  background: var(--text-tertiary);
+}
+.status-dot.healthy { background: var(--success); }
+.status-dot.warning { background: var(--warning); }
+.status-dot.unhealthy { background: var(--danger); }
+.status-dot.muted { background: var(--text-tertiary); }
+
+/* ============================================================
+   Accounts — TOP SECTION: summary stat cards + toolbar
+   (clean-room port of the reference dashboard credentials view)
+   ============================================================ */
+.accounts-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1rem;
+  margin: 1rem 0 1.25rem;
+}
+.acct-stat-card {
+  padding: 0.85rem 1rem;
+  transition: var(--transition);
+}
+.acct-stat-card.is-clickable { cursor: pointer; }
+.acct-stat-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+  border-color: var(--primary-20);
+}
+.acct-stat-label {
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  margin-bottom: 0.35rem;
+}
+.acct-stat-num {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.1;
+}
+.acct-stat-card.ok .acct-stat-num { color: var(--success); }
+.acct-stat-card.warn .acct-stat-num { color: var(--warning); }
+.acct-stat-card.credits .acct-stat-num { color: var(--warning); }
+.acct-stat-sub {
+  font-size: 0.72rem;
+  color: var(--text-tertiary);
+  margin-top: 0.3rem;
+}
+.acct-stat-cost {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--warning);
+  margin-top: 0.15rem;
+}
+.acct-stat-meter {
+  height: 5px;
+  border-radius: var(--radius-full);
+  background: var(--bg-tertiary);
+  overflow: hidden;
+  margin-top: 0.4rem;
+}
+.acct-stat-meter > span {
+  display: block;
+  height: 100%;
+  border-radius: var(--radius-full);
+  background: var(--warning);
+  transition: width 0.3s ease;
+}
+
+/* toolbar: batch actions bar (appears when rows are selected) */
+.accounts-batchbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0.6rem 0.85rem;
+  margin-bottom: 0.9rem;
+  border: 1px solid var(--primary-20);
+  border-radius: var(--radius-lg);
+  background: var(--primary-10);
+}
+.accounts-batchbar .bb-count {
+  font-weight: 600;
+  color: var(--primary);
+  font-size: 0.85rem;
+}
+.accounts-batchbar .bb-spacer { flex: 1 1 auto; }
+
+/* per-row selection checkbox */
+.account-row-select {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  margin-right: 0.25rem;
+}
+.account-row-select input {
+  width: 16px; height: 16px;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+.account-row.is-selected {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 1px var(--primary-20);
+}
+
+/* ============================================================
+   Accounts — paginated list (one account per row)
+   ============================================================ */
+.accounts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.account-row {
+  background: var(--bg-primary);
+  padding: 0.9rem 1.1rem;
+  border-radius: var(--radius-xl);
+  border: 1px solid var(--border-color);
+  box-shadow: var(--shadow-sm);
+  transition: var(--transition);
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.account-row:hover {
+  transform: translateY(-4px);
+  box-shadow: var(--shadow-lg);
+  border-color: var(--primary-20);
+}
+.account-row.is-current {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 1px var(--primary);
+}
+.account-row.is-disabled { opacity: 0.6; }
+
+/* left: info column */
+.account-row-info {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.account-row-idline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.account-row-id {
+  font-family: 'SFMono-Regular', ui-monospace, 'Menlo', 'Consolas', monospace;
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  font-weight: 600;
+}
+.account-row-name {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.15rem 0.9rem;
+  font-size: 0.78rem;
+  color: var(--text-tertiary);
+}
+.account-row-meta .meta-k {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.account-row-stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 1.1rem;
+  font-size: 0.8rem;
+}
+.account-stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.3rem;
+}
+.account-stat .stat-k {
+  color: var(--text-tertiary);
+  font-size: 0.75rem;
+}
+.account-stat .stat-n {
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.account-stat.ok .stat-n { color: var(--success); }
+.account-stat.bad .stat-n { color: var(--danger); }
+.account-stat.warn .stat-n { color: var(--warning); }
+.account-stat.info .stat-n { color: var(--info, var(--primary)); }
+.account-stat.muted .stat-n { color: var(--text-secondary); }
+.account-stat.is-link { cursor: pointer; }
+.account-stat.is-link:hover .stat-n { text-decoration: underline; }
+
+.current-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: var(--radius-full);
+  background: var(--primary-10);
+  color: var(--primary);
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+/* right: action cluster — icon toggle switch + icon buttons (the reference panel card) */
+.account-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.25rem;
+  flex: 0 0 auto;
+}
+
+/* ---- CSS icon toggle switch (enable/disable) ----
+   Replicates the reference panel's Radix Switch: 44x24 track, 20px thumb,
+   checked = blue, thumb slides +20px. */
+.acct-switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  width: 44px;
+  height: 24px;
+  padding: 0;
+  margin-right: 0.35rem;
+  border: 2px solid transparent;
+  border-radius: var(--radius-full);
+  background: var(--bg-tertiary);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.08);
+  cursor: pointer;
+  transition: background-color 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  vertical-align: middle;
+}
+.acct-switch:hover:not(:disabled) { background: var(--border-hover); }
+.acct-switch:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg-primary), 0 0 0 4px var(--primary);
+}
+.acct-switch.is-on {
+  background: var(--primary);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+.acct-switch.is-on:hover:not(:disabled) { background: var(--primary-hover); }
+.acct-switch:disabled { cursor: not-allowed; opacity: 0.5; }
+.acct-switch-thumb {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25), 0 1px 1px rgba(0, 0, 0, 0.12);
+  transform: translate(0, -50%);
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.acct-switch.is-on .acct-switch-thumb { transform: translate(20px, -50%); }
+
+/* ---- icon action buttons (Wallet / FileText / Pencil / RefreshCw / Trash2) ---- */
+.acct-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-md, 8px);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: var(--transition);
+}
+.acct-icon-btn svg {
+  width: 18px;
+  height: 18px;
+  display: block;
+}
+.acct-icon-btn:hover:not(:disabled) {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+.acct-icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.acct-icon-btn.is-danger { color: var(--danger); }
+.acct-icon-btn.is-danger:hover:not(:disabled) {
+  background: var(--danger-10);
+  color: var(--danger);
+}
+
+/* generic info row (reused inside balance modal) */
+.account-info-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--border-color);
+}
+.account-info-row:last-child { border-bottom: none; }
+.account-info-label {
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  font-weight: 500;
+}
+.account-info-value {
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-align: right;
+  word-break: break-word;
+}
+
+/* ---- pagination controls ---- */
+.accounts-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  margin-top: 1.1rem;
+}
+.accounts-page-indicator {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  font-weight: 500;
+  min-width: 8rem;
+  text-align: center;
+}
+
+/* add-account split button + dropdown menu */
+.add-menu-wrap { position: relative; display: inline-block; }
+.add-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 220px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  padding: 0.4rem;
+  z-index: 40;
+  display: none;
+}
+.add-menu.open { display: block; }
+.add-menu-label {
+  padding: 0.4rem 0.7rem 0.2rem;
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-tertiary);
+}
+.add-menu-label + .add-menu-label { margin-top: 0.25rem; }
+.add-menu button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+  width: 100%;
+  text-align: left;
+  padding: 0.55rem 0.7rem;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  border-radius: var(--radius-md, 10px);
+  cursor: pointer;
+  transition: var(--transition);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.add-menu button:hover { background: var(--primary-10); color: var(--primary); }
+.add-menu button .sub {
+  font-size: 0.72rem;
+  font-weight: 400;
+  color: var(--text-tertiary);
+}
+.add-menu button:hover .sub { color: var(--primary); }
+
+/* ============================================================
+   Interactive-login modal (device code / callback / token import)
+   ============================================================ */
+.login-tabs {
+  display: flex;
+  gap: 0.35rem;
+  margin-bottom: 1.1rem;
+  border-bottom: 1px solid var(--border-color);
+}
+.login-tab {
+  padding: 0.55rem 0.9rem;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: var(--transition);
+}
+.login-tab:hover { color: var(--text-primary); }
+.login-tab.active { color: var(--primary); border-bottom-color: var(--primary); }
+
+.login-pane { display: none; }
+.login-pane.active { display: block; }
+
+.device-code-box {
+  text-align: center;
+  padding: 1.25rem;
+  border: 1px dashed var(--border-color);
+  border-radius: var(--radius-lg);
+  background: var(--bg-secondary);
+  margin: 0.75rem 0;
+}
+.device-code {
+  font-family: 'SFMono-Regular', ui-monospace, 'Menlo', 'Consolas', monospace;
+  font-size: 1.6rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: var(--primary);
+  user-select: all;
+}
+.device-code-label {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  margin-bottom: 0.5rem;
+}
+.waiting-line {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  margin-top: 0.75rem;
+}
+
+/* per-account refresh error list */
+.refresh-errors {
+  margin-top: 0.75rem;
+  border: 1px solid var(--danger-10);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+.refresh-errors .rex-head {
+  padding: 0.6rem 0.9rem;
+  background: var(--danger-10);
+  color: var(--danger);
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+.refresh-errors .rex-item {
+  padding: 0.55rem 0.9rem;
+  border-top: 1px solid var(--border-color);
+  font-size: 0.82rem;
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+.refresh-errors .rex-item .rex-acct {
+  font-weight: 700;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+.refresh-errors .rex-item .rex-reason {
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+
+/* ============================================================
+   Balance / usage modal bits
+   ============================================================ */
+.meter {
+  height: 10px;
+  border-radius: var(--radius-full);
+  background: var(--bg-tertiary);
+  overflow: hidden;
+  margin: 0.5rem 0;
+}
+.meter > span {
+  display: block;
+  height: 100%;
+  border-radius: var(--radius-full);
+  background: var(--primary);
+  transition: width 0.3s ease;
+}
+.meter.hot > span { background: var(--danger); }
+.meter.warm > span { background: var(--warning); }
+
+/* ============================================================
+   API keys — clean-room replica of the reference panel's ApiKeysPanel
+   (service-info card, status stat cards, sort/search toolbar,
+    bound/global grouped key cards, create/edit dialog, showcase)
+   ============================================================ */
+
+/* ---- service connection info card ---- */
+.svc-card { padding: 1rem 1.1rem; }
+.svc-card-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  margin-bottom: 0.75rem;
+}
+.svc-card-head .svc-ico { width: 16px; height: 16px; }
+.svc-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.4rem 0;
+}
+.svc-row + .svc-row { border-top: 1px solid var(--border-color); }
+.svc-row-left { min-width: 0; }
+.svc-row-label {
+  font-size: 0.72rem;
+  color: var(--text-tertiary);
+  margin-bottom: 0.15rem;
+}
+.svc-row-val {
+  font-family: 'SFMono-Regular', ui-monospace, 'Menlo', 'Consolas', monospace;
+  font-size: 0.85rem;
+  color: var(--text-primary);
+  word-break: break-all;
+}
+
+/* ---- status stat cards ---- */
+.key-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 1rem;
+  margin: 1rem 0;
+}
+.key-stat {
+  padding: 0.85rem 1rem;
+  transition: var(--transition);
+}
+.key-stat:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+  border-color: var(--primary-20);
+}
+.key-stat-label {
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  margin-bottom: 0.35rem;
+}
+.key-stat-num {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.1;
+}
+.key-stat.ok .key-stat-num { color: var(--success); }
+.key-stat.bad .key-stat-num { color: var(--danger); }
+.key-stat.warn .key-stat-num { color: var(--warning); }
+.key-stat.muted .key-stat-num { color: var(--text-secondary); }
+
+/* ---- sort segment in toolbar ---- */
+.key-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+.key-sort .key-sort-ico { width: 16px; height: 16px; color: var(--text-tertiary); }
+.btn .btn-ico { width: 15px; height: 15px; margin-right: 0.3rem; vertical-align: -2px; }
+.btn.btn-primary .btn-ico { color: currentColor; }
+
+/* ---- search box ---- */
+.key-search-wrap {
+  position: relative;
+  margin: 0.5rem 0 1rem;
+}
+.key-search-wrap .key-search-ico {
+  position: absolute;
+  left: 0.7rem; top: 50%;
+  transform: translateY(-50%);
+  width: 16px; height: 16px;
+  color: var(--text-tertiary);
+  pointer-events: none;
+}
+.key-search { padding-left: 2.1rem; }
+
+/* ---- grouped key lists ---- */
+.key-list { display: flex; flex-direction: column; gap: 1.5rem; }
+.key-group { display: flex; flex-direction: column; gap: 0.5rem; }
+.key-group-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-tertiary);
+}
+.key-group-head.is-bound { color: #7c3aed; }
+.key-group-head .key-group-ico { width: 16px; height: 16px; }
+.key-group-count { font-size: 0.78rem; font-weight: 400; color: var(--text-tertiary); }
+.key-cards { display: flex; flex-direction: column; gap: 0.5rem; }
+
+/* ---- key card ---- */
+.key-card {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-sm);
+  padding: 0.75rem 0.9rem;
+  transition: var(--transition);
+}
+.key-card:hover {
+  transform: translateY(-4px);
+  box-shadow: var(--shadow-lg);
+  border-color: var(--primary-20);
+}
+.key-card.is-bound:hover {
+  border-color: color-mix(in srgb, #7c3aed 45%, var(--border-color));
+}
+.key-card.is-dim { opacity: 0.6; }
+.key-card.is-bound {
+  border-color: color-mix(in srgb, #7c3aed 35%, var(--border-color));
+  background: color-mix(in srgb, #7c3aed 5%, var(--bg-primary));
+}
+.key-card-main {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.key-card-info { min-width: 0; flex: 1 1 auto; }
+
+.key-line1 {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.key-serial {
+  font-family: 'SFMono-Regular', ui-monospace, 'Menlo', 'Consolas', monospace;
+  font-size: 0.72rem;
+  color: var(--text-tertiary);
+}
+.key-name {
+  font-weight: 600;
+  color: var(--text-primary);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.key-bound-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, #7c3aed 12%, transparent);
+  color: #7c3aed;
+  border: 1px solid color-mix(in srgb, #7c3aed 25%, transparent);
+  font-size: 0.72rem;
+  font-weight: 500;
+}
+.key-bound-chip .chip-ico { width: 12px; height: 12px; flex: 0 0 12px; }
+.key-bound-chip .chip-sep { opacity: 0.4; }
+
+.key-line2, .key-line3 {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.2rem 0.85rem;
+  margin-top: 0.35rem;
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+}
+.key-mono {
+  font-family: 'SFMono-Regular', ui-monospace, 'Menlo', 'Consolas', monospace;
+}
+.key-line2 .meta-k { color: var(--text-secondary); }
+.key-limit { display: inline-flex; align-items: center; gap: 0.25rem; }
+.key-limit .meta-ico { width: 12px; height: 12px; }
+
+.key-usg-item { display: inline-flex; align-items: center; gap: 0.25rem; }
+.key-usg-item .usg-ico { width: 12px; height: 12px; }
+.key-usg-rpm { color: var(--info, var(--primary)); font-weight: 500; }
+.key-usg-io { color: var(--text-tertiary); }
+.key-usg-cost { font-weight: 600; color: var(--warning); }
+
+.key-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.15rem;
+  flex: 0 0 auto;
+}
+.acct-icon-btn.is-mini { width: 22px; height: 22px; }
+.acct-icon-btn.is-mini svg { width: 13px; height: 13px; }
+
+/* ---- detail modal sub-bits ---- */
+.key-sub-h {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  margin: 1rem 0 0.5rem;
+}
+.key-model-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 0.5rem;
+}
+.key-model-card { padding: 0.6rem 0.8rem; }
+.key-model-name {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.key-model-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.1rem 0.7rem;
+  margin-top: 0.25rem;
+  font-size: 0.72rem;
+  color: var(--text-tertiary);
+}
+
+/* ---- purge dialog ---- */
+.purge-list {
+  max-height: 15rem;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-top: 0.5rem;
+}
+.purge-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.35rem 0.6rem;
+  border-radius: var(--radius-md, 8px);
+  background: var(--bg-secondary);
+  font-size: 0.85rem;
+  color: var(--text-primary);
+}
+
+/* ============================================================
+   API-key create/edit dialog — segmented controls, chips,
+   quota inputs, credential multi-select (the reference panel replica)
+   ============================================================ */
+/* Modal header: title + subtitle grouped in a left column, above the
+   header's bottom divider; close button aligns to the top-right. */
+.modal-header { align-items: flex-start; }
+.modal-head-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+.modal-desc {
+  font-size: 0.82rem;
+  line-height: 1.35;
+  color: var(--text-tertiary);
+  margin: 0;
+  padding: 0;
+}
+.key-form { display: flex; flex-direction: column; gap: 1rem; }
+.form-error {
+  font-size: 0.75rem;
+  color: var(--danger);
+  margin-top: 0.25rem;
+}
+.form-label-mt { margin-top: 0.75rem; display: block; }
+
+/* segmented control (mode / unit toggles) */
+.seg-group {
+  display: inline-flex;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+  flex-wrap: wrap;
+}
+.seg-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.35rem 0.7rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md, 8px);
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: var(--transition);
+}
+.seg-btn:hover { border-color: var(--primary); color: var(--primary); }
+.seg-btn.is-active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+.seg-btn .seg-ico { width: 14px; height: 14px; }
+
+/* quick-choice chips (durations, quota presets) */
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+.chip-btn {
+  padding: 0.3rem 0.7rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md, 8px);
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: var(--transition);
+}
+.chip-btn:hover { border-color: var(--primary); color: var(--primary); }
+.chip-btn.is-active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+
+/* custom duration / quota input row */
+.dur-custom {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+.dur-num { width: 7rem; }
+.quota-prefix { font-size: 0.85rem; color: var(--text-secondary); }
+
+.form-hint {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-top: 0.5rem;
+}
+.form-hint .hint-ico { width: 12px; height: 12px; flex: 0 0 12px; }
+
+/* credential multi-select dropdown */
+.cred-ms { position: relative; margin-top: 0.5rem; }
+.cred-ms-trigger {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md, 8px);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: var(--transition);
+}
+.cred-ms-trigger:hover { background: var(--bg-secondary); }
+.cred-ms-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.cred-ms-ph { color: var(--text-tertiary); font-size: 0.85rem; }
+.cred-ms-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, #7c3aed 12%, transparent);
+  color: #7c3aed;
+  border: 1px solid color-mix(in srgb, #7c3aed 25%, transparent);
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+.cred-ms-x { cursor: pointer; }
+.cred-ms-x:hover { color: var(--danger); }
+.cred-ms-chev { color: var(--text-tertiary); transition: transform 0.2s ease; }
+.cred-ms-chev.is-open { transform: rotate(180deg); }
+.cred-ms-panel {
+  position: absolute;
+  z-index: 50;
+  top: calc(100% + 4px);
+  left: 0; right: 0;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md, 8px);
+  box-shadow: var(--shadow-lg);
+}
+.cred-ms-search {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.5rem 0.6rem;
+  border-bottom: 1px solid var(--border-color);
+}
+/* Constrain the inline search icon so it renders at ~16px instead of
+   blowing up to the SVG's intrinsic size. */
+.cred-ms-search .key-search-ico {
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  color: var(--text-tertiary);
+  pointer-events: none;
+}
+.cred-ms-search input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  outline: none;
+}
+.cred-ms-options { max-height: 12rem; overflow-y: auto; padding: 0.25rem; }
+.cred-ms-opt {
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.4rem 0.5rem;
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-md, 8px);
+  text-align: left;
+  cursor: pointer;
+  transition: var(--transition);
+}
+.cred-ms-opt:hover { background: var(--bg-secondary); }
+.cred-ms-opt.is-sel { background: color-mix(in srgb, #7c3aed 8%, transparent); }
+.cred-ms-check {
+  width: 16px; height: 16px;
+  flex: 0 0 16px;
+  margin-top: 0.1rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm, 4px);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.cred-ms-opt.is-sel .cred-ms-check {
+  background: #7c3aed;
+  border-color: #7c3aed;
+  color: #fff;
+}
+.cred-ms-check .check-ico { width: 12px; height: 12px; }
+.cred-ms-meta { min-width: 0; flex: 1 1 auto; }
+.cred-ms-top {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+.cred-ms-name { font-size: 0.85rem; font-weight: 500; color: var(--text-primary); }
+.cred-ms-id { font-size: 0.72rem; color: var(--text-tertiary); }
+.cred-ms-off { font-size: 0.72rem; color: var(--danger); }
+.cred-ms-empty, .cred-ms-panel .empty-state {
+  padding: 0.6rem 0.7rem;
+  font-size: 0.85rem;
+  color: var(--text-tertiary);
+}
+
+.created-key-box {
+  margin: 0.5rem 0;
+  padding: 1rem;
+  border: 1px solid var(--primary-20);
+  border-radius: var(--radius-lg);
+  background: var(--primary-10);
+}
+.created-key-box .cka-key {
+  font-family: 'SFMono-Regular', ui-monospace, 'Menlo', 'Consolas', monospace;
+  font-size: 0.9rem;
+  color: var(--text-primary);
+  word-break: break-all;
+  margin: 0.5rem 0 0.75rem;
+  user-select: all;
+}
+
+.bound-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+/* multi-select for bound accounts */
+.multiselect {
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  max-height: 180px;
+  overflow-y: auto;
+  padding: 0.4rem;
+  background: var(--bg-secondary);
+}
+.multiselect label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: var(--radius-md, 10px);
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--text-primary);
+}
+.multiselect label:hover { background: var(--bg-tertiary); }
+.multiselect input { width: 16px; height: 16px; accent-color: var(--primary); }
+
+/* usage summary strip inside modals */
+.usage-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+.usage-strip .us-item {
+  padding: 0.75rem;
+  border-radius: var(--radius-lg);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+}
+.usage-strip .us-n {
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.usage-strip .us-k {
+  font-size: 0.72rem;
+  color: var(--text-tertiary);
+  margin-top: 0.15rem;
+}
+.usage-strip .us-sub {
+  font-size: 0.7rem;
+  color: var(--success);
+  margin-top: 0.15rem;
+}
+/* colored summary-card value accents */
+.usage-strip .us-n.us-cost    { color: var(--warning); }
+.usage-strip .us-n.us-credits { color: var(--primary); }
+.usage-strip .us-n.us-today   { color: #06b6d4; }
+
+/* ---- ACCOUNT USAGE dialog: by-model breakdown (current page) ---- */
+.usage-bymodel-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+.usage-bymodel-card {
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-lg);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+}
+.usage-bymodel-card .ubm-model {
+  font-size: 0.85rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.usage-bymodel-card .ubm-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.15rem 0.75rem;
+  margin-top: 0.25rem;
+  font-size: 0.72rem;
+  color: var(--text-tertiary);
+}
+.usage-bymodel-card .ubm-cost { color: var(--warning); font-weight: 600; }
+
+/* model name color accents — shared by by-model cards + records table */
+.model-opus   { color: #9333ea; }   /* purple */
+.model-sonnet { color: #2563eb; }   /* blue   */
+.model-haiku  { color: #16a34a; }   /* green  */
+.model-muted  { color: var(--text-tertiary); }
+
+/* ---- ACCOUNT USAGE dialog: request-log header + records table ---- */
+.usage-log-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.usage-log-count {
+  margin-left: 0.35rem;
+  font-size: 0.78rem;
+  font-weight: 400;
+  color: var(--text-tertiary);
+}
+.usage-records-table th.ta-right,
+.usage-records-table td.ta-right { text-align: right; }
+.usage-records-table .ur-time,
+.usage-records-table .ur-ip { font-size: 0.75rem; color: var(--text-tertiary); white-space: nowrap; }
+.usage-records-table .ur-acct {
+  font-size: 0.75rem; color: var(--text-tertiary);
+  max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.usage-records-table .ur-model { font-family: ui-monospace, monospace; font-size: 0.75rem; }
+.usage-records-table .ur-tokens { font-size: 0.75rem; }
+.usage-records-table .ur-tok-line { line-height: 1.4; }
+.usage-records-table .ur-tok-line.tok-cache { color: var(--success); }
+.usage-records-table .ur-tok-line.tok-sum   { font-weight: 600; }
+.usage-records-table .ur-tok-v { font-variant-numeric: tabular-nums; }
+.usage-records-table .ur-cost {
+  font-variant-numeric: tabular-nums; font-weight: 600; color: var(--warning); white-space: nowrap;
+}
+.usage-records-table .ur-credits {
+  font-variant-numeric: tabular-nums; font-weight: 600; color: var(--primary); white-space: nowrap;
+}
+.usage-records-table .ur-cred-check { color: var(--success); font-size: 0.75rem; }
+.usage-records-table .ur-cred-saved { color: var(--success); font-size: 0.72rem; }
+
+/* ---- ACCOUNT USAGE dialog: pagination ---- */
+.usage-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+.usage-page-indicator { font-size: 0.82rem; color: var(--text-tertiary); }
+/* summary-card accent colors (mirror the reference detail page) */
+.usage-strip .us-n.us-cost { color: var(--warning); }
+.usage-strip .us-n.us-credits { color: var(--info, var(--primary)); }
+.usage-strip .us-sub {
+  font-size: 0.7rem;
+  color: var(--success);
+  margin-top: 0.1rem;
+}
+
+/* ---- per-key detail: model-name color coding (opus/sonnet/haiku) ---- */
+.model-opus { color: #9333ea; }      /* purple-600 */
+.model-sonnet { color: #2563eb; }    /* blue-600 */
+.model-haiku { color: #16a34a; }     /* green-600 */
+.model-default { color: var(--text-tertiary); }
+
+/* ---- per-key detail: request-log header (title + count + refresh) ---- */
+.key-log-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.key-log-head .key-sub-h { margin-bottom: 0.35rem; }
+.key-log-count {
+  margin-left: 0.35rem;
+  font-weight: 400;
+  color: var(--text-tertiary);
+}
+
+/* ---- per-key detail: request-log table cells ---- */
+.data-table td.rec-time,
+.data-table td.rec-ip { font-size: 0.75rem; color: var(--text-tertiary); white-space: nowrap; }
+.data-table td.rec-acct {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.data-table td.rec-model {
+  font-family: 'SFMono-Regular', ui-monospace, 'Menlo', 'Consolas', monospace;
+  font-size: 0.75rem;
+}
+.data-table td.rec-cost { font-weight: 600; color: var(--warning); text-align: right; white-space: nowrap; }
+.data-table td.rec-credits { font-weight: 600; color: var(--info, var(--primary)); text-align: right; white-space: nowrap; }
+.rec-credit-ok { color: var(--success); font-size: 0.75rem; }
+.rec-credit-saved { color: var(--success); font-size: 0.72rem; }
+.rec-tok-box { display: flex; flex-direction: column; gap: 0.1rem; font-size: 0.75rem; }
+.rec-tok-line { white-space: nowrap; }
+.rec-tok-v { font-variant-numeric: tabular-nums; }
+.rec-tok-line.rec-tok-cache .rec-tok-k,
+.rec-tok-line.rec-tok-cache .rec-tok-v { color: var(--success); }
+.rec-tok-line.rec-tok-total { font-weight: 600; }
+
+/* ============================================================
+   Settings — stacked panels
+   ============================================================ */
+/* 2-column responsive card grid: side-by-side on md+, single column below. */
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  align-items: start;
+}
+@media (max-width: 768px) {
+  .settings-grid { grid-template-columns: 1fr; }
+}
+/* legacy single-column stack (retained for back-compat) */
+.settings-stack { display: flex; flex-direction: column; gap: 1.25rem; }
+.settings-card-desc {
+  font-size: 0.82rem;
+  color: var(--text-tertiary);
+  margin: -0.25rem 0 1rem;
+}
+.readonly-value {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.readonly-value .rv-text {
+  font-family: 'SFMono-Regular', ui-monospace, 'Menlo', 'Consolas', monospace;
+  font-size: 0.85rem;
+  color: var(--text-primary);
+  word-break: break-all;
+}
+.model-chip-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.model-chip {
+  padding: 0.35rem 0.7rem;
+  border-radius: var(--radius-full);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: var(--transition);
+}
+.model-chip:hover { color: var(--primary); border-color: var(--primary); background: var(--primary-10); }
+
+/* ============================================================
+   Models — standalone supported-models page (table + tags)
+   ============================================================ */
+.models-table-scroll {
+  width: 100%;
+  overflow-x: auto;
+}
+.models-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.models-table th,
+.models-table td {
+  padding: 0.6rem 0.9rem;
+  text-align: left;
+  vertical-align: middle;
+  border-bottom: 1px solid var(--border-color);
+  font-size: 0.85rem;
+}
+.models-table thead th {
+  font-weight: 600;
+  color: var(--text-tertiary);
+  background: var(--bg-secondary);
+  white-space: nowrap;
+}
+.models-table tbody tr:last-child td { border-bottom: none; }
+.models-table tbody tr.model-row:hover { background: var(--bg-secondary); }
+.models-table .ta-right { text-align: right; }
+.models-table .tabular {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}
+.models-table .model-cell-id code {
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+.models-table .model-cell-name {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.models-table .model-cell-owner { color: var(--text-secondary); }
+.models-table .models-state-row td { padding: 0; }
+.models-table .models-state-row .empty-state {
+  padding: 2rem 1rem;
+  text-align: center;
+  color: var(--text-tertiary);
+}
+
+/* reference-style model tag */
+.model-tag {
+  display: inline-block;
+  padding: 0.15rem 0.6rem;
+  border-radius: var(--radius-full);
+  background: var(--primary-10);
+  color: var(--primary);
+  border: 1px solid var(--primary-20);
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+/* ============================================================
+   Responsive
+   ============================================================ */
+@media (max-width: 768px) {
+  .mng-search { max-width: none; flex: 1 1 100%; }
+
+  /* accounts: 2-col stat cards on narrow screens */
+  .accounts-stat-grid { grid-template-columns: repeat(2, 1fr); }
+
+  /* accounts: stack info over actions, let actions wrap full-width */
+  .account-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.75rem;
+  }
+  .account-row-name { max-width: none; white-space: normal; }
+  .account-row-actions {
+    justify-content: flex-start;
+  }
+
+  /* api keys: 2-col stats, stacked key cards */
+  .key-stat-grid { grid-template-columns: repeat(2, 1fr); }
+  .key-card-main { flex-direction: column; align-items: stretch; gap: 0.6rem; }
+  .key-card-actions { justify-content: flex-end; }
+  .key-name { max-width: none; white-space: normal; }
+}
+
+/* 迷你图标按钮(设置页主 Key 的显示/复制等) */
+.icon-mini {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; padding: 0;
+  background: transparent; border: none; border-radius: var(--radius-md, .5rem);
+  color: var(--text-secondary, #64748b); cursor: pointer;
+  transition: var(--transition, all .2s);
+}
+.icon-mini:hover { background: var(--bg-tertiary, #f1f5f9); color: var(--primary-color, #059669); }
+
+/* ---- Account form additions (parity with reference add/edit dialogs) ---- */
+/* required-field asterisk on form labels */
+.req-star { color: var(--danger, #ef4444); font-weight: 700; }
+
+/* inline priority editor inside an .account-stat (click-to-edit) */
+.acct-inline-input {
+  width: 3.5rem;
+  height: 1.5rem;
+  padding: 0 0.3rem;
+  font-size: 0.8rem;
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: var(--radius-sm, 0.25rem);
+  background: var(--bg-primary, #fff);
+  color: var(--text-primary);
+}
+.acct-inline-input:focus {
+  outline: none;
+  border-color: var(--primary, #059669);
+  box-shadow: 0 0 0 2px var(--primary-10, rgba(5,150,105,0.1));
+}
+
+/* file-upload row inside local-cache dialog (hidden input + trigger button) */
+.upload-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.4rem 0;
+}
+
+/* ---- Integration examples (settings): protocol × language snippets ---- */
+.int-card .card-body { display: flex; flex-direction: column; gap: 0.5rem; }
+.int-card .seg-group { margin-top: 0.25rem; }
+.int-codewrap { position: relative; margin-top: 0.5rem; }
+.int-copy { position: absolute; top: 0.5rem; right: 0.5rem; z-index: 1; }
+.int-code {
+  margin: 0;
+  background: var(--code-bg);
+  color: var(--code-text);
+  border-radius: var(--radius-md, 8px);
+  padding: 0.9rem 1rem;
+  padding-right: 4.75rem;            /* room for the copy button */
+  overflow-x: auto;
+  font-family: 'SFMono-Regular', ui-monospace, 'Menlo', 'Consolas', monospace;
+  font-size: 0.78rem;
+  line-height: 1.55;
+  white-space: pre;
+  -webkit-overflow-scrolling: touch;
+}
+.int-code code { font-family: inherit; background: none; color: inherit; padding: 0; }

@@ -1,0 +1,560 @@
+/* kiro2api Admin UI v2 — sections-tools.css
+   Styles for the two "tools" sections: Model Test (playground) and Live Logs.
+   Reuses shared primitives from base.css (.card, .btn, .form-control,
+   .form-label, .form-hint, .btn-group, .badge) and only adds what these two
+   sections need. Emerald + glass aesthetic; all colors reference CSS vars so
+   both themes work. No external assets. */
+
+/* ============================================================ *
+ *  Shared small primitives used by both sections
+ * ============================================================ */
+
+/* section heading row (title + optional toolbar), matches .stats-head vibe */
+.mt-head,
+.logs-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+.mt-head h2,
+.logs-head h2 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+/* checkbox row (used by playground stream toggle + logs autoscroll) */
+.mt-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  user-select: none;
+}
+.mt-check input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+
+/* ============================================================ *
+ *  MODEL TEST / PLAYGROUND  (#sec-modeltest)
+ * ============================================================ */
+
+.mt-layout {
+  display: grid;
+  grid-template-columns: minmax(320px, 1fr) minmax(340px, 1.2fr);
+  gap: 1.25rem;
+  align-items: start;
+}
+
+/* Playground panels lift subtly on hover (gemini2api .playground-panel:hover
+   → --shadow-md), matching the refined tactile feel of the rest of the UI. */
+.mt-layout > .card {
+  transition: var(--transition);
+}
+.mt-layout > .card:hover {
+  box-shadow: var(--shadow-md);
+  border-color: var(--primary-20);
+}
+
+.mt-panel-title {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0 0 1.1rem;
+  padding-bottom: 0.7rem;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.mt-config .form-group { margin-bottom: 1.15rem; }
+.mt-config .form-group:last-child { margin-bottom: 0; }
+
+/* master-key row: input + save button inline */
+.mt-key-row,
+.mt-model-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: stretch;
+}
+.mt-key-row .form-control,
+.mt-model-row .form-control { flex: 1; min-width: 0; }
+.mt-key-row .btn,
+.mt-model-row .btn { flex: 0 0 auto; font-size: 1rem; line-height: 1; }
+
+/* api-key select hint: warn variant when there are no keys yet */
+.mt-config .form-hint.mt-hint-warn { color: var(--warning); font-weight: 600; }
+
+/* endpoint radios */
+.mt-endpoint {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+.mt-radio {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+.mt-radio input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+
+textarea.mt-prompt {
+  min-height: 130px;
+  resize: vertical;
+  line-height: 1.55;
+}
+
+/* attached-image preview (thumbnails for the next turn) */
+.mt-image-preview {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+.mt-image-preview:empty { margin-bottom: 0; }
+.mt-img-thumb { position: relative; display: inline-block; }
+.mt-img-thumb img {
+  width: 56px;
+  height: 56px;
+  object-fit: cover;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-color);
+  display: block;
+}
+.mt-img-del {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 18px;
+  height: 18px;
+  line-height: 1;
+  border: none;
+  border-radius: 50%;
+  background: var(--danger);
+  color: #fff;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mt-actions {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  margin-top: 0.25rem;
+}
+
+/* response panel */
+.mt-response-card {
+  display: flex;
+  flex-direction: column;
+  min-height: 420px;
+}
+.mt-response-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 0 0 0.9rem;
+  padding-bottom: 0.7rem;
+  border-bottom: 1px solid var(--border-color);
+}
+.mt-response-head .mt-panel-title {
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+.mt-meta {
+  display: flex;
+  gap: 0.85rem 1rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.mt-meta-item {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  line-height: 1.2;
+}
+.mt-meta-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-tertiary);
+}
+.mt-meta-val {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--primary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* conversation surface (scrolling list of user / assistant bubbles) */
+.mt-chat {
+  flex: 1;
+  min-height: 260px;
+  max-height: 620px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 0.25rem 0.15rem;
+}
+
+.mt-chat-placeholder {
+  flex: 1;
+  min-height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+  font-size: 0.9rem;
+  text-align: center;
+}
+.mt-chat-placeholder p { margin: 0; }
+
+/* one message row */
+.mt-msg {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.7rem;
+  animation: mtFadeIn 0.25s ease;
+}
+.mt-msg-user { flex-direction: row-reverse; }
+@keyframes mtFadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.mt-avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+.mt-msg-user .mt-avatar {
+  background: var(--primary);
+  color: #fff;
+}
+.mt-msg-assistant .mt-avatar {
+  background: var(--bg-tertiary);
+  color: var(--primary);
+  border: 2px solid var(--primary);
+}
+
+.mt-bubble {
+  max-width: 78%;
+  padding: 0.7rem 0.95rem;
+  border-radius: 12px;
+  font-size: 0.9rem;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.mt-msg-user .mt-bubble {
+  background: var(--primary);
+  color: #fff;
+  border-top-right-radius: 4px;
+}
+.mt-msg-assistant .mt-bubble {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-top-left-radius: 4px;
+}
+.mt-bubble-text { white-space: pre-wrap; }
+
+/* image thumbnails inside a chat bubble */
+.mt-chat-img {
+  display: block;
+  max-width: 200px;
+  max-height: 200px;
+  margin-top: 0.5rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-color);
+}
+.mt-msg-user .mt-chat-img { border-color: rgba(255, 255, 255, 0.35); }
+
+.mt-typing-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background: var(--primary);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: mtBlink 0.85s steps(1) infinite;
+}
+@keyframes mtBlink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+/* error rendering (real backend message shown verbatim, textContent) */
+.mt-error {
+  max-width: 78%;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-md);
+  background: var(--danger-soft);
+  padding: 0.9rem 1rem;
+}
+.mt-error-title {
+  font-weight: 600;
+  color: var(--danger);
+  margin-bottom: 0.5rem;
+  font-size: 0.9rem;
+}
+.mt-error-body {
+  margin: 0;
+  font-family: 'SFMono-Regular', ui-monospace, 'Menlo', 'Consolas', monospace;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-primary);
+}
+
+/* ============================================================ *
+ *  LIVE LOGS  (#sec-logs)
+ * ============================================================ */
+
+.logs-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  flex-wrap: wrap;
+}
+
+.logs-search {
+  position: relative;
+  flex: 1 1 200px;
+  min-width: 170px;
+  max-width: 320px;
+}
+.logs-search-icon {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 0.8rem;
+  opacity: 0.6;
+  pointer-events: none;
+}
+.logs-search .form-control {
+  padding-left: 2rem;
+  font-size: 0.85rem;
+}
+
+.logs-levels { display: inline-flex; gap: 0.25rem; }
+.logs-levels .btn.active {
+  background: var(--primary-10);
+  color: var(--primary);
+  border-color: var(--primary);
+  font-weight: 600;
+}
+
+.logs-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+/* connection status pill */
+.logs-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.7rem;
+  border-radius: var(--radius-full);
+  font-size: 0.75rem;
+  font-weight: 600;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+}
+.logs-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+  flex-shrink: 0;
+}
+.logs-status[data-state="connected"] { color: var(--success); border-color: var(--success); }
+.logs-status[data-state="connected"] .logs-status-dot {
+  background: var(--success);
+  box-shadow: 0 0 0 3px var(--success-10);
+  animation: logsPulse 1.8s ease-in-out infinite;
+}
+.logs-status[data-state="connecting"] .logs-status-dot,
+.logs-status[data-state="reconnecting"] .logs-status-dot {
+  background: var(--warning);
+  animation: logsPulse 1s ease-in-out infinite;
+}
+.logs-status[data-state="reconnecting"] { color: var(--warning); border-color: var(--warning); }
+.logs-status[data-state="disconnected"] { color: var(--danger); border-color: var(--danger); }
+.logs-status[data-state="disconnected"] .logs-status-dot { background: var(--danger); }
+@keyframes logsPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* layout: console + optional detail pane */
+.logs-layout {
+  display: flex;
+  gap: 1rem;
+  min-height: 460px;
+  max-width: 100%;
+}
+
+/* the console keeps a dark surface even in light theme */
+.logs-console {
+  flex: 1;
+  min-width: 0;
+  height: 560px;
+  overflow-y: auto;
+  background: var(--code-bg);
+  color: var(--code-text);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-sm);
+  padding: 0.75rem 0.9rem;
+  font-family: 'SFMono-Regular', ui-monospace, 'Menlo', 'Consolas', monospace;
+  font-size: 0.78rem;
+  line-height: 1.55;
+}
+
+.log-line {
+  display: flex;
+  gap: 0.65rem;
+  align-items: baseline;
+  padding: 0.12rem 0.35rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.log-line:hover { background: rgba(255, 255, 255, 0.06); }
+.log-line.selected { background: var(--primary-10); }
+
+.log-ts {
+  flex: 0 0 auto;
+  color: #7d8590;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+}
+.log-level {
+  flex: 0 0 auto;
+  min-width: 48px;
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  letter-spacing: 0.03em;
+}
+.log-msg {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--code-text);
+}
+
+/* per-level colors (info=blue, warn=amber, error=red, debug/trace=muted) */
+.log-line.lvl-error .log-level { color: #ff7b72; }
+.log-line.lvl-error .log-msg { color: #ffb3ad; }
+.log-line.lvl-warn  .log-level { color: #f0b849; }
+.log-line.lvl-warn  .log-msg { color: #e8cf9a; }
+.log-line.lvl-info  .log-level { color: #6cb6ff; }
+.log-line.lvl-debug .log-level { color: #8b949e; }
+.log-line.lvl-debug .log-msg { color: #9aa4af; }
+.log-line.lvl-trace .log-level { color: #6e7681; }
+.log-line.lvl-trace .log-msg { color: #8b949e; }
+
+.logs-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 220px;
+  height: 100%;
+  color: #7d8590;
+  font-size: 0.85rem;
+  opacity: 0.8;
+}
+
+/* detail pane */
+.logs-detail {
+  width: 360px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-xl);
+  background: var(--bg-primary);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+.logs-detail[hidden] { display: none; }
+.logs-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.7rem 0.9rem;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+}
+.logs-detail-head h4 {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--text-primary);
+}
+.logs-detail-body {
+  flex: 1;
+  overflow: auto;
+  margin: 0;
+  padding: 0.9rem 1rem;
+  font-family: 'SFMono-Regular', ui-monospace, 'Menlo', 'Consolas', monospace;
+  font-size: 0.78rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-primary);
+}
+
+/* ============================================================ *
+ *  Responsive
+ * ============================================================ */
+@media (max-width: 1024px) {
+  .mt-layout { grid-template-columns: 1fr; }
+  .logs-detail { width: 320px; }
+}
+@media (max-width: 768px) {
+  .mt-head h2, .logs-head h2 { font-size: 1.25rem; }
+  .logs-layout { flex-direction: column; }
+  .logs-detail { width: 100%; }
+  .logs-console { height: 440px; }
+  .mt-chat { max-height: 440px; }
+  .mt-bubble { max-width: 85%; }
+  .logs-toolbar { gap: 0.6rem; }
+  .logs-search { max-width: none; }
+}

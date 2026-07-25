@@ -1,0 +1,14 @@
+/target
+/data
+config.json
+credentials.json
+*.log
+node_modules/
+/admin-ui/dist
+/user-ui/dist
+# admin-ui-v2 is a static, hand-written UI (source, not build output) — it IS committed.
+!/admin-ui-v2/
+.env
+/.superpowers/
+/docs/superpowers/
+*.tsbuildinfo
