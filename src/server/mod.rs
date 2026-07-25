@@ -136,14 +136,18 @@ pub fn build_router_with_logs(
     // 互不影响——协议组用 api_key,admin 组用 admin_api_key 优先。
     // Admin 复用 messages_state:其已携带同一个 `Arc<StatsManager>`(上方 line 28-34 构造),
     // 故 admin 只读查询与 relay 记录写入共享同一内存存储,无需再建第二份。
-    let admin =
-        crate::admin::admin_api_router(messages_state).layer(axum::middleware::from_fn_with_state(
+    let admin = crate::admin::admin_api_router(messages_state)
+        .layer(axum::middleware::from_fn_with_state(
             // admin 闸:admin_api_key(非空)否则回退主 api_key 的全局 key 校验,
             // 不接 store、不查消费上限。期望 key 从 runtime_cfg 实时读取,
             // 使 PUT /config/auth-keys 改 admin 密码后无需重启即时生效。
             auth::AuthState::admin(runtime_cfg.clone()),
             auth::require_api_key,
-        ));
+        ))
+        // 批量导入等 admin 端点可能提交大 JSON(多账号凭据集,单个 token 就上千字符)。
+        // 把请求体上限从 axum 默认 2MB 提到 32MB,避免大导入被 413 拦下(体现为前端"发生错误");
+        // admin 已鉴权,放宽仅限受信管理面。
+        .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024));
 
     Router::new()
         .route("/health", get(health))

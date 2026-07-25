@@ -1573,19 +1573,77 @@
       var raw = ta.value.trim();
       if (!raw) return;
       var parsed;
-      try { parsed = JSON.parse(raw); } catch (e) { parsed = raw; }
+      try { parsed = JSON.parse(raw); } catch (e) { api.toast(t('imp.badJson'), 'error'); return; }
+      // 归整顶层为账号列表:数组 / KAM `{accounts:[...]}` / 单对象。
+      var list = Array.isArray(parsed) ? parsed
+        : (parsed && Array.isArray(parsed.accounts)) ? parsed.accounts
+        : (parsed && typeof parsed === 'object') ? [parsed] : null;
+      if (!list || !list.length) { api.toast(t('imp.badJson'), 'error'); return; }
+
+      // 逐条串行「添加 → 验活 → 过滤」:
+      //   1) 走单条 /credentials 添加(每个请求都小,不受批量体积上限影响,保留 profileArn 等完整字段);
+      //   2) 略等 ~0.9s 后查该账号余额(getUsageLimits 真打上游)= 验活:能查到=活,报错=死;
+      //   3) 死号回滚删除(过滤失效账号),活号保留。逐条韧性——单条失败不阻断其余;串行 + 间隔限速。
       run.disabled = true;
-      api.post('/credentials/batch-import', { data: parsed })
-        .then(function (r) {
-          r = r || {};
-          var added = r.added != null ? r.added : 0;
-          var total = r.total != null ? r.total : added + (r.failed || 0);
-          var failed = r.failed != null ? r.failed : 0;
-          api.toast(t('imp.result', { added: added, total: total, failed: failed }), failed ? 'info' : 'success');
-          m.close(); loadAccounts();
-        })
-        .catch(function (e) { api.toast(e.message || t('common.error'), 'error'); run.disabled = false; });
+      var origLabel = run.textContent;
+      var alive = 0, dead = 0, failed = 0, i = 0, total = list.length;
+      function done() {
+        run.textContent = origLabel; run.disabled = false;
+        api.toast(t('imp.resultVerify', { alive: alive, dead: dead, failed: failed, total: total }),
+          (dead || failed) ? 'info' : 'success');
+        m.close(); loadAccounts();
+      }
+      function step() {
+        if (i >= total) { done(); return; }
+        var idx = i; i++;
+        run.textContent = t('imp.running', { i: idx + 1, total: total });
+        var payload = toAddPayload(list[idx]);
+        if (!payload) { failed++; step(); return; }        // 无有效 refreshToken → 跳过
+        api.post('/credentials', payload).then(function (r) {
+          var id = r && (r.credentialId != null ? r.credentialId : r.id);
+          if (id == null) { failed++; step(); return; }
+          // 略等后验活(限速,避免连续打上游触发风控)。
+          setTimeout(function () {
+            api.get('/credentials/' + id + '/balance').then(function () {
+              alive++; step();                              // 余额查到 → 活,保留
+            }, function () {
+              dead++;                                        // 余额报错 → 失效,回滚删除后继续
+              api.del('/credentials/' + id).then(step, step);
+            });
+          }, 900);
+        }, function () { failed++; step(); });               // 添加本身失败
+      }
+      step();
     });
+  }
+
+  // 把一个账号对象(顶层扁平或 KAM `credentials` 嵌套)映射成单条 add 的 payload(camelCase)。
+  // 无有效 refreshToken → 返回 null(调用方计为跳过/失败)。accessToken/expiresAt 不传:账号
+  // 首次使用时会自行用 refreshToken 刷新取回,故无需导入。
+  function toAddPayload(acc) {
+    if (!acc || typeof acc !== 'object') return null;
+    var creds = (acc.credentials && typeof acc.credentials === 'object') ? acc.credentials : null;
+    var pick = function (k) {
+      var v = (creds && creds[k] != null && creds[k] !== '') ? creds[k] : acc[k];
+      if (typeof v === 'string') { v = v.trim(); return v || undefined; }
+      return (v != null && v !== '') ? v : undefined;
+    };
+    var refreshToken = pick('refreshToken');
+    if (!refreshToken || typeof refreshToken !== 'string') return null;
+    var clientId = pick('clientId'), clientSecret = pick('clientSecret');
+    return {
+      refreshToken: refreshToken,
+      authMethod: pick('authMethod') || (clientId && clientSecret ? 'idc' : 'social'),
+      email: pick('email') || pick('nickname'),
+      nickname: pick('nickname'),
+      clientId: clientId,
+      clientSecret: clientSecret,
+      profileArn: pick('profileArn'),
+      machineId: pick('machineId'),
+      authRegion: pick('authRegion') || pick('region'),
+      apiRegion: pick('apiRegion'),
+      priority: (typeof acc.priority === 'number') ? acc.priority : undefined
+    };
   }
 
   // ---------- interactive login flows ----------
