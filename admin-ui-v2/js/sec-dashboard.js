@@ -414,23 +414,44 @@
     });
   }
 
+  // gemini2api 同款「更新服务」弹窗:居中卡片 + 顶部图标圆圈 + 居中标题 + 版本徽标
+  // (v当前 → v最新)+ 说明文案 + 命令块(可复制)+ 双按钮(打开 Release / 确认更新)。
+  // 弃用旧的左对齐 header/body/footer 版式与截断的 notes 文本块(改由「打开 Release」看全文)。
   function showUpdateModal(current, latest, command, url, notes) {
     var root = document.getElementById('modalRoot') || document.body;
     var overlay = document.createElement('div'); overlay.className = 'modal-overlay active';
     var modal = document.createElement('div'); modal.className = 'modal';
-    var head = document.createElement('div'); head.className = 'modal-header';
-    var h3 = document.createElement('h3'); h3.textContent = t('dash.updateFound'); head.appendChild(h3);
-    var x = document.createElement('button'); x.className = 'modal-close'; x.type = 'button'; x.textContent = '✕'; head.appendChild(x);
-    modal.appendChild(head);
-    var body = document.createElement('div'); body.className = 'modal-body';
-    var p = document.createElement('p'); p.textContent = t('dash.updateFoundMsg', { current: current, latest: latest }); body.appendChild(p);
-    if (notes) {
-      var nt = document.createElement('p'); nt.className = 'settings-card-desc'; nt.style.marginTop = '4px';
-      nt.textContent = String(notes).slice(0, 500); body.appendChild(nt);
-    }
+    modal.style.cssText = 'max-width:440px;text-align:center;';
+
+    var body = document.createElement('div'); body.style.cssText = 'padding:2rem 2rem 1.25rem;';
+
+    // 顶部图标圆圈(翡翠绿 cloud-download,与 gemini2api 的居中图标一致)
+    var ic = document.createElement('div');
+    ic.style.cssText = 'width:56px;height:56px;border-radius:50%;background:var(--primary-soft);color:var(--primary);display:inline-flex;align-items:center;justify-content:center;margin-bottom:1rem;';
+    ic.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 13v8"/><path d="m8 17 4 4 4-4"/><path d="M4.393 15.269A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.436 8.284"/></svg>';
+    body.appendChild(ic);
+
+    var h3 = document.createElement('h3');
+    h3.textContent = t('dash.updateService');
+    h3.style.cssText = 'margin:0 0 0.6rem;font-size:1.125rem;font-weight:700;color:var(--text-primary);';
+    body.appendChild(h3);
+
+    // 版本徽标:v当前 →(翡翠绿)v最新
+    var vr = document.createElement('div');
+    vr.style.cssText = 'display:inline-flex;align-items:center;gap:0.5rem;margin:0 0 1rem;font-size:0.9rem;';
+    var cv = document.createElement('span'); cv.textContent = 'v' + current; cv.style.cssText = 'color:var(--text-secondary);';
+    var ar = document.createElement('span'); ar.textContent = '→'; ar.style.cssText = 'color:var(--text-secondary);';
+    var lv = document.createElement('span'); lv.textContent = 'v' + latest; lv.style.cssText = 'color:var(--primary);font-weight:700;';
+    vr.appendChild(cv); vr.appendChild(ar); vr.appendChild(lv);
+    body.appendChild(vr);
+
+    var msg = document.createElement('p');
+    msg.textContent = t('dash.updateCommand');
+    msg.style.cssText = 'margin:0 0 0.75rem;color:var(--text-secondary);font-size:0.85rem;line-height:1.5;';
+    body.appendChild(msg);
+
     if (command) {
-      var lbl = document.createElement('p'); lbl.style.cssText = 'margin:10px 0 4px;font-weight:600'; lbl.textContent = t('dash.updateCommand'); body.appendChild(lbl);
-      var wrap = document.createElement('div'); wrap.className = 'int-codewrap';
+      var wrap = document.createElement('div'); wrap.className = 'int-codewrap'; wrap.style.textAlign = 'left';
       var cbtn = document.createElement('button'); cbtn.className = 'btn btn-outline btn-sm int-copy'; cbtn.type = 'button'; cbtn.textContent = t('common.copy');
       cbtn.addEventListener('click', function () {
         try { navigator.clipboard.writeText(command).then(function () { K.api.toast(t('common.copied'), 'success'); }); } catch (e) {}
@@ -440,17 +461,21 @@
       wrap.appendChild(cbtn); wrap.appendChild(pre); body.appendChild(wrap);
     }
     modal.appendChild(body);
-    var foot = document.createElement('div'); foot.className = 'modal-footer';
+
+    var foot = document.createElement('div');
+    foot.style.cssText = 'display:flex;gap:0.75rem;padding:0 2rem 2rem;justify-content:center;';
     // 仅接受 http(s) 链接(纵深防御:防远端返回 javascript:/data: 之类的伪 href)。
     if (url && /^https?:\/\//i.test(url)) {
-      var a = document.createElement('a'); a.className = 'btn btn-outline'; a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer'; a.textContent = t('dash.openRelease');
+      var a = document.createElement('a'); a.className = 'btn btn-outline'; a.style.flex = '1'; a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer'; a.textContent = t('dash.openRelease');
       foot.appendChild(a);
     }
-    var ok = document.createElement('button'); ok.className = 'btn btn-primary'; ok.type = 'button'; ok.textContent = t('common.confirm');
+    var ok = document.createElement('button'); ok.className = 'btn btn-primary'; ok.style.flex = '1'; ok.type = 'button'; ok.textContent = t('dash.confirmUpdate');
     foot.appendChild(ok); modal.appendChild(foot);
+
     overlay.appendChild(modal); root.appendChild(overlay);
-    function done() { overlay.remove(); }
-    x.addEventListener('click', done);
+    function done() { document.removeEventListener('keydown', onKey, true); overlay.remove(); }
+    function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); done(); } }
+    document.addEventListener('keydown', onKey, true);
     ok.addEventListener('click', done);
     overlay.addEventListener('click', function (e) { if (e.target === overlay) done(); });
   }
