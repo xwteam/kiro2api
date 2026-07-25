@@ -526,7 +526,20 @@
         K.api.toast(t('common.copied'), 'success');
         setTimeout(function () { copyBtn.innerHTML = SVG_COPY; copyBtn.style.color = 'var(--text-secondary)'; }, 1500);
       };
-      try { navigator.clipboard.writeText(cmd).then(okCopy, function () {}); } catch (e) {}
+      // navigator.clipboard 仅安全上下文(HTTPS/localhost)可用;纯 HTTP 下为 undefined,
+      // 必须用 execCommand('copy') 兜底(与 sec-settings/sec-apikeys 一致,亦同 gemini2api)。
+      function fallbackCopy() {
+        var ta = document.createElement('textarea'); ta.value = cmd;
+        ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;';
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); okCopy(); } catch (_) {}
+        ta.remove();
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(cmd).then(okCopy, fallbackCopy);
+      } else {
+        fallbackCopy();
+      }
     });
     cmdRow.appendChild(code); cmdRow.appendChild(copyBtn); body.appendChild(cmdRow);
     modal.appendChild(body);
