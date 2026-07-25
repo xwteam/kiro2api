@@ -1552,71 +1552,197 @@
   }
 
   // ---------- bulk import ----------
+  // 批量导入 JSON(自动验活):
+  // 逐条实时「检查重复 → 添加 → 验活 → 失败回滚」,每个账号一行、实时显示状态图标 +
+  // 进度条 + 成功/重复/失败统计。账号是**逐个**加进池并即时验活的:中途关掉也不白等,
+  // 已验活通过的都已落库保留(未通过的已回滚删除)。
   function openImportModal() {
+    var list = null, results = [], rowEls = [];
+    var importing = false, anyAdded = false;
+    var total = 0, cur = 0, okCount = 0, dupCount = 0, failCount = 0;
+    var rbSuccess = 0, rbFailed = 0, rbSkipped = 0;
+
     var body = el('div');
+    // JSON 输入
     var g = el('div', 'form-group');
-    g.appendChild(elI18n('label', 'form-label', 'imp.paste'));
-    var ta = el('textarea', 'form-control'); ta.rows = 10;
-    ta.setAttribute('data-i18n-ph', 'imp.paste');
+    g.appendChild(elI18n('label', 'form-label', 'imp.jsonLabel'));
+    var ta = el('textarea', 'form-control'); ta.rows = 8; ta.style.fontFamily = 'monospace';
     ta.setAttribute('placeholder', t('imp.paste'));
     g.appendChild(ta);
+    var hint = elI18n('div', null, 'imp.hint');
+    hint.style.cssText = 'font-size:0.78rem;color:var(--text-secondary);margin-top:6px;';
+    g.appendChild(hint);
     body.appendChild(g);
+
+    // 进度 + 统计 + 结果列表(导入开始前隐藏)
+    var panel = el('div'); panel.style.cssText = 'display:none;margin-top:1rem;';
+    var progHead = el('div'); progHead.style.cssText = 'display:flex;justify-content:space-between;font-size:0.85rem;margin-bottom:5px;';
+    var progLabel = elI18n('span', null, 'imp.progress');
+    var progCount = el('span', null, '0 / 0');
+    progHead.appendChild(progLabel); progHead.appendChild(progCount); panel.appendChild(progHead);
+    var progBar = el('div'); progBar.style.cssText = 'width:100%;height:8px;border-radius:999px;background:var(--bg-tertiary);overflow:hidden;';
+    var progFill = el('div'); progFill.style.cssText = 'height:100%;width:0;background:var(--primary);border-radius:999px;transition:width 0.2s;';
+    progBar.appendChild(progFill); panel.appendChild(progBar);
+    var procText = el('div'); procText.style.cssText = 'font-size:0.75rem;color:var(--text-secondary);margin-top:6px;min-height:1em;';
+    panel.appendChild(procText);
+    var stats = el('div'); stats.style.cssText = 'display:flex;gap:1.25rem;font-size:0.85rem;margin:0.85rem 0;';
+    var statOk = el('span'); statOk.style.color = 'var(--success)';
+    var statDup = el('span'); statDup.style.color = 'var(--warning)';
+    var statFail = el('span'); statFail.style.color = 'var(--danger)';
+    stats.appendChild(statOk); stats.appendChild(statDup); stats.appendChild(statFail); panel.appendChild(stats);
+    var listEl = el('div'); listEl.style.cssText = 'border:1px solid var(--border-color);border-radius:var(--radius-md,8px);max-height:300px;overflow-y:auto;';
+    panel.appendChild(listEl);
+    body.appendChild(panel);
 
     var footer = el('div', 'modal-footer');
     var cancel = elI18n('button', 'btn btn-outline', 'common.cancel'); cancel.type = 'button';
     var run = elI18n('button', 'btn btn-primary', 'imp.run'); run.type = 'button';
     footer.appendChild(cancel); footer.appendChild(run);
 
-    var m = openModal({ title: t('imp.title'), bodyEl: body, footerEl: footer, size: 'lg' });
-    cancel.addEventListener('click', function () { m.close(); });
+    var m = openModal({ title: t('imp.title'), bodyEl: body, footerEl: footer, size: 'lg',
+      onClose: function () { if (anyAdded) loadAccounts(); } });
+    // 导入进行中禁止关闭(隐藏 ✕、拦截遮罩点击)。
+    var closeX = m.modal.querySelector('.modal-close');
+    m.overlay.addEventListener('click', function (e) {
+      if (importing && e.target === m.overlay) e.stopImmediatePropagation();
+    }, true);
+    cancel.addEventListener('click', function () { if (!importing) m.close(); });
+
+    function iconEl(status) {
+      var s = el('span'); s.style.cssText = 'flex-shrink:0;width:20px;height:20px;display:inline-flex;';
+      if (status === 'pending') {
+        s.innerHTML = '<span style="width:16px;height:16px;margin:2px;border-radius:50%;border:2px solid var(--border-color);display:inline-block;"></span>';
+      } else if (status === 'checking' || status === 'verifying') {
+        s.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--info)" stroke-width="2" stroke-linecap="round" style="animation:spin 0.8s linear infinite"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>';
+      } else if (status === 'verified') {
+        s.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>';
+      } else if (status === 'duplicate') {
+        s.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--warning)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>';
+      } else {
+        s.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--danger)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></svg>';
+      }
+      return s;
+    }
+    function statusText(r) {
+      if (r.status === 'failed') {
+        if (r.rollbackStatus === 'success') return t('imp.st.failExcluded');
+        if (r.rollbackStatus === 'failed') return t('imp.st.failNotExcluded');
+        return t('imp.st.failNotCreated');
+      }
+      return t('imp.st.' + r.status);
+    }
+    function renderRow(i) {
+      var r = results[i], row = rowEls[i];
+      row.textContent = '';
+      row.style.cssText = 'padding:0.6rem 0.75rem;display:flex;align-items:flex-start;gap:0.6rem;' + (i ? 'border-top:1px solid var(--border-color);' : '');
+      row.appendChild(iconEl(r.status));
+      var main = el('div'); main.style.cssText = 'flex:1;min-width:0;';
+      var line = el('div'); line.style.cssText = 'display:flex;align-items:center;gap:0.5rem;';
+      var name = el('span', null, r.email || t('imp.acctNo', { n: r.index }));
+      name.style.cssText = 'font-size:0.85rem;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+      var st = el('span', null, statusText(r)); st.style.cssText = 'font-size:0.75rem;color:var(--text-secondary);flex-shrink:0;';
+      line.appendChild(name); line.appendChild(st); main.appendChild(line);
+      if (r.usage) { var u = el('div', null, t('imp.usage', { usage: r.usage })); u.style.cssText = 'font-size:0.72rem;color:var(--text-secondary);margin-top:2px;'; main.appendChild(u); }
+      if (r.error) { var e = el('div', null, r.error); e.style.cssText = 'font-size:0.72rem;color:var(--danger);margin-top:2px;'; main.appendChild(e); }
+      row.appendChild(main);
+    }
+    function paintStats() {
+      statOk.textContent = '✓ ' + t('imp.statOk') + ': ' + okCount;
+      statDup.textContent = '⚠ ' + t('imp.statDup') + ': ' + dupCount;
+      statFail.textContent = '✗ ' + t('imp.statFail') + ': ' + failCount;
+    }
+    function paintProgress() {
+      progCount.textContent = cur + ' / ' + total;
+      progFill.style.width = (total ? (cur / total * 100) : 0) + '%';
+    }
+    function fmtNum(v) {
+      var n = Number(v);
+      if (v == null || !isFinite(n)) return v == null ? '?' : String(v);
+      return String(Math.round(n * 100) / 100);
+    }
+
     run.addEventListener('click', function () {
       var raw = ta.value.trim();
       if (!raw) return;
       var parsed;
       try { parsed = JSON.parse(raw); } catch (e) { api.toast(t('imp.badJson'), 'error'); return; }
       // 归整顶层为账号列表:数组 / KAM `{accounts:[...]}` / 单对象。
-      var list = Array.isArray(parsed) ? parsed
+      list = Array.isArray(parsed) ? parsed
         : (parsed && Array.isArray(parsed.accounts)) ? parsed.accounts
         : (parsed && typeof parsed === 'object') ? [parsed] : null;
-      if (!list || !list.length) { api.toast(t('imp.badJson'), 'error'); return; }
+      if (!list || !list.length) { api.toast(t('imp.noAccounts'), 'error'); return; }
 
-      // 逐条串行「去重 → 添加 → 验活 → 过滤」:
-      //   1) 走单条 /credentials 添加(每个请求都小,不受批量体积上限影响,保留 profileArn 等完整字段);
-      //      后端按 refreshToken 去重——已存在则回 duplicate,不新增(避免两条抢同一轮换令牌、增风控);
-      //   2) 新增的略等 ~0.9s 后查该账号余额(getUsageLimits 真打上游)= 验活:能查到=活,报错=死;
-      //   3) 死号回滚删除(过滤失效账号),活号保留。逐条韧性——单条失败不阻断其余;串行 + 间隔限速。
-      run.disabled = true;
-      var origLabel = run.textContent;
-      var alive = 0, dead = 0, dup = 0, failed = 0, i = 0, total = list.length;
-      function done() {
-        run.textContent = origLabel; run.disabled = false;
-        api.toast(t('imp.resultVerify', { alive: alive, dead: dead, dup: dup, failed: failed, total: total }),
-          (dead || failed) ? 'info' : 'success');
-        m.close(); loadAccounts();
-      }
-      function step() {
-        if (i >= total) { done(); return; }
-        var idx = i; i++;
-        run.textContent = t('imp.running', { i: idx + 1, total: total });
-        var payload = toAddPayload(list[idx]);
-        if (!payload) { failed++; step(); return; }        // 无有效 refreshToken → 跳过
-        api.post('/credentials', payload).then(function (r) {
-          if (r && r.duplicate) { dup++; step(); return; }  // 已存在池中 → 跳过,不验活
-          var id = r && (r.credentialId != null ? r.credentialId : r.id);
-          if (id == null) { failed++; step(); return; }
-          // 略等后验活(限速,避免连续打上游触发风控)。
-          setTimeout(function () {
-            api.get('/credentials/' + id + '/balance').then(function () {
-              alive++; step();                              // 余额查到 → 活,保留
-            }, function () {
-              dead++;                                        // 余额报错 → 失效,回滚删除后继续
-              api.del('/credentials/' + id).then(step, step);
-            });
-          }, 900);
-        }, function () { failed++; step(); });               // 添加本身失败
-      }
-      step();
+      total = list.length; cur = okCount = dupCount = failCount = 0;
+      rbSuccess = rbFailed = rbSkipped = 0;
+      results = list.map(function (_, i) { return { index: i + 1, status: 'pending' }; });
+      rowEls = []; listEl.textContent = '';
+      results.forEach(function (_, i) { var row = el('div'); rowEls.push(row); listEl.appendChild(row); renderRow(i); });
+
+      importing = true; anyAdded = false;
+      run.style.display = 'none'; cancel.disabled = true; ta.disabled = true;
+      if (closeX) closeX.style.display = 'none';
+      panel.style.display = ''; progLabel.textContent = t('imp.progress');
+      paintStats(); paintProgress();
+      processNext(0);
     });
+
+    function advance(i) { cur = i + 1; paintProgress(); paintStats(); processNext(i + 1); }
+
+    // 逐条:检查重复(后端按 refreshToken 去重)→ 添加 → 等 1s → 验活(查余额)→ 失败回滚删除。
+    function processNext(i) {
+      if (i >= total) { finish(); return; }
+      results[i].status = 'checking'; renderRow(i);
+      procText.textContent = t('imp.processing', { i: i + 1, total: total });
+      var payload = toAddPayload(list[i]);
+      if (!payload) { results[i].status = 'failed'; results[i].rollbackStatus = 'skipped'; failCount++; rbSkipped++; renderRow(i); advance(i); return; }
+      api.post('/credentials', payload).then(function (r) {
+        if (r && r.duplicate) {
+          results[i].status = 'duplicate'; results[i].error = t('imp.dupExists');
+          if (r.email) results[i].email = r.email;
+          dupCount++; renderRow(i); advance(i); return;
+        }
+        var id = r && (r.credentialId != null ? r.credentialId : r.id);
+        if (id == null) { results[i].status = 'failed'; results[i].rollbackStatus = 'skipped'; failCount++; rbSkipped++; renderRow(i); advance(i); return; }
+        anyAdded = true;
+        if (r.email) results[i].email = r.email;
+        results[i].credentialId = id; results[i].status = 'verifying'; renderRow(i);
+        setTimeout(function () {
+          api.get('/credentials/' + id + '/balance').then(function (bal) {
+            results[i].status = 'verified';
+            if (bal && bal.usageLimit != null) results[i].usage = fmtNum(bal.currentUsage) + '/' + fmtNum(bal.usageLimit);
+            okCount++;
+            procText.textContent = t('imp.verifiedName', { name: results[i].email || t('imp.acctNo', { n: results[i].index }) });
+            renderRow(i); advance(i);
+          }, function () {
+            // 验活失败 → 回滚删除(过滤失效账号)
+            api.del('/credentials/' + id).then(function () {
+              results[i].status = 'failed'; results[i].rollbackStatus = 'success'; failCount++; rbSuccess++; renderRow(i); advance(i);
+            }, function () {
+              results[i].status = 'failed'; results[i].rollbackStatus = 'failed'; failCount++; rbFailed++; renderRow(i); advance(i);
+            });
+          });
+        }, 1000);
+      }, function (err) {
+        results[i].status = 'failed'; results[i].rollbackStatus = 'skipped';
+        results[i].error = (err && err.message) ? err.message : undefined;
+        failCount++; rbSkipped++; renderRow(i); advance(i);
+      });
+    }
+
+    function finish() {
+      importing = false; cancel.disabled = false;
+      cancel.textContent = t('imp.close'); cancel.removeAttribute('data-i18n');
+      if (closeX) closeX.style.display = '';
+      progLabel.textContent = t('imp.progressDone'); procText.textContent = '';
+      if (failCount === 0 && dupCount === 0) {
+        api.toast(t('imp.doneOk', { n: okCount }), 'success');
+      } else {
+        var failPart = failCount > 0 ? t('imp.doneFailPart', { fail: failCount, ex: rbSuccess, nex: rbFailed }) : '';
+        api.toast(t('imp.doneMixed', { ok: okCount, dup: dupCount, fail: failPart }), 'info');
+        if (rbFailed > 0) api.toast(t('imp.rollbackWarn', { n: rbFailed }), 'warning');
+      }
+      if (anyAdded) loadAccounts();
+    }
   }
 
   // 把一个账号对象(顶层扁平或 KAM `credentials` 嵌套)映射成单条 add 的 payload(camelCase)。
