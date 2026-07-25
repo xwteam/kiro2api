@@ -540,6 +540,8 @@ window.I18N = {
   'mt.configTitle':       { 'zh-CN': '请求', 'zh-TW': '請求', 'en': 'Request', 'ja': 'リクエスト', 'ko': '요청' },
   'mt.key':               { 'zh-CN': 'API 密钥', 'zh-TW': 'API 金鑰', 'en': 'API Key', 'ja': 'API キー', 'ko': 'API 키' },
   'mt.keyHint':           { 'zh-CN': '选择一个已有的 API 密钥来授权测试请求', 'zh-TW': '選擇一個已有的 API 金鑰來授權測試請求', 'en': 'Pick an existing API key to authorize the test request', 'ja': '既存の API キーを選択してテストリクエストを認可します', 'ko': '기존 API 키를 선택하여 테스트 요청을 인증하세요' },
+  'mt.keyHintMaster':     { 'zh-CN': '默认用主 API Key;也可选择已创建的密钥', 'zh-TW': '預設使用主 API Key;也可選擇已建立的金鑰', 'en': 'Defaults to the master API key; you can also pick a created key', 'ja': 'デフォルトはマスター API キー。作成済みのキーも選べます', 'ko': '기본값은 마스터 API 키입니다. 생성한 키도 선택할 수 있습니다' },
+  'mt.masterKey':         { 'zh-CN': '主 API Key（默认）', 'zh-TW': '主 API Key（預設）', 'en': 'Master API Key (default)', 'ja': 'マスター API キー（既定）', 'ko': '마스터 API 키(기본)' },
   'mt.keyEmpty':          { 'zh-CN': '暂无 API 密钥 — 请先在「API 管理」中创建', 'zh-TW': '暫無 API 金鑰 — 請先在「API 管理」中建立', 'en': 'No API keys — create one in "API Keys" first', 'ja': 'API キーがありません — まず「API キー」で作成してください', 'ko': 'API 키가 없습니다 — 먼저 "API 키"에서 생성하세요' },
   'mt.keyEmptyOption':    { 'zh-CN': '无可用密钥', 'zh-TW': '無可用金鑰', 'en': 'No keys available', 'ja': '利用可能なキーなし', 'ko': '사용 가능한 키 없음' },
   'mt.noKey':             { 'zh-CN': '请先选择一个 API 密钥', 'zh-TW': '請先選擇一個 API 金鑰', 'en': 'Select an API key first', 'ja': '先に API キーを選択してください', 'ko': '먼저 API 키를 선택하세요' },

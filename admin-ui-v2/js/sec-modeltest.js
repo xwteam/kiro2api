@@ -66,6 +66,8 @@
     modelsLoaded: false,
     keys: [],            // [{id, key, name, enabled}]
     keysLoaded: false,
+    masterKey: null,     // 主 API Key(全局 apiKey,取自 GET /server-info;可作默认测试凭证)
+    masterLoaded: false,
     endpoint: 'chat',    // 'chat' (OpenAI) | 'messages' (Anthropic)
     stream: false,
     sending: false,
@@ -219,7 +221,7 @@
     els.totalTokens = host.querySelector('#mtTotalTokens');
     els.chat = host.querySelector('#mtChat');
 
-    els.reloadKeys.addEventListener('click', function () { loadKeys(true); });
+    els.reloadKeys.addEventListener('click', function () { loadMasterKey(true); loadKeys(true); });
     els.reloadModels.addEventListener('click', function () { loadModels(true); });
 
     els.endpoint.addEventListener('change', function (e) {
@@ -269,6 +271,22 @@
   }
 
   // ---------------- api keys ----------------
+  // 主 API Key(全局 apiKey):从 GET /server-info 取完整值(该端点在 admin 鉴权后返回完整主 key
+  // 供复制/使用)。取到后作为 key 下拉的默认首选项——没创建任何密钥时也能用它直接测试。
+  function loadMasterKey(force) {
+    if (!force && state.masterLoaded) { fillKeySelect(); return; }
+    K.api.get('/server-info').then(function (info) {
+      var mk = info && (info.masterApiKey || info.master_api_key);
+      // 脱敏串(含 * )不可用于实际调用;仅接受完整 key,否则视为未配置。
+      state.masterKey = (mk && typeof mk === 'string' && mk.indexOf('*') < 0) ? mk : null;
+      state.masterLoaded = true;
+      fillKeySelect();
+    }).catch(function () {
+      state.masterLoaded = true;
+      fillKeySelect();
+    });
+  }
+
   function loadKeys(force) {
     if (!force && state.keysLoaded && state.keys.length) { fillKeySelect(); return; }
     setKeySelectLoading();
@@ -315,11 +333,20 @@
   function fillKeySelect() {
     var prev = els.key.value;
     els.key.innerHTML = '';
-    if (!state.keys.length) {
+    var hasMaster = !!state.masterKey;
+    // 无任何可用凭证(主 key 未配置 + 没有创建的密钥)才置空禁用。
+    if (!hasMaster && !state.keys.length) {
       els.key.appendChild(simpleOption('', 'mt.keyEmptyOption'));
       els.key.disabled = true;
-      paintKeyHint('empty');
+      paintKeyHint();
       return;
+    }
+    // 主 API Key 作为首选默认项:没创建密钥时也能直接用它测试。
+    if (hasMaster) {
+      var mo = document.createElement('option');
+      mo.value = state.masterKey;
+      mo.textContent = t('mt.masterKey') + ' · ' + maskKey(state.masterKey);
+      els.key.appendChild(mo);
     }
     state.keys.forEach(function (k) {
       var o = document.createElement('option');
@@ -330,17 +357,21 @@
       els.key.appendChild(o);
     });
     els.key.disabled = false;
-    if (prev && state.keys.some(function (k) { return k.key === prev; })) els.key.value = prev;
-    paintKeyHint('ready');
+    // 保留上次选择;否则默认第一项(有主 key 时即主 key)。
+    if (prev && (prev === state.masterKey || state.keys.some(function (k) { return k.key === prev; }))) {
+      els.key.value = prev;
+    }
+    paintKeyHint();
   }
 
   function paintKeyHint() {
     if (!els.keyHint) return;
-    var empty = state.keysLoaded && !state.keys.length;
-    var key = empty ? 'mt.keyEmpty' : 'mt.keyHint';
+    // 只有连主 key 都没有、且没创建密钥时才提示"无可用密钥"。
+    var noKey = !state.masterKey && state.keysLoaded && !state.keys.length;
+    var key = noKey ? 'mt.keyEmpty' : (state.masterKey ? 'mt.keyHintMaster' : 'mt.keyHint');
     els.keyHint.setAttribute('data-i18n', key);
     els.keyHint.textContent = t(key);
-    els.keyHint.classList.toggle('mt-hint-warn', !!empty);
+    els.keyHint.classList.toggle('mt-hint-warn', !!noKey);
   }
 
   // ---------------- models ----------------
@@ -854,6 +885,7 @@
     init: init,
     onShow: function () {
       if (!inited) init();
+      if (!state.masterLoaded) loadMasterKey(false);
       if (!state.keysLoaded) loadKeys(false);
       if (!state.modelsLoaded) loadModels(false);
     },
@@ -864,6 +896,7 @@
 
   window.renderModelTest = function () {
     if (!inited) init();
+    loadMasterKey(false);
     loadKeys(false);
     loadModels(false);
   };
