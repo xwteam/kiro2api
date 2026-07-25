@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.1.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.1.2-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,8 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-07-25 | v0.1.2 - 🔔 检查更新弹窗改版：弹窗内展示当前语言的版本更新说明 + 可一键复制的升级命令；有新版本时按钮高亮为「更新到 vX」；修复纯 HTTP 下复制按钮失效 |
+| 2026-07-25 | v0.1.1 - 🩹 面板与账号导入修复：模型测试在未创建自定义 key 时默认用主 API-KEY；批量导入改为逐条「验活 + 去重」；修复批量导入较大清单时失败；用户面板/全站 favicon + 128x128 logo 与各语言 README 版本徽章；交叉编译多架构镜像构建 |
 | 2026-07-25 | v0.1.0 - 🚀 首个版本：四协议前端（Anthropic 中枢 + OpenAI / OpenAI-Responses / Gemini）、Kiro 账号池（多账号轮询 / 分级冷却 / 令牌自愈）、端点回退与跨账号重试、统一鉴权闸、`/admin` 管理面板与 `/user` 用户面板、每日/账号用量统计、失败/限流日志、账号余额缓存、实时日志（SSE）、三种交互式登录流、Docker 多架构（amd64/arm64）交付与 CI |
 
 ---
@@ -98,8 +100,9 @@
 ### 🖥 Web 管理面板
 
 - 内置静态管理台（`/admin`），凭 `adminApiKey` 登录，`/api/admin/*` 富接口驱动
-- **仪表盘**：运行时间实时计时、全局剩余积分、系统信息（版本/Rust/OS/内存/CPU/PID/运行模式）、赞助二维码卡（实时拉取远程配置）、**检查更新**（GitHub Release 比对）
-- **账号管理**：增删改查、三种交互式登录、批量导入、优先级/权重、余额查询
+- **仪表盘**：运行时间实时计时、全局剩余积分、系统信息（版本/Rust/OS/内存/CPU/PID/运行模式）、赞助二维码卡（实时拉取远程配置）、**检查更新**（GitHub Release 比对，弹窗展示当前语言的版本更新说明 + 可一键复制的升级命令）
+- **账号管理**：增删改查、三种交互式登录、批量导入（逐条验活 + 去重）、优先级/权重、余额查询
+- **模型测试**：从面板向任意模型发一条测试请求验证连通性；未创建自定义 key 时默认用主 API-KEY
 - **API-KEY 管理**：发放/禁用/改标签、按 key 用量与分页记录
 - **用量统计**：每日/账号维度、含客户端 IP 与账号标签、按日下钻
 - **实时日志**：结构化表格 + 方向过滤 + 搜索 + 分页 + SSE 实时推送 + 下载

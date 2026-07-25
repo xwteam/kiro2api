@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.1.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.1.2-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,8 @@
 
 | 날짜 | 업데이트 내용 |
 |------|----------|
+| 2026-07-25 | v0.1.2 - 업데이트 대화상자 개편: 업데이트 확인 대화상자가 현지화된 릴리스 노트 + 복사 가능한 업그레이드 명령을 표시, 업데이트가 있으면 버튼이 「vX로 업데이트」로 강조, 순수 HTTP 환경에서 복사 버튼 오류 수정 |
+| 2026-07-25 | v0.1.1 - 패널 및 계정 가져오기 수정: 모델 테스트가 마스터 API 키로 폴백, 일괄 가져오기를 항목별 「생존 검증 + 중복 제거」로 전환, 대량 목록에서 일괄 가져오기 실패 수정, 사용자 패널/전체 페이지 favicon + 128x128 로고 및 각 README의 버전 배지, 크로스 컴파일 멀티 아키텍처 이미지 빌드 |
 | 2026-07-25 | v0.1.0 - 🚀 첫 릴리스: 4개 프로토콜 프런트엔드(Anthropic 중추 + OpenAI / OpenAI-Responses / Gemini), Kiro 계정 풀(다중 계정 라운드로빈 / 단계별 쿨다운 / 토큰 자가 치유), 엔드포인트 폴백 및 크로스 계정 재시도, 통합 인증 게이트, `/admin` 관리 패널과 `/user` 사용자 패널, 일별/계정별 사용량 통계, 실패/스로틀 로그, 계정 잔액 캐시, 실시간 로그(SSE), 3가지 대화형 로그인 플로우, Docker 멀티 아키텍처(amd64/arm64) 배포 및 CI |
 
 ---
@@ -95,9 +97,10 @@
 ### 🖥 웹 관리 패널
 
 - 내장 정적 관리 콘솔(`/admin`), `adminApiKey`로 로그인, 풍부한 `/api/admin/*` 인터페이스로 구동
-- **대시보드**: 가동 시간 실시간 카운터, 전역 잔여 크레딧, 시스템 정보(버전/Rust/OS/메모리/CPU/PID/실행 모드), 후원 QR 코드 카드(원격 설정 실시간 로드), **업데이트 확인**(GitHub Release 비교)
-- **계정 관리**: 추가/삭제/수정/조회, 3가지 대화형 로그인, 일괄 가져오기, 우선순위/가중치, 잔액 조회
+- **대시보드**: 가동 시간 실시간 카운터, 전역 잔여 크레딧, 시스템 정보(버전/Rust/OS/메모리/CPU/PID/실행 모드), 후원 QR 코드 카드(원격 설정 실시간 로드), **업데이트 확인**(GitHub Release 비교, 대화상자에서 현지화된 릴리스 노트 + 업그레이드 명령 표시)
+- **계정 관리**: 추가/삭제/수정/조회, 3가지 대화형 로그인, 일괄 가져오기(항목별 생존 검증 + 중복 제거), 우선순위/가중치, 잔액 조회
 - **API-KEY 관리**: 발급/비활성화/라벨 수정, key별 사용량 및 페이지 단위 기록
+- **모델 테스트**: 패널에서 임의의 모델에 테스트 요청을 보내 연결성 확인; 커스텀 key가 없으면 마스터 API 키로 폴백
 - **사용량 통계**: 일별/계정별 차원, 클라이언트 IP 및 계정 라벨 포함, 일별 드릴다운
 - **실시간 로그**: 구조화 테이블 + 방향 필터 + 검색 + 페이지네이션 + SSE 실시간 푸시 + 다운로드
 - **설정**: 런타임에 부하 분산/인증 키 변경, 통합 예시(프로토콜×언어 복사 가능 스니펫), **원클릭 서비스 재시작**

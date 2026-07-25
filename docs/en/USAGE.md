@@ -23,7 +23,7 @@ The dashboard provides a system overview:
 - **Global Credits**: Remaining balance aggregated across the pool
 - **System Info**: Rust build info, OS, memory usage, CPU usage, PID
 - **Configuration**: Current load-balancing mode and per-credential RPM limit
-- **Check for Updates**: Compares the running version against the latest GitHub Release
+- **Check for Updates**: On dashboard load the panel silently auto-checks GitHub for a newer release. When one exists, the button highlights as **Update to vX**; clicking it opens an **Update Service vX** dialog that shows the release notes for the current UI language in a scrollable box, plus the upgrade command `docker compose pull && docker compose up -d` with a one-click copy button. It only informs and displays — it never runs the upgrade automatically
 - **Sponsor QR Codes**: Shareable codes pulled from remote config
 
 ### Account Management
@@ -32,7 +32,7 @@ Manage your Kiro (CodeWhisperer) accounts:
 
 1. Click **Credentials** in the sidebar
 2. View all configured accounts with their status (health, weight, failure/throttle counts, balance)
-3. **Add Account**: Bring in accounts without touching `credentials.json` — interactive **Builder ID** (device code), **IAM Identity Center (SSO)** login, **social token** import, or **batch import** of an array / KAM `{accounts}` object
+3. **Add Account**: Bring in accounts without touching `credentials.json` — interactive **Builder ID** (device code), **IAM Identity Center (SSO)** login, **social token** import, or **batch import**. Batch import accepts one bearer/SSO token per line, or a pasted credentials array / `{accounts}` object, and adds accounts **one by one**: right after adding each account it queries that account's balance once (a real upstream `getUsageLimits` call) to **verify it is alive** — a live account is kept, a dead one is automatically rolled back/deleted and filtered out. It also **dedupes by `refreshToken`**: an account already in the pool is skipped, so the same account is never imported twice (which would make two credentials race the same rotating token — mutual invalidation, wasted quota, upstream risk-control)
 4. **Enable / Disable / Reset**: Toggle an account on/off or clear its cooldown state
 5. **Edit Priority / Weight**: Tune how the load balancer rotates the account
 6. **Check Balance**: Query the remaining credits for an account
@@ -64,6 +64,17 @@ Monitor API usage and performance:
    - A live requests-per-minute view
 3. Usage records include the **client IP** and **account label**
 4. Drill down by day for historical trends
+
+### Model Test
+
+Verify that an account/model actually works, straight through the relay:
+
+1. Click **Model Test** in the sidebar
+2. Pick a model (and, optionally, a specific endpoint)
+3. Click **Send** — the test request goes through the relay and the raw result is shown
+4. This calls the relay with one of your created API keys. When no custom keys have been created yet, it **defaults to the master API key** (`adminApiKey` / `apiKey`) so testing works out of the box
+
+The key is stored only in the browser (localStorage) and is used solely to call the relay endpoint.
 
 ### API Keys Management
 
