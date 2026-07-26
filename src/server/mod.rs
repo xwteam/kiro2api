@@ -38,6 +38,16 @@ pub fn build_router_with_logs(
     cfg: Arc<Config>,
     log_capture: Option<Arc<crate::logcap::LogCapture>>,
 ) -> Router {
+    build_router_with_handles(cfg, log_capture).0
+}
+
+/// 与 [`build_router_with_logs`] 完全相同的路由,但额外交出内部构造的 `StatsManager` 句柄。
+/// `serve()` 据此在收到停机信号后触发统计最终刷盘——统计层由 `build_router*` 内部构造,
+/// 外部拿不到句柄就无法在退出前落盘。
+pub fn build_router_with_handles(
+    cfg: Arc<Config>,
+    log_capture: Option<Arc<crate::logcap::LogCapture>>,
+) -> (Router, Arc<crate::stats::StatsManager>) {
     // 捕获进程启动时刻(幂等):admin system-info 端点据此算 uptimeSecs。
     // 首次调用置入,后续调用(如测试重复建 router)不覆盖,保留最早时刻。
     let _ = SERVER_START.get_or_init(Instant::now);
@@ -131,17 +141,18 @@ pub fn build_router_with_logs(
     // 两组的鉴权闸互不相干。复用同一 MessagesState(共享 api_keys + stats)。
     let user = crate::user::user_api_router(messages_state.clone());
 
-    // Admin REST API 单独一组:鉴权用 admin_api_key,未配置则回退主 api_key
-    // (都空则开放,复用 require_api_key 既有语义)。与协议组各自独立 layer,
-    // 互不影响——协议组用 api_key,admin 组用 admin_api_key 优先。
+    // Admin REST API 单独一组:鉴权用 admin_api_key,未配置则回退主 api_key。
+    // 与协议组各自独立 layer,互不影响——协议组用 api_key,admin 组用 admin_api_key 优先。
     // Admin 复用 messages_state:其已携带同一个 `Arc<StatsManager>`(上方 line 28-34 构造),
     // 故 admin 只读查询与 relay 记录写入共享同一内存存储,无需再建第二份。
     let admin = crate::admin::admin_api_router(messages_state)
         .layer(axum::middleware::from_fn_with_state(
-            // admin 闸:admin_api_key(非空)否则回退主 api_key 的全局 key 校验,
-            // 不接 store、不查消费上限。期望 key 从 runtime_cfg 实时读取,
-            // 使 PUT /config/auth-keys 改 admin 密码后无需重启即时生效。
-            auth::AuthState::admin(runtime_cfg.clone()),
+            // admin 闸:admin_api_key(非空)否则回退主 api_key 的全局 key 校验,不查消费上限。
+            // 期望 key 从 runtime_cfg 实时读取,使 PUT /config/auth-keys 改 admin 密码后
+            // 无需重启即时生效。store 一并传入,但**只作"系统是否已配置鉴权"的判据**:
+            // 仅用 store key 部署(两个全局 key 都为空)时管理面必须校验凭据而非开放;
+            // store key 本身在 admin 闸不放行,拿不到管理员权限。
+            auth::AuthState::admin(runtime_cfg.clone(), api_keys.clone()),
             auth::require_api_key,
         ))
         // 批量导入等 admin 端点可能提交大 JSON(多账号凭据集,单个 token 就上千字符)。
@@ -149,7 +160,7 @@ pub fn build_router_with_logs(
         // admin 已鉴权,放宽仅限受信管理面。
         .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024));
 
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/v1/ping", get(ping))
         .with_state(cfg)
@@ -162,7 +173,8 @@ pub fn build_router_with_logs(
         .merge(webui::user_router())
         .merge(protocol)
         .merge(admin)
-        .merge(user)
+        .merge(user);
+    (router, stats)
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -177,24 +189,97 @@ async fn ping() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "pong": true }))
 }
 
+/// 启动期鉴权配置体检:返回需要提示的告警文案(空 = 无隐患)。
+///
+/// 抽成纯函数以便单测钉住各场景的覆盖面;`serve()` 只负责逐条 warn。
+/// 判据只看两个全局 key:store 里的每用户 key 会让两道闸都要求凭据,故文案里以
+/// "未创建任何 API-KEY 前"限定开放的适用范围。
+fn auth_startup_warnings(cfg: &Config) -> Vec<String> {
+    let api_key_set = !cfg.api_key.as_deref().unwrap_or("").trim().is_empty();
+    let admin_key_set = !cfg.admin_api_key.as_deref().unwrap_or("").trim().is_empty();
+    let mut warnings = Vec::new();
+    if !api_key_set {
+        warnings.push(
+            "未设置 api_key:在未创建任何 API-KEY 前,四条协议端点(Anthropic/OpenAI/Responses/Gemini)开放访问"
+                .to_string(),
+        );
+    }
+    if !admin_key_set {
+        if api_key_set {
+            // 只有主 key:管理闸回退用它,数据面 key 持有者即管理员。
+            warnings.push(
+                "未设置 admin_api_key:/admin 管理面回退用主 api_key 校验,数据面 key 持有者同时具备完整管理员权限;建议设置环境变量 ADMIN_API_KEY=<独立强口令> 与数据面分离"
+                    .to_string(),
+            );
+        } else {
+            // 两个 key 都没有:管理面同样开放——可读写账号凭据、密钥与统计,危害远大于协议端点。
+            warnings.push(
+                "未设置 admin_api_key:/admin 管理面在未创建任何 API-KEY 前同样开放访问(可读写账号凭据、API-KEY 与统计);请设置环境变量 ADMIN_API_KEY=<强口令> 后重启"
+                    .to_string(),
+            );
+        }
+    }
+    warnings
+}
+
+/// 停机信号:SIGTERM(`docker stop`/编排器回收)或 SIGINT(Ctrl-C)任一到达即返回。
+/// 非 unix 平台只等 Ctrl-C。
+///
+/// 容器里本进程常是 PID 1:不处理 SIGTERM 就会一直等到宽限期结束被 SIGKILL,
+/// 在途 SSE 长流被硬掐、未刷盘的统计丢失。
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                let _ = sig.recv().await;
+            }
+            Err(e) => {
+                // 注册失败(极罕见)退化为只响应 Ctrl-C,不让停机路径 panic。
+                tracing::warn!(error = %e, "SIGTERM 处理器注册失败,停机仅响应 Ctrl-C");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("收到停机信号,停止接受新连接,等待在途请求结束");
+}
+
 pub async fn serve(
     cfg: Config,
     log_capture: Option<Arc<crate::logcap::LogCapture>>,
 ) -> anyhow::Result<()> {
-    if cfg.api_key.as_deref().unwrap_or("").is_empty() {
-        tracing::warn!("未设置 api_key,协议端点开放访问");
+    for w in auth_startup_warnings(&cfg) {
+        tracing::warn!("{w}");
     }
     let addr = format!("{}:{}", cfg.host, cfg.port);
-    let app = build_router_with_logs(Arc::new(cfg), log_capture);
+    let (app, stats) = build_router_with_handles(Arc::new(cfg), log_capture);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("kiro2api listening on {addr}");
     // `into_make_service_with_connect_info` 使各 handler 可经 `ConnectInfo<SocketAddr>`
     // 拿到 socket 对端地址(用于提取客户端 IP;有反代时优先 X-Forwarded-For/X-Real-IP)。
+    //
+    // `with_graceful_shutdown`:收到 SIGTERM/SIGINT 后停止 accept,已建立的连接(含在途
+    // SSE 长流)跑完才返回,而不是被 SIGKILL 硬掐。
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
+    // 在途请求已结束,把去抖窗口内(约 5s)未落盘的用量写下去,否则每次停机都静默丢这一段。
+    stats.flush_now().await;
+    tracing::info!("kiro2api 已停止");
     Ok(())
 }
 
@@ -521,7 +606,100 @@ mod tests {
         assert_ne!(resp2.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// admin_api_key 与 api_key 均未设置时,admin API 开放访问。
+    /// 仅用 store key 部署(config 里 api_key / admin_api_key 都没配)时,/admin API 必须 401:
+    /// 系统里已存在鉴权材料,管理面不得再按"首次运行"开放。
+    #[tokio::test]
+    async fn admin_stats_requires_key_when_only_store_keys_exist() {
+        let dir =
+            std::env::temp_dir().join(format!("kiro2api_srv_adminguard_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let creds = dir.join("credentials.json").to_string_lossy().into_owned();
+        let store_path = crate::apikey::api_keys_path_from(&creds);
+        let _ = std::fs::remove_file(&store_path);
+        {
+            let store = crate::apikey::ApiKeyStore::load(&store_path);
+            let _ = store.create(
+                "0001".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                chrono::Utc::now(),
+            );
+            store.save_now().unwrap();
+        }
+
+        let cfg = Config {
+            credentials_path: creds,
+            ..Config::default()
+        };
+        let app = build_router(Arc::new(cfg));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_file(&store_path);
+    }
+
+    /// 启动告警必须显式点名管理面(而非只提协议端点),并给出可操作的补救指令。
+    #[test]
+    fn auth_startup_warnings_name_admin_panel_and_shared_key_risk() {
+        // 一个 key 都没配:协议端点 + 管理面各一条,管理面那条须点名 /admin 与 ADMIN_API_KEY。
+        let none = auth_startup_warnings(&Config::default());
+        assert_eq!(none.len(), 2, "{none:?}");
+        assert!(none.iter().any(|w| w.contains("协议端点")));
+        let admin_warn = none
+            .iter()
+            .find(|w| w.contains("/admin"))
+            .expect("必须点名管理面同样开放");
+        assert!(admin_warn.contains("ADMIN_API_KEY"), "{admin_warn}");
+
+        // 只设主 key:管理闸回退用它,须提示数据面 key 同时具备管理员权限。
+        let only_api = auth_startup_warnings(&Config {
+            api_key: Some("sk-main".into()),
+            ..Config::default()
+        });
+        assert_eq!(only_api.len(), 1, "{only_api:?}");
+        assert!(only_api[0].contains("管理员权限"), "{}", only_api[0]);
+        assert!(only_api[0].contains("ADMIN_API_KEY"), "{}", only_api[0]);
+
+        // 只设 admin key:协议端点仍开放,管理面无隐患。
+        let only_admin = auth_startup_warnings(&Config {
+            admin_api_key: Some("adm".into()),
+            ..Config::default()
+        });
+        assert_eq!(only_admin.len(), 1, "{only_admin:?}");
+        assert!(only_admin[0].contains("协议端点"));
+
+        // 两个都设 → 无告警;空串/纯空白视同未设置。
+        assert!(
+            auth_startup_warnings(&Config {
+                api_key: Some("sk-main".into()),
+                admin_api_key: Some("adm".into()),
+                ..Config::default()
+            })
+            .is_empty()
+        );
+        assert_eq!(
+            auth_startup_warnings(&Config {
+                api_key: Some("   ".into()),
+                admin_api_key: Some(String::new()),
+                ..Config::default()
+            })
+            .len(),
+            2
+        );
+    }
+
+    /// admin_api_key 与 api_key 均未设置、且 store 里一条 key 都没有时,admin API 开放访问
+    /// (首次运行体验;只要出现任一鉴权材料就不再开放,见上一条测试)。
     #[tokio::test]
     async fn admin_stats_open_when_no_keys_configured() {
         let app = build_router(Arc::new(Config::default()));

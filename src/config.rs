@@ -70,7 +70,7 @@ impl Config {
     }
 
     fn apply_env_overrides(&mut self) {
-        if let Ok(v) = std::env::var("HOST") {
+        if let Some(v) = env_non_empty("HOST") {
             self.host = v;
         }
         if let Ok(v) = std::env::var("PORT")
@@ -78,16 +78,16 @@ impl Config {
         {
             self.port = p;
         }
-        if let Ok(v) = std::env::var("REGION") {
+        if let Some(v) = env_non_empty("REGION") {
             self.region = v;
         }
-        if let Ok(v) = std::env::var("API_KEY") {
+        if let Some(v) = env_non_empty("API_KEY") {
             self.api_key = Some(v);
         }
-        if let Ok(v) = std::env::var("ADMIN_API_KEY") {
+        if let Some(v) = env_non_empty("ADMIN_API_KEY") {
             self.admin_api_key = Some(v);
         }
-        if let Ok(v) = std::env::var("CREDENTIALS_PATH") {
+        if let Some(v) = env_non_empty("CREDENTIALS_PATH") {
             self.credentials_path = v;
         }
         if let Ok(v) = std::env::var("MAX_RPM_PER_CREDENTIAL")
@@ -95,10 +95,24 @@ impl Config {
         {
             self.max_rpm_per_credential = n;
         }
-        if let Ok(v) = std::env::var("LOAD_BALANCING_MODE") {
+        if let Some(v) = env_non_empty("LOAD_BALANCING_MODE") {
             self.load_balancing_mode = v;
         }
     }
+}
+
+/// 读取字符串类环境变量:未设置、或 trim 后为空一律视为**未设置**(返回 `None`),
+/// 由调用方保留 `config.json` / 面板里已有的值。
+///
+/// 约束来自部署形态:`.env.example` 自带 `API_KEY=` 这类空赋值,compose 的 `env_file`
+/// 会把空串原样注入容器;若不过滤,空串会覆盖掉已配好的密钥(等于静默关掉鉴权)。
+/// 返回值取 trim 后的内容:`.env` 行尾空白/CR 不会混进 key 与路径
+/// (鉴权闸提取到的调用方 key 本就是 trim 过的,期望值带空白永远匹配不上)。
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// 运行期可变配置存储:仅承载**可在运行时改写**的字段(auth key / RPM / 负载均衡模式),
@@ -303,6 +317,49 @@ mod tests {
         unsafe {
             std::env::remove_var("PORT");
             std::env::remove_var("HOST");
+        }
+    }
+
+    /// 空串环境变量(compose 的 env_file 注入 `.env.example` 里的 `API_KEY=`)
+    /// 不得覆盖 config.json / 面板已配好的值——否则鉴权被静默关闭。
+    /// 只用空白的值同样视为未设置。
+    #[test]
+    fn blank_env_vars_do_not_override_configured_values() {
+        let mut c = Config {
+            api_key: Some("sk-from-config".into()),
+            admin_api_key: Some("adm-from-config".into()),
+            credentials_path: "/data/credentials.json".into(),
+            region: "eu-west-1".into(),
+            load_balancing_mode: "balanced".into(),
+            ..Config::default()
+        };
+        unsafe {
+            std::env::set_var("API_KEY", "");
+            std::env::set_var("ADMIN_API_KEY", "   ");
+            std::env::set_var("CREDENTIALS_PATH", "");
+            std::env::set_var("REGION", "");
+            std::env::set_var("LOAD_BALANCING_MODE", "");
+        }
+        c.apply_env_overrides();
+        assert_eq!(c.api_key.as_deref(), Some("sk-from-config"));
+        assert_eq!(c.admin_api_key.as_deref(), Some("adm-from-config"));
+        assert_eq!(c.credentials_path, "/data/credentials.json");
+        assert_eq!(c.region, "eu-west-1");
+        assert_eq!(c.load_balancing_mode, "balanced");
+
+        // 非空环境变量仍照常覆盖,且前后空白被剔除。
+        unsafe {
+            std::env::set_var("API_KEY", "  sk-from-env  ");
+        }
+        c.apply_env_overrides();
+        assert_eq!(c.api_key.as_deref(), Some("sk-from-env"));
+
+        unsafe {
+            std::env::remove_var("API_KEY");
+            std::env::remove_var("ADMIN_API_KEY");
+            std::env::remove_var("CREDENTIALS_PATH");
+            std::env::remove_var("REGION");
+            std::env::remove_var("LOAD_BALANCING_MODE");
         }
     }
 }

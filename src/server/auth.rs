@@ -31,15 +31,17 @@ pub struct ApiKeyId(pub Option<u32>);
 
 /// 鉴权中间件所需状态:
 /// - `api_key`:全局 API key(`None`/空串 = 该来源不设全局 key)。
-/// - `api_keys`:store-backed 每用户 key(协议闸接入;admin 闸传 `None`,行为不变)。
+/// - `api_keys`:store-backed 每用户 key。协议闸据此放行 store key;admin 闸也接同一份
+///   store,但**只用于判定“系统里是否已存在鉴权材料”**,绝不放行 store key(见 `AuthRole`)。
 /// - `stats`:用量统计(仅协议闸用于消费上限求和;admin 闸传 `None`)。
 ///
-/// 放行规则(协议闸):既无全局 key、又无任何 store key 时视为开放模式直接放行;
-/// 否则须命中全局 key 或有效 store key 之一。admin 闸只带 `api_key`,语义与原先一致
-/// (仅全局/回退 key 常量时间比较,无 store/消费上限逻辑)。
-/// 鉴权闸的角色:决定运行期可变配置里“期望的全局 key”取哪一个字段。
-/// - `Protocol`:协议闸,期望 = 主 `api_key`。
-/// - `Admin`:管理闸,期望 = `admin_api_key`(非空)否则回退主 `api_key`。
+/// 放行规则:全局 key、admin key、store 里任意一条 key——只要存在其一,就视为
+/// “已配置鉴权”,请求必须命中本闸接受的凭据,否则 401;一条鉴权材料都没有时才维持
+/// 首次运行的开放模式。
+/// 鉴权闸的角色:决定运行期可变配置里“期望的全局 key”取哪一个字段,以及是否接受 store key。
+/// - `Protocol`:协议闸,期望 = 主 `api_key`;另接受有效 store key。
+/// - `Admin`:管理闸,期望 = `admin_api_key`(非空)否则回退主 `api_key`;
+///   **不接受 store key**——数据面每用户 key 不得取得管理员权限。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthRole {
     Protocol,
@@ -87,13 +89,20 @@ impl AuthState {
         }
     }
 
-    /// 管理闸:期望 = 运行期 `admin_api_key`(非空)否则回退主 `api_key`;不接 store。
-    pub fn admin(runtime_cfg: crate::config::SharedRuntimeConfig) -> Self {
+    /// 管理闸:期望 = 运行期 `admin_api_key`(非空)否则回退主 `api_key`。
+    ///
+    /// 同时接入 store,但 `AuthRole::Admin` 下 store **只参与“是否已配置鉴权”的判定**:
+    /// 仅用 store key 部署(全局 key 与 admin key 都为空)时,管理面必须校验凭据而非开放;
+    /// store key 本身在本闸一律不放行,拿不到管理员权限。
+    pub fn admin(
+        runtime_cfg: crate::config::SharedRuntimeConfig,
+        api_keys: Arc<ApiKeyStore>,
+    ) -> Self {
         Self {
             api_key: None,
             runtime_cfg: Some(runtime_cfg),
             role: AuthRole::Admin,
-            api_keys: None,
+            api_keys: Some(api_keys),
             stats: None,
         }
     }
@@ -179,23 +188,25 @@ fn attach_reservation_to_response(
     Response::from_parts(parts, new_body)
 }
 
-/// 统一鉴权闸:提取 key(Authorization: Bearer > x-api-key > ?token=)。
+/// 统一鉴权闸:提取 key(Authorization: Bearer > x-api-key > x-goog-api-key > query)。
 ///
 /// 判定顺序:
 /// 1. 配置了非空全局 key 且常量时间匹配 → 放行(全局模式,不归属 store key)。
-/// 2. 否则若有 store,按 `validate` 裁决:
+/// 2. 否则,协议闸按 store 的 `validate` 裁决:
 ///    - Valid 且未超消费上限 → 惰性激活 + 把 `ApiKeyId(Some(id))` 塞进请求扩展后放行;
 ///    - Valid 但已达/超上限 → 402;
 ///    - Disabled / Expired / NotFound → 401(不泄露具体命中与否细节,统一措辞)。
-/// 3. 既无全局 key(未配置/空)又无任何 store key → 开放模式放行。
-/// 4. 其余(有全局 key 或有 store key 但都未匹配)→ 401。
+///    admin 闸跳过本步:store key 不得取得管理员权限。
+/// 3. 系统里存在任一鉴权材料(全局 key / admin key / 任意 store key)却未命中 → 401。
+/// 4. 一条鉴权材料都没有 → 开放模式放行(首次运行体验)。
 pub async fn require_api_key(
     State(auth): State<AuthState>,
     mut request: Request,
     next: Next,
 ) -> Response {
     // 查询串鉴权:原生 EventSource(SSE)无法设自定义头,只能把 key 放进 URL query。
-    // 前端日志流用 `?api_key=`,历史契约用 `?token=`——两者都接受,api_key 优先。
+    // 前端日志流用 `?api_key=`,历史契约用 `?token=`,Gemini SDK 用 `?key=`——都接受,
+    // 优先级见 [`query_param_key`]。
     let query_key = request.uri().query().and_then(query_param_key);
     let key = extract_key(request.headers(), query_key.as_deref());
 
@@ -212,73 +223,74 @@ pub async fn require_api_key(
         return next.run(request).await;
     }
 
-    // 2) store key 路径(仅协议闸带 store)。
-    if let Some(store) = &auth.api_keys {
-        // 有 store key 时须鉴权;store 为空且无全局 key → 落到开放模式(见 3)。
-        let store_has_keys = !store.is_empty();
-        if let Some(provided) = key.as_deref()
-            && (store_has_keys || global_configured)
-        {
-            let now = now_utc();
-            match store.validate(provided, now) {
-                ApiKeyAuthResult::Valid {
-                    id,
-                    spending_limit,
-                    limit_unit,
-                    ..
-                } => {
-                    // 消费上限:原子 reserve-then-reconcile(闭合 check-then-act 的并发窗口)。
-                    // 读当前已花用量后,在 store 的预留锁内**单一临界区**原子判
-                    // `已花 + 在途预留 + 本次预估 <= 上限`,通过即累加预留并拿到 RAII guard。
-                    //
-                    // finding #3:guard 必须活到**整条响应(含流式 body)真正发完**为止,而非
-                    // 只活到 `next.run` 返回。axum 的 `next.run(request).await` 返回的是一个 body
-                    // 尚未被 poll 的 `Response`——对流式(SSE)响应,此刻 body 一个字节都还没发出去。
-                    // 若 guard 在此作用域结束(即 `require_api_key` return 处)就 drop,则预留在流式
-                    // 消费**开始前**已释放,并发上限形同虚设。故对准入放行的响应,把 guard **移入
-                    // response body**,让 Drop 在 body 流(缓冲或流式一视同仁)彻底读完时才触发。
-                    //
-                    // finding #7:`spent` 快照先读好(stats 是 async 锁,无法与 sync 预留锁合并),
-                    // 随后 `try_reserve_spend` 在同一把 sync 锁内原子完成“读 reserved→判越界→写 reserved”,
-                    // 二者之间无 await;reserved 锁内累加,故并发请求不会据同一 spent 各自越界放行。
-                    let reservation = if let Some(limit) = spending_limit
-                        && let Some(stats) = &auth.stats
-                    {
-                        let spent = current_spent(stats, id, &limit_unit).await;
-                        let est = est_cost_in_unit(&limit_unit);
-                        match store.try_reserve_spend(id, spent, limit, est) {
-                            Ok(guard) => Some(guard),
-                            Err(()) => {
-                                return payment_required("api key spending limit exceeded");
-                            }
+    // 系统里是否存在任何鉴权材料:本闸的期望全局 key(协议闸=主 key;admin 闸=admin key
+    // 否则回退主 key)或 store 里任意一条 key。只要有一条,未命中的请求就必须被拒——
+    // 尤其是"仅用 store key 部署"时,admin 闸的期望全局 key 为空但系统显然已启用鉴权,
+    // 此时管理面绝不能开放。
+    let store_has_keys = auth.api_keys.as_ref().is_some_and(|s| !s.is_empty());
+    let auth_configured = global_configured || store_has_keys;
+
+    // 2) store key 路径:仅协议闸把 store key 当作凭据;admin 闸只在上面用 store 参与
+    //    "是否已配置鉴权"的判定,不在此放行(store key 不得取得管理员权限)。
+    if auth.role == AuthRole::Protocol
+        && let Some(store) = &auth.api_keys
+        && let Some(provided) = key.as_deref()
+        && auth_configured
+    {
+        let now = now_utc();
+        match store.validate(provided, now) {
+            ApiKeyAuthResult::Valid {
+                id,
+                spending_limit,
+                limit_unit,
+                ..
+            } => {
+                // 消费上限:原子 reserve-then-reconcile(闭合 check-then-act 的并发窗口)。
+                // 读当前已花用量后,在 store 的预留锁内**单一临界区**原子判
+                // `已花 + 在途预留 + 本次预估 <= 上限`,通过即累加预留并拿到 RAII guard。
+                //
+                // finding #3:guard 必须活到**整条响应(含流式 body)真正发完**为止,而非
+                // 只活到 `next.run` 返回。axum 的 `next.run(request).await` 返回的是一个 body
+                // 尚未被 poll 的 `Response`——对流式(SSE)响应,此刻 body 一个字节都还没发出去。
+                // 若 guard 在此作用域结束(即 `require_api_key` return 处)就 drop,则预留在流式
+                // 消费**开始前**已释放,并发上限形同虚设。故对准入放行的响应,把 guard **移入
+                // response body**,让 Drop 在 body 流(缓冲或流式一视同仁)彻底读完时才触发。
+                //
+                // finding #7:`spent` 快照先读好(stats 是 async 锁,无法与 sync 预留锁合并),
+                // 随后 `try_reserve_spend` 在同一把 sync 锁内原子完成“读 reserved→判越界→写 reserved”,
+                // 二者之间无 await;reserved 锁内累加,故并发请求不会据同一 spent 各自越界放行。
+                let reservation = if let Some(limit) = spending_limit
+                    && let Some(stats) = &auth.stats
+                {
+                    let spent = current_spent(stats, id, &limit_unit).await;
+                    let est = est_cost_in_unit(&limit_unit);
+                    match store.try_reserve_spend(id, spent, limit, est) {
+                        Ok(guard) => Some(guard),
+                        Err(()) => {
+                            return payment_required("api key spending limit exceeded");
                         }
-                    } else {
-                        None
-                    };
-                    // 惰性激活(首次使用才据 duration_days 定 expires_at;已激活幂等)。
-                    let _ = store.activate_key(id, now);
-                    request.extensions_mut().insert(ApiKeyId(Some(id)));
-                    let response = next.run(request).await;
-                    // 把预留 guard 绑定到响应 body 的生命周期:body 全部发完(流式亦然)才释放预留。
-                    return attach_reservation_to_response(response, reservation);
-                }
-                ApiKeyAuthResult::Disabled => return unauthorized("api key disabled"),
-                ApiKeyAuthResult::Expired => return unauthorized("api key expired"),
-                ApiKeyAuthResult::NotFound => return unauthorized("invalid api key"),
+                    }
+                } else {
+                    None
+                };
+                // 惰性激活(首次使用才据 duration_days 定 expires_at;已激活幂等)。
+                let _ = store.activate_key(id, now);
+                request.extensions_mut().insert(ApiKeyId(Some(id)));
+                let response = next.run(request).await;
+                // 把预留 guard 绑定到响应 body 的生命周期:body 全部发完(流式亦然)才释放预留。
+                return attach_reservation_to_response(response, reservation);
             }
+            ApiKeyAuthResult::Disabled => return unauthorized("api key disabled"),
+            ApiKeyAuthResult::Expired => return unauthorized("api key expired"),
+            ApiKeyAuthResult::NotFound => return unauthorized("invalid api key"),
         }
-        // 无 key 提供:若有全局 key 或有 store key,则要求鉴权 → 401;否则开放。
-        if store_has_keys || global_configured {
-            return unauthorized("invalid api key");
-        }
-        // store 为空且无全局 key → 开放模式。
-        return next.run(request).await;
     }
 
-    // 3) 无 store 的闸(如 admin):仅有全局 key 时须命中,否则(未配置)开放。
-    if global_configured {
+    // 3) 未命中本闸接受的任何凭据:系统里只要存在一条鉴权材料就必须拒。
+    if auth_configured {
         return unauthorized("invalid api key");
     }
+    // 4) 一条鉴权材料都没有(全局 key、admin key、store key 全空)→ 开放模式。
     next.run(request).await
 }
 
@@ -308,21 +320,26 @@ fn now_utc() -> DateTime<Utc> {
     Utc::now()
 }
 
-/// 从 URL query 串提取用于鉴权的 key:优先 `api_key`(SSE EventSource 用),回退 `token`(历史)。
-/// 原生 EventSource 不能设自定义头,故这两条 query 参数是浏览器端 SSE 唯一的携带 key 通道。
+/// 从 URL query 串提取用于鉴权的 key:优先 `api_key`(SSE EventSource 用),
+/// 回退 `token`(历史契约),再回退 `key`(Gemini 生态标准的 `?key=<API key>`)。
+/// 原生 EventSource 不能设自定义头,故 query 参数是浏览器端 SSE 唯一的携带 key 通道;
+/// 官方 Gemini SDK 则默认把 key 放在 `?key=`。
 pub fn query_param_key(query: &str) -> Option<String> {
     let pairs: Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)> =
         url::form_urlencoded::parse(query.as_bytes()).collect();
-    if let Some((_, v)) = pairs.iter().find(|(k, _)| k == "api_key") {
-        return Some(v.clone().into_owned());
-    }
-    if let Some((_, v)) = pairs.iter().find(|(k, _)| k == "token") {
-        return Some(v.clone().into_owned());
+    for name in ["api_key", "token", "key"] {
+        if let Some((_, v)) = pairs.iter().find(|(k, _)| k == name) {
+            return Some(v.clone().into_owned());
+        }
     }
     None
 }
 
-/// 从请求提取调用方 key:优先级 Authorization: Bearer > x-api-key > query(api_key/token)。
+/// 从请求提取调用方 key:优先级
+/// Authorization: Bearer > x-api-key > x-goog-api-key > query(api_key/token/key)。
+///
+/// `x-goog-api-key` 与 `?key=` 是 Gemini 生态的标准凭据通道:官方 SDK 只会走这两条,
+/// 不带 `Authorization`/`x-api-key`,故 Gemini 兼容路由必须认它们,否则携带正确 key 也 401。
 pub fn extract_key(headers: &HeaderMap, query_key: Option<&str>) -> Option<String> {
     if let Some(v) = headers.get("authorization").and_then(|h| h.to_str().ok())
         && let Some(rest) = v.strip_prefix("Bearer ")
@@ -330,6 +347,9 @@ pub fn extract_key(headers: &HeaderMap, query_key: Option<&str>) -> Option<Strin
         return Some(rest.trim().to_string());
     }
     if let Some(v) = headers.get("x-api-key").and_then(|h| h.to_str().ok()) {
+        return Some(v.trim().to_string());
+    }
+    if let Some(v) = headers.get("x-goog-api-key").and_then(|h| h.to_str().ok()) {
         return Some(v.trim().to_string());
     }
     query_key.map(|s| s.to_string())
@@ -452,7 +472,9 @@ mod tests {
             ..Config::default()
         };
         let rc = shared_runtime_config(&cfg);
-        let auth = AuthState::admin(rc.clone());
+        let path = tmp_store_path("adminrole");
+        let _ = std::fs::remove_file(&path);
+        let auth = AuthState::admin(rc.clone(), ApiKeyStore::load(&path));
         let app = Router::new()
             .route("/protected", get(ok_handler))
             .layer(middleware::from_fn_with_state(auth, require_api_key));
@@ -496,6 +518,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 仅用 store key 部署(全局 api_key / admin_api_key 都没配)时,管理面**必须**校验凭据:
+    /// store 里存在任何一条 key 就说明系统已启用鉴权,admin 端点不得当作首次运行而开放。
+    /// 同时 store key 自身在 admin 闸一律不放行——数据面 key 不得取得管理员权限。
+    #[tokio::test]
+    async fn admin_gate_requires_credentials_when_only_store_keys_exist() {
+        use crate::config::{Config, shared_runtime_config};
+        let path = tmp_store_path("adminonlystore");
+        let _ = std::fs::remove_file(&path);
+        let store = ApiKeyStore::load(&path);
+        let k = store.create("u1".into(), None, None, None, None, None, Utc::now());
+        // 全局 key 与 admin key 均未配置,只有 store key。
+        let rc = shared_runtime_config(&Config::default());
+        let auth = AuthState::admin(rc, store);
+        let app = Router::new()
+            .route("/protected", get(ok_handler))
+            .layer(middleware::from_fn_with_state(auth, require_api_key));
+
+        // 不带凭据 → 401(旧行为在此直接放行,等于管理面裸奔)。
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // 带有效 store key → 依旧 401:store key 不是管理员凭据。
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header("authorization", format!("Bearer {}", k.key))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 配了全局 key 且 store 里也有 key 时:admin 闸只认全局 key,store key 仍 401。
+    #[tokio::test]
+    async fn admin_gate_accepts_global_key_but_never_store_key() {
+        use crate::config::{Config, shared_runtime_config};
+        let path = tmp_store_path("adminglobalonly");
+        let _ = std::fs::remove_file(&path);
+        let store = ApiKeyStore::load(&path);
+        let k = store.create("u1".into(), None, None, None, None, None, Utc::now());
+        let cfg = Config {
+            admin_api_key: Some("adm".into()),
+            ..Config::default()
+        };
+        let auth = AuthState::admin(shared_runtime_config(&cfg), store);
+        let app = Router::new()
+            .route("/protected", get(ok_handler))
+            .layer(middleware::from_fn_with_state(auth, require_api_key));
+
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header("authorization", "Bearer adm")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header("authorization", format!("Bearer {}", k.key))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 一条鉴权材料都没有(无全局 key、无 admin key、store 为空)时,admin 闸维持首次运行的开放行为。
+    #[tokio::test]
+    async fn admin_gate_open_when_no_auth_material_at_all() {
+        use crate::config::{Config, shared_runtime_config};
+        let path = tmp_store_path("adminnomaterial");
+        let _ = std::fs::remove_file(&path);
+        let auth = AuthState::admin(
+            shared_runtime_config(&Config::default()),
+            ApiKeyStore::load(&path),
+        );
+        let app = Router::new()
+            .route("/protected", get(ok_handler))
+            .layer(middleware::from_fn_with_state(auth, require_api_key));
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
@@ -596,15 +734,101 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// Gemini 生态标准通道之一:`x-goog-api-key` 请求头(官方 SDK 默认携带方式)。
+    #[tokio::test]
+    async fn accepts_correct_x_goog_api_key_header() {
+        let app = guarded_router(Some("secret".into()));
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header("x-goog-api-key", "secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 错误 key 仍 401。
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header("x-goog-api-key", "wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Gemini 生态标准通道之二:`?key=<API key>` 查询参数。
+    #[tokio::test]
+    async fn accepts_correct_query_key_param() {
+        let app = guarded_router(Some("secret".into()));
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected?key=secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected?key=wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[test]
-    fn query_param_key_prefers_api_key_then_token() {
+    fn query_param_key_prefers_api_key_then_token_then_key() {
         assert_eq!(
             query_param_key("api_key=aaa&token=bbb").as_deref(),
             Some("aaa")
         );
         assert_eq!(query_param_key("token=bbb").as_deref(), Some("bbb"));
+        // Gemini SDK 的 `?key=`;优先级低于既有两条,不改变既有契约。
+        assert_eq!(query_param_key("key=ccc").as_deref(), Some("ccc"));
+        assert_eq!(
+            query_param_key("key=ccc&api_key=aaa").as_deref(),
+            Some("aaa")
+        );
+        assert_eq!(query_param_key("key=ccc&token=bbb").as_deref(), Some("bbb"));
         assert_eq!(query_param_key("foo=bar").as_deref(), None);
         assert_eq!(query_param_key("").as_deref(), None);
+    }
+
+    #[test]
+    fn extract_key_header_priority_covers_gemini_channels() {
+        use axum::http::HeaderValue;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-goog-api-key", HeaderValue::from_static("goog"));
+        // 只有 x-goog-api-key → 用它。
+        assert_eq!(extract_key(&headers, None).as_deref(), Some("goog"));
+        // x-api-key 优先于 x-goog-api-key。
+        headers.insert("x-api-key", HeaderValue::from_static("xapi"));
+        assert_eq!(extract_key(&headers, None).as_deref(), Some("xapi"));
+        // Authorization: Bearer 最优先。
+        headers.insert("authorization", HeaderValue::from_static("Bearer bearer"));
+        assert_eq!(extract_key(&headers, None).as_deref(), Some("bearer"));
+        // 头都没有时才回落 query。
+        assert_eq!(
+            extract_key(&HeaderMap::new(), Some("fromquery")).as_deref(),
+            Some("fromquery")
+        );
     }
 
     #[tokio::test]

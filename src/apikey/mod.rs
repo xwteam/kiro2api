@@ -14,10 +14,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::stats::persist::{
     DirtyFlag, FLUSH_INTERVAL_SECS, atomic_write_json, dirty_channel, read_json, spawn_flush_loop,
@@ -118,9 +120,32 @@ pub enum ApiKeyAuthResult {
     NotFound,
 }
 
+/// 落盘结构:除 key 列表外还持久化 `next_id`,使 id 分配在**删除后也不回收**。
+/// 字段 snake_case,与 `ApiKey` 同规约。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApiKeyStoreFile {
+    /// 下一个待分配的 id;单调递增,进程重启/删除 key 都不回退。
+    #[serde(default)]
+    next_id: u32,
+    #[serde(default)]
+    keys: Vec<ApiKey>,
+}
+
+/// 磁盘上的两种形态:新版对象(含 `next_id`)与旧版裸数组(仅 key 列表)。
+/// 旧文件按 `Legacy` 载入,`next_id` 由现存 id 推出,升级无需迁移脚本。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ApiKeyFile {
+    Versioned(ApiKeyStoreFile),
+    Legacy(Vec<ApiKey>),
+}
+
 /// 线程安全的 API-KEY 存储。持锁在内存改动,落盘经脏标记 + 后台刷盘去抖。
 pub struct ApiKeyStore {
     keys: RwLock<Vec<ApiKey>>,
+    /// 下一个待分配的 id。只增不减(删除的 id 永不回收),随 keys 一同落盘。
+    /// 分配在 `keys` 写锁内完成,故无需自身的原子 CAS 循环。
+    next_id: AtomicU32,
     dirty: DirtyFlag,
     file_path: PathBuf,
     /// 每 key 的“在途预留额”(按各 key 自身 limit_unit 计量,与消费上限同单位)。
@@ -165,12 +190,21 @@ impl Drop for SpendReservation {
 
 impl ApiKeyStore {
     /// 从 `path` 载入(不存在则空),并启动后台刷盘任务(约 5s 去抖批量落盘)。
+    ///
+    /// `next_id` 取 `max(文件里的 next_id, 现存最大 id + 1)`:旧版裸数组文件无该字段时
+    /// 由现存 id 推出(平滑升级),文件被手工编辑过导致 next_id 落后时也不会退回去撞已用 id。
     pub fn load<P: AsRef<Path>>(path: P) -> Arc<Self> {
         let path = path.as_ref().to_path_buf();
-        let initial: Vec<ApiKey> = read_json(&path).ok().flatten().unwrap_or_default();
+        let (initial, stored_next_id) = match read_json::<ApiKeyFile>(&path).ok().flatten() {
+            Some(ApiKeyFile::Versioned(f)) => (f.keys, f.next_id),
+            Some(ApiKeyFile::Legacy(keys)) => (keys, 0),
+            None => (Vec::new(), 0),
+        };
+        let next_id = stored_next_id.max(max_id_plus_one(initial.as_slice()));
         let (dirty, handle) = dirty_channel();
         let store = Arc::new(Self {
             keys: RwLock::new(initial),
+            next_id: AtomicU32::new(next_id),
             dirty,
             file_path: path.clone(),
             reservations: Mutex::new(HashMap::new()),
@@ -180,24 +214,42 @@ impl ApiKeyStore {
         if tokio::runtime::Handle::try_current().is_ok() {
             let snap = store.clone();
             spawn_flush_loop(path, handle, FLUSH_INTERVAL_SECS, move || {
-                let guard = snap.keys.read();
-                serde_json::to_vec_pretty(&*guard).unwrap_or_else(|_| b"[]".to_vec())
+                serde_json::to_vec_pretty(&snap.snapshot_file())
+                    .unwrap_or_else(|_| br#"{"next_id":1,"keys":[]}"#.to_vec())
             });
         }
         store
     }
 
+    /// 当前内存态的落盘快照(key 列表 + 单调 next_id)。
+    fn snapshot_file(&self) -> ApiKeyStoreFile {
+        let keys = self.keys.read().clone();
+        ApiKeyStoreFile {
+            next_id: self.next_id.load(Ordering::SeqCst),
+            keys,
+        }
+    }
+
     /// 同步原子落盘(测试/关键路径即时持久化用;常规写走脏标记后台刷盘)。
     pub fn save_now(&self) -> std::io::Result<()> {
-        let guard = self.keys.read();
-        atomic_write_json(&self.file_path, &*guard)
+        atomic_write_json(&self.file_path, &self.snapshot_file())
     }
 
     /// 校验明文 key:命中后按 启用 + 过期(注入 now)裁决。不检查消费上限
     /// (上限求和依赖 stats 层,由 relay/handler 另行处理)。
+    ///
+    /// 比较走常量时间(与全局 key 同规约),且**遍历全部候选**不在命中处提前退出:
+    /// 否则耗时会随"命中的是第几条 key"/"与某条 key 前多少字节相同"变化,
+    /// 给出可按字节试探的时序侧信道。
     pub fn validate(&self, key_str: &str, now: DateTime<Utc>) -> ApiKeyAuthResult {
         let guard = self.keys.read();
-        match guard.iter().find(|k| k.key == key_str) {
+        let mut hit: Option<&ApiKey> = None;
+        for k in guard.iter() {
+            if ct_eq_key(&k.key, key_str) && hit.is_none() {
+                hit = Some(k);
+            }
+        }
+        match hit {
             None => ApiKeyAuthResult::NotFound,
             Some(k) if !k.enabled => ApiKeyAuthResult::Disabled,
             Some(k) if k.is_expired(now) => ApiKeyAuthResult::Expired,
@@ -221,8 +273,11 @@ impl ApiKeyStore {
         self.keys.read().iter().find(|k| k.id == id).cloned()
     }
 
-    /// 新建一个 key。id 取当前最大值 +1(从 1 起)。生成 "sk-" 前缀随机明文。
-    /// `created_at` 由注入的 `now` 决定。返回新建的 ApiKey 克隆。
+    /// 新建一个 key。id 由单调递增的 `next_id` 分配(从 1 起,已删除的 id 永不回收)。
+    /// 生成 "sk-" 前缀随机明文。`created_at` 由注入的 `now` 决定。返回新建的 ApiKey 克隆。
+    ///
+    /// id 不回收是硬约束:用量记录、消费统计均以 api-key id 归属,复用已删除的 id 会让
+    /// 新 key 直接继承前任的调用明细(IP/模型/费用跨用户泄露)与累计消费(可能一上来就 402)。
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         &self,
@@ -236,7 +291,14 @@ impl ApiKeyStore {
     ) -> ApiKey {
         let created = {
             let mut guard = self.keys.write();
-            let next_id = guard.iter().map(|k| k.id).max().unwrap_or(0) + 1;
+            // 在 keys 写锁内分配:与现存最大 id + 1 取上确界,兼容外部直接改文件后
+            // next_id 落后于实际 id 的情形;分配后立即推进,故并发 create 不会撞号。
+            let next_id = self
+                .next_id
+                .load(Ordering::SeqCst)
+                .max(max_id_plus_one(guard.as_slice()));
+            self.next_id
+                .store(next_id.saturating_add(1), Ordering::SeqCst);
             let key = ApiKey {
                 id: next_id,
                 key: generate_api_key(),
@@ -429,6 +491,26 @@ pub fn api_keys_path_from(credentials_path: &str) -> PathBuf {
         _ => PathBuf::from("."),
     };
     dir.join("api_keys.json")
+}
+
+/// 现存 key 里最大 id + 1(空列表 → 1),即"不撞已用 id"的下界。
+/// id 已到 u32 上界时饱和(现实中不可达),不回绕成小 id。
+fn max_id_plus_one(keys: &[ApiKey]) -> u32 {
+    keys.iter()
+        .map(|k| k.id)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+}
+
+/// 明文 key 的常量时间比较:长度不同直接判否(长度非秘密),等长走 `subtle`,
+/// 使耗时与"前多少字节相同"无关。
+fn ct_eq_key(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.ct_eq(b).into()
 }
 
 /// 生成 "sk-" 前缀 + 128-bit 随机(hex)明文 key。getrandom 失败极罕见,回退时
@@ -685,6 +767,106 @@ mod tests {
         assert_eq!(k.duration_days, Some(1.0));
         assert_eq!(k.bound_credential_ids, Some(vec![1]));
         assert!(k.key.starts_with("sk-"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deleted_ids_are_never_reused_across_reload() {
+        let path = tmp_path("nextid");
+        let _ = std::fs::remove_file(&path);
+        let now = ts("2026-07-20T00:00:00Z");
+        {
+            let store = ApiKeyStore::load(&path);
+            let k1 = store.create("0001".into(), None, None, None, None, None, now);
+            let k2 = store.create("0002".into(), None, None, None, None, None, now);
+            assert_eq!((k1.id, k2.id), (1, 2));
+            // 删掉末条后新建:不得复用 id=2(否则新 key 继承前任的用量记录与累计消费)。
+            assert!(store.delete(k2.id));
+            let k3 = store.create("0003".into(), None, None, None, None, None, now);
+            assert_eq!(k3.id, 3);
+            // 全部删光后依然不回退到 1。
+            assert!(store.delete(k1.id));
+            assert!(store.delete(k3.id));
+            assert!(store.is_empty());
+            let k4 = store.create("0004".into(), None, None, None, None, None, now);
+            assert_eq!(k4.id, 4);
+            assert!(store.delete(k4.id));
+            store.save_now().unwrap();
+        }
+        // 重启:key 列表已空,next_id 仍由落盘字段恢复,不从 1 重来。
+        let reloaded = ApiKeyStore::load(&path);
+        assert!(reloaded.is_empty());
+        let k5 = reloaded.create("0005".into(), None, None, None, None, None, now);
+        assert_eq!(k5.id, 5);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_array_file_loads_and_next_id_follows_max_id() {
+        let path = tmp_path("legacy");
+        let _ = std::fs::remove_file(&path);
+        // 旧版落盘形态:裸数组、无 next_id 字段。
+        let legacy = r#"[
+          {"id":1,"key":"sk-aaa","name":"0001","enabled":true,"created_at":"2026-07-20T00:00:00Z"},
+          {"id":7,"key":"sk-bbb","name":"0007","enabled":true,"created_at":"2026-07-20T00:00:00Z"}
+        ]"#;
+        std::fs::write(&path, legacy).unwrap();
+        let now = ts("2026-07-21T00:00:00Z");
+
+        let store = ApiKeyStore::load(&path);
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.get_by_id(7).unwrap().name, "0007");
+        // 无 next_id 字段 → 由现存最大 id 推出,新 key 不撞已用 id。
+        let k = store.create("new".into(), None, None, None, None, None, now);
+        assert_eq!(k.id, 8);
+        // 升级后按新形态落盘;删掉最后一条再载入,next_id 依旧不回退。
+        assert!(store.delete(k.id));
+        store.save_now().unwrap();
+        let reloaded = ApiKeyStore::load(&path);
+        assert_eq!(reloaded.len(), 2);
+        let k2 = reloaded.create("newer".into(), None, None, None, None, None, now);
+        assert_eq!(k2.id, 9);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn constant_time_key_compare_accepts_exact_match_only() {
+        assert!(ct_eq_key("sk-abc", "sk-abc"));
+        assert!(!ct_eq_key("sk-abc", "sk-abd"));
+        assert!(!ct_eq_key("sk-abc", "sk-ab")); // 前缀不算命中
+        assert!(!ct_eq_key("sk-abc", "sk-abcd"));
+        assert!(!ct_eq_key("", "sk-abc"));
+        assert!(ct_eq_key("", ""));
+    }
+
+    #[test]
+    fn validate_matches_exact_key_at_any_position() {
+        let path = tmp_path("ctvalidate");
+        let _ = std::fs::remove_file(&path);
+        let store = ApiKeyStore::load(&path);
+        let now = ts("2026-07-20T00:00:00Z");
+        let first = store.create("a".into(), None, None, None, None, None, now);
+        let _mid = store.create("b".into(), None, None, None, None, None, now);
+        let last = store.create("c".into(), None, None, None, None, None, now);
+
+        // 首条与末条都须命中(遍历全部候选,不因位置靠后而漏判)。
+        for k in [&first, &last] {
+            match store.validate(&k.key, now) {
+                ApiKeyAuthResult::Valid { id, .. } => assert_eq!(id, k.id),
+                other => panic!("expected Valid, got {other:?}"),
+            }
+        }
+        // 前缀/多一字节/大小写变体都不得命中。
+        let prefix = &last.key[..last.key.len() - 1];
+        assert_eq!(store.validate(prefix, now), ApiKeyAuthResult::NotFound);
+        assert_eq!(
+            store.validate(&format!("{}0", last.key), now),
+            ApiKeyAuthResult::NotFound
+        );
+        assert_eq!(
+            store.validate(&last.key.to_uppercase(), now),
+            ApiKeyAuthResult::NotFound
+        );
         let _ = std::fs::remove_file(&path);
     }
 
