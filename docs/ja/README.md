@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.1.3-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.1.4-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日付 | 更新内容 |
 |------|----------|
+| 2026-07-26 | v0.1.4 - 🐛 修正：Anthropic の `system` フィールドがコンテンツブロック配列（文字列だけでなく）に対応——Claude Code / プロンプトキャッシュ対応 SDK が配列で送っても 422 にならない |
 | 2026-07-26 | v0.1.3 - 📥 一括 JSON インポートがアカウントごとの進捗をリアルタイム表示：プログレスバー、成功/重複/失敗の集計、行ごとのステータスリスト（検証中 → 検証済み（使用量付き）/ 重複 / 失敗（ロールバック））；検証済みアカウントは即座に保存されるため、途中で中断しても失われません |
 | 2026-07-25 | v0.1.2 - 🔔 更新ダイアログ刷新：更新チェックダイアログが現在の UI 言語のリリースノート + コピー可能なアップグレードコマンドを表示、更新がある場合はボタンが「vX に更新」とハイライト；平文 HTTP 下でのコピーボタンの不具合を修正 |
 | 2026-07-25 | v0.1.1 - 🛠 パネルとアカウントインポートの修正：モデルテストが未作成時にマスター API キーへフォールバック；一括インポートを 1 件ずつの「疎通検証 + 重複排除」に変更；大量リストで一括インポートが失敗する不具合を修正；ユーザーパネル/全ページの favicon + 128x128 ロゴと各 README のバージョンバッジ；クロスコンパイルのマルチアーキテクチャイメージビルド |

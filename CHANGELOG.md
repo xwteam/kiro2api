@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-07-26
+
+### Fixed
+
+- **Anthropic `system` 字段兼容内容块数组**:真实客户端(Claude Code、带 prompt 缓存的 SDK)会把 `system` 发成 `[{"type":"text","text":"…","cache_control":{…}}]` 数组,之前只接受字符串会返回 422(`invalid type: sequence, expected a string`)。现在 `system` 同时接受字符串与内容块数组两种形态,转发到 Kiro 后端与 `count_tokens` 时拍平为纯文本(OpenAI/Gemini/Responses 前端不受影响)。
+
 ## [0.1.3] - 2026-07-26
 
 批量导入 JSON 的实时化改版。

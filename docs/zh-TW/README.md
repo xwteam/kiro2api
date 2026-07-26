@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.1.3-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.1.4-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-07-26 | v0.1.4 - 🐛 修復 Anthropic `system` 欄位支援內容區塊陣列（不只字串）——Claude Code / 帶 prompt 快取的 SDK 把 system 發成陣列時不再回 422 |
 | 2026-07-26 | v0.1.3 - 📥 批次 JSON 匯入改為即時逐條進度：進度條、即時累計成功/重複/失敗統計，以及逐條狀態清單（驗證中 → 已驗證並顯示用量 / 重複 / 失敗已回滾）；已驗證帳號即時落盤，匯入途中中斷也不會遺失 |
 | 2026-07-25 | v0.1.2 - 🔄 檢查更新對話框改版：檢查更新對話框改為顯示當前介面語言的發行說明 + 可一鍵複製的升級指令；有更新時按鈕高亮為「更新到 vX」；修復純 HTTP 下複製按鈕失效 |
 | 2026-07-25 | v0.1.1 - 🛠 面板與帳號匯入修復：模型測試在未建立自訂 key 時預設回退主 API 金鑰；批次匯入改為逐條「探活驗證 + 去重」；修復批次匯入在較大清單時失敗；使用者面板/全頁 favicon + 128×128 logo 與各語言 README 版本徽章；交叉編譯多架構映像建置 |
