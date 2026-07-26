@@ -191,19 +191,30 @@ pub fn body_signals_auth_invalid(body: &str) -> bool {
 ///
 /// 判定顺序与 [`classify_with_body`] 一致地保守:
 /// 1. 体带**可自愈**信号([`body_signals_recoverable`]:过期/暂停/限流/配额/风控)→ `AuthAmbiguous`;
-/// 2. 体带**真凭据失效**信号([`body_signals_auth_invalid`]:invalid_grant 等)→ `AuthInvalid`(永久禁用);
+/// 2. **仅在 400/401/403** 上,体带**真凭据失效**信号([`body_signals_auth_invalid`]:invalid_grant
+///    等)→ `AuthInvalid`(永久禁用);
 /// 3. 402/429 → `Quota`;401/403 但无确证 → `AuthAmbiguous`(冷却,不禁用);
-/// 4. 其余(5xx/网关错误/无体)→ `Transient`(记 strike)。
+/// 4. 其余(5xx/网关错误/无体)→ `Transient`(记 strike);其中若体里恰好带失效字样,
+///    降级为 `AuthAmbiguous`(冷却,可自愈)而非禁用。
 pub fn classify_refresh_failure(status: u16, body: &str) -> FailureKind {
     if body_signals_recoverable(body) {
         return FailureKind::AuthAmbiguous;
     }
-    if body_signals_auth_invalid(body) {
+    // 永久禁用的升级**必须**被状态码收口:只有上游真的在"报授权作废"的那几个码才算确证——
+    // token 端点用 400 + error=invalid_grant(RFC 6749 §5.2)表达授权已作废,401/403 则是凭据被拒。
+    // 其余状态码(5xx、网关/代理返回的 HTML 错误页、404、传输层无应答的 0)哪怕体里恰好出现
+    // "invalid" 字样,也只是错误页文案的巧合,不足以证明凭据作废;不收口就会因上游一次抖动把
+    // 完全健康的账号永久禁用。这与数据面 [`classify_with_body`] 把同一判定关在 401|403 分支内
+    // 是同一条纪律。
+    let signals_auth_invalid = body_signals_auth_invalid(body);
+    if signals_auth_invalid && matches!(status, 400 | 401 | 403) {
         return FailureKind::AuthInvalid;
     }
     match status {
         402 | 429 => FailureKind::Quota,
         401 | 403 => FailureKind::AuthAmbiguous,
+        // 命中失效标记但状态码不构成确证 → 落 AuthAmbiguous(自愈冷却),绝不永久禁用。
+        _ if signals_auth_invalid => FailureKind::AuthAmbiguous,
         _ => FailureKind::Transient,
     }
 }
@@ -1467,6 +1478,70 @@ mod tests {
             FailureKind::AuthAmbiguous
         );
         assert_eq!(classify_refresh_failure(429, ""), FailureKind::Quota);
+    }
+
+    /// 永久禁用只允许发生在上游"真的在报授权作废"的状态码(400/401/403)上;其余状态码
+    /// 哪怕体里恰好带 invalid 字样(网关 HTML 错误页/代理文案),也只能冷却。
+    #[test]
+    fn classify_refresh_failure_confines_permanent_disable_to_auth_statuses() {
+        // (a) 5xx + 看着像 invalid_grant 的体 → 冷却,**不**永久禁用。
+        for status in [500u16, 502, 503, 504] {
+            assert_eq!(
+                classify_refresh_failure(status, r#"{"error":"invalid_grant"}"#),
+                FailureKind::AuthAmbiguous,
+                "status {status} 不得因体里带 invalid_grant 就永久禁用"
+            );
+        }
+        // 网关/代理返回的 HTML 错误页里出现 "...is invalid." 之类措辞,同样只冷却。
+        assert_eq!(
+            classify_refresh_failure(
+                502,
+                "<html><body>Bad Gateway: the upstream response is invalid.</body></html>"
+            ),
+            FailureKind::AuthAmbiguous
+        );
+        assert_eq!(
+            classify_refresh_failure(404, r#"{"__type":"InvalidGrantException"}"#),
+            FailureKind::AuthAmbiguous
+        );
+        // 传输层无 HTTP 应答(status=0,ensure_fresh 用 0 传短标签)→ 也不得禁用。
+        assert_eq!(
+            classify_refresh_failure(0, "connect error: invalid_token"),
+            FailureKind::AuthAmbiguous
+        );
+
+        // (b) 真正的 invalid_grant 状态码(token 端点 400,以及 401/403)→ 仍然永久禁用。
+        for status in [400u16, 401, 403] {
+            assert_eq!(
+                classify_refresh_failure(status, r#"{"error":"invalid_grant"}"#),
+                FailureKind::AuthInvalid,
+                "status {status} + invalid_grant 必须仍判永久失效"
+            );
+        }
+        assert_eq!(
+            classify_refresh_failure(401, r#"{"__type":"UnauthorizedException"}"#),
+            FailureKind::AuthInvalid
+        );
+
+        // (c) 瞬时类判定不受影响:无失效标记的 5xx / 无体 / 传输层错误仍是 Transient。
+        assert_eq!(
+            classify_refresh_failure(500, "internal error"),
+            FailureKind::Transient
+        );
+        assert_eq!(classify_refresh_failure(502, ""), FailureKind::Transient);
+        assert_eq!(
+            classify_refresh_failure(0, "connection timed out"),
+            FailureKind::Transient
+        );
+        // 可自愈信号仍最先短路(即便状态码是 400/401/403)。
+        assert_eq!(
+            classify_refresh_failure(400, r#"{"__type":"ExpiredTokenException"}"#),
+            FailureKind::AuthAmbiguous
+        );
+        assert_eq!(
+            classify_refresh_failure(503, r#"{"__type":"ThrottlingException"}"#),
+            FailureKind::AuthAmbiguous
+        );
     }
 
     #[test]

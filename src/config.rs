@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -63,10 +64,38 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
             Err(e) => return Err(e.into()),
         };
+        // 未显式配置 credentialsPath 时,把内置默认就近解析到配置文件所在目录
+        // (必须在 apply_env_overrides 之前:它只是"默认层",不能盖过 env/config.json)。
+        cfg.resolve_default_credentials_beside_config(path);
         cfg.apply_env_overrides();
         // 记录本配置文件路径,供运行期改写(auth-keys / load-balancing)原子落盘定位。
         cfg.config_path = path.to_string();
         Ok(cfg)
+    }
+
+    /// 把**内置默认**的凭据路径(相对文件名 `credentials.json`)就近解析到配置文件所在目录。
+    ///
+    /// 凭据路径的父目录同时承载用量统计 / api_keys.json / 余额缓存,容器里必须落在挂载卷内,
+    /// 否则重建即丢。容器以 `-c /app/data/config.json` 启动,故就近解析后默认落在
+    /// `/app/data/`(卷内)——无需在镜像里烘焙 `ENV CREDENTIALS_PATH`,那会让环境变量层
+    /// **凌驾于 config.json 之上**,把用户在 config.json 里设的自定义路径静默改道。
+    ///
+    /// 仅在"值仍等于内置默认"时生效,故显式配置(config.json / env / CLI)一律不受影响;
+    /// 配置文件本身是无目录的相对名(裸机默认 `config.json`)时是 no-op,裸机行为不变。
+    fn resolve_default_credentials_beside_config(&mut self, config_path: &str) {
+        if self.credentials_path != Config::default().credentials_path {
+            return; // 已显式配置 → 不碰
+        }
+        let Some(dir) = Path::new(config_path).parent() else {
+            return;
+        };
+        if dir.as_os_str().is_empty() {
+            return; // 无目录部分(如 "config.json")→ 保持相对名,行为不变
+        }
+        self.credentials_path = dir
+            .join(&self.credentials_path)
+            .to_string_lossy()
+            .into_owned();
     }
 
     fn apply_env_overrides(&mut self) {

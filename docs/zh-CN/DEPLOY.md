@@ -493,7 +493,7 @@ API_KEY=sk-xxx ./target/release/kiro2api \
 > 配置优先级：**命令行参数 > 环境变量 > `config.json` > 内置默认**。`--credentials` 不给时由 `CREDENTIALS_PATH` / `config.json` 的 `credentialsPath` / 默认的 `credentials.json`（相对当前工作目录）决定；用量统计、`api_keys.json` 与余额缓存都落在该文件的父目录里。
 
 > [!TIP]
-> 裸机部署请勿轻易把 `HOST` 改成 `0.0.0.0`。`/admin`、`/user` 面板本体始终不鉴权，`/api/admin/*`、`/api/user/*` 也只有在配置了 `adminApiKey`/`apiKey` 之后才受保护——一个都不配时管理接口对所有人开放。
+> 裸机部署请勿轻易把 `HOST` 改成 `0.0.0.0`。`/admin`、`/user` 面板本体始终不鉴权，`/api/admin/*` 只有在配置了 `adminApiKey`（缺省回退 `apiKey`）之后才受保护——一个都不配时管理接口对所有人开放；`/api/user/*` 不走该闸，始终要求调用方自带有效 API-KEY（无效/停用/过期即 401）。
 
 ## 上线切换建议
 

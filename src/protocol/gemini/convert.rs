@@ -25,36 +25,48 @@ fn response_value_to_text(v: &Value) -> Value {
 /// 缺失时按「函数名 + 该名在本请求内的出现序号」生成——**不能**拿函数名当 id,
 /// 否则同一轮里并行调用同一个函数会产生重复 id,中枢按 id 归并时会把它们并成一条。
 ///
-/// 调用与结果各用一套计数器:一次 `functionCall` 之后必跟一次 `functionResponse`,
-/// 两侧同名序号天然对齐,故即便双方都没带 id,tool_use 与 tool_result 仍能配上对。
+/// 结果侧缺 id 时**按同名调用的出现顺序回填**成那次调用的实际 id,而不是另起一套计数器。
+///
+/// 为什么不能各记各的:出站 `hub_to_gemini` 会把中枢 tool_use_id 带进 `functionCall.id`,而
+/// Google SDK 的惯用法是把模型那条 Content **原样**塞回历史、再追加一条只有 `name`+`response`
+/// 的 `functionResponse`(不回带 id)。于是调用侧取到真 id(如 `tooluse_abc`)、结果侧却生成
+/// `{name}_{n}`,两边对不上 —— 中枢按 id 配对,工具结果就成了没人认领的孤儿,模型会反复重发
+/// 同一个调用。改为回填后:客户端回带 id → 精确配对(并行同名调用也不串);不回带 id → 按同名
+/// 第 n 次调用positional 配对(正是 Gemini 语义);历史里压根没有对应调用 → 才回落 `{name}_{n}`。
 /// 生成式 `{name}_{n}`(`n` 为纯数字)在名字集合上是单射,不会与另一函数名撞车。
 #[derive(Default)]
 struct ToolIdAlloc {
-    calls: HashMap<String, u32>,
-    responses: HashMap<String, u32>,
+    /// 每个函数名已出现过的 `functionCall` id,按出现顺序;结果侧缺 id 时据此回填。
+    calls_by_name: HashMap<String, Vec<String>>,
+    /// 每个函数名已消费掉的 `functionResponse` 个数(即下一个该配第几次调用)。
+    responses_seen: HashMap<String, usize>,
 }
 
 impl ToolIdAlloc {
-    /// 取该函数名的下一个序号并拼出 id(序号自 0 起,确定性、不含随机数)。
-    fn next(counter: &mut HashMap<String, u32>, name: &str) -> String {
-        let n = counter.entry(name.to_string()).or_insert(0);
-        let id = format!("{name}_{n}");
-        *n += 1;
+    fn call_id(&mut self, call: &FunctionCall) -> String {
+        let seen = self.calls_by_name.entry(call.name.clone()).or_default();
+        let id = match call.id.as_deref().filter(|s| !s.is_empty()) {
+            Some(id) => id.to_string(),
+            // 缺 id:按同名出现序号生成,保证并行同名调用彼此不同 id。
+            None => format!("{}_{}", call.name, seen.len()),
+        };
+        seen.push(id.clone());
         id
     }
 
-    fn call_id(&mut self, call: &FunctionCall) -> String {
-        match call.id.as_deref().filter(|s| !s.is_empty()) {
-            Some(id) => id.to_string(),
-            None => Self::next(&mut self.calls, &call.name),
-        }
-    }
-
     fn response_id(&mut self, resp: &FunctionResponse) -> String {
-        match resp.id.as_deref().filter(|s| !s.is_empty()) {
-            Some(id) => id.to_string(),
-            None => Self::next(&mut self.responses, &resp.name),
+        if let Some(id) = resp.id.as_deref().filter(|s| !s.is_empty()) {
+            return id.to_string(); // 客户端回带了 id:直接用,最精确
         }
+        let n = self.responses_seen.entry(resp.name.clone()).or_insert(0);
+        let idx = *n;
+        *n += 1;
+        self.calls_by_name
+            .get(&resp.name)
+            .and_then(|ids| ids.get(idx))
+            .cloned()
+            // 历史里没有第 idx 次同名调用(客户端只发结果不发调用)→ 保持原生成式。
+            .unwrap_or_else(|| format!("{}_{}", resp.name, idx))
     }
 }
 
@@ -263,6 +275,79 @@ mod tests {
                 function_response: None,
             }],
         }
+    }
+
+    /// 回归:出站 `functionCall.id` + 客户端**不回带 id** 的 `functionResponse` 必须仍能配对。
+    ///
+    /// 这是 Google SDK 的惯用法(模型那条 Content 原样塞回历史,结果只带 name+response)。
+    /// 结果侧若另起计数器生成 `{name}_0`,就与调用侧的真 id 对不上,工具结果成孤儿、模型反复重发。
+    #[test]
+    fn function_response_without_id_pairs_with_echoed_call_id() {
+        let hub = gemini_to_hub(
+            GenerateContentRequest {
+                contents: vec![
+                    // 模型那条:带出站真 id(hub_to_gemini 恒发)
+                    Content {
+                        role: Some("model".to_string()),
+                        parts: vec![Part {
+                            text: None,
+                            inline_data: None,
+                            function_call: Some(FunctionCall {
+                                id: Some("tooluse_abc123".to_string()),
+                                name: "get_weather".to_string(),
+                                args: json!({"city": "SF"}),
+                            }),
+                            function_response: None,
+                        }],
+                    },
+                    // 客户端回填的结果:只有 name + response,**没有 id**
+                    Content {
+                        role: Some("user".to_string()),
+                        parts: vec![Part {
+                            text: None,
+                            inline_data: None,
+                            function_call: None,
+                            function_response: Some(FunctionResponse {
+                                id: None,
+                                name: "get_weather".to_string(),
+                                response: json!({"temp": 20}),
+                            }),
+                        }],
+                    },
+                ],
+                system_instruction: None,
+                tools: None,
+                tool_config: None,
+                generation_config: None,
+            },
+            "claude-sonnet-4.5".to_string(),
+        );
+
+        let ContentIn::Blocks(call_blocks) = &hub.messages[0].content else {
+            panic!("模型消息应为块数组");
+        };
+        let call_id = call_blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("应有 tool_use");
+        let ContentIn::Blocks(result_blocks) = &hub.messages[1].content else {
+            panic!("结果消息应为块数组");
+        };
+        let result_id = result_blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .expect("应有 tool_result");
+        assert_eq!(call_id, "tooluse_abc123");
+        assert_eq!(
+            result_id, call_id,
+            "结果侧缺 id 时必须回填成同名调用的真实 id,否则工具配对断裂"
+        );
     }
 
     #[test]

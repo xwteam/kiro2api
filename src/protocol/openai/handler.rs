@@ -316,6 +316,9 @@ pub async fn chat_completions_stream(
         let mut truncation: Option<crate::kiro::convert::Truncation> = None;
         // 上游中途下发的非截断 exception:置位即停读,收尾走错误分支。
         let mut upstream_error: Option<crate::kiro::convert::StreamException> = None;
+        // 传输层中断(连接重置 / 读超时 / chunked 体未收尾):与 in-band exception 一样
+        // 必须以错误 chunk 收尾且**不发 [DONE]**,否则客户端把半截回答当正常完成。
+        let mut transport_err: Option<(u16, String)> = None;
 
         'read: loop {
             match resp.chunk().await {
@@ -385,11 +388,32 @@ pub async fn chat_completions_stream(
                     }
                 }
                 Ok(None) => break,
-                Err(_) => break, // 流中断:尽力收尾
+                Err(e) => {
+                    // 流中断:记下原因,收尾走错误 chunk(不可伪装成正常完成)。
+                    let status = if e.is_timeout() { 504 } else { 502 };
+                    transport_err = Some((status, e.to_string()));
+                    break;
+                }
             }
         }
 
-        if let Some(e) = upstream_error {
+        if let Some((status, detail)) = transport_err {
+            // 与 exception 分支同口径:发错误 chunk 后终止,不补 [DONE]。
+            tracing::warn!(
+                event = "upstream_stream_interrupted",
+                status = status,
+                detail = %detail,
+                "上游事件流传输中断"
+            );
+            let body = serde_json::json!({
+                "error": {
+                    "message": format!("upstream stream interrupted: {detail}"),
+                    "type": "upstream_error",
+                    "code": status,
+                }
+            });
+            yield Ok(Event::default().data(body.to_string()));
+        } else if let Some(e) = upstream_error {
             let (status, err_body) = upstream_exception_to_openai(&e);
             tracing::warn!(
                 event = "upstream_stream_exception",

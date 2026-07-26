@@ -8,7 +8,7 @@ use crate::webui;
 use axum::{Json, Router, routing::get};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 /// 进程启动时刻,首次 `build_router*` 时捕获一次(`OnceLock` 幂等)。
@@ -54,7 +54,11 @@ pub fn build_router_with_handles(
     // 从配置路径加载凭据;文件不存在/解析失败均回落空池,
     // /v1/messages 遇空池返回 503(不影响 health/webui 路由,默认配置测试保持全绿)。
     let creds = credential::load(&cfg.credentials_path).unwrap_or_default();
-    let mut pool_inner = Pool::new(creds, LbMode::Priority);
+    // 账号 id 高水位:读上次落盘值,使"已删除账号的编号"重启后也不被复用。
+    // 旧安装没有该旁挂文件 → `None` → 传 0,由 `with_next_id` 平滑退化为 `max(现有 id)+1`
+    // 的原语义。不接这一步的话高水位只写不读,重启即退回复用编号(旧令牌覆盖新账号凭据)。
+    let persisted_next_id = credential::load_next_id(&cfg.credentials_path).unwrap_or(0);
+    let mut pool_inner = Pool::with_next_id(creds, LbMode::Priority, persisted_next_id);
     // RPM 限流与负载均衡模式均来自配置(默认无限 RPM/Priority,保持既有行为)。
     pool_inner.set_max_rpm(cfg.max_rpm_per_credential);
     if cfg.load_balancing_mode.eq_ignore_ascii_case("balanced") {
@@ -149,9 +153,10 @@ pub fn build_router_with_handles(
         .layer(axum::middleware::from_fn_with_state(
             // admin 闸:admin_api_key(非空)否则回退主 api_key 的全局 key 校验,不查消费上限。
             // 期望 key 从 runtime_cfg 实时读取,使 PUT /config/auth-keys 改 admin 密码后
-            // 无需重启即时生效。store 一并传入,但**只作"系统是否已配置鉴权"的判据**:
-            // 仅用 store key 部署(两个全局 key 都为空)时管理面必须校验凭据而非开放;
-            // store key 本身在 admin 闸不放行,拿不到管理员权限。
+            // 无需重启即时生效。store 一并传入但 admin 闸**不据其判定"是否已配置鉴权"**:
+            // store key 是用户级凭据、在 admin 闸永不放行,若让它把闸判成已配置,首次部署
+            // 建出第一把 key 就会自锁(能开锁的管理员凭据一把都没有)。故 admin 闸只认
+            // 管理员级凭据(admin_api_key,缺省回退 api_key)。
             auth::AuthState::admin(runtime_cfg.clone(), api_keys.clone()),
             auth::require_api_key,
         ))
@@ -192,8 +197,9 @@ async fn ping() -> Json<serde_json::Value> {
 /// 启动期鉴权配置体检:返回需要提示的告警文案(空 = 无隐患)。
 ///
 /// 抽成纯函数以便单测钉住各场景的覆盖面;`serve()` 只负责逐条 warn。
-/// 判据只看两个全局 key:store 里的每用户 key 会让两道闸都要求凭据,故文案里以
-/// "未创建任何 API-KEY 前"限定开放的适用范围。
+/// 判据只看两个全局 key。注意两道闸的口径不同:**协议闸**认 store key(建了 API-KEY 即收口,
+/// 故协议那条文案带"未创建任何 API-KEY 前"限定);**admin 闸**只认管理员级凭据,建 API-KEY
+/// 不会收口,故管理面那条**不得**带该限定,否则低估暴露面。
 fn auth_startup_warnings(cfg: &Config) -> Vec<String> {
     let api_key_set = !cfg.api_key.as_deref().unwrap_or("").trim().is_empty();
     let admin_key_set = !cfg.admin_api_key.as_deref().unwrap_or("").trim().is_empty();
@@ -212,9 +218,11 @@ fn auth_startup_warnings(cfg: &Config) -> Vec<String> {
                     .to_string(),
             );
         } else {
-            // 两个 key 都没有:管理面同样开放——可读写账号凭据、密钥与统计,危害远大于协议端点。
+            // 两个 key 都没有:管理面完全开放——可读写账号凭据、密钥与统计,危害远大于协议端点。
+            // 措辞不能带"在未创建任何 API-KEY 前"这类限定:admin 闸只认管理员级凭据,建 API-KEY
+            // **不会**自动收口(那样会把首次部署的运营者锁在门外,见 admin_stats_open_when_only_store_keys_exist)。
             warnings.push(
-                "未设置 admin_api_key:/admin 管理面在未创建任何 API-KEY 前同样开放访问(可读写账号凭据、API-KEY 与统计);请设置环境变量 ADMIN_API_KEY=<强口令> 后重启"
+                "未设置 admin_api_key/api_key:/admin 管理面当前完全开放(任何人可读写账号凭据、API-KEY 与统计),创建 API-KEY 也不会自动收口;请在管理面设置管理员密钥,或设置环境变量 ADMIN_API_KEY=<强口令> 后重启"
                     .to_string(),
             );
         }
@@ -255,6 +263,52 @@ async fn shutdown_signal() {
     tracing::info!("收到停机信号,停止接受新连接,等待在途请求结束");
 }
 
+/// 停机排空窗口:收到 SIGTERM/SIGINT 后最多再给在途请求这么久收尾,到点无论是否
+/// 还有连接挂着都继续走最终刷盘并退出。
+///
+/// 为什么必须有上界:admin 实时日志 SSE(`/api/admin/logs/stream`)是**无限流**——它只在
+/// 广播发送端释放时才结束,而发送端由路由 state 持有,服务器活着就不会释放。axum 的
+/// `with_graceful_shutdown` 要等所有在途响应结束才返回,故只要有一个管理页开着日志流,
+/// 停机就会永远卡住,最后被容器宽限期结束时的 SIGKILL 硬掐——在途中转流照样被切断,
+/// 统计最终刷盘反而彻底跳过,和不做优雅停机相比只坏不好。
+///
+/// 取 8s 的理由:必须**短于**容器宽限期(docker stop 默认 10s、本仓 compose 未改;
+/// 编排器一般 30s),给窗口到期后的刷盘 + 收尾留出余量;同时长于绝大多数在途一问一答
+/// 请求(控制面有整请求超时护栏),正常停机仍能干净排空。
+const SHUTDOWN_DRAIN_WINDOW: Duration = Duration::from_secs(8);
+
+/// 等服务器结束,但只给"停机信号已到"之后的排空阶段有界的等待时长。
+///
+/// - `server`:`axum::serve(..).with_graceful_shutdown(..)` 的 future。
+/// - `shutdown_started`:停机信号已触发的通知(由信号 future 顺手发出)。
+/// - 返回 `Some(结果)` = 服务器自行结束(干净排空);`None` = 窗口到期仍有连接未结束,
+///   调用方应放弃等待、直接收尾。
+///
+/// 抽成泛型函数是为了能用假 future 单测边界行为,不必真开监听 socket。
+/// 取 `IntoFuture` 而非 `Future`:axum 的 `WithGracefulShutdown` 只实现前者(普通 future
+/// 经空实现自动满足),这样调用点直接传 `axum::serve(..)..` 的返回值即可。
+/// `biased`:优先轮询服务器,使"信号与结束同时就绪"时确定性地报干净结束。
+async fn drain_with_deadline<F, S>(
+    server: F,
+    shutdown_started: S,
+    window: Duration,
+) -> Option<F::Output>
+where
+    F: std::future::IntoFuture,
+    S: std::future::Future<Output = ()>,
+{
+    let server = server.into_future();
+    tokio::pin!(server, shutdown_started);
+    tokio::select! {
+        biased;
+        // 服务器先结束:要么在途请求已全部跑完,要么 accept 出错提前返回。
+        out = &mut server => return Some(out),
+        // 停机信号到达:进入下面的有界排空窗口。
+        _ = &mut shutdown_started => {}
+    }
+    tokio::time::timeout(window, &mut server).await.ok()
+}
+
 pub async fn serve(
     cfg: Config,
     log_capture: Option<Arc<crate::logcap::LogCapture>>,
@@ -271,15 +325,44 @@ pub async fn serve(
     //
     // `with_graceful_shutdown`:收到 SIGTERM/SIGINT 后停止 accept,已建立的连接(含在途
     // SSE 长流)跑完才返回,而不是被 SIGKILL 硬掐。
-    axum::serve(
+    //
+    // 但这份等待必须封顶(见 SHUTDOWN_DRAIN_WINDOW):admin 日志 SSE 是无限流,单靠
+    // graceful shutdown 会永远等下去。故信号 future 在放行 axum 的同时经 oneshot 通知
+    // 本函数开始计时,由 drain_with_deadline 给排空阶段设上界。
+    let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
-    // 在途请求已结束,把去抖窗口内(约 5s)未落盘的用量写下去,否则每次停机都静默丢这一段。
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        // 接收端在 serve 结束前一直活着;即便已被丢弃也无需处理(那说明服务器已自行结束)。
+        let _ = drain_tx.send(());
+    });
+
+    let outcome = drain_with_deadline(
+        server,
+        async {
+            let _ = drain_rx.await;
+        },
+        SHUTDOWN_DRAIN_WINDOW,
+    )
+    .await;
+    if outcome.is_none() {
+        tracing::warn!(
+            drain_window_secs = SHUTDOWN_DRAIN_WINDOW.as_secs(),
+            "排空窗口到期仍有连接未结束(常见于 admin 实时日志 SSE 这类长连接),不再等待,直接刷盘退出"
+        );
+    }
+    // 无论是干净排空还是窗口到期,最终刷盘都必须跑且只跑一次:把去抖窗口内(约 5s)
+    // 未落盘的用量写下去,否则每次停机都静默丢这一段。
     stats.flush_now().await;
     tracing::info!("kiro2api 已停止");
+    // 服务器自身的错误(accept 失败等,极罕见)放到刷盘之后再上抛,
+    // 避免用 `?` 提前返回把统计吞掉。
+    if let Some(res) = outcome {
+        res?;
+    }
     Ok(())
 }
 
@@ -606,10 +689,15 @@ mod tests {
         assert_ne!(resp2.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// 仅用 store key 部署(config 里 api_key / admin_api_key 都没配)时,/admin API 必须 401:
-    /// 系统里已存在鉴权材料,管理面不得再按"首次运行"开放。
+    /// 仅用 store key 部署(config 里 api_key / admin_api_key 都没配)时,/admin API **仍开放**。
+    ///
+    /// 这是防"首次部署自锁"的回归测试,与直觉相反故写明:store key 是**用户级**凭据,在 admin
+    /// 闸永远不放行。若让它把 admin 闸判成"已配置鉴权",首次部署的运营者一在开放面板里建出第一把
+    /// API-KEY,下一次 /api/admin/* 就 401——而能开锁的管理员凭据一把都不存在,产品内再无自救途径。
+    /// 故 admin 闸的"是否已配置"只认管理员级凭据(admin_api_key,缺省回退 api_key);运营者据此
+    /// 仍能在开放面板里调 PUT /config/auth-keys 设好管理员密钥,当场收口(见 auth.rs 同名回归测试)。
     #[tokio::test]
-    async fn admin_stats_requires_key_when_only_store_keys_exist() {
+    async fn admin_stats_open_when_only_store_keys_exist() {
         let dir =
             std::env::temp_dir().join(format!("kiro2api_srv_adminguard_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -644,7 +732,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "store key 不得关上 admin 闸,否则首次部署建完第一把 key 即自锁"
+        );
         let _ = std::fs::remove_file(&store_path);
     }
 
@@ -770,6 +862,56 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(ct.starts_with("text/event-stream"), "content-type = {ct}");
+    }
+
+    /// 排空窗口必须有界,且短于容器默认宽限期(docker stop 10s),
+    /// 否则窗口一到就被 SIGKILL,最终刷盘照样跑不到。
+    #[test]
+    fn shutdown_drain_window_is_bounded_below_container_grace() {
+        assert!(SHUTDOWN_DRAIN_WINDOW >= Duration::from_secs(1));
+        assert!(
+            SHUTDOWN_DRAIN_WINDOW <= Duration::from_secs(9),
+            "排空窗口须给刷盘留余量:{SHUTDOWN_DRAIN_WINDOW:?}"
+        );
+    }
+
+    /// 服务器在停机信号之前就自行结束(如 accept 出错):原样交回结果,不进排空窗口。
+    #[tokio::test]
+    async fn drain_returns_server_result_when_server_finishes_first() {
+        let out = drain_with_deadline(
+            async { 7u32 },
+            std::future::pending::<()>(),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(out, Some(7));
+    }
+
+    /// 信号已到但在途请求在窗口内跑完:等到干净结束,拿到服务器结果(正常停机路径)。
+    #[tokio::test]
+    async fn drain_waits_for_inflight_requests_within_window() {
+        let out = drain_with_deadline(
+            async {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                1u32
+            },
+            async {},
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(out, Some(1));
+    }
+
+    /// 关键回归:连接永不结束(admin 日志 SSE 就是这种无限流)时,等待必须在窗口到期后
+    /// 放弃并返回 None,由调用方继续刷盘退出——而不是永远挂着等 SIGKILL。
+    #[tokio::test]
+    async fn drain_gives_up_when_connection_never_ends() {
+        let started = Instant::now();
+        let window = Duration::from_millis(80);
+        let out = drain_with_deadline(std::future::pending::<()>(), async {}, window).await;
+        assert!(out.is_none(), "窗口到期必须放弃等待");
+        // 确实等满了窗口(留调度余量,只校验下界)。
+        assert!(started.elapsed() >= Duration::from_millis(60));
     }
 
     /// 日志捕获未接线(build_router 默认 None)时,日志端点在通过鉴权后返回 503。

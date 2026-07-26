@@ -505,6 +505,9 @@ pub(crate) async fn select_and_call_once(
                 // #7:403 后的强制换新令牌同样走控制面硬超时客户端,防上游刷新挂死拖垮 relay。
                 &state.control_client,
                 now_unix,
+                // 本次数据面请求实际用的 bearer(provider 用的就是它),即"失败令牌":
+                // 池内当前值若已不是它,说明别人刚换过,直接复用、不再多刷一轮。
+                &cred.access_token,
                 Some(&state.refresh_ctx),
             )
             .await
@@ -1000,6 +1003,11 @@ pub async fn relay_stream_attributed(
         let mut any_tool = false;
         let mut truncation: Option<Truncation> = None; // 首个截断信号(max_tokens / 上下文耗尽)
         let mut stream_error: Option<StreamException> = None; // 上游中途下发的 exception
+        // 传输层中断(连接重置 / TLS 中断 / 读超时 / chunked 体未收尾)。与上面的 in-band
+        // exception 是两回事:那是上游"说"自己出错了,这是连接本身断了。两者都必须以 error
+        // 事件收尾——若照常发 message_delta(end_turn)+message_stop,客户端会把半截回答
+        // 当成正常完成,既不报错也不重试。(504=读超时,其余 502。)
+        let mut transport_err: Option<(u16, String)> = None;
 
         loop {
             match resp.chunk().await {
@@ -1077,7 +1085,12 @@ pub async fn relay_stream_attributed(
                     }
                 }
                 Ok(None) => break,
-                Err(_) => break, // 流中断:尽力收尾
+                Err(e) => {
+                    // 流中断:记下原因,收尾走 error 事件(不可伪装成正常完成)。
+                    let status = if e.is_timeout() { 504 } else { 502 };
+                    transport_err = Some((status, e.to_string()));
+                    break;
+                }
             }
         }
 
@@ -1085,7 +1098,19 @@ pub async fn relay_stream_attributed(
             yield Ok(to_event(stream::content_block_stop(oi)));
         }
 
-        if let Some(e) = stream_error {
+        if let Some((status, detail)) = transport_err {
+            // 传输层中断:同 in-band exception 的收尾口径——发 error 事件后终止,
+            // 不发 message_delta/message_stop。用量照常落库(上游确实已消耗)。
+            tracing::warn!(
+                event = "upstream_stream_interrupted",
+                model = %model,
+                account_id = credential_id,
+                status = status,
+                detail = %detail,
+                "上游事件流传输中断"
+            );
+            yield Ok(to_event(stream_error_event(status, &format!("upstream stream interrupted: {detail}"))));
+        } else if let Some(e) = stream_error {
             // 上游在 200 事件流里报错:照 Anthropic 流式规范发 `error` 事件后就此终止。
             // **不**再发 message_delta/message_stop——那会把失败伪装成正常完成,
             // 客户端既察觉不到也不会重试。

@@ -10,6 +10,13 @@
 //!
 //! 落盘由 `persist` 层的脏标记 + 5s 定时器驱动,热路径不做 I/O;后台任务只持 `Weak`,
 //! 停机时的最终刷盘由 [`UsageTracker::flush_now`] 显式驱动。
+//!
+//! **落盘格式契约(回滚安全,别动)**:主文件 `usage_records.json` 永远只写**裸记录数组**
+//! `[UsageRecord, ...]`;每日汇总写在同目录的边车文件(见 [`daily_sidecar_path`])。
+//! 因为线上一旦回滚到旧版本二进制,旧版本只会把主文件按 `Vec<UsageRecord>` 解析——
+//! 主文件若包了一层对象,旧版本解析失败即按空库继续,并在 5s 内原子覆写,整本用量/
+//! 计费账本被静默清空且不可恢复。边车是旧版本不认识、也永远不会去动的文件,新增状态
+//! 一律往边车放。读侧仍兼容历史上短暂落过的对象格式 `{records, daily}`。
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -287,61 +294,108 @@ impl UsageState {
     }
 }
 
-/// 落盘结构(v1):原始记录 + 已淘汰记录的每日累计。
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// 内存快照载体:原始记录 + 已淘汰记录的每日累计。**刻意不 derive `Serialize`** ——
+/// 两部分分别落到两个文件(记录写主文件的裸数组、汇总写边车),整体写回去就会把主文件
+/// 变成对象格式、破坏回滚兼容(见模块头的落盘格式契约)。
+#[derive(Debug, Default, Deserialize)]
 struct PersistedUsage {
     records: Vec<UsageRecord>,
     #[serde(default)]
     daily: BTreeMap<String, DayArchive>,
 }
 
-/// 落盘文件的兼容外壳:v1 为对象,更早的版本落的是裸记录数组。
+/// 主文件的**读**兼容外壳:当前(与旧版本)恒写裸记录数组,但历史上短暂落过
+/// `{records, daily}` 对象格式,野外已存在这种文件,故读侧必须继续接住。
+/// 写侧只走裸数组一条路。
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum PersistedFile {
+    /// 历史对象格式:`{"records": [...], "daily": {...}}`,自带每日汇总。
     Structured(PersistedUsage),
-    /// 旧格式:`[UsageRecord, ...]`,无每日汇总。
+    /// 标准格式:`[UsageRecord, ...]`,每日汇总在边车文件里。
     Legacy(Vec<UsageRecord>),
 }
 
-impl From<PersistedFile> for PersistedUsage {
-    fn from(f: PersistedFile) -> Self {
-        match f {
-            PersistedFile::Structured(p) => p,
-            PersistedFile::Legacy(records) => PersistedUsage {
-                records,
-                daily: BTreeMap::new(),
-            },
+/// 每日汇总边车路径:与主文件同目录同名基底,只换后缀
+/// (`usage_records.json` → `usage_records.daily.json`)。
+/// 单独一个文件的意义见模块头:旧版本二进制不认识它、也不会去动它,回滚不丢账本。
+fn daily_sidecar_path(path: &Path) -> PathBuf {
+    let mut p = path.to_path_buf();
+    if !p.set_extension("daily.json") {
+        // 极端路径(无文件名,如 "/")换不了后缀,退化成整体追加,保证与主文件不同名。
+        let mut s = path.as_os_str().to_os_string();
+        s.push(".daily.json");
+        p = PathBuf::from(s);
+    }
+    p
+}
+
+/// 载入落盘内容:
+/// - 主文件不存在 → 空库(首次运行的正常路径,静默);
+/// - 主文件存在但读取/解析失败 → **error 日志 + 把损坏文件改名备份**后按空库继续,
+///   绝不让随后的原子写静默覆盖掉可能可挽救的历史;
+/// - 主文件为裸数组(标准格式)→ 每日汇总从边车补;
+/// - 主文件为历史对象格式 → 每日汇总取文件内的,忽略边车(对象文件自带汇总,
+///   且必然比边车新:写侧改成裸数组后就再没写过对象了)。
+///
+/// 边车与主文件**互不影响**:边车缺失/损坏只丢长窗口兜底汇总,绝不能连累记录载入。
+fn load_persisted(path: &Path) -> PersistedUsage {
+    let sidecar = daily_sidecar_path(path);
+    match read_json::<PersistedFile>(path) {
+        Ok(Some(PersistedFile::Structured(p))) => p,
+        Ok(Some(PersistedFile::Legacy(records))) => PersistedUsage {
+            records,
+            daily: load_daily_sidecar(&sidecar),
+        },
+        // 主文件缺失/损坏:记录只能从空开始,但边车里的历史汇总照收 —— 汇总只统计
+        // **已淘汰**的记录,记录为空时不可能与之重复计数,7d/30d 兜底不必跟着一起丢。
+        Ok(None) => PersistedUsage {
+            records: Vec::new(),
+            daily: load_daily_sidecar(&sidecar),
+        },
+        Err(e) => {
+            backup_corrupt(path, "用量记录文件", &e);
+            PersistedUsage {
+                records: Vec::new(),
+                daily: load_daily_sidecar(&sidecar),
+            }
         }
     }
 }
 
-/// 载入落盘文件:
-/// - 不存在 → 空库(首次运行的正常路径,静默);
-/// - 存在但读取/解析失败 → **error 日志 + 把损坏文件改名备份**后按空库继续,
-///   绝不让随后的原子写静默覆盖掉可能可挽救的历史。
-fn load_persisted(path: &Path) -> PersistedUsage {
-    match read_json::<PersistedFile>(path) {
-        Ok(Some(f)) => f.into(),
-        Ok(None) => PersistedUsage::default(),
+/// 载入每日汇总边车:不存在 → 空(首次运行、或刚从只写主文件的旧版本升上来,静默);
+/// 损坏 → error 日志 + 改名备份后按空继续。汇总只是长窗口统计的兜底,丢了顶多让
+/// 7d/30d 少算已淘汰部分,记录才是账本本体,故本函数的任何失败都不向上传播。
+fn load_daily_sidecar(path: &Path) -> BTreeMap<String, DayArchive> {
+    match read_json::<BTreeMap<String, DayArchive>>(path) {
+        Ok(Some(daily)) => daily,
+        Ok(None) => BTreeMap::new(),
         Err(e) => {
-            let backup = corrupt_backup_path(path);
-            match std::fs::rename(path, &backup) {
-                Ok(()) => tracing::error!(
-                    path = %path.display(),
-                    backup = %backup.display(),
-                    error = %e,
-                    "用量记录文件损坏或不兼容,已改名备份,按空库继续"
-                ),
-                Err(re) => tracing::error!(
-                    path = %path.display(),
-                    error = %e,
-                    rename_error = %re,
-                    "用量记录文件损坏或不兼容,且备份改名失败,按空库继续(下次刷盘将覆盖该文件)"
-                ),
-            }
-            PersistedUsage::default()
+            backup_corrupt(path, "每日汇总边车文件", &e);
+            BTreeMap::new()
         }
+    }
+}
+
+/// 把损坏/不兼容的文件改名备份(主文件与边车共用)。改名失败只记日志:此时下次刷盘
+/// 会覆盖该文件,已在日志里说明,不再有别的挽救手段。
+fn backup_corrupt(path: &Path, kind: &str, error: &std::io::Error) {
+    let backup = corrupt_backup_path(path);
+    match std::fs::rename(path, &backup) {
+        Ok(()) => tracing::error!(
+            kind = kind,
+            path = %path.display(),
+            backup = %backup.display(),
+            error = %error,
+            "损坏或不兼容,已改名备份,按空继续"
+        ),
+        Err(re) => tracing::error!(
+            kind = kind,
+            path = %path.display(),
+            error = %error,
+            rename_error = %re,
+            "损坏或不兼容,且备份改名失败,按空继续(下次刷盘将覆盖该文件)"
+        ),
     }
 }
 
@@ -366,11 +420,13 @@ fn corrupt_backup_path(path: &Path) -> PathBuf {
     with_suffix(99)
 }
 
-/// 序列化落盘快照:紧凑 JSON(该文件只供本程序回读,pretty 只是徒增写盘量)。
+/// 序列化主文件:**恒为裸记录数组** `[UsageRecord, ...]`,紧凑 JSON(该文件只供程序
+/// 回读,pretty 只是徒增写盘量)。这里绝不许再包一层对象,理由见模块头的落盘格式契约。
+///
 /// 序列化失败(如出现非有限浮点)返回 `None` —— 本轮跳过写盘,保留磁盘上一版本,
 /// 而不是把空内容原子覆写上去。
-fn serialize_snapshot(snap: &PersistedUsage) -> Option<Vec<u8>> {
-    match serde_json::to_vec(snap) {
+fn serialize_records(records: &[UsageRecord]) -> Option<Vec<u8>> {
+    match serde_json::to_vec(records) {
         Ok(bytes) => Some(bytes),
         Err(e) => {
             tracing::error!(error = %e, "用量记录序列化失败,本轮跳过刷盘");
@@ -379,23 +435,44 @@ fn serialize_snapshot(snap: &PersistedUsage) -> Option<Vec<u8>> {
     }
 }
 
+/// 把每日汇总原子写入边车文件。任何失败只记 error 日志、**不影响主文件落盘**:
+/// 汇总只是已淘汰记录的当日累计(长窗口兜底),边车缺失/陈旧顶多让 7d/30d 少算,
+/// 记录才是账本本体,绝不能因为边车写不出去就连记录一起不写。
+fn write_daily_sidecar(path: &Path, daily: &BTreeMap<String, DayArchive>) {
+    let bytes = match serde_json::to_vec(daily) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::error!(error = %e, path = %path.display(), "每日汇总序列化失败,本轮跳过边车写盘");
+            return;
+        }
+    };
+    if let Err(e) = write_bytes_atomic(path, &bytes) {
+        tracing::error!(error = %e, path = %path.display(), "每日汇总边车写盘失败,本轮只落用量记录");
+    }
+}
+
 /// 用量追踪器。`Arc<UsageTracker>` 可在 relay 与 admin 间共享。
 pub struct UsageTracker {
     state: RwLock<UsageState>,
     dirty: DirtyFlag,
-    /// 落盘路径,供 [`flush_now`](Self::flush_now) 在停机流程里显式刷盘。
+    /// 主文件(裸记录数组)路径,供 [`flush_now`](Self::flush_now) 在停机流程里显式刷盘。
     path: PathBuf,
+    /// 每日汇总边车路径(由 `path` 推出,见 [`daily_sidecar_path`])。
+    daily_path: PathBuf,
 }
 
 impl UsageTracker {
     /// 从 `path` 载入(不存在则空;损坏则备份后按空库继续),并启动后台刷盘任务。
+    /// 每日汇总从同目录的边车文件载入/落盘,主文件恒为裸记录数组(回滚兼容)。
     pub fn load(path: PathBuf) -> Arc<Self> {
         let initial = UsageState::from_persisted(load_persisted(&path), USAGE_CAP_PER_CREDENTIAL);
+        let daily_path = daily_sidecar_path(&path);
         let (dirty, handle) = dirty_channel();
         let tracker = Arc::new(Self {
             state: RwLock::new(initial),
             dirty,
             path: path.clone(),
+            daily_path: daily_path.clone(),
         });
         // 后台任务只持 Weak:持 Arc 会与 tracker 构成自引用环,`DirtyFlag` 永不析构、
         // 通道永不关闭,"关闭时最终刷盘"分支不可达。停机刷盘走显式的 `flush_now`。
@@ -413,13 +490,18 @@ impl UsageTracker {
                     guard.to_persisted()
                 };
                 drop(tracker);
-                serialize_snapshot(&snap)
+                // 先序列化记录:失败则本轮整体跳过(主文件与边车都不动),磁盘保留上一版本。
+                let bytes = serialize_records(&snap.records)?;
+                // 记录能写才写边车;边车失败只记日志,记录照写(见 write_daily_sidecar)。
+                write_daily_sidecar(&daily_path, &snap.daily);
+                Some(bytes)
             },
         );
         tracker
     }
 
-    /// 立即把当前用量记录与每日汇总同步落盘(原子写),不等后台去抖定时器。
+    /// 立即把当前用量记录(主文件裸数组)与每日汇总(边车)同步落盘(原子写),
+    /// 不等后台去抖定时器。
     ///
     /// 停机流程的最终刷盘入口:后台任务只在每 5s 的拍子上落盘,进程退出时最近一拍
     /// 之后的记录尚在内存,须由停机流程显式调用本方法(`stats.usage.flush_now().await`)。
@@ -430,8 +512,13 @@ impl UsageTracker {
             guard.to_persisted()
         };
         let path = self.path.clone();
-        let res = tokio::task::spawn_blocking(move || match serde_json::to_vec(&snap) {
-            Ok(bytes) => write_bytes_atomic(&path, &bytes),
+        let daily_path = self.daily_path.clone();
+        // 记录序列化失败 → 整体跳过写盘(含边车),不拿坏快照覆盖磁盘上的好数据。
+        let res = tokio::task::spawn_blocking(move || match serde_json::to_vec(&snap.records) {
+            Ok(bytes) => {
+                write_daily_sidecar(&daily_path, &snap.daily);
+                write_bytes_atomic(&path, &bytes)
+            }
             Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
         })
         .await;
@@ -1400,5 +1487,183 @@ mod tests {
         assert_eq!(t.reset_credential(1).await, 0);
         assert_eq!(t.len().await, 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 建一个本测试专用的空目录(同名残留先清掉)。
+    fn test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kiro2api_usage_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 目录下的损坏备份文件列表(`*.corrupt.*`)。
+    fn corrupt_backups(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains(".corrupt."))
+            .collect()
+    }
+
+    /// **回滚安全的硬契约**:主文件必须永远是裸记录数组。
+    ///
+    /// 这条断言就是旧版本二进制(v0.1.0~v0.1.4)的解析动作本身:它只会把该文件当
+    /// `Vec<UsageRecord>` 读。一旦有人再给主文件包一层对象,回滚后旧版本解析失败 →
+    /// 按空库继续 → 5s 内原子覆写,整本用量/计费账本静默清零且不可恢复。故此测试失败
+    /// 绝不能靠改断言"修",只能把新增状态挪进边车文件。
+    #[tokio::test]
+    async fn primary_file_stays_bare_array_parsable_by_older_binaries() {
+        let dir = test_dir("bare_array");
+        let path = dir.join("usage_records.json");
+        let t = UsageTracker::load(path.clone());
+        // 全字段都填上,确保回读是逐字段等值而非"碰巧能解析"。
+        t.record_usage_full(
+            1,
+            9,
+            "claude-sonnet-4.5".into(),
+            100,
+            200,
+            0.5,
+            Some(2.5),
+            Some("1.2.3.4".into()),
+            Some(10),
+            Some(20),
+            Some(123),
+            1000,
+        )
+        .await;
+        t.record_usage(2, "m".into(), 1, 2, 0.25, None, None, None, 1001)
+            .await;
+        // 内存里还有每日汇总:它必须落到边车,绝不能混进主文件。
+        {
+            let mut guard = t.state.write().await;
+            guard.daily.insert(
+                "2026-07-01".into(),
+                DayArchive {
+                    requests: 4,
+                    cost: 4.0,
+                    credits: 2.0,
+                },
+            );
+        }
+        t.flush_now().await;
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        // 旧版本二进制的解析口径:裸数组,且逐条与内存记录一致。
+        let parsed: Vec<UsageRecord> = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("主文件必须能被旧版本按裸数组解析: {e}: {raw}"));
+        let in_mem = t.state.read().await.records.clone();
+        assert_eq!(parsed, in_mem, "主文件应完整回放全部记录");
+        assert!(raw.starts_with('['), "主文件必须是裸数组: {raw}");
+        assert!(!raw.contains("\"daily\""), "每日汇总不得写进主文件: {raw}");
+
+        // 每日汇总在边车里,旧版本不认识也不会去动它。
+        let sidecar = daily_sidecar_path(&path);
+        assert!(sidecar.exists(), "每日汇总应落在边车文件");
+        let daily: BTreeMap<String, DayArchive> =
+            serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+        assert_eq!(daily.get("2026-07-01").unwrap().requests, 4);
+
+        // 重新载入:记录与汇总都要回来(裸数组 + 边车 = 对象格式的等价物)。
+        drop(t);
+        let t2 = UsageTracker::load(path.clone());
+        assert_eq!(t2.len().await, 2);
+        let roll = t2.daily_rollup().await;
+        let d = roll.iter().find(|r| r.date == "2026-07-01").unwrap();
+        assert_eq!(d.total_requests, 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bare_array_without_sidecar_loads_with_empty_daily() {
+        let dir = test_dir("no_sidecar");
+        let path = dir.join("usage_records.json");
+        // 只有主文件、没有边车(旧版本写出来的、或首次升级上来的正常形态)。
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&vec![rec(1, 1000, 1.0, 5), rec(2, 1001, 2.0, 6)]).unwrap(),
+        )
+        .unwrap();
+        let t = UsageTracker::load(path.clone());
+        assert_eq!(t.len().await, 2);
+        // 边车缺失 → 汇总为空(与加边车之前的行为完全一致),不是错误、不备份任何文件。
+        assert!(t.state.read().await.daily.is_empty());
+        assert!(path.exists(), "缺边车不是损坏,主文件不应被改名备份");
+        assert!(corrupt_backups(&dir).is_empty());
+        // 汇总只剩存活记录的聚合。
+        let roll = t.daily_rollup().await;
+        assert_eq!(roll.len(), 1);
+        assert_eq!(roll[0].total_requests, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 野外已存在的对象格式文件(本分支曾短暂写出过)必须仍能读,并在下次刷盘时
+    /// **自动迁回**"裸数组主文件 + 边车"——迁完才算恢复回滚安全。
+    #[tokio::test]
+    async fn wild_object_format_file_loads_and_migrates_back_to_bare_array() {
+        let dir = test_dir("wild_object");
+        let path = dir.join("usage_records.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "records": [rec(1, 1000, 1.0, 5)],
+                "daily": { "2026-07-01": { "requests": 3, "cost": 3.0, "credits": 1.5 } },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let t = UsageTracker::load(path.clone());
+        assert_eq!(t.len().await, 1);
+        let loaded_daily = t.state.read().await.daily.clone();
+        assert_eq!(loaded_daily.get("2026-07-01").unwrap().requests, 3);
+        assert!(corrupt_backups(&dir).is_empty(), "对象格式不是损坏文件");
+
+        // 刷盘 = 迁移:主文件变裸数组,汇总挪进边车,一条不丢。
+        t.flush_now().await;
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed: Vec<UsageRecord> = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("迁移后主文件必须是裸数组: {e}: {raw}"));
+        assert_eq!(parsed.len(), 1);
+        let daily: BTreeMap<String, DayArchive> =
+            serde_json::from_str(&std::fs::read_to_string(daily_sidecar_path(&path)).unwrap())
+                .unwrap();
+        assert_eq!(daily.get("2026-07-01").unwrap().requests, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn corrupt_sidecar_is_backed_up_without_blocking_records() {
+        let dir = test_dir("bad_sidecar");
+        let path = dir.join("usage_records.json");
+        let sidecar = daily_sidecar_path(&path);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&vec![rec(1, 1000, 1.0, 5), rec(2, 1001, 2.0, 6)]).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&sidecar, b"{ not valid json").unwrap();
+
+        let t = UsageTracker::load(path.clone());
+        // 边车坏了只丢兜底汇总,记录照常载入 —— 账本本体绝不受边车连累。
+        assert_eq!(t.len().await, 2);
+        assert!(t.state.read().await.daily.is_empty());
+        assert!(path.exists(), "主文件完好,不得被改名备份");
+        // 坏边车被改名备份走,内容原样保留;原路径腾空,等下次刷盘重建。
+        assert!(!sidecar.exists(), "坏边车必须改名,不能留在原地被静默覆盖");
+        let backups = corrupt_backups(&dir);
+        assert_eq!(backups.len(), 1, "应有且仅有一个边车备份");
+        assert_eq!(
+            std::fs::read(&backups[0]).unwrap(),
+            b"{ not valid json".to_vec()
+        );
+        // 刷盘后边车重建为合法 JSON。
+        t.flush_now().await;
+        let daily: BTreeMap<String, DayArchive> =
+            serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+        assert!(daily.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

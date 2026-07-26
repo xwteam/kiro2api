@@ -360,32 +360,22 @@ pub async fn ensure_fresh(
 ///
 /// 并发纪律同 [`ensure_fresh`]:池锁只在取快照(步骤 1)与写回(步骤 3)时短暂持有,
 /// 网络 `.await` 期间不持锁。不记录任何令牌明文。
-pub async fn force_refresh(
-    pool: &Arc<Mutex<Pool>>,
-    credential_id: &str,
-    client: &reqwest::Client,
-    now_unix: u64,
-    ctx: Option<&RefreshCtx>,
-) -> Result<Credential, EnsureFreshError> {
-    force_refresh_with_failed_token(pool, credential_id, client, now_unix, None, ctx).await
-}
-
-/// [`force_refresh`] 的完整形式:`failed_access_token` 为**调用方实际失败时所用的那个**
-/// access_token。
+/// `failed_access_token` 为**调用方实际失败时所用的那个** access_token。
 ///
 /// #5:双检基线必须是"失败令牌",而不是本函数入口处的池内快照。上游 401/403 后各消费方陆续进来
 /// 强制刷新,迟到者进入本函数时池内往往已经是别人刚换好的**有效**令牌;若拿入口快照当基线,
 /// 基线与池内当前值当然相等,双检放行 → 又把这枚刚换好的令牌轮换一遍。Social 账号的
 /// refresh_token 单次轮换,这样连锁刷下去既作废彼此的令牌,也徒增上游风控。
 ///
-/// 传 `None` 时退化为"以入口快照为基线"的原语义(与 [`force_refresh`] 等价),供尚未传递失败
-/// 令牌的调用点平滑过渡。
-pub async fn force_refresh_with_failed_token(
+/// 该参数**必填**:曾提供过 `Option<&str>` 的退化形式,结果三个调用点全部传 `None`,身份校验
+/// 成了自比自的死代码(恒相等 → 恒放行)。改成必填后"退化"在类型上不可表达,调用点漏传即编译
+/// 不过;每个调用方本就持有那枚失败令牌(数据面 bearer 即 `cred.access_token`)。
+pub async fn force_refresh(
     pool: &Arc<Mutex<Pool>>,
     credential_id: &str,
     client: &reqwest::Client,
     now_unix: u64,
-    failed_access_token: Option<&str>,
+    failed_access_token: &str,
     ctx: Option<&RefreshCtx>,
 ) -> Result<Credential, EnsureFreshError> {
     // 1) 取快照(短暂持锁)。
@@ -398,10 +388,8 @@ pub async fn force_refresh_with_failed_token(
             .ok_or(EnsureFreshError::NotFound)?
     };
 
-    // 双检基线:调用方失败时用的那个令牌;未提供则退化为入口快照(原语义)。
-    let baseline_token = failed_access_token
-        .map(|t| t.to_string())
-        .unwrap_or_else(|| cred_snapshot.access_token.clone());
+    // 双检基线:调用方失败时用的那个令牌(必填,故不再有退化分支)。
+    let baseline_token = failed_access_token;
 
     // 1.5) 池内当前令牌已经不是失败令牌 → 别人已经换过新的,直接复用,不再发起刷新。
     if cred_snapshot.access_token != baseline_token {

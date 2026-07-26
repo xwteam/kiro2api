@@ -196,8 +196,15 @@ pub async fn fetch_available_models_fresh(
     match fetch_available_models(client, cfg, &cred).await {
         // 401/403:该 access_token 可能已被服务端失效(哪怕尚未过期)。强制刷新令牌后重试一次。
         Err(e) if e.is_auth() => {
+            // 传本次失败请求实际用的 access_token 作双检基线:池内若已换过新的,
+            // 说明别人刚刷完,直接复用而不再轮换一次(轮换会作废他人在用的令牌)。
             let fresh = match crate::kiro::ensure_fresh::force_refresh(
-                pool, cred_id, client, now_unix, ctx,
+                pool,
+                cred_id,
+                client,
+                now_unix,
+                &cred.access_token,
+                ctx,
             )
             .await
             {

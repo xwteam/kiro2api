@@ -305,6 +305,9 @@ pub async fn responses_stream(
         let mut truncation: Option<crate::kiro::convert::Truncation> = None;
         // 上游中途下发的非截断 exception:置位即停读,末事件改发 response.failed。
         let mut upstream_error: Option<crate::kiro::convert::StreamException> = None;
+        // 传输层中断(连接重置 / 读超时 / chunked 体未收尾):与 in-band exception 一样
+        // 必须以 response.failed 收束,否则 agent 框架会把半截回答当完整结果继续用。
+        let mut transport_err: Option<(u16, String)> = None;
 
         'read: loop {
             match resp.chunk().await {
@@ -415,8 +418,33 @@ pub async fn responses_stream(
                     }
                 }
                 Ok(None) => break,
-                Err(_) => break, // 流中断:尽力收尾
+                Err(e) => {
+                    // 流中断:记下原因,收尾走 response.failed(不可伪装成 completed)。
+                    let status = if e.is_timeout() { 504 } else { 502 };
+                    transport_err = Some((status, e.to_string()));
+                    break;
+                }
             }
+        }
+
+        // 传输层中断:与上游报错同口径,直接以 response.failed 收束(不发"条目已完成")。
+        if let Some((status, detail)) = transport_err {
+            tracing::warn!(
+                event = "upstream_stream_interrupted",
+                status = status,
+                detail = %detail,
+                "上游事件流传输中断"
+            );
+            let mut failed = response_obj("failed", serde_json::json!([]), serde_json::Value::Null);
+            if let Some(map) = failed.as_object_mut() {
+                map.insert("error".to_string(), serde_json::json!({
+                    "code": "upstream_stream_interrupted",
+                    "message": format!("upstream stream interrupted: {detail}"),
+                }));
+            }
+            yield Ok(emit!("response.failed", serde_json::json!({ "response": failed })));
+            usage_guard.flush();
+            return;
         }
 
         // 上游报错:不发任何"条目已完成"事件,直接以 response.failed 收束整条流。

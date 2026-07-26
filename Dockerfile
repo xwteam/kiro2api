@@ -51,11 +51,14 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates wget gosu \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 1000 appuser
-# 凭据路径走环境变量而非启动命令的 --credentials:命令行优先级最高,写死在 CMD 里会让
-# 用户在 .env 里设的 CREDENTIALS_PATH 静默失效。默认值指向挂载卷 /app/data——凭据以及
-# 由其父目录推断的用量统计 / api_keys.json / 余额缓存都必须落在卷内,否则容器重建即丢。
-ENV HOST=0.0.0.0 \
-    CREDENTIALS_PATH=/app/data/credentials.json
+# 凭据路径**不**在镜像里烘焙成 ENV,也不写进 CMD 的 --credentials:那两层的优先级都高于
+# config.json,会把用户在 config.json 里设的自定义路径静默改道(CMD 更甚,连 .env 里的
+# CREDENTIALS_PATH 都会被压掉)。改由应用把"内置默认"就近解析到 `-c` 所指配置文件的目录
+# (见 `Config::resolve_default_credentials_beside_config`):容器以 -c /app/data/config.json
+# 启动,默认便落在挂载卷 /app/data 内(凭据及由其父目录推断的用量统计 / api_keys.json /
+# 余额缓存都必须在卷内,否则容器重建即丢),而 config.json / CREDENTIALS_PATH / --credentials
+# 三层显式配置依然按文档的优先级各自生效。
+ENV HOST=0.0.0.0
 WORKDIR /app
 COPY --from=builder /build/kiro2api /usr/local/bin/kiro2api
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh

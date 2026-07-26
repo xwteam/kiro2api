@@ -374,6 +374,9 @@ pub async fn stream_generate_content(
         let mut first = true;
         let mut truncation: Option<Truncation> = None;
         let mut exception: Option<StreamException> = None;
+        // 传输层中断(连接重置 / 读超时 / chunked 体未收尾):与 in-band exception 一样
+        // 必须发错误块收尾,**绝不能报 STOP**——否则客户端把"内容缺失"当成正常完成。
+        let mut transport_err: Option<(u16, String)> = None;
 
         'read: loop {
             match resp.chunk().await {
@@ -441,14 +444,32 @@ pub async fn stream_generate_content(
                     }
                 }
                 Ok(None) => break,
-                Err(_) => break, // 流中断:尽力收尾
+                Err(e) => {
+                    // 流中断:记下原因,收尾走错误块(不可报 STOP 伪装成正常完成)。
+                    let status = if e.is_timeout() { 504 } else { 502 };
+                    transport_err = Some((status, e.to_string()));
+                    break;
+                }
             }
         }
 
-        // 收尾块二选一:上游 exception → Gemini 错误块(绝不能报 STOP,否则客户端把"内容缺失"
-        // 当成正常完成);否则正常收尾块,finishReason 按是否命中截断给 MAX_TOKENS / STOP,
-        // usageMetadata 用上游真实计量(缺项才回退估算)。
-        let final_json = match &exception {
+        // 收尾块三选一:传输中断 / 上游 exception → Gemini 错误块(绝不能报 STOP,否则客户端把
+        // "内容缺失"当成正常完成);否则正常收尾块,finishReason 按是否命中截断给 MAX_TOKENS /
+        // STOP,usageMetadata 用上游真实计量(缺项才回退估算)。
+        let final_json = if let Some((status, detail)) = &transport_err {
+            tracing::warn!(
+                event = "upstream_stream_interrupted",
+                status = status,
+                detail = %detail,
+                "上游事件流传输中断"
+            );
+            // 复用 exception 的错误体形状:合成一个 kind,免得再造一套错误块。
+            let synthetic = StreamException {
+                kind: "UpstreamStreamInterrupted".to_string(),
+                message: format!("upstream stream interrupted: {detail}"),
+            };
+            exception_error_body(*status, &synthetic).to_string()
+        } else { match &exception {
             Some(e) => {
                 let status = crate::kiro::convert::exception_status(&e.kind);
                 tracing::warn!(
@@ -474,7 +495,7 @@ pub async fn stream_generate_content(
                     }),
                 })
             }
-        };
+        }};
         yield Ok(frame_out(wire, &mut first, &final_json));
 
         // JSON 数组线格式收尾:上面恒发一个元素,故此处必是闭合括号,数组恒合法。
@@ -486,7 +507,9 @@ pub async fn stream_generate_content(
         // 不会重复落库。上游中途出错的流不在此显式落库:交给哨兵 Drop,由它的
         // has_meaningful_usage 闸滤掉「一个字都没产出」的零行(#9/#16);已产出内容的则照常补记。
         // 客户端在收尾前断连时本行同样不执行,走同一条 Drop 补记路径(#8/#9/#15)。
-        if exception.is_none() {
+        // 传输中断与 exception 同处理:不在此显式落库,交给哨兵 Drop——由它的
+        // has_meaningful_usage 闸决定(有产出才补记,一个字没出的零行滤掉)。
+        if exception.is_none() && transport_err.is_none() {
             usage_guard.flush();
         }
     };

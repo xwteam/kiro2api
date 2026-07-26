@@ -31,17 +31,19 @@ pub struct ApiKeyId(pub Option<u32>);
 
 /// 鉴权中间件所需状态:
 /// - `api_key`:全局 API key(`None`/空串 = 该来源不设全局 key)。
-/// - `api_keys`:store-backed 每用户 key。协议闸据此放行 store key;admin 闸也接同一份
-///   store,但**只用于判定“系统里是否已存在鉴权材料”**,绝不放行 store key(见 `AuthRole`)。
+/// - `api_keys`:store-backed 每用户 key。协议闸据此放行 store key,并据“store 里是否有 key”
+///   判定协议面是否已启用鉴权;admin 闸虽接同一份 store,但**既不放行也不据它判定**(见 `AuthRole`)。
 /// - `stats`:用量统计(仅协议闸用于消费上限求和;admin 闸传 `None`)。
 ///
-/// 放行规则:全局 key、admin key、store 里任意一条 key——只要存在其一,就视为
-/// “已配置鉴权”,请求必须命中本闸接受的凭据,否则 401;一条鉴权材料都没有时才维持
-/// 首次运行的开放模式。
-/// 鉴权闸的角色:决定运行期可变配置里“期望的全局 key”取哪一个字段,以及是否接受 store key。
+/// 放行规则按闸分开(见 `AuthRole`):请求必须命中本闸接受的凭据,否则 401;本闸判定
+/// “尚未配置鉴权”时才维持首次运行的开放模式。
+/// 鉴权闸的角色:决定运行期可变配置里“期望的全局 key”取哪一个字段、是否接受 store key,
+/// 以及**据什么判定“已配置鉴权”**(判定为已配置后,未命中凭据的请求一律 401)。
 /// - `Protocol`:协议闸,期望 = 主 `api_key`;另接受有效 store key。
+///   判据 = 主 `api_key` 或 store 里任意一条 key(数据面只要发出过 key 就不再开放)。
 /// - `Admin`:管理闸,期望 = `admin_api_key`(非空)否则回退主 `api_key`;
 ///   **不接受 store key**——数据面每用户 key 不得取得管理员权限。
+///   判据 = **只看管理员级凭据**(admin key / 主 key),store key 不参与,理由见 [`require_api_key`]。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthRole {
     Protocol,
@@ -91,9 +93,10 @@ impl AuthState {
 
     /// 管理闸:期望 = 运行期 `admin_api_key`(非空)否则回退主 `api_key`。
     ///
-    /// 同时接入 store,但 `AuthRole::Admin` 下 store **只参与“是否已配置鉴权”的判定**:
-    /// 仅用 store key 部署(全局 key 与 admin key 都为空)时,管理面必须校验凭据而非开放;
-    /// store key 本身在本闸一律不放行,拿不到管理员权限。
+    /// 同时接入 store,但 `AuthRole::Admin` 下 store **完全不参与本闸的裁决**:既不放行
+    /// store key(数据面每用户 key 不得取得管理员权限),也不据“store 里有 key”把管理闸
+    /// 判成已配置鉴权(否则首次运行会自锁,见 [`require_api_key`])。入参保留是为了不动
+    /// 调用方接线、并给日后 admin 侧用得上 store 的场景留口。
     pub fn admin(
         runtime_cfg: crate::config::SharedRuntimeConfig,
         api_keys: Arc<ApiKeyStore>,
@@ -197,8 +200,10 @@ fn attach_reservation_to_response(
 ///    - Valid 但已达/超上限 → 402;
 ///    - Disabled / Expired / NotFound → 401(不泄露具体命中与否细节,统一措辞)。
 ///    admin 闸跳过本步:store key 不得取得管理员权限。
-/// 3. 系统里存在任一鉴权材料(全局 key / admin key / 任意 store key)却未命中 → 401。
-/// 4. 一条鉴权材料都没有 → 开放模式放行(首次运行体验)。
+/// 3. 本闸判定“已配置鉴权”却未命中凭据 → 401。判据按闸不同:
+///    - 协议闸:主 `api_key` 非空,或 store 里有任意一条 key;
+///    - admin 闸:**只看管理员级凭据**(admin key,回退主 key)。
+/// 4. 本闸判定“尚未配置鉴权” → 开放模式放行(首次运行体验)。
 pub async fn require_api_key(
     State(auth): State<AuthState>,
     mut request: Request,
@@ -223,15 +228,27 @@ pub async fn require_api_key(
         return next.run(request).await;
     }
 
-    // 系统里是否存在任何鉴权材料:本闸的期望全局 key(协议闸=主 key;admin 闸=admin key
-    // 否则回退主 key)或 store 里任意一条 key。只要有一条,未命中的请求就必须被拒——
-    // 尤其是"仅用 store key 部署"时,admin 闸的期望全局 key 为空但系统显然已启用鉴权,
-    // 此时管理面绝不能开放。
-    let store_has_keys = auth.api_keys.as_ref().is_some_and(|s| !s.is_empty());
-    let auth_configured = global_configured || store_has_keys;
+    // 本闸是否已配置鉴权(已配置 → 未命中凭据的请求必须 401;未配置 → 开放模式)。
+    // 判据按闸分开,**不能共用一套**:
+    // - 协议闸:期望主 key 非空,或 store 里有任意一条 key。数据面一旦发出过 key 就说明
+    //   鉴权已启用,裸请求必须拒。
+    // - admin 闸:只认管理员级凭据(admin key,回退主 key),store key 一概不算。
+    //   若让 store key 把管理闸判成"已配置",首次运行会自锁:全新部署没有任何全局 key
+    //   时管理面按设计是开放的(供操作者做初始配置),操作者在这个开放的管理面里建出
+    //   第一条 API-KEY 的瞬间,管理闸就变成"已配置"→ 下一个 /api/admin/* 请求 401,而
+    //   store key 在本闸永不放行,产品内再没有任何补救入口,操作者被永久锁在门外。
+    //   故管理闸的开闭只能由管理员级凭据决定:设了才关,没设就一直开着——开放期间操作者
+    //   可经 PUT /api/admin/config/auth-keys 设 admin key,设完立即收口(即时生效+落盘)。
+    //   "没设 admin/主 key 时管理面开放"这一暴露面由启动告警显式点名,见 `auth_startup_warnings`。
+    let auth_configured = match auth.role {
+        AuthRole::Protocol => {
+            global_configured || auth.api_keys.as_ref().is_some_and(|s| !s.is_empty())
+        }
+        AuthRole::Admin => global_configured,
+    };
 
-    // 2) store key 路径:仅协议闸把 store key 当作凭据;admin 闸只在上面用 store 参与
-    //    "是否已配置鉴权"的判定,不在此放行(store key 不得取得管理员权限)。
+    // 2) store key 路径:仅协议闸把 store key 当作凭据;admin 闸不在此放行,
+    //    store key 不得取得管理员权限(它在 admin 闸也不参与上面的已配置判定)。
     if auth.role == AuthRole::Protocol
         && let Some(store) = &auth.api_keys
         && let Some(provided) = key.as_deref()
@@ -286,11 +303,11 @@ pub async fn require_api_key(
         }
     }
 
-    // 3) 未命中本闸接受的任何凭据:系统里只要存在一条鉴权材料就必须拒。
+    // 3) 未命中本闸接受的任何凭据:本闸已配置鉴权就必须拒。
     if auth_configured {
         return unauthorized("invalid api key");
     }
-    // 4) 一条鉴权材料都没有(全局 key、admin key、store key 全空)→ 开放模式。
+    // 4) 本闸尚未配置鉴权(协议闸:主 key 与 store 全空;admin 闸:admin/主 key 全空)→ 开放模式。
     next.run(request).await
 }
 
@@ -521,24 +538,142 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// 仅用 store key 部署(全局 api_key / admin_api_key 都没配)时,管理面**必须**校验凭据:
-    /// store 里存在任何一条 key 就说明系统已启用鉴权,admin 端点不得当作首次运行而开放。
-    /// 同时 store key 自身在 admin 闸一律不放行——数据面 key 不得取得管理员权限。
+    /// 首次运行自锁回归:全新部署(无全局 api_key / admin_api_key)管理面按设计开放,
+    /// 操作者在开放的管理面里建出第一条 store key 后,管理面**必须仍然开放**。
+    ///
+    /// 若 store key 能把管理闸判成"已配置鉴权",建 key 的下一个 /api/admin/* 就 401,而
+    /// store key 在 admin 闸永不放行 → 操作者被永久锁死、产品内无补救入口。管理闸的开闭
+    /// 只由管理员级凭据决定:本测试同时钉住"设了 admin key 立刻收口"的补救路径。
     #[tokio::test]
-    async fn admin_gate_requires_credentials_when_only_store_keys_exist() {
+    async fn admin_gate_stays_open_when_only_store_keys_exist() {
         use crate::config::{Config, shared_runtime_config};
         let path = tmp_store_path("adminonlystore");
         let _ = std::fs::remove_file(&path);
         let store = ApiKeyStore::load(&path);
+        // 全局 key 与 admin key 均未配置,只有操作者刚建出来的 store key。
         let k = store.create("u1".into(), None, None, None, None, None, Utc::now());
-        // 全局 key 与 admin key 均未配置,只有 store key。
+        assert!(!store.is_empty());
         let rc = shared_runtime_config(&Config::default());
-        let auth = AuthState::admin(rc, store);
+        let auth = AuthState::admin(rc.clone(), store);
         let app = Router::new()
             .route("/protected", get(ok_handler))
             .layer(middleware::from_fn_with_state(auth, require_api_key));
 
-        // 不带凭据 → 401(旧行为在此直接放行,等于管理面裸奔)。
+        // 核心断言:store 里已有 key,但没有任何管理员级凭据 → 管理面仍开放(不自锁)。
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "首次运行的管理面不得被 store key 锁死"
+        );
+
+        // 带 store key 同样通过——走的是开放模式,而非"store key 被当作管理员凭据"
+        // (下面配上 admin key 后同一条 store key 立即 401,即可证明这一点)。
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header("authorization", format!("Bearer {}", k.key))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 补救路径:操作者经开放的管理面设 admin key(PUT /config/auth-keys 写的就是这个
+        // 运行期字段)→ 管理闸即时收口,store key 与裸请求一律 401,只认 admin key。
+        rc.write().admin_api_key = Some("adm".into());
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header("authorization", format!("Bearer {}", k.key))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header("authorization", "Bearer adm")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 协议闸不受上面的放宽影响:store 里有 key = 数据面已启用鉴权,不带凭据的请求仍 401
+    /// (管理闸放开的只是管理闸自己,协议端点不得跟着裸奔)。
+    #[tokio::test]
+    async fn protocol_gate_still_requires_key_when_store_has_keys() {
+        use crate::config::{Config, shared_runtime_config};
+        let path = tmp_store_path("protoonlystore");
+        let _ = std::fs::remove_file(&path);
+        let store = ApiKeyStore::load(&path);
+        let _ = store.create("u1".into(), None, None, None, None, None, Utc::now());
+        // 全局 api_key 未配置,只有 store key。
+        let auth = AuthState::protocol(
+            shared_runtime_config(&Config::default()),
+            store,
+            StatsManager::load_from_dir(&std::env::temp_dir()),
+        );
+        let app = store_router(auth);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 配了 admin key 时管理闸照常收口:不带凭据 → 401(开放模式只属于"一个管理员级凭据都没配")。
+    #[tokio::test]
+    async fn admin_gate_requires_admin_key_when_configured() {
+        use crate::config::{Config, shared_runtime_config};
+        let path = tmp_store_path("adminkeyset");
+        let _ = std::fs::remove_file(&path);
+        let cfg = Config {
+            admin_api_key: Some("adm".into()),
+            ..Config::default()
+        };
+        let auth = AuthState::admin(shared_runtime_config(&cfg), ApiKeyStore::load(&path));
+        let app = Router::new()
+            .route("/protected", get(ok_handler))
+            .layer(middleware::from_fn_with_state(auth, require_api_key));
         let resp = app
             .clone()
             .oneshot(
@@ -551,18 +686,18 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        // 带有效 store key → 依旧 401:store key 不是管理员凭据。
+        // 正确 admin key → 放行。
         let resp = app
             .oneshot(
                 HttpRequest::builder()
                     .uri("/protected")
-                    .header("authorization", format!("Bearer {}", k.key))
+                    .header("authorization", "Bearer adm")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.status(), StatusCode::OK);
         let _ = std::fs::remove_file(&path);
     }
 
