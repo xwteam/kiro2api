@@ -75,7 +75,10 @@ impl InMsg {
                 .iter()
                 .filter_map(|b| match b {
                     Block::Text { text } => Some(text.as_str()),
-                    Block::ToolUse { .. } | Block::ToolResult { .. } | Block::Image { .. } => None,
+                    Block::ToolUse { .. }
+                    | Block::ToolResult { .. }
+                    | Block::Image { .. }
+                    | Block::Other => None,
                 })
                 .collect::<Vec<_>>()
                 .concat(),
@@ -92,6 +95,11 @@ pub enum ContentIn {
 }
 
 /// 输入内容块(照 Anthropic 公开规范:文本/工具调用/工具结果/图片)。
+///
+/// 规范里的内容块类型远不止这四种(`thinking` / `redacted_thinking` / `document` /
+/// `search_result` …),真实客户端会把带 thinking 的历史、PDF 文档原样续传过来。
+/// 这些块本中转无法转发给 Kiro 数据面,但**不能**因此让整条请求反序列化失败——
+/// 故用 [`Block::Other`] 兜住所有未知 `type`,由各转换器按既有的"非文本块跳过"逻辑忽略。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Block {
@@ -113,6 +121,10 @@ pub enum Block {
     Image {
         source: serde_json::Value,
     },
+    /// 上面之外的任何 `type`(thinking / redacted_thinking / document / search_result 及
+    /// 未来新增类型)。承接即丢弃:不进上游请求、不计入 token 估算、不参与文本拍平。
+    #[serde(other)]
+    Other,
 }
 
 /// `/v1/messages` 响应体。
@@ -287,6 +299,52 @@ mod tests {
                 }
                 other => panic!("应为 ToolUse,实际: {other:?}"),
             },
+            other => panic!("应为 Blocks,实际: {other:?}"),
+        }
+    }
+
+    // --- 未知内容块的宽容处理 ---
+
+    /// 带 `thinking` / `redacted_thinking` 块的助手历史续传:整条请求仍应解析成功,
+    /// 未知块落到 `Block::Other`,`text()` 只拍平真正的文本块。
+    #[test]
+    fn parses_thinking_blocks_without_failing() {
+        let raw = r#"{"role":"assistant","content":[
+            {"type":"thinking","thinking":"let me think","signature":"sig"},
+            {"type":"redacted_thinking","data":"opaque"},
+            {"type":"text","text":"answer"}
+        ]}"#;
+        let msg: InMsg = serde_json::from_str(raw).expect("thinking 块不应导致解析失败");
+        match &msg.content {
+            ContentIn::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 3);
+                assert_eq!(blocks[0], Block::Other);
+                assert_eq!(blocks[1], Block::Other);
+            }
+            other => panic!("应为 Blocks,实际: {other:?}"),
+        }
+        assert_eq!(msg.text(), "answer");
+    }
+
+    /// `document`(PDF)/ `search_result` 等本中转不转发的块同样不应让整条请求失败。
+    #[test]
+    fn parses_document_and_unknown_blocks_without_failing() {
+        let raw = r#"{"model":"claude-sonnet-4.5","messages":[{"role":"user","content":[
+            {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBER"}},
+            {"type":"search_result","source":"https://example.com","title":"t","content":[{"type":"text","text":"c"}]},
+            {"type":"brand_new_block_type","whatever":1},
+            {"type":"text","text":"summarize"}
+        ]}]}"#;
+        let req: MessagesRequest = serde_json::from_str(raw).expect("未知块不应导致整体 422");
+        assert_eq!(req.messages[0].text(), "summarize");
+        match &req.messages[0].content {
+            ContentIn::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 4);
+                assert!(
+                    blocks[..3].iter().all(|b| *b == Block::Other),
+                    "前三块都应落到 Other,实际: {blocks:?}"
+                );
+            }
             other => panic!("应为 Blocks,实际: {other:?}"),
         }
     }

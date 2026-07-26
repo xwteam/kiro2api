@@ -21,7 +21,10 @@ use tokio::sync::Mutex;
 
 use crate::apikey::ApiKeyStore;
 use crate::config::Config;
-use crate::kiro::convert::{ConvertError, anthropic_to_kiro, kiro_events_to_anthropic};
+use crate::kiro::convert::{
+    ConvertError, StreamException, Truncation, anthropic_to_kiro, exception_status,
+    extract_exception, kiro_events_to_anthropic,
+};
 use crate::kiro::endpoint::Endpoint;
 use crate::kiro::eventstream::decoder::StreamDecoder;
 use crate::kiro::login::LoginError;
@@ -189,6 +192,55 @@ impl IntoResponse for RelayError {
             "error": { "type": self.err_type(), "message": self.message() },
         });
         (self.status(), Json(body)).into_response()
+    }
+}
+
+/// HTTP 状态码 → Anthropic 错误类型串(照公开错误规范的对照表)。
+/// 上游 exception 经 [`exception_status`] 只会落到 400/403/429/502 这几档,
+/// 其余状态码一律按 `api_error` 处理。
+fn anthropic_error_type(status: u16) -> &'static str {
+    match status {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        429 => "rate_limit_error",
+        _ => "api_error",
+    }
+}
+
+/// 组装标准 Anthropic 错误响应:`{"type":"error","error":{"type":…,"message":…}}`。
+/// 状态码非法(理论上不会)时回落 502,避免 `from_u16` 直接 panic。
+fn anthropic_error_response(status: u16, message: &str) -> Response {
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = serde_json::json!({
+        "type": "error",
+        "error": { "type": anthropic_error_type(status), "message": message },
+    });
+    (code, Json(body)).into_response()
+}
+
+/// 流式 `error` 事件(照 Anthropic 公开 Messages streaming 规范:`event: error` +
+/// 与非流式同形的错误体)。构造放在 handler 而非 `stream` 事件构造器里,
+/// 因为错误类型要按上游 exception 映射出的状态码决定。
+fn stream_error_event(status: u16, message: &str) -> stream::SseEvent {
+    stream::SseEvent {
+        event: "error",
+        data: serde_json::json!({
+            "type": "error",
+            "error": { "type": anthropic_error_type(status), "message": message },
+        })
+        .to_string(),
+    }
+}
+
+/// 把上游 exception 拼成对客户端可见的说明:有人类可读消息就 `<类型>: <消息>`,
+/// 否则只给类型(消息为空是上游没带,不是内部细节被抹掉)。
+fn exception_detail(e: &StreamException) -> String {
+    if e.message.is_empty() {
+        e.kind.clone()
+    } else {
+        format!("{}: {}", e.kind, e.message)
     }
 }
 
@@ -621,6 +673,9 @@ pub async fn relay_core(
 /// 非流式内核(带 store-key 归属)。`api_key_id` 为鉴权闸解析出的 store-key id
 /// (0 = 全局/开放模式,无归属),用量记录归属到该 key。`client_ip` 为调用方 IP
 /// (由 handler 经 [`extract_client_ip`] 算出;无则 `None`),随用量记录落库。
+///
+/// 兼容入口:上游在 200 事件流里下发的 exception 在这里被压成 [`RelayError::Upstream`],
+/// 对外即 502;需要按 429/403/400 精确回状态码的协议层改用 [`relay_core_outcome`]。
 pub async fn relay_core_attributed(
     state: &MessagesState,
     req: MessagesRequest,
@@ -628,6 +683,37 @@ pub async fn relay_core_attributed(
     client_ip: Option<String>,
     now_unix: u64,
 ) -> Result<MessagesResponse, RelayError> {
+    match relay_core_outcome(state, req, api_key_id, client_ip, now_unix).await? {
+        CoreOutcome::Response(resp) => Ok(resp),
+        CoreOutcome::Exception { e, .. } => Err(RelayError::Upstream(exception_detail(&e))),
+    }
+}
+
+/// 非流式内核的完整结果。
+///
+/// 上游把限流/鉴权/参数错误放在 **HTTP 200** 的事件流里,以 `:message-type == "exception"`
+/// 帧下发;直接把这样的帧序列交给还原函数,客户端只会拿到 200 + 空内容 + `end_turn`,
+/// 既察觉不到失败也不会重试。故内核把它单独表达出来,由协议层按自己的错误体形状回错。
+#[derive(Debug)]
+pub enum CoreOutcome {
+    /// 正常响应。
+    Response(MessagesResponse),
+    /// 上游事件流内的非截断 exception。`status` 已由 `exception_status` 映射为对外 HTTP 码
+    /// (429 / 403 / 400 / 502)。
+    Exception { status: u16, e: StreamException },
+}
+
+/// 非流式内核本体(见 [`relay_core_attributed`] 的参数语义)。
+///
+/// 与旧版的唯一差别:把上游事件流里的 exception 帧当作一等结果返回,而不是还原成
+/// "空内容 + end_turn" 的假成功。命中 exception 时**不**落用量记录(本轮没有产出内容)。
+pub async fn relay_core_outcome(
+    state: &MessagesState,
+    req: MessagesRequest,
+    api_key_id: u32,
+    client_ip: Option<String>,
+    now_unix: u64,
+) -> Result<CoreOutcome, RelayError> {
     let started = std::time::Instant::now();
     // 跨账号重试:账号级失败自动换下一个健康账号,直到成功或用尽自适应上限;
     // 请求级致命错误(Convert/400)不重试。返回成功前不会开始读 body。
@@ -660,6 +746,23 @@ pub async fn relay_core_attributed(
     let mut dec = StreamDecoder::new();
     dec.push(&bytes);
     let frames = dec.drain();
+
+    // 必须先于还原响应查 exception:上游用 200 + exception 帧表达限流/鉴权/参数错误,
+    // 交给 kiro_events_to_anthropic 只会得到空内容 + end_turn(截断类另有 Truncation 路径,
+    // 与此互斥,不会被这里抢走)。
+    if let Some(e) = extract_exception(&frames) {
+        let status = exception_status(&e.kind);
+        tracing::warn!(
+            event = "upstream_stream_exception",
+            model = %req.model,
+            account_id = credential_id,
+            kind = %e.kind,
+            status = status,
+            "上游事件流下发 exception"
+        );
+        return Ok(CoreOutcome::Exception { status, e });
+    }
+
     let out = kiro_events_to_anthropic(&frames, &req.model);
 
     // meteringEvent(若上游发了)带真实积分消耗与缓存 token;无则 credits=None、回退字符估算。
@@ -671,8 +774,9 @@ pub async fn relay_core_attributed(
         .and_then(|m| m.cache_creation_input_tokens);
 
     // 成功中转 → 记录一条用量(池锁已释放,异步/批量存储,不阻塞热路径)。
-    // token 数取自解码后的 usage(input 现为 0 占位、output 为字符估算);credits 取自 meteringEvent。
-    // estimated_cost 按定价表由 token 数换算(USD 等值基线;input=0 时仅反映 output 侧)。
+    // token 数取自解码后的 usage:meteringEvent 带真实计量时即上游口径,缺项才回退
+    // (input → 0、output → 字符估算);credits 取自 meteringEvent。
+    // estimated_cost 按定价表由 token 数换算(USD 等值基线)。
     let estimated_cost = crate::stats::pricing::calculate_cost(
         &req.model,
         out.usage.input_tokens as i32,
@@ -697,7 +801,7 @@ pub async fn relay_core_attributed(
         )
         .await;
 
-    Ok(out)
+    Ok(CoreOutcome::Response(out))
 }
 
 /// 流式用量记账哨兵(#18):无论流如何结束(正常收尾 / 客户端断连 / 上游中途出错),
@@ -742,7 +846,19 @@ impl StreamUsageGuard {
         }
         self.recorded = true;
 
-        let output_tokens = (self.total_chars / CHARS_PER_TOKEN) as i32;
+        // token 数优先取 meteringEvent 的真实计量,逐项回退:input 无从估算 → 0;
+        // output → 累计字符数 ÷ 4。
+        let input_tokens = self
+            .metering
+            .as_ref()
+            .and_then(|m| m.input_tokens)
+            .unwrap_or(0) as i32;
+        let output_tokens = self
+            .metering
+            .as_ref()
+            .and_then(|m| m.output_tokens)
+            .map(|n| n as i32)
+            .unwrap_or((self.total_chars / CHARS_PER_TOKEN) as i32);
         let credits = self.metering.as_ref().map(|m| m.credits);
         let cache_read = self
             .metering
@@ -752,8 +868,9 @@ impl StreamUsageGuard {
             .metering
             .as_ref()
             .and_then(|m| m.cache_creation_input_tokens);
-        // estimated_cost:input 无从取(置 0),output 按定价表换算(见 stats::pricing)。
-        let estimated_cost = crate::stats::pricing::calculate_cost(&self.model, 0, output_tokens);
+        // estimated_cost 按定价表由两侧 token 换算(见 stats::pricing)。
+        let estimated_cost =
+            crate::stats::pricing::calculate_cost(&self.model, input_tokens, output_tokens);
 
         let usage = self.usage.clone();
         let model = self.model.clone();
@@ -767,7 +884,7 @@ impl StreamUsageGuard {
                     credential_id,
                     api_key_id,
                     model,
-                    0,
+                    input_tokens,
                     output_tokens,
                     estimated_cost,
                     credits,
@@ -850,6 +967,9 @@ pub async fn relay_stream_attributed(
     // 不变量 = 同一时刻至多一个内容块打开(先关后开);每块分配唯一递增 index;
     // 工具块按 toolUseId 键控;文本块懒开(首个文本增量到达才发 text 的 content_block_start),
     // 故纯工具轮不产出空文本块。文本块收到工具块后可重开(index 递增)。
+    // 已发过 content_block_stop 的 index 记进 `closed_blocks`:该块此后不再产出任何
+    // delta,也不会再发第二个 stop——上游偶发的迟到 input/stop 帧会让严格校验的官方 SDK
+    // 报解析错误或把参数拼错块。
     let body = async_stream::stream! {
         let id = crate::kiro::convert::new_message_id();
         let to_event = |e: stream::SseEvent| Event::default().event(e.event).data(e.data);
@@ -876,7 +996,10 @@ pub async fn relay_stream_attributed(
         let mut open_block: Option<u32> = None; // 当前打开的块 index
         let mut text_index: Option<u32> = None; // 当前文本块 index(关闭后置 None 以便重开)
         let mut tool_index: HashMap<String, u32> = HashMap::new(); // toolUseId → 块 index
+        let mut closed_blocks: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut any_tool = false;
+        let mut truncation: Option<Truncation> = None; // 首个截断信号(max_tokens / 上下文耗尽)
+        let mut stream_error: Option<StreamException> = None; // 上游中途下发的 exception
 
         loop {
             match resp.chunk().await {
@@ -887,7 +1010,7 @@ pub async fn relay_stream_attributed(
                             // assistantResponseEvent:懒开文本块,再发 text_delta。
                             if text_index.is_none() {
                                 // 关闭当前工具块(若有);随后无条件开新文本块,故此处不必显式置 None。
-                                if let Some(oi) = open_block {
+                                if let Some(oi) = open_block && closed_blocks.insert(oi) {
                                     yield Ok(to_event(stream::content_block_stop(oi)));
                                 }
                                 let idx = next_index;
@@ -904,7 +1027,9 @@ pub async fn relay_stream_attributed(
                             if !tool_index.contains_key(id) {
                                 // 关闭当前块(若有);随后无条件开新工具块,故此处不必显式置 None。
                                 if let Some(oi) = open_block {
-                                    yield Ok(to_event(stream::content_block_stop(oi)));
+                                    if closed_blocks.insert(oi) {
+                                        yield Ok(to_event(stream::content_block_stop(oi)));
+                                    }
                                     if text_index == Some(oi) {
                                         text_index = None; // 允许后续文本重开新块
                                     }
@@ -918,20 +1043,37 @@ pub async fn relay_stream_attributed(
                                 any_tool = true;
                             }
                             let idx = tool_index[id];
-                            if let Some(inp) = v["input"].as_str() {
-                                yield Ok(to_event(stream::input_json_delta(idx, inp)));
-                            }
-                            if v["stop"].as_bool() == Some(true) {
-                                yield Ok(to_event(stream::content_block_stop(idx)));
-                                if open_block == Some(idx) {
-                                    open_block = None;
+                            // 该块已收尾 → 迟到的 input/stop 帧一律丢弃,不再产出 delta 或第二个 stop。
+                            if !closed_blocks.contains(&idx) {
+                                if let Some(inp) = v["input"].as_str() {
+                                    yield Ok(to_event(stream::input_json_delta(idx, inp)));
+                                }
+                                if v["stop"].as_bool() == Some(true) {
+                                    closed_blocks.insert(idx);
+                                    yield Ok(to_event(stream::content_block_stop(idx)));
+                                    if open_block == Some(idx) {
+                                        open_block = None;
+                                    }
                                 }
                             }
                         } else if let Some(m) = crate::kiro::convert::metering_frame(&frame) {
                             // meteringEvent:记住真实积分消耗(多个则末次覆盖),流收尾时落库。
                             usage_guard.metering = Some(m);
+                        } else if let Some(tr) = crate::kiro::convert::frame_truncation(&frame) {
+                            // 截断信号(ContentLengthExceededException / contextUsage 100%):
+                            // 取首个,收尾时据此给出 stop_reason,与非流式路径同口径。
+                            if truncation.is_none() {
+                                truncation = Some(tr);
+                            }
+                        } else if let Some(e) = crate::kiro::convert::frame_exception(&frame) {
+                            // 上游中途报错(限流/鉴权/参数):记下并立刻停止读帧,收尾走 error 事件。
+                            stream_error = Some(e);
+                            break;
                         }
-                        // 忽略 contextUsageEvent / 其它。
+                        // 忽略其它事件。
+                    }
+                    if stream_error.is_some() {
+                        break;
                     }
                 }
                 Ok(None) => break,
@@ -939,17 +1081,50 @@ pub async fn relay_stream_attributed(
             }
         }
 
-        if let Some(oi) = open_block {
+        if let Some(oi) = open_block && closed_blocks.insert(oi) {
             yield Ok(to_event(stream::content_block_stop(oi)));
         }
-        let stop_reason = if any_tool { "tool_use" } else { "end_turn" };
-        let output_tokens = (usage_guard.total_chars / CHARS_PER_TOKEN) as u32;
-        yield Ok(to_event(stream::message_delta(stop_reason, output_tokens)));
-        yield Ok(to_event(stream::message_stop()));
 
-        // 流成功收尾 → 立即用当前累计量记一条用量(与非流式一致:input 置 0;output 为字符估算,
-        // credits/缓存取末次 meteringEvent)。flush 幂等并置 recorded,故随后哨兵 Drop 不会重复落库。
-        // 若客户端在收尾前断连/上游中途出错,则本行不执行,由 usage_guard 的 Drop 补记同样的累计量(#18)。
+        if let Some(e) = stream_error {
+            // 上游在 200 事件流里报错:照 Anthropic 流式规范发 `error` 事件后就此终止。
+            // **不**再发 message_delta/message_stop——那会把失败伪装成正常完成,
+            // 客户端既察觉不到也不会重试。
+            let status = exception_status(&e.kind);
+            tracing::warn!(
+                event = "upstream_stream_exception",
+                model = %model,
+                account_id = credential_id,
+                kind = %e.kind,
+                status = status,
+                "上游事件流下发 exception"
+            );
+            yield Ok(to_event(stream_error_event(status, &exception_detail(&e))));
+        } else {
+            // stop_reason 与非流式 kiro_events_to_anthropic 同口径:tool_use 优先级最高,
+            // 其次才看截断信号,最后才是 end_turn。
+            let stop_reason = if any_tool {
+                "tool_use"
+            } else {
+                match truncation {
+                    Some(Truncation::MaxTokens) => "max_tokens",
+                    Some(Truncation::ContextWindow) => "model_context_window_exceeded",
+                    None => "end_turn",
+                }
+            };
+            // output_tokens 优先用 meteringEvent 的真实计量,上游没带才回退字符估算。
+            let output_tokens = usage_guard
+                .metering
+                .as_ref()
+                .and_then(|m| m.output_tokens)
+                .unwrap_or((usage_guard.total_chars / CHARS_PER_TOKEN) as u32);
+            yield Ok(to_event(stream::message_delta(stop_reason, output_tokens)));
+            yield Ok(to_event(stream::message_stop()));
+        }
+
+        // 流收尾(正常完成或已发 error 事件)→ 立即用当前累计量记一条用量:token 优先取
+        // meteringEvent 的真实计量,缺项回退估算;credits/缓存同样取末次 meteringEvent。
+        // flush 幂等并置 recorded,故随后哨兵 Drop 不会重复落库。若客户端在收尾前断连,
+        // 则本行不执行,由 usage_guard 的 Drop 补记同样的累计量(#18)。
         usage_guard.flush();
     };
 
@@ -960,13 +1135,25 @@ pub async fn relay_stream_attributed(
 ///
 /// 鉴权闸(见 `server::auth`)命中 store key 时会把 [`ApiKeyId`] 塞进请求扩展;
 /// 全局 key/开放模式下扩展缺失,归属 id 记 0。
+///
+/// 请求体以 `Result<Json<..>, JsonRejection>` 提取:解析失败时由本函数回标准 Anthropic
+/// 错误体(400 + `invalid_request_error`),而不是 axum 默认的纯文本 422 —— 后者 SDK 解析不了。
 pub async fn messages(
     State(state): State<MessagesState>,
     connect_info: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: axum::http::HeaderMap,
     api_key_id: Option<axum::Extension<ApiKeyId>>,
-    Json(req): Json<MessagesRequest>,
+    payload: Result<Json<MessagesRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let req = match payload {
+        Ok(Json(req)) => req,
+        Err(rejection) => {
+            return anthropic_error_response(
+                StatusCode::BAD_REQUEST.as_u16(),
+                &rejection.body_text(),
+            );
+        }
+    };
     let api_key_id = api_key_id.and_then(|axum::Extension(k)| k.0).unwrap_or(0);
     // 客户端 IP:优先 X-Forwarded-For/X-Real-IP(反代场景),否则取 socket 对端地址。
     // ConnectInfo 经 make-service 塞进请求扩展,以 `Option<Extension<..>>` 读取:单测用 oneshot
@@ -982,8 +1169,12 @@ pub async fn messages(
             Err(e) => e.into_response(),
         }
     } else {
-        match relay_core_attributed(&state, req, api_key_id, client_ip, now_unix).await {
-            Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        match relay_core_outcome(&state, req, api_key_id, client_ip, now_unix).await {
+            Ok(CoreOutcome::Response(resp)) => (StatusCode::OK, Json(resp)).into_response(),
+            // 上游 200 事件流里的 exception:按映射出的状态码回错误,不再是 200 + 空内容。
+            Ok(CoreOutcome::Exception { status, e }) => {
+                anthropic_error_response(status, &exception_detail(&e))
+            }
             Err(e) => e.into_response(),
         }
     }
@@ -1024,6 +1215,8 @@ fn count_content_chars(content: &crate::protocol::anthropic::types::ContentIn) -
                     }
                     // 图片:按固定 token 估算,不按 base64 字符数(见 IMAGE_TOKEN_ESTIMATE)。
                     Block::Image { .. } => images += 1,
+                    // 未知/不转发的块(thinking、document、search_result…):不进上游请求,不计入估算。
+                    Block::Other => {}
                 }
             }
             (chars, images)
@@ -1219,6 +1412,53 @@ mod tests {
         let msg_crc = crc32(&msg);
         msg.extend_from_slice(&msg_crc.to_be_bytes());
         msg
+    }
+
+    /// 构造一条 exception 帧:`:message-type=exception` + `:exception-type=<kind>`
+    /// 两个 string header(上游在 200 事件流里报错的真实形态)。
+    fn exception_frame(kind: &str, payload: &[u8]) -> Vec<u8> {
+        let mut headers = Vec::new();
+        for (name, value) in [(":message-type", "exception"), (":exception-type", kind)] {
+            headers.push(name.len() as u8);
+            headers.extend_from_slice(name.as_bytes());
+            headers.push(7u8); // string 类型
+            headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            headers.extend_from_slice(value.as_bytes());
+        }
+
+        let headers_len = headers.len() as u32;
+        let total_len = 16 + headers_len + payload.len() as u32;
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&total_len.to_be_bytes());
+        msg.extend_from_slice(&headers_len.to_be_bytes());
+        let prelude_crc = crc32(&msg[0..8]);
+        msg.extend_from_slice(&prelude_crc.to_be_bytes());
+        msg.extend_from_slice(&headers);
+        msg.extend_from_slice(payload);
+        let msg_crc = crc32(&msg);
+        msg.extend_from_slice(&msg_crc.to_be_bytes());
+        msg
+    }
+
+    /// 发一次 `/v1/messages`,返回 (状态码, 响应体字节)。
+    async fn post_messages(app: Router, body: &'static str) -> (StatusCode, Vec<u8>) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, bytes.to_vec())
     }
 
     fn cred() -> Credential {
@@ -1747,6 +1987,344 @@ mod tests {
         let stop_pos = s.find("event: content_block_stop").unwrap();
         let msg_stop_pos = s.find("event: message_stop").unwrap();
         assert!(start_pos < stop_pos && stop_pos < msg_stop_pos);
+    }
+
+    // ==================== 上游 200 事件流里的 exception ====================
+
+    /// 状态码 → Anthropic 错误类型的对照(exception_status 只会给出 400/403/429/502)。
+    #[test]
+    fn anthropic_error_type_maps_status_codes() {
+        assert_eq!(anthropic_error_type(429), "rate_limit_error");
+        assert_eq!(anthropic_error_type(403), "permission_error");
+        assert_eq!(anthropic_error_type(400), "invalid_request_error");
+        assert_eq!(anthropic_error_type(502), "api_error");
+        assert_eq!(anthropic_error_type(500), "api_error");
+    }
+
+    /// 非流式:上游回 200 但事件流里夹 ThrottlingException →
+    /// 必须回 429 + Anthropic 错误体,而不是 200 + 空内容 + end_turn。
+    #[tokio::test]
+    async fn non_streaming_upstream_exception_yields_mapped_status() {
+        let server = MockServer::start().await;
+        let body = exception_frame("ThrottlingException", br#"{"message":"slow down"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let (status, bytes) = post_messages(
+            app,
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "rate_limit_error");
+        let msg = v["error"]["message"].as_str().expect("message 应为字符串");
+        assert!(
+            msg.contains("ThrottlingException") && msg.contains("slow down"),
+            "错误消息应带上游类型与说明;实际:{msg}"
+        );
+    }
+
+    /// 非流式:鉴权类 exception → 403 + permission_error。
+    #[tokio::test]
+    async fn non_streaming_access_denied_exception_yields_403() {
+        let server = MockServer::start().await;
+        let body = exception_frame("AccessDeniedException", br#"{"message":"nope"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let (status, bytes) = post_messages(
+            app,
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "permission_error");
+    }
+
+    /// 流式:上游先发文本再发 exception → 必须发 `event: error` 并就此终止,
+    /// **不得**再发 message_delta/message_stop 把失败伪装成正常完成。
+    #[tokio::test]
+    async fn streaming_upstream_exception_emits_error_event() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("assistantResponseEvent", br#"{"content":"po"}"#);
+        body.extend(exception_frame(
+            "ThrottlingException",
+            br#"{"message":"slow down"}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let (status, bytes) = post_messages(
+            app,
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let s = String::from_utf8_lossy(&bytes);
+        for needle in [
+            "event: error",
+            "\"type\":\"rate_limit_error\"",
+            "ThrottlingException",
+        ] {
+            assert!(s.contains(needle), "SSE 缺 `{needle}`;实际:\n{s}");
+        }
+        assert!(
+            !s.contains("event: message_stop"),
+            "出错的流不应发 message_stop;实际:\n{s}"
+        );
+        assert!(
+            !s.contains("event: message_delta"),
+            "出错的流不应发 message_delta;实际:\n{s}"
+        );
+        // 已打开的文本块仍要收尾,保持内容块结构完整。
+        assert!(
+            s.contains("event: content_block_stop"),
+            "已打开的块应先收尾;实际:\n{s}"
+        );
+    }
+
+    // ==================== 流式截断信号 ====================
+
+    /// 流式:命中 max_tokens(ContentLengthExceededException)→ stop_reason 必须是
+    /// `max_tokens`,而不是按"有无工具调用"推出来的 end_turn。截断不是错误,仍正常收尾。
+    #[tokio::test]
+    async fn streaming_max_tokens_truncation_sets_stop_reason() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("assistantResponseEvent", br#"{"content":"po"}"#);
+        body.extend(exception_frame("ContentLengthExceededException", b"{}"));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let (status, bytes) = post_messages(
+            app,
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains("\"stop_reason\":\"max_tokens\""),
+            "截断应报 max_tokens;实际:\n{s}"
+        );
+        assert!(
+            s.contains("event: message_stop"),
+            "截断是正常收尾,应有 message_stop;实际:\n{s}"
+        );
+        assert!(
+            !s.contains("event: error"),
+            "截断不是错误,不应发 error 事件;实际:\n{s}"
+        );
+    }
+
+    /// 流式:上下文窗口耗尽(contextUsagePercentage=100)→ stop_reason
+    /// `model_context_window_exceeded`。
+    #[tokio::test]
+    async fn streaming_context_window_truncation_sets_stop_reason() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("assistantResponseEvent", br#"{"content":"po"}"#);
+        body.extend(event_frame(
+            "contextUsageEvent",
+            br#"{"contextUsagePercentage":100}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let (status, bytes) = post_messages(
+            app,
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains("\"stop_reason\":\"model_context_window_exceeded\""),
+            "上下文耗尽应报 model_context_window_exceeded;实际:\n{s}"
+        );
+    }
+
+    // ==================== 内容块开闭状态机 ====================
+
+    /// 工具块 stop 之后上游又发来同一块的 input/stop 帧:不得产出已关闭块的 delta,
+    /// 也不得重复发 content_block_stop(严格校验的官方 SDK 会因此解析失败/参数错乱)。
+    #[tokio::test]
+    async fn streaming_ignores_frames_after_tool_block_closed() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("toolUseEvent", br#"{"name":"f","toolUseId":"tu1"}"#);
+        body.extend(event_frame(
+            "toolUseEvent",
+            br#"{"input":"{}","name":"f","toolUseId":"tu1"}"#,
+        ));
+        body.extend(event_frame(
+            "toolUseEvent",
+            br#"{"name":"f","stop":true,"toolUseId":"tu1"}"#,
+        ));
+        // 收尾之后迟到的 input / 重复 stop:都应被丢弃。
+        body.extend(event_frame(
+            "toolUseEvent",
+            br#"{"input":"LATEFRAGMENT","name":"f","toolUseId":"tu1"}"#,
+        ));
+        body.extend(event_frame(
+            "toolUseEvent",
+            br#"{"name":"f","stop":true,"toolUseId":"tu1"}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let (status, bytes) = post_messages(
+            app,
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            !s.contains("LATEFRAGMENT"),
+            "已关闭的块不应再产出 delta;实际:\n{s}"
+        );
+        assert_eq!(
+            s.matches("event: content_block_stop").count(),
+            1,
+            "content_block_stop 应恰好一次;实际:\n{s}"
+        );
+        assert!(
+            s.contains("\"stop_reason\":\"tool_use\""),
+            "仍应正常收尾于 tool_use;实际:\n{s}"
+        );
+    }
+
+    // ==================== usage 用上游真实计量 ====================
+
+    /// 流式:meteringEvent 带真实 token 计量时,message_delta 的 usage 必须用它,
+    /// 而不是"输出字符数 ÷ 4"的估算(2 个字符本会估成 0)。
+    #[tokio::test]
+    async fn streaming_message_delta_uses_metering_output_tokens() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("assistantResponseEvent", br#"{"content":"po"}"#);
+        body.extend(event_frame(
+            "meteringEvent",
+            br#"{"usage":1.5,"input_tokens":1234,"output_tokens":777}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let (status, bytes) = post_messages(
+            app,
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains("\"output_tokens\":777"),
+            "message_delta 应用 meteringEvent 的真实 output_tokens;实际:\n{s}"
+        );
+    }
+
+    /// 非流式:meteringEvent 的真实 token 计量应原样出现在响应 usage 里
+    /// (input 不再恒 0、output 不再是字符估算)。
+    #[tokio::test]
+    async fn non_streaming_usage_uses_metering_tokens() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        body.extend(event_frame(
+            "meteringEvent",
+            br#"{"usage":1.5,"input_tokens":1234,"output_tokens":777}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let (status, bytes) = post_messages(
+            app,
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["usage"]["input_tokens"], 1234);
+        assert_eq!(v["usage"]["output_tokens"], 777);
+    }
+
+    // ==================== 请求体宽容度与错误体形状 ====================
+
+    /// 带 thinking / document 块的请求不应整体失败(旧行为:422 纯文本),
+    /// 未知块被跳过、其余内容照常转发。
+    #[tokio::test]
+    async fn unknown_content_blocks_do_not_fail_request() {
+        let server = MockServer::start().await;
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let (status, bytes) = post_messages(
+            app,
+            r#"{"model":"sonnet","messages":[{"role":"user","content":[
+                {"type":"thinking","thinking":"hmm","signature":"s"},
+                {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBER"}},
+                {"type":"text","text":"hi"}
+            ]}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["content"][0]["text"], "pong");
+    }
+
+    /// 请求体解析失败 → 400 + 标准 Anthropic 错误体(而非 axum 默认的纯文本 422)。
+    #[tokio::test]
+    async fn malformed_body_yields_anthropic_error_shape() {
+        let server = MockServer::start().await;
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let (status, bytes) = post_messages(app, r#"{"model":"sonnet","messages":"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("错误体应为 JSON,而不是纯文本");
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .is_some_and(|m| !m.is_empty()),
+            "错误体应带说明;实际:{v}"
+        );
     }
 
     /// `POST /v1/messages/count_tokens`:纯估算,不打网络(空池也应 200)。
