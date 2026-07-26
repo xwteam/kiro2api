@@ -2,6 +2,7 @@
 //!
 //! 净室实现:形状照 OpenAI 公开 Responses API 规范(线上 JSON 字段名/结构)
 //! 由本仓从公开文档重新推导实现,不含任何第三方专有代码。
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
 /// `/v1/responses` 请求体。
@@ -32,7 +33,11 @@ pub enum ResponsesInput {
 }
 
 /// 单条输入条目(消息/函数调用/函数调用结果)。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// 序列化恒带 `type`;**反序列化时 `type` 可缺省**——官方 SDK 的常见写法
+/// `{"role":"user","content":"hi"}` 不带 `type`,缺失时按 `role` 判定为普通 message 条目。
+/// 上一轮 `output` 原样回灌做多轮时,条目自带的 `id`/`status` 等额外字段一律忽略。
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InputItem {
     Message {
@@ -50,6 +55,50 @@ pub enum InputItem {
     },
 }
 
+/// 从 JSON 对象里取一个必填字符串字段;缺失/非字符串 → `missing_field` 错误。
+fn required_str<E: de::Error>(v: &serde_json::Value, name: &'static str) -> Result<String, E> {
+    v.get(name)
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| de::Error::missing_field(name))
+}
+
+impl<'de> Deserialize<'de> for InputItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v = serde_json::Value::deserialize(deserializer)?;
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("function_call") => Ok(InputItem::FunctionCall {
+                call_id: required_str::<D::Error>(&v, "call_id")?,
+                name: required_str::<D::Error>(&v, "name")?,
+                arguments: required_str::<D::Error>(&v, "arguments")?,
+            }),
+            Some("function_call_output") => {
+                let call_id = required_str::<D::Error>(&v, "call_id")?;
+                let Some(output) = v.get("output").cloned() else {
+                    return Err(de::Error::missing_field("output"));
+                };
+                Ok(InputItem::FunctionCallOutput { call_id, output })
+            }
+            // `type` 缺失时靠 `role` 认定为消息条目;两者都没有才算真的无法解析。
+            Some("message") | None => {
+                let role = required_str::<D::Error>(&v, "role")?;
+                let Some(raw) = v.get("content") else {
+                    return Err(de::Error::missing_field("content"));
+                };
+                let content = match InputItemContent::deserialize(raw) {
+                    Ok(c) => c,
+                    Err(e) => return Err(de::Error::custom(e)),
+                };
+                Ok(InputItem::Message { role, content })
+            }
+            Some(other) => Err(de::Error::custom(format!("不支持的输入条目类型: {other}"))),
+        }
+    }
+}
+
 /// 消息条目的 `content`:裸字符串或内容块数组。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -59,10 +108,15 @@ pub enum InputItemContent {
 }
 
 /// 多模态输入内容块(照 OpenAI 公开规范:文本/图片)。
+///
+/// `output_text` 也认:把上一轮的 output message 原样回灌做多轮时,其内容块正是这个类型。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InputContentPart {
     InputText {
+        text: String,
+    },
+    OutputText {
         text: String,
     },
     InputImage {
@@ -93,10 +147,13 @@ pub struct ResponseObject {
     pub model: String,
     pub output: Vec<OutputItem>,
     pub usage: ResponsesUsage,
+    /// `status:"incomplete"` 时的补充说明;`completed` 时整字段省略(照 OpenAI 规范)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_details: Option<IncompleteDetails>,
 }
 
 impl ResponseObject {
-    /// 构造响应,`object` 固定填 `"response"`。
+    /// 构造响应,`object` 固定填 `"response"`(不带 `incomplete_details`)。
     pub fn new(
         id: String,
         created_at: u64,
@@ -113,8 +170,15 @@ impl ResponseObject {
             model,
             output,
             usage,
+            incomplete_details: None,
         }
     }
+}
+
+/// `status:"incomplete"` 的原因(照 OpenAI 规范,取值为 `max_output_tokens` / `content_filter`)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncompleteDetails {
+    pub reason: String,
 }
 
 /// 非流式响应的单条输出条目(消息/函数调用)。
@@ -249,6 +313,73 @@ mod tests {
         }
     }
 
+    /// 官方 SDK 的常见写法:input 条目不带 `type`,靠 `role` 认定为 message 条目。
+    #[test]
+    fn parses_input_items_without_type_field() {
+        let raw = r#"{"model":"gpt-4o","input":[{"role":"user","content":"hi"}]}"#;
+        let req: ResponsesRequest = serde_json::from_str(raw).expect("解析失败");
+        match &req.input {
+            ResponsesInput::Items(items) => {
+                assert_eq!(items.len(), 1);
+                match &items[0] {
+                    InputItem::Message { role, content } => {
+                        assert_eq!(role, "user");
+                        assert_eq!(content, &InputItemContent::Text("hi".to_string()));
+                    }
+                    other => panic!("应为 Message,实际: {other:?}"),
+                }
+            }
+            other => panic!("应为 Items,实际: {other:?}"),
+        }
+    }
+
+    /// 上一轮 output 原样回灌做多轮:message 条目带 `id`/`status` 且内容块是 `output_text`,
+    /// function_call 条目带 `id`/`status`——多余字段忽略,不得整体 422。
+    #[test]
+    fn parses_previous_output_items_fed_back_as_input() {
+        let raw = r#"{"model":"gpt-4o","input":[
+            {"role":"user","content":"hi"},
+            {"type":"message","id":"msg_1","status":"completed","role":"assistant",
+             "content":[{"type":"output_text","text":"hello"}]},
+            {"type":"function_call","id":"fc_1","status":"completed","call_id":"c1","name":"f","arguments":"{}"},
+            {"type":"function_call_output","call_id":"c1","output":"ok"}
+        ]}"#;
+        let req: ResponsesRequest = serde_json::from_str(raw).expect("解析失败");
+        match &req.input {
+            ResponsesInput::Items(items) => {
+                assert_eq!(items.len(), 4);
+                match &items[1] {
+                    InputItem::Message { role, content } => {
+                        assert_eq!(role, "assistant");
+                        match content {
+                            InputItemContent::Parts(parts) => match &parts[0] {
+                                InputContentPart::OutputText { text } => assert_eq!(text, "hello"),
+                                other => panic!("应为 OutputText,实际: {other:?}"),
+                            },
+                            other => panic!("应为 Parts,实际: {other:?}"),
+                        }
+                    }
+                    other => panic!("应为 Message,实际: {other:?}"),
+                }
+                match &items[2] {
+                    InputItem::FunctionCall { call_id, name, .. } => {
+                        assert_eq!(call_id, "c1");
+                        assert_eq!(name, "f");
+                    }
+                    other => panic!("应为 FunctionCall,实际: {other:?}"),
+                }
+            }
+            other => panic!("应为 Items,实际: {other:?}"),
+        }
+    }
+
+    /// 既无 `type` 又无 `role`:确实无从判定,仍须报错(而不是猜成空消息)。
+    #[test]
+    fn rejects_input_item_without_type_and_role() {
+        let raw = r#"{"model":"gpt-4o","input":[{"content":"hi"}]}"#;
+        assert!(serde_json::from_str::<ResponsesRequest>(raw).is_err());
+    }
+
     #[test]
     fn parses_request_with_instructions_previous_response_id_and_tools() {
         let raw = r#"{
@@ -297,6 +428,32 @@ mod tests {
         assert_eq!(v["output"][0]["content"][0]["type"], "output_text");
         assert_eq!(v["output"][0]["content"][0]["text"], "hi");
         assert_eq!(v["usage"]["total_tokens"], 3);
+        assert!(
+            v.get("incomplete_details").is_none(),
+            "completed 响应不应带 incomplete_details"
+        );
+    }
+
+    #[test]
+    fn serializes_incomplete_response_object_with_details() {
+        let mut resp = ResponseObject::new(
+            "resp_1".to_string(),
+            1_700_000_000,
+            "incomplete".to_string(),
+            "gpt-4o".to_string(),
+            Vec::new(),
+            ResponsesUsage {
+                input_tokens: 1,
+                output_tokens: 2,
+                total_tokens: 3,
+            },
+        );
+        resp.incomplete_details = Some(IncompleteDetails {
+            reason: "max_output_tokens".to_string(),
+        });
+        let v = serde_json::to_value(&resp).expect("序列化失败");
+        assert_eq!(v["status"], "incomplete");
+        assert_eq!(v["incomplete_details"]["reason"], "max_output_tokens");
     }
 
     #[test]

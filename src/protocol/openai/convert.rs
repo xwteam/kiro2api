@@ -42,15 +42,39 @@ fn convert_content_part(part: &ContentPart) -> Option<Block> {
     }
 }
 
-/// 把单条 OpenAI 消息转换成 0~1 条中枢消息(`role:"system"` 由调用方单独处理,这里不产出)。
+/// `developer` 是 OpenAI 新版规范里 `system` 的更名,语义相同;两者都并入中枢 `system` 提示词。
+fn is_system_role(role: &str) -> bool {
+    role == "system" || role == "developer"
+}
+
+/// 把消息 `content` 拍平成纯文本:裸字符串取自身;数组形按 parts 顺序拼接其中的文本块
+/// (图片块无文本可拼,跳过)。拼接不加分隔符,与 user 角色数组形被拆成多个文本块后
+/// 由中枢 `InMsg::text()` 直接 concat 的口径一致。
+fn content_text(content: &OpenAiContent) -> String {
+    match content {
+        OpenAiContent::Text(s) => s.clone(),
+        OpenAiContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::ImageUrl { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .concat(),
+    }
+}
+
+/// 把单条 OpenAI 消息转换成 0~1 条中枢消息(system/developer 由调用方单独处理,这里不产出)。
 fn convert_message(msg: &ChatMessage) -> Option<InMsg> {
-    if msg.role == "system" {
+    if is_system_role(&msg.role) {
         return None;
     }
     if let Some(tool_call_id) = &msg.tool_call_id {
+        // tool 角色的 content 同样可能是数组形(LangChain 等客户端即如此发),必须按 parts
+        // 拼出文本;丢成空串等于把整个工具结果吞掉,模型只能反复重发同一个工具调用。
         let text_val = match &msg.content {
-            Some(OpenAiContent::Text(s)) => Value::String(s.clone()),
-            Some(OpenAiContent::Parts(_)) | None => Value::String(String::new()),
+            Some(content) => Value::String(content_text(content)),
+            None => Value::String(String::new()),
         };
         return Some(InMsg {
             role: "user".to_string(),
@@ -109,9 +133,12 @@ pub fn openai_to_hub(req: ChatCompletionRequest) -> MessagesRequest {
     let mut messages: Vec<InMsg> = Vec::new();
 
     for msg in &req.messages {
-        if msg.role == "system" {
-            if let Some(OpenAiContent::Text(s)) = &msg.content {
-                system_parts.push(s.clone());
+        if is_system_role(&msg.role) {
+            if let Some(content) = &msg.content {
+                let text = content_text(content);
+                if !text.is_empty() {
+                    system_parts.push(text);
+                }
             }
             continue;
         }
@@ -144,6 +171,8 @@ pub fn openai_to_hub(req: ChatCompletionRequest) -> MessagesRequest {
         max_tokens: req.max_tokens,
         stream: req.stream,
         tools,
+        // Kiro 数据面 wire 无 tool_choice 对应字段(见 `kiro::convert::anthropic_to_kiro`),
+        // 故只原样带进中枢请求,链路末端故意不转发,也不改写成提示词伪装成已生效。
         tool_choice: req.tool_choice,
     }
 }
@@ -260,6 +289,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: None,
+            stream_options: None,
             max_tokens: None,
         };
         let hub = openai_to_hub(req);
@@ -278,6 +308,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: None,
+            stream_options: None,
             max_tokens: None,
         };
         let hub = openai_to_hub(req);
@@ -302,6 +333,7 @@ mod tests {
             }]),
             tool_choice: None,
             stream: None,
+            stream_options: None,
             max_tokens: None,
         };
         let hub = openai_to_hub(req);
@@ -334,6 +366,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: None,
+            stream_options: None,
             max_tokens: None,
         };
         let hub = openai_to_hub(req);
@@ -372,6 +405,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: None,
+            stream_options: None,
             max_tokens: None,
         };
         let hub = openai_to_hub(req);
@@ -397,6 +431,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: None,
+            stream_options: None,
             max_tokens: None,
         };
         let hub = openai_to_hub(req);
@@ -417,6 +452,111 @@ mod tests {
             },
             other => panic!("应为 Blocks,实际: {other:?}"),
         }
+    }
+
+    #[test]
+    fn openai_to_hub_tool_message_with_content_parts_keeps_text() {
+        // 数组形 content 的 tool 消息(LangChain 等客户端写法):工具结果必须原样带上,
+        // 不能被拍成空串。
+        let req = ChatCompletionRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![ChatMessage {
+                role: "tool".to_string(),
+                content: Some(OpenAiContent::Parts(vec![
+                    ContentPart::Text {
+                        text: "sunny".to_string(),
+                    },
+                    ContentPart::Text {
+                        text: " 25C".to_string(),
+                    },
+                ])),
+                tool_calls: None,
+                tool_call_id: Some("c1".to_string()),
+            }],
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            stream_options: None,
+            max_tokens: None,
+        };
+        let hub = openai_to_hub(req);
+        match &hub.messages[0].content {
+            ContentIn::Blocks(blocks) => match &blocks[0] {
+                Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
+                    assert_eq!(tool_use_id, "c1");
+                    assert_eq!(content, "sunny 25C");
+                }
+                other => panic!("应为 ToolResult,实际: {other:?}"),
+            },
+            other => panic!("应为 Blocks,实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_to_hub_system_content_parts_joined_into_system_prompt() {
+        let req = ChatCompletionRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(OpenAiContent::Parts(vec![
+                        ContentPart::Text {
+                            text: "be ".to_string(),
+                        },
+                        ContentPart::Text {
+                            text: "nice".to_string(),
+                        },
+                    ])),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                user_msg("hi"),
+            ],
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            stream_options: None,
+            max_tokens: None,
+        };
+        let hub = openai_to_hub(req);
+        assert_eq!(
+            hub.system.as_ref().map(|s| s.text()).as_deref(),
+            Some("be nice")
+        );
+        assert_eq!(hub.messages.len(), 1);
+    }
+
+    #[test]
+    fn openai_to_hub_developer_role_becomes_system() {
+        let req = ChatCompletionRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![
+                ChatMessage {
+                    role: "developer".to_string(),
+                    content: Some(OpenAiContent::Text("be nice".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                user_msg("hi"),
+            ],
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            stream_options: None,
+            max_tokens: None,
+        };
+        let hub = openai_to_hub(req);
+        assert_eq!(
+            hub.system.as_ref().map(|s| s.text()).as_deref(),
+            Some("be nice")
+        );
+        // developer 不得再作为普通消息进 messages。
+        assert_eq!(hub.messages.len(), 1);
+        assert_eq!(hub.messages[0].role, "user");
     }
 
     #[test]
@@ -441,6 +581,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: None,
+            stream_options: None,
             max_tokens: None,
         };
         let hub = openai_to_hub(req);
@@ -478,6 +619,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: None,
+            stream_options: None,
             max_tokens: None,
         };
         let hub = openai_to_hub(req);

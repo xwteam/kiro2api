@@ -16,7 +16,19 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+    #[serde(default)]
     pub max_tokens: Option<u32>,
+}
+
+/// 流式附加选项(照 OpenAI 公开规范)。
+///
+/// `include_usage:true` 时,`[DONE]` 之前多发一个 `choices:[]`、仅带 `usage` 的收尾 chunk
+/// (见 [`ChatCompletionChunk::usage_only`]);为假/缺失时全流不出现 `usage` 字段。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: Option<bool>,
 }
 
 /// 单条消息(user/assistant/system/tool)。
@@ -156,10 +168,14 @@ pub struct ChatCompletionChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+    /// 仅 `stream_options.include_usage` 为真时的收尾 chunk 带值;其余 chunk 整字段省略
+    /// (OpenAI 规范:普通增量 chunk 不含 `usage`)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<OpenAiUsage>,
 }
 
 impl ChatCompletionChunk {
-    /// 构造 chunk,`object` 固定填 `"chat.completion.chunk"`。
+    /// 构造 chunk,`object` 固定填 `"chat.completion.chunk"`(不带 `usage`)。
     pub fn new(id: String, created: u64, model: String, choices: Vec<ChunkChoice>) -> Self {
         Self {
             id,
@@ -167,6 +183,19 @@ impl ChatCompletionChunk {
             created,
             model,
             choices,
+            usage: None,
+        }
+    }
+
+    /// 构造 `include_usage` 的收尾 chunk:`choices` 为空数组,只携带 `usage`。
+    pub fn usage_only(id: String, created: u64, model: String, usage: OpenAiUsage) -> Self {
+        Self {
+            id,
+            object: "chat.completion.chunk".to_string(),
+            created,
+            model,
+            choices: Vec::new(),
+            usage: Some(usage),
         }
     }
 }
@@ -266,6 +295,19 @@ mod tests {
         assert_eq!(req.stream, None);
         assert_eq!(req.tools, None);
         assert_eq!(req.max_tokens, None);
+        assert_eq!(req.stream_options, None);
+    }
+
+    #[test]
+    fn parses_stream_options_include_usage() {
+        let raw = r#"{"model":"gpt-4o","messages":[],"stream":true,"stream_options":{"include_usage":true}}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(raw).expect("解析失败");
+        assert_eq!(
+            req.stream_options,
+            Some(StreamOptions {
+                include_usage: Some(true)
+            })
+        );
     }
 
     #[test]
@@ -400,6 +442,27 @@ mod tests {
         assert_eq!(v["object"], "chat.completion.chunk");
         assert_eq!(v["choices"][0]["delta"]["role"], "assistant");
         assert_eq!(v["choices"][0]["delta"]["content"], "hi");
+        assert!(v.get("usage").is_none(), "普通增量 chunk 不应带 usage");
+    }
+
+    #[test]
+    fn serializes_usage_only_chunk_with_empty_choices() {
+        let chunk = ChatCompletionChunk::usage_only(
+            "chatcmpl-1".to_string(),
+            1_700_000_000,
+            "gpt-4o".to_string(),
+            OpenAiUsage {
+                prompt_tokens: 7,
+                completion_tokens: 11,
+                total_tokens: 18,
+            },
+        );
+        let v = serde_json::to_value(&chunk).expect("序列化失败");
+        assert_eq!(v["object"], "chat.completion.chunk");
+        assert_eq!(v["choices"].as_array().expect("choices 应为数组").len(), 0);
+        assert_eq!(v["usage"]["prompt_tokens"], 7);
+        assert_eq!(v["usage"]["completion_tokens"], 11);
+        assert_eq!(v["usage"]["total_tokens"], 18);
     }
 
     #[test]

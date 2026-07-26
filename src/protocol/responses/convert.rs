@@ -1,7 +1,7 @@
 //! Responses ↔ 中枢转换自写;形状照 OpenAI 公开 Responses 规范/中枢既有(`anthropic::types`)。
 use super::types::{
-    InputContentPart, InputItem, InputItemContent, OutputContentPart, OutputItem, ResponseObject,
-    ResponsesInput, ResponsesRequest, ResponsesTool, ResponsesUsage,
+    IncompleteDetails, InputContentPart, InputItem, InputItemContent, OutputContentPart,
+    OutputItem, ResponseObject, ResponsesInput, ResponsesRequest, ResponsesTool, ResponsesUsage,
 };
 use crate::protocol::anthropic::types::{
     Block, ContentIn, InMsg, MessagesRequest, MessagesResponse, OutBlock, SystemPrompt, ToolDef,
@@ -48,9 +48,13 @@ fn parse_data_url(url: &str) -> Option<(String, String)> {
 }
 
 /// 把单个 Responses 输入内容块转换成中枢 `Block`(非 data: 图片/空 image_url 跳过)。
+///
+/// `output_text`(上一轮 output 回灌)与 `input_text` 同样落成文本块。
 fn convert_input_part(part: &InputContentPart) -> Option<Block> {
     match part {
-        InputContentPart::InputText { text } => Some(Block::Text { text: text.clone() }),
+        InputContentPart::InputText { text } | InputContentPart::OutputText { text } => {
+            Some(Block::Text { text: text.clone() })
+        }
         InputContentPart::InputImage { image_url } => {
             let url = image_url.as_deref()?;
             let (mime, data) = parse_data_url(url)?;
@@ -139,12 +143,26 @@ pub fn responses_to_hub(req: ResponsesRequest) -> Result<MessagesRequest, Respon
         max_tokens: req.max_output_tokens,
         stream: req.stream,
         tools,
+        // Kiro 数据面 wire 无 tool_choice 对应字段(见 `kiro::convert::anthropic_to_kiro`),
+        // 故只原样带进中枢请求,链路末端故意不转发,也不改写成提示词伪装成已生效。
         tool_choice: req.tool_choice,
     })
 }
 
 /// 把中枢 `MessagesResponse` 转换成 Responses `ResponseObject`。
+///
+/// `stop_reason` 决定顶层 `status`:上游截断(`max_tokens` / `model_context_window_exceeded`)
+/// → `"incomplete"` + `incomplete_details.reason="max_output_tokens"`,文本条目同样标
+/// `"incomplete"`;其余(含 `end_turn`/`tool_use`)→ `"completed"`。Responses 规范只有
+/// `max_output_tokens` / `content_filter` 两种 reason,故两类截断共用前者——真正要紧的是
+/// `status` 不能报 completed,否则 agent 框架会把半截回答当完整结果继续用。
 pub fn hub_to_responses(resp: MessagesResponse, created_at: u64) -> ResponseObject {
+    let truncated = matches!(
+        resp.stop_reason.as_deref(),
+        Some("max_tokens") | Some("model_context_window_exceeded")
+    );
+    let status = if truncated { "incomplete" } else { "completed" };
+
     let mut output: Vec<OutputItem> = Vec::new();
     let mut text = String::new();
 
@@ -169,7 +187,7 @@ pub fn hub_to_responses(resp: MessagesResponse, created_at: u64) -> ResponseObje
             0,
             OutputItem::Message {
                 id: format!("msg_{}", random_hex_id()),
-                status: "completed".to_string(),
+                status: status.to_string(),
                 role: "assistant".to_string(),
                 content: vec![OutputContentPart::OutputText { text }],
             },
@@ -184,14 +202,20 @@ pub fn hub_to_responses(resp: MessagesResponse, created_at: u64) -> ResponseObje
         total_tokens: input_tokens + output_tokens,
     };
 
-    ResponseObject::new(
+    let mut out = ResponseObject::new(
         format!("resp_{}", random_hex_id()),
         created_at,
-        "completed".to_string(),
+        status.to_string(),
         resp.model,
         output,
         usage,
-    )
+    );
+    if truncated {
+        out.incomplete_details = Some(IncompleteDetails {
+            reason: "max_output_tokens".to_string(),
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -522,6 +546,81 @@ mod tests {
             }
             other => panic!("应为 FunctionCall,实际: {other:?}"),
         }
+    }
+
+    #[test]
+    fn responses_to_hub_output_text_part_becomes_text_block() {
+        // 上一轮 output 回灌:assistant 消息的 output_text 块必须落成文本块,不能被丢掉。
+        let req = ResponsesRequest {
+            model: "gpt-4o".to_string(),
+            input: ResponsesInput::Items(vec![InputItem::Message {
+                role: "assistant".to_string(),
+                content: InputItemContent::Parts(vec![InputContentPart::OutputText {
+                    text: "hello".to_string(),
+                }]),
+            }]),
+            instructions: None,
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            max_output_tokens: None,
+            previous_response_id: None,
+        };
+        let hub = responses_to_hub(req).expect("应转换成功");
+        assert_eq!(hub.messages[0].role, "assistant");
+        assert_eq!(hub.messages[0].text(), "hello");
+    }
+
+    #[test]
+    fn hub_to_responses_truncated_response_is_incomplete() {
+        for stop in ["max_tokens", "model_context_window_exceeded"] {
+            let resp = MessagesResponse {
+                id: "msg_1".to_string(),
+                kind: "message".to_string(),
+                role: "assistant".to_string(),
+                model: "claude-sonnet-4.5".to_string(),
+                content: vec![OutBlock::Text {
+                    text: "half".to_string(),
+                }],
+                stop_reason: Some(stop.to_string()),
+                usage: crate::protocol::anthropic::types::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            };
+            let out = hub_to_responses(resp, 1_700_000_000);
+            assert_eq!(out.status, "incomplete", "{stop} 应报 incomplete");
+            assert_eq!(
+                out.incomplete_details.as_ref().map(|d| d.reason.as_str()),
+                Some("max_output_tokens"),
+                "{stop} 应带 incomplete_details"
+            );
+            match &out.output[0] {
+                OutputItem::Message { status, .. } => assert_eq!(status, "incomplete"),
+                other => panic!("应为 Message,实际: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn hub_to_responses_end_turn_stays_completed() {
+        let resp = MessagesResponse {
+            id: "msg_1".to_string(),
+            kind: "message".to_string(),
+            role: "assistant".to_string(),
+            model: "claude-sonnet-4.5".to_string(),
+            content: vec![OutBlock::Text {
+                text: "hi".to_string(),
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::protocol::anthropic::types::Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        };
+        let out = hub_to_responses(resp, 1_700_000_000);
+        assert_eq!(out.status, "completed");
+        assert_eq!(out.incomplete_details, None);
     }
 
     #[test]
