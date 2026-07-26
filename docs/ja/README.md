@@ -51,7 +51,7 @@
 > バックエンドは Kiro（CodeWhisperer）アカウントプールです。**利用可能なモデルはアカウントのサブスクリプション階層に依存します**：無料階層（KIRO FREE）は通常 `claude-sonnet-4.5` のみを許可し、opus/GPT などはより上位の階層が必要です。サポートされていないモデルを要求すると明示的に 400（`INVALID_MODEL_ID`）を返し、黙って失敗することはありません。
 
 > [!IMPORTANT]
-> `apiKey`/`API_KEY` が空の場合、プロトコルエンドポイントは**オープンアクセス**になります（起動時に警告）。外部デプロイでは必ず設定してください。コンテナイメージには `HOST=0.0.0.0` が組み込まれています。ベアメタルデプロイでは `HOST` を安易に `0.0.0.0` に変更しないでください（現時点で `/admin`・`/user` パネル本体は認証未接続で、保護されるのは `/api/admin/*`・`/api/user/*` インターフェースです）。
+> `apiKey`/`API_KEY` が空の場合、プロトコルエンドポイントは**オープンアクセス**になります（起動時に警告）。外部デプロイでは必ず設定してください。管理インターフェース `/api/admin/*` は `adminApiKey`（未設定時は `apiKey` にフォールバック）を設定して初めて保護されます——**どちらのキーも未設定なら、管理インターフェースもパネル同様に誰でも叩ける状態**で、認証情報の追加・削除も認証キーの書き換えも自由にできてしまいます。`/admin`・`/user` パネル本体は常に認証されません。インターネットに公開するなら `ADMIN_API_KEY` の設定が必須です。コンテナイメージには `HOST=0.0.0.0` が組み込まれています。ベアメタルデプロイでは `HOST` を安易に `0.0.0.0` に変更しないでください。
 
 ---
 
@@ -83,7 +83,7 @@
 ### 🔐 統一認証ゲート
 
 - 3 択：`Authorization: Bearer` / `x-api-key` / `?token=`、定数時間比較、失敗時は即座に `401`
-- `adminApiKey`（未設定時は `apiKey` にフォールバック）が `/api/admin/*` を保護；保有者は自身の **API-KEY** で `/api/user/*` にアクセス
+- `adminApiKey`（未設定時は `apiKey` にフォールバック）が `/api/admin/*` を保護、両方とも未設定ならこのゲートはオープンモード；保有者は自身の **API-KEY** で `/api/user/*` にアクセス
 - `/health`、`/v1/ping` などの疎通確認エンドポイントは認証不要
 
 ### 🔄 アカウントプールとトークン自己修復
@@ -175,7 +175,9 @@ cp .env.example .env
 
 ```env
 API_KEY=sk-あなたの外部呼び出しキー
-ADMIN_API_KEY=任意,管理端の独立キー（空の場合は API_KEY にフォールバック）
+# 管理端の独立キー。公開デプロイでは必須（未設定なら /api/admin/* は API_KEY にフォールバック、両方とも未設定なら無認証）。
+# 不要なら行ごとコメントアウトしてください——空値で書くと config.json に設定済みのキーを上書きします。
+ADMIN_API_KEY=sk-あなたの管理端キー
 ```
 
 Kiro アカウント認証情報を `data/credentials.json` に配置（配列、既存の Kiro 認証情報をそのままドロップイン可能）：
@@ -390,7 +392,7 @@ resp = client.chat.completions.create(
 
 | メソッド | エンドポイント | 機能 |
 |---------|--------------|------|
-| GET | `/admin` · `/api/admin/*` | 管理パネル + 管理インターフェース（`adminApiKey` 認証：認証情報 CRUD / ログイン / API-KEY / 使用量 / ログ / 残高 / 設定 / 更新チェック / 再起動） |
+| GET | `/admin` · `/api/admin/*` | 管理パネル + 管理インターフェース（`adminApiKey` 認証、キーを一つも設定していなければオープン：認証情報 CRUD / ログイン / API-KEY / 使用量 / ログ / 残高 / 設定 / 更新チェック / 再起動） |
 | GET | `/user` · `/api/user/*` | ユーザーパネル + インターフェース（自身の API-KEY 認証） |
 | GET | `/health` · `/v1/ping` | 疎通確認（認証不要） |
 
@@ -404,20 +406,22 @@ resp = client.chat.completions.create(
 
 ## ⚙ 設定
 
-優先順位：**環境変数 > `config.json` > 組み込み既定**。マウントボリューム `./data` に `config.json`、`credentials.json`、ログと実行状態を格納します。
+優先順位：**コマンドライン引数 > 環境変数 > `config.json` > 組み込み既定**。コマンドライン引数は 2 つだけです：`-c/--config`（設定ファイルのパス）と `--credentials`（認証情報ファイルのパス。省略時は `CREDENTIALS_PATH`/`config.json`/既定値で決まります）。マウントボリューム `./data` に `config.json`、`credentials.json`、ログと実行状態を格納します。
+
+> 認証情報のパスは、使用量統計（`stats/`）・API-KEY ストア（`api_keys.json`）・残高キャッシュの保存先ディレクトリも決めます——いずれも `credentials.json` の親ディレクトリを使うためです。コンテナイメージには `CREDENTIALS_PATH=/app/data/credentials.json` が組み込まれているので、既定ではこれらもマウントボリュームに落ちます。パスを変更する場合はマウントボリューム内を指すようにしてください。さもないとコンテナを作り直した時点で消えます。
 
 **環境変数**（`.env.example` 参照）：
 
 | 変数 | 必須 | デフォルト | 説明 |
 |------|------|----------|------|
 | `API_KEY` | ✅ | — | 外部呼び出しキー（空の場合はプロトコルエンドポイントがオープンアクセス、起動時に警告） |
-| `ADMIN_API_KEY` | ❌ | `API_KEY` にフォールバック | 管理端の独立認証キー |
+| `ADMIN_API_KEY` | ❌ | `API_KEY` にフォールバック | 管理端の独立認証キー；`API_KEY` ともども未設定だと `/api/admin/*` はオープン、公開デプロイでは必須 |
 | `HOST` | ❌ | `127.0.0.1`（イメージは `0.0.0.0` 組み込み） | 待受アドレス |
-| `PORT` | ❌ | `8080` | サービスポート |
+| `PORT` | ❌ | `8080` | サービスポート（compose のポートマッピングとヘルスチェックもこの値に追従） |
 | `REGION` | ❌ | `us-east-1` | 既定 AWS region（アカウント `profileArn` 内の region が優先） |
 | `LOAD_BALANCING_MODE` | ❌ | `priority` | 負荷分散：`priority`（等重みローテーション）/ `balanced`（weight による加重） |
 | `MAX_RPM_PER_CREDENTIAL` | ❌ | `0` | アカウントあたり毎分のリクエスト上限、`0` = 無制限 |
-| `CREDENTIALS_PATH` | ❌ | `/app/data/credentials.json` | 認証情報ファイルのパス |
+| `CREDENTIALS_PATH` | ❌ | `credentials.json`（イメージは `/app/data/credentials.json` 組み込み） | 認証情報ファイルのパス；コマンドラインの `--credentials` が優先 |
 
 **`data/config.json`**（camelCase、すべて任意；`logCapacity` はここでのみ設定）：
 
@@ -431,21 +435,21 @@ resp = client.chat.completions.create(
   "credentialsPath": "/app/data/credentials.json",
   "loadBalancingMode": "priority",
   "maxRpmPerCredential": 0,
-  "logCapacity": 1000,
+  "logCapacity": 5000,
   "kiroVersion": "0.11.107",
   "systemVersion": "win32#10.0.22631",
   "nodeVersion": "22.22.0"
 }
 ```
 
-- `logCapacity`：リアルタイムログのリングバッファ件数、`>0` でログキャプチャを有効化（管理パネルのログページで再生/SSE）、`0` で無効化（ログエンドポイントは 503 を返却）；既定 `1000`。
+- `logCapacity`：リアルタイムログのリングバッファ件数、`>0` でログキャプチャを有効化（管理パネルのログページで再生/SSE）、`0` で無効化（ログエンドポイントは 503 を返却）；既定 `5000`。
 - `kiroVersion`/`systemVersion`/`nodeVersion`：偽装 UA のバージョン番号、設定から注入。
 
 ---
 
 ## ⚠ 重要な注意事項
 
-1. **外部デプロイでは必ず `API_KEY` を設定**：空の場合はプロトコルエンドポイントがオープンアクセスになります（起動時に警告）。`/admin`・`/user` パネル本体は認証未接続で、保護されるのは `/api/admin/*`・`/api/user/*`；ベアメタルデプロイでは `HOST=0.0.0.0` の変更に注意してください。
+1. **外部デプロイでは必ず `API_KEY` と `ADMIN_API_KEY` を設定**：`API_KEY` が空の場合はプロトコルエンドポイントがオープンアクセスになります（起動時に警告）；`adminApiKey`/`apiKey` のどちらも未設定なら `/api/admin/*` も同様にオープンで、認証情報・API-KEY・認証設定を誰にでも書き換えられてしまいます。`/admin`・`/user` パネル本体は常に認証されません（本当のゲートはその `/api/**` インターフェース側にあります）；ベアメタルデプロイでは `HOST=0.0.0.0` の変更に注意してください。
 
 2. **利用可能なモデルはアカウントのサブスクリプション階層に依存**：無料階層（KIRO FREE）は通常 `claude-sonnet-4.5` のみを許可；サポートされていないモデルを要求すると `400`（`INVALID_MODEL_ID`）を返し、無闇にリトライせず、アカウントを誤って傷つけません。
 

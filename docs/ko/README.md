@@ -45,7 +45,7 @@
 > 이 프로젝트는 연구 및 학습 목적으로만 사용됩니다. 책임감 있게 사용하고 상업적 목적으로 사용하지 마십시오.
 
 > [!IMPORTANT]
-> `apiKey`/`API_KEY`가 비어 있으면 프로토콜 엔드포인트가 **개방 액세스** 상태가 됩니다(시작 시 경고 표시). 외부 배포 시 반드시 설정하십시오. 컨테이너 이미지는 `HOST=0.0.0.0`이 기본 내장되어 있습니다. 베어메탈 배포 시에는 `HOST`를 함부로 `0.0.0.0`으로 바꾸지 마십시오(현재 `/admin`, `/user` 패널 본체는 아직 인증이 걸려 있지 않으며, 보호되는 것은 `/api/admin/*`, `/api/user/*` 인터페이스입니다).
+> `apiKey`/`API_KEY`가 비어 있으면 프로토콜 엔드포인트가 **개방 액세스** 상태가 됩니다(시작 시 경고 표시). 외부 배포 시 반드시 설정하십시오. 관리 인터페이스 `/api/admin/*`는 `adminApiKey`(미설정 시 `apiKey`로 폴백)를 설정한 뒤에야 보호됩니다 — **두 key를 모두 설정하지 않으면 관리 인터페이스도 패널과 똑같이 개방 상태**가 되어, 누구나 자격 증명을 추가·삭제하고 인증 키를 바꿀 수 있습니다. `/admin`, `/user` 패널 본체는 언제나 인증이 걸려 있지 않습니다. 공개 인터넷에 배포한다면 `ADMIN_API_KEY`를 반드시 설정하십시오. 컨테이너 이미지는 `HOST=0.0.0.0`이 기본 내장되어 있습니다. 베어메탈 배포 시에는 `HOST`를 함부로 `0.0.0.0`으로 바꾸지 마십시오.
 
 > [!TIP]
 > 백엔드는 Kiro(CodeWhisperer) 계정 풀입니다. **사용 가능한 모델은 계정 구독 등급에 따라 결정됩니다**: 무료 등급(KIRO FREE)은 일반적으로 `claude-sonnet-4.5`만 허용하며, opus/GPT 등은 더 높은 등급이 필요합니다 — 지원되지 않는 모델을 요청하면 조용히 실패하는 대신 400(`INVALID_MODEL_ID`)을 명확히 반환합니다.
@@ -80,7 +80,7 @@
 ### 🔐 통합 인증 게이트
 
 - 셋 중 하나: `Authorization: Bearer` / `x-api-key` / `?token=`, 상수 시간 비교, 실패 시 즉시 `401`
-- `adminApiKey`(미설정 시 `apiKey`로 폴백)로 `/api/admin/*` 보호; 보유자는 자신의 **API-KEY**로 `/api/user/*` 액세스
+- `adminApiKey`(미설정 시 `apiKey`로 폴백)로 `/api/admin/*` 보호, 둘 다 설정되지 않으면 이 게이트는 개방 모드; 보유자는 자신의 **API-KEY**로 `/api/user/*` 액세스
 - `/health`, `/v1/ping` 등 헬스 엔드포인트는 인증 불필요
 
 ### 🔄 계정 풀 및 토큰 자가 치유
@@ -172,7 +172,9 @@ cp .env.example .env
 
 ```env
 API_KEY=sk-당신의외부호출키
-ADMIN_API_KEY=선택,관리자 전용 독립 키(비워두면 API_KEY로 폴백)
+# 관리자 전용 독립 키. 공개 인터넷 배포 시 필수(설정하지 않으면 /api/admin/*가 API_KEY로 폴백되며, 둘 다 없으면 개방 상태).
+# 필요 없다면 줄 전체를 주석 처리하십시오 — 빈 값으로 쓰면 config.json에 설정해 둔 키를 덮어씁니다.
+ADMIN_API_KEY=sk-당신의관리자키
 ```
 
 Kiro 계정 자격 증명을 `data/credentials.json`(배열, 기존 Kiro 자격 증명을 그대로 drop-in 가능)에 배치하십시오:
@@ -387,7 +389,7 @@ resp = client.chat.completions.create(
 
 | 메서드 | 엔드포인트 | 기능 |
 |------|------|------|
-| GET | `/admin` · `/api/admin/*` | 관리 패널 + 관리 인터페이스(`adminApiKey`: 자격 증명 CRUD / 로그인 / API-KEY / 사용량 / 로그 / 잔액 / 설정 / 업데이트 확인 / 재시작) |
+| GET | `/admin` · `/api/admin/*` | 관리 패널 + 관리 인터페이스(`adminApiKey`, key를 하나도 설정하지 않으면 개방: 자격 증명 CRUD / 로그인 / API-KEY / 사용량 / 로그 / 잔액 / 설정 / 업데이트 확인 / 재시작) |
 | GET | `/user` · `/api/user/*` | 사용자 패널 + 인터페이스(자신의 API-KEY) |
 | GET | `/health` · `/v1/ping` | 헬스 체크(인증 불필요) |
 
@@ -401,20 +403,22 @@ resp = client.chat.completions.create(
 
 ## ⚙ 설정
 
-우선순위: **환경 변수 > `config.json` > 내장 기본값**. 마운트 볼륨 `./data`에 `config.json`, `credentials.json`, 로그 및 런타임 상태가 저장됩니다.
+우선순위: **명령줄 인자 > 환경 변수 > `config.json` > 내장 기본값**. 명령줄 인자는 두 개뿐입니다: `-c/--config`(설정 파일 경로)와 `--credentials`(자격 증명 파일 경로, 주지 않으면 `CREDENTIALS_PATH`/`config.json`/기본값 순으로 결정). 마운트 볼륨 `./data`에 `config.json`, `credentials.json`, 로그 및 런타임 상태가 저장됩니다.
+
+> 자격 증명 경로는 사용량 통계(`stats/`), API-KEY 저장소(`api_keys.json`), 잔액 캐시가 기록되는 디렉터리까지 함께 결정합니다 — 모두 `credentials.json`의 상위 디렉터리를 사용합니다. 컨테이너 이미지에는 `CREDENTIALS_PATH=/app/data/credentials.json`이 내장되어 있어 이 데이터도 기본적으로 마운트 볼륨에 저장됩니다. 경로를 직접 지정할 때는 반드시 마운트 볼륨 안을 가리키게 하십시오. 그러지 않으면 컨테이너를 다시 만드는 순간 유실됩니다.
 
 **환경 변수**(`.env.example` 참조):
 
 | 변수 | 필수 | 기본값 | 설명 |
 |------|------|--------|------|
 | `API_KEY` | ✅ | — | 외부 호출 키(비워두면 프로토콜 엔드포인트 개방 액세스, 시작 시 경고) |
-| `ADMIN_API_KEY` | ❌ | `API_KEY`로 폴백 | 관리자 전용 독립 인증 키 |
+| `ADMIN_API_KEY` | ❌ | `API_KEY`로 폴백 | 관리자 전용 독립 인증 키; `API_KEY`와 함께 설정하지 않으면 `/api/admin/*`가 개방되므로 공개 배포 시 필수 |
 | `HOST` | ❌ | `127.0.0.1`(이미지 내장 `0.0.0.0`) | 리스닝 주소 |
-| `PORT` | ❌ | `8080` | 서비스 포트 |
+| `PORT` | ❌ | `8080` | 서비스 포트(compose의 포트 매핑과 헬스체크가 모두 이 값을 따름) |
 | `REGION` | ❌ | `us-east-1` | 기본 AWS region(계정 `profileArn` 내 region 우선) |
 | `LOAD_BALANCING_MODE` | ❌ | `priority` | 부하 분산: `priority`(등가 순환) / `balanced`(weight 가중치) |
 | `MAX_RPM_PER_CREDENTIAL` | ❌ | `0` | 계정당 분당 요청 상한, `0` = 무제한 |
-| `CREDENTIALS_PATH` | ❌ | `/app/data/credentials.json` | 자격 증명 파일 경로 |
+| `CREDENTIALS_PATH` | ❌ | `credentials.json`(이미지 내장 `/app/data/credentials.json`) | 자격 증명 파일 경로; 명령줄 `--credentials`가 우선 |
 
 **`data/config.json`**(camelCase, 모두 선택; `logCapacity`는 여기서만 설정):
 
@@ -428,21 +432,21 @@ resp = client.chat.completions.create(
   "credentialsPath": "/app/data/credentials.json",
   "loadBalancingMode": "priority",
   "maxRpmPerCredential": 0,
-  "logCapacity": 1000,
+  "logCapacity": 5000,
   "kiroVersion": "0.11.107",
   "systemVersion": "win32#10.0.22631",
   "nodeVersion": "22.22.0"
 }
 ```
 
-- `logCapacity`: 실시간 로그 링 버퍼 개수, `>0`이면 로그 캡처 활성화(관리 패널 로그 페이지 재생/SSE), `0`이면 비활성화(로그 엔드포인트 503 반환); 기본값 `1000`.
+- `logCapacity`: 실시간 로그 링 버퍼 개수, `>0`이면 로그 캡처 활성화(관리 패널 로그 페이지 재생/SSE), `0`이면 비활성화(로그 엔드포인트 503 반환); 기본값 `5000`.
 - `kiroVersion`/`systemVersion`/`nodeVersion`: 위장 UA 버전 번호, 설정에서 주입.
 
 ---
 
 ## ⚠ 주의사항
 
-1. **외부 배포 시 반드시 `API_KEY` 설정**: 비워두면 프로토콜 엔드포인트가 개방 액세스됩니다(시작 시 경고). `/admin`, `/user` 패널 본체는 아직 인증이 걸려 있지 않으며, 보호되는 것은 `/api/admin/*`, `/api/user/*`입니다; 베어메탈 배포 시 `HOST=0.0.0.0` 변경에 주의하십시오.
+1. **외부 배포 시 반드시 `API_KEY`와 `ADMIN_API_KEY` 설정**: `API_KEY`를 비워두면 프로토콜 엔드포인트가 개방 액세스됩니다(시작 시 경고). `adminApiKey`/`apiKey`를 모두 설정하지 않으면 `/api/admin/*`도 똑같이 개방되어 자격 증명, API-KEY, 인증 설정을 누구나 바꿀 수 있습니다. `/admin`, `/user` 패널 본체는 언제나 인증이 걸려 있지 않습니다(실제 게이트는 그 뒤의 `/api/**` 인터페이스에 있습니다); 베어메탈 배포 시 `HOST=0.0.0.0` 변경에 주의하십시오.
 
 2. **사용 가능한 모델은 계정 구독 등급에 따라 결정**: 무료 등급(KIRO FREE)은 일반적으로 `claude-sonnet-4.5`만 허용합니다; 지원되지 않는 모델을 요청하면 `400`(`INVALID_MODEL_ID`)을 반환하며, 무모하게 재시도하거나 계정을 오손시키지 않습니다.
 

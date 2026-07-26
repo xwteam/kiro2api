@@ -63,7 +63,9 @@ cp .env.example .env
 
 ```env
 API_KEY=sk-你的對外呼叫金鑰
-ADMIN_API_KEY=可選，管理端獨立金鑰（留空回退用 API_KEY）
+# 管理端獨立金鑰；公網部署必填（不設則 /api/admin/* 回退用 API_KEY 驗證，兩者都不設即開放）。
+# 不需要就把整行註解掉——寫成空值會覆蓋 config.json 裡已設定的金鑰。
+ADMIN_API_KEY=sk-你的管理端金鑰
 ```
 
 把 Kiro 帳號憑證放到 `data/credentials.json`（陣列，可直接 drop-in 現有 Kiro 憑證）：
@@ -85,7 +87,9 @@ ADMIN_API_KEY=可選，管理端獨立金鑰（留空回退用 API_KEY）
 **重要事項：**
 - `API_KEY` 為空時協議端點**開放存取**（啟動時會告警），對外部署務必設定
 - 容器映像檔已內建 `HOST=0.0.0.0`；裸機部署請勿輕易把 `HOST` 改成 `0.0.0.0`
-- 目前 `/admin`、`/user` 面板本體尚未接驗證，受保護的是 `/api/admin/*`、`/api/user/*`
+- `/api/admin/*` 只有在設定了 `adminApiKey`（未設則回退 `apiKey`）之後才受保護；**兩個 key 都不設時管理介面完全開放**，任何人都能增刪憑證、改驗證金鑰、重啟服務，公網部署務必設定 `ADMIN_API_KEY`
+- `/admin`、`/user` 面板本體始終不驗證，真正的閘在其 `/api/**` 介面上
+- **不要寫空值**：`API_KEY=`、`ADMIN_API_KEY=` 這種空賦值會覆蓋 `config.json` 裡已設定的金鑰，不想用就把整行註解掉
 
 啟動服務：
 
@@ -248,9 +252,12 @@ lsof -i :8080
 # 終止程序
 kill -9 <PID>
 
-# 或在 docker-compose.yml 中使用不同連接埠
-# 將 "8080:8080" 改為 "8081:8080"
+# 或改用其他連接埠：編輯 .env 的 PORT，再重啟
+# PORT=8081
+docker compose down && docker compose up -d
 ```
+
+> `PORT` 一處改動即可：應用監聽、compose 的連接埠映射（`${PORT:-8080}:${PORT:-8080}`）與健康檢查探測的連接埠都跟隨它，無需再改 `docker-compose.yml`。裸機部署同理，`PORT` 優先於 `config.json` 裡的 `port`。
 
 ### 網路無法訪問上游
 
@@ -274,18 +281,20 @@ kill -9 <PID>
 
 ## 配置參考
 
-優先順序：**環境變數 > `config.json` > 內建預設值**。
+優先順序：**命令列參數 > 環境變數 > `config.json` > 內建預設值**。命令列只有兩個參數：`-c/--config`（設定檔路徑）與 `--credentials`（憑證檔案路徑，不給則由 `CREDENTIALS_PATH`/`config.json`/預設值決定）。
 
 | 變數 | 預設值 | 說明 |
 |------|--------|------|
 | `API_KEY` | — | 對外呼叫金鑰（留空則協議端點開放存取，啟動告警） |
-| `ADMIN_API_KEY` | 回退 `API_KEY` | 管理端獨立鑑權 key，保護 `/api/admin/*` |
+| `ADMIN_API_KEY` | 回退 `API_KEY` | 管理端獨立鑑權 key，保護 `/api/admin/*`；與 `API_KEY` 都不設時該介面開放，公網部署必填 |
 | `HOST` | `127.0.0.1`（映像檔內建 `0.0.0.0`） | 監聽位址 |
-| `PORT` | `8080` | 服務連接埠 |
+| `PORT` | `8080` | 服務連接埠（compose 的連接埠映射與健康檢查都跟隨該值） |
 | `REGION` | `us-east-1` | 預設 AWS region（帳號 `profileArn` 內的 region 優先） |
 | `LOAD_BALANCING_MODE` | `priority` | 負載均衡：`priority`（等權輪詢）/ `balanced`（按 `weight` 加權） |
 | `MAX_RPM_PER_CREDENTIAL` | `0` | 每帳號每分鐘請求上限，`0` = 無限制 |
-| `CREDENTIALS_PATH` | `/app/data/credentials.json` | 憑證檔案路徑 |
+| `CREDENTIALS_PATH` | `credentials.json`（映像檔內建 `/app/data/credentials.json`） | 憑證檔案路徑；被命令列 `--credentials` 覆蓋 |
+
+> 憑證路徑同時決定用量統計（`stats/`）、API-KEY 儲存（`api_keys.json`）與餘額快取的落盤目錄——它們都取 `credentials.json` 的上層目錄。容器映像檔已內建 `CREDENTIALS_PATH=/app/data/credentials.json`，這些資料預設就落在掛載卷裡；自訂路徑時請一併指向掛載卷，否則容器重建即遺失。
 
 **`data/config.json`（camelCase，均可選；`logCapacity` 僅在此配置）：**
 
@@ -299,14 +308,14 @@ kill -9 <PID>
   "credentialsPath": "/app/data/credentials.json",
   "loadBalancingMode": "priority",
   "maxRpmPerCredential": 0,
-  "logCapacity": 1000,
+  "logCapacity": 5000,
   "kiroVersion": "0.11.107",
   "systemVersion": "win32#10.0.22631",
   "nodeVersion": "22.22.0"
 }
 ```
 
-- `logCapacity`：即時日誌環形緩衝條數，`> 0` 啟用日誌捕獲（管理面板日誌頁回放/SSE），`0` 關閉（日誌端點回傳 `503`）；預設 `1000`。
+- `logCapacity`：即時日誌環形緩衝條數，`> 0` 啟用日誌捕獲（管理面板日誌頁回放/SSE），`0` 關閉（日誌端點回傳 `503`）；預設 `5000`。
 - `kiroVersion`/`systemVersion`/`nodeVersion`：偽裝 UA 版本號，從配置注入。
 
 ## Docker Compose 參考
@@ -319,7 +328,7 @@ volumes:
   - /etc/localtime:/etc/localtime:ro  # 系統時區
 ```
 
-容器內以非 root 使用者 `appuser`（UID 1000）執行：`docker-entrypoint.sh` 先以 root `chown` 掛載卷再 `gosu` 降權（無縫升級舊版 root 建立的 `data`）。映像檔內建 `HEALTHCHECK` 與 compose healthcheck，`restart: unless-stopped`。
+容器內以非 root 使用者 `appuser`（UID 1000）執行：`docker-entrypoint.sh` 先以 root `chown` 掛載卷再 `gosu` 降權（無縫升級舊版 root 建立的 `data`）。映像檔內建 `HEALTHCHECK` 與 compose healthcheck（探測連接埠按 `PORT` 環境變數 > `data/config.json` 的 `port` > `8080` 解析，與應用監聽的連接埠一致），`restart: unless-stopped`。
 
 在 `docker-compose.yml` 中修改時區：
 ```yaml
@@ -339,7 +348,9 @@ API_KEY=sk-xxx ./target/release/kiro2api \
   --credentials data/credentials.json
 ```
 
-> 裸機部署請勿輕易把 `HOST` 改成 `0.0.0.0`（目前 `/admin`、`/user` 面板本體尚未接鑑權）。
+> 設定優先順序：**命令列參數 > 環境變數 > `config.json` > 內建預設值**。`--credentials` 不給時，由 `CREDENTIALS_PATH` / `config.json` 的 `credentialsPath` / 預設的 `credentials.json`（相對目前工作目錄）決定；用量統計、`api_keys.json` 與餘額快取都落在該檔案的上層目錄裡。
+
+> 裸機部署請勿輕易把 `HOST` 改成 `0.0.0.0`。`/admin`、`/user` 面板本體始終不驗證，`/api/admin/*`、`/api/user/*` 也只有在設定了 `adminApiKey`/`apiKey` 之後才受保護——一個都不設時管理介面對所有人開放。
 
 </details>
 

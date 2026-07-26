@@ -48,7 +48,7 @@
 > 本專案與 Amazon / AWS / Kiro 無關聯。透過封裝 Kiro（CodeWhisperer）後端提供多協議相容 API，可能不符合相關服務條款。使用風險自負，作者不對任何帳號處罰或資料遺失承擔責任。
 
 > [!IMPORTANT]
-> `apiKey`/`API_KEY` 為空時，協議端點會**開放存取**（啟動會告警）。對外部署務必設定。容器映像已內建 `HOST=0.0.0.0`；裸機部署請勿輕易把 `HOST` 改成 `0.0.0.0`（目前 `/admin`、`/user` 面板本體尚未接驗證，受保護的是 `/api/admin/*`、`/api/user/*` 介面）。
+> `apiKey`/`API_KEY` 為空時，協議端點會**開放存取**（啟動會告警）。對外部署務必設定。管理介面 `/api/admin/*` 只有在設定了 `adminApiKey`（缺省回退 `apiKey`）之後才受保護——**兩個 key 都不設時，管理介面跟面板一樣是開放的**，任何人都能增刪憑證、改驗證金鑰；`/admin`、`/user` 面板本體則始終不驗證。部署到公網必須設定 `ADMIN_API_KEY`。容器映像已內建 `HOST=0.0.0.0`；裸機部署請勿輕易把 `HOST` 改成 `0.0.0.0`。
 
 > [!TIP]
 > 後端為 Kiro（CodeWhisperer）帳號池。**可用模型取決於帳號訂閱檔位**：免費檔（KIRO FREE）通常只授權 `claude-sonnet-4.5`，opus/GPT 等需更高檔位——請求不支援的模型會明確傳回 `400`（`INVALID_MODEL_ID`），而非靜默失敗。
@@ -83,7 +83,7 @@
 ### 🔐 統一驗證閘
 
 - 三選一：`Authorization: Bearer` / `x-api-key` / `?token=`，常數時間比較，失敗即 `401`
-- `adminApiKey`（缺省回退 `apiKey`）保護 `/api/admin/*`；持有者用自己的 **API-KEY** 存取 `/api/user/*`
+- `adminApiKey`（缺省回退 `apiKey`）保護 `/api/admin/*`，兩者都未設定時該閘為開放模式；持有者用自己的 **API-KEY** 存取 `/api/user/*`
 - `/health`、`/v1/ping` 等探活端點不驗證
 
 ### 🔄 帳號池與令牌自癒
@@ -175,7 +175,9 @@ cp .env.example .env
 
 ```env
 API_KEY=sk-你的對外呼叫金鑰
-ADMIN_API_KEY=可選,管理端獨立金鑰（留空回退用 API_KEY）
+# 管理端獨立金鑰；公網部署必填（不設則 /api/admin/* 回退用 API_KEY 驗證，兩者都不設即開放）。
+# 不需要就把整行註解掉——寫成空值會覆蓋 config.json 裡已設定的金鑰。
+ADMIN_API_KEY=sk-你的管理端金鑰
 ```
 
 把 Kiro 帳號憑證放到 `data/credentials.json`（陣列，可直接 drop-in 現有 Kiro 憑證）：
@@ -387,7 +389,7 @@ resp = client.chat.completions.create(
 
 | 方法 | 端點 | 功能 |
 |------|------|------|
-| GET | `/admin` · `/api/admin/*` | 管理面板 + 管理介面（憑 `adminApiKey`：憑證 CRUD / 登入 / API-KEY / 用量 / 日誌 / 餘額 / 設定 / 檢查更新 / 重啟） |
+| GET | `/admin` · `/api/admin/*` | 管理面板 + 管理介面（憑 `adminApiKey`，未設定任何 key 時開放：憑證 CRUD / 登入 / API-KEY / 用量 / 日誌 / 餘額 / 設定 / 檢查更新 / 重啟） |
 | GET | `/user` · `/api/user/*` | 使用者面板 + 介面（憑自身 API-KEY） |
 | GET | `/health` · `/v1/ping` | 探活（不驗證） |
 
@@ -399,20 +401,22 @@ resp = client.chat.completions.create(
 
 ## ⚙ 設定說明
 
-優先級：**環境變數 > `config.json` > 內建預設**。掛載卷 `./data` 存放 `config.json`、`credentials.json`、日誌與執行態。
+優先級：**命令列參數 > 環境變數 > `config.json` > 內建預設**。命令列只有兩個參數：`-c/--config`（設定檔路徑）與 `--credentials`（憑證檔案路徑，不給則由 `CREDENTIALS_PATH`/`config.json`/預設值決定）。掛載卷 `./data` 存放 `config.json`、`credentials.json`、日誌與執行態。
+
+> 憑證路徑同時決定用量統計（`stats/`）、API-KEY 儲存（`api_keys.json`）與餘額快取的落盤目錄——它們都取 `credentials.json` 的上層目錄。容器映像已內建 `CREDENTIALS_PATH=/app/data/credentials.json`，這些資料預設就落在掛載卷裡；自訂路徑時請一併指向掛載卷，否則容器重建即遺失。
 
 **環境變數**（見 `.env.example`）：
 
 | 變數 | 必填 | 預設值 | 說明 |
 |------|------|--------|------|
 | `API_KEY` | ✅ | — | 對外呼叫金鑰（留空則協議端點開放存取，啟動告警） |
-| `ADMIN_API_KEY` | ❌ | 回退 `API_KEY` | 管理端獨立驗證 key |
+| `ADMIN_API_KEY` | ❌ | 回退 `API_KEY` | 管理端獨立驗證 key；與 `API_KEY` 都不設時 `/api/admin/*` 開放，公網部署必填 |
 | `HOST` | ❌ | `127.0.0.1`（映像內建 `0.0.0.0`） | 監聽位址 |
-| `PORT` | ❌ | `8080` | 服務連接埠 |
+| `PORT` | ❌ | `8080` | 服務連接埠（compose 的連接埠映射與健康檢查都跟隨該值） |
 | `REGION` | ❌ | `us-east-1` | 預設 AWS region（帳號 `profileArn` 內的 region 優先） |
 | `LOAD_BALANCING_MODE` | ❌ | `priority` | 負載平衡：`priority`（等權輪詢）/ `balanced`（按 weight 加權） |
 | `MAX_RPM_PER_CREDENTIAL` | ❌ | `0` | 每帳號每分鐘請求上限，`0` = 無限 |
-| `CREDENTIALS_PATH` | ❌ | `/app/data/credentials.json` | 憑證檔案路徑 |
+| `CREDENTIALS_PATH` | ❌ | `credentials.json`（映像內建 `/app/data/credentials.json`） | 憑證檔案路徑；被命令列 `--credentials` 覆蓋 |
 
 **`data/config.json`**（camelCase，均可選；`logCapacity` 僅在此配置）：
 
@@ -426,21 +430,21 @@ resp = client.chat.completions.create(
   "credentialsPath": "/app/data/credentials.json",
   "loadBalancingMode": "priority",
   "maxRpmPerCredential": 0,
-  "logCapacity": 1000,
+  "logCapacity": 5000,
   "kiroVersion": "0.11.107",
   "systemVersion": "win32#10.0.22631",
   "nodeVersion": "22.22.0"
 }
 ```
 
-- `logCapacity`：即時日誌環形緩衝條數，`>0` 啟用日誌捕獲（管理面板日誌頁回放/SSE），`0` 關閉（日誌端點傳回 503）；預設 `1000`。
+- `logCapacity`：即時日誌環形緩衝條數，`>0` 啟用日誌捕獲（管理面板日誌頁回放/SSE），`0` 關閉（日誌端點傳回 503）；預設 `5000`。
 - `kiroVersion`/`systemVersion`/`nodeVersion`：偽裝 UA 版本號，從配置注入。
 
 ---
 
 ## ⚠ 注意事項
 
-1. **對外部署務必設定 `API_KEY`**：留空時協議端點開放存取（啟動會告警）。`/admin`、`/user` 面板本體尚未接驗證，受保護的是 `/api/admin/*`、`/api/user/*`；裸機部署慎改 `HOST=0.0.0.0`。
+1. **對外部署務必設定 `API_KEY` 與 `ADMIN_API_KEY`**：`API_KEY` 留空時協議端點開放存取（啟動會告警）；`adminApiKey`/`apiKey` 都不設時 `/api/admin/*` 同樣開放，憑證、API-KEY、驗證設定都能被任意改寫。`/admin`、`/user` 面板本體始終不驗證（真正的閘在其 `/api/**` 介面上）；裸機部署慎改 `HOST=0.0.0.0`。
 
 2. **可用模型取決於帳號訂閱檔位**：免費檔（KIRO FREE）通常只授權 `claude-sonnet-4.5`；請求不支援的模型傳回 `400`（`INVALID_MODEL_ID`），不瞎重試、不誤傷帳號。
 

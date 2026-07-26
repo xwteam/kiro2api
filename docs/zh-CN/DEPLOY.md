@@ -93,13 +93,14 @@ mkdir -p data
 # 必填：对外调用密钥（留空则协议端点开放访问，启动会告警）
 API_KEY=sk-你的对外调用密钥
 
-# 可选：管理端独立鉴权 key（留空则回退用 API_KEY）
-ADMIN_API_KEY=
+# 管理端独立鉴权 key（不写这一行才回退用 API_KEY；写成空值等于把 config.json 里的管理密钥清掉）
+# 公网部署必须设置，否则 /api/admin/* 无鉴权
+ADMIN_API_KEY=sk-你的管理端密钥
 
 # 可选：监听地址（容器镜像已内置 HOST=0.0.0.0）
 HOST=0.0.0.0
 
-# 可选：服务端口（默认 8080）
+# 可选：服务端口（默认 8080）。compose 的端口映射与健康检查都跟随该值，改这里即可换端口
 PORT=8080
 
 # 可选：默认 AWS region（账号 profileArn 内的 region 优先，默认 us-east-1）
@@ -111,7 +112,8 @@ LOAD_BALANCING_MODE=priority
 # 可选：每账号每分钟请求上限（0 = 无限，默认 0）
 MAX_RPM_PER_CREDENTIAL=0
 
-# 可选：凭据文件路径（默认 /app/data/credentials.json）
+# 可选：凭据文件路径（镜像已内置该默认值）。
+# 它同时决定用量统计、api_keys.json 与余额缓存的目录（取其父目录），务必指向挂载卷内
 CREDENTIALS_PATH=/app/data/credentials.json
 ```
 
@@ -119,7 +121,8 @@ CREDENTIALS_PATH=/app/data/credentials.json
 
 - **不要加引号**：`API_KEY=sk-xxx` 而不是 `API_KEY="sk-xxx"`
 - **不要有空格**：`API_KEY=sk-xxx` 而不是 `API_KEY = sk-xxx`
-- **务必设置密钥**：`API_KEY` 留空时协议端点开放访问，对外部署必须填
+- **务必设置密钥**：`API_KEY` 留空时协议端点开放访问，对外部署必须填；`ADMIN_API_KEY`、`API_KEY` 都不设时 `/api/admin/*` 同样开放，公网部署必须设置 `ADMIN_API_KEY`
+- **不要留空值**：`API_KEY=`、`ADMIN_API_KEY=` 这样的空值会覆盖 `config.json` 里已配的密钥，不想用就把整行注释掉
 - **敏感信息**：不要将 `.env`、`credentials.json` 提交到 Git，已在 `.gitignore` 中
 
 ### 放入 Kiro 凭据
@@ -154,7 +157,7 @@ docker compose logs -f
 # 服务监听 0.0.0.0:8080
 ```
 
-> 镜像为多架构（amd64/arm64），容器内以非 root 用户 `appuser`（UID 1000）运行：`docker-entrypoint.sh` 先以 root `chown` 挂载卷再 `gosu` 降权（无缝升级 legacy root 创建的 data）。镜像内置 `HEALTHCHECK`，compose 使用 `restart: unless-stopped`。
+> 镜像为多架构（amd64/arm64），容器内以非 root 用户 `appuser`（UID 1000）运行：`docker-entrypoint.sh` 先以 root `chown` 挂载卷再 `gosu` 降权（无缝升级 legacy root 创建的 data）。镜像内置 `HEALTHCHECK`（探测端口按 `PORT` 环境变量 > `data/config.json` 的 `port` > `8080` 解析，与应用监听端口一致），compose 使用 `restart: unless-stopped`。
 
 ### 停止服务
 
@@ -322,6 +325,8 @@ curl -X POST http://localhost:8080/v1/chat/completions \
    docker compose up -d
    ```
 
+> `PORT` 一处改动即可：应用监听、compose 的端口映射（`${PORT:-8080}:${PORT:-8080}`）与健康检查探测的端口都跟随它，无需再改 `docker-compose.yml`。裸机部署同理，`PORT` 优先于 `config.json` 里的 `port`。
+
 ### 请求不支持的模型返回 400
 
 **症状**：请求返回 `400`（`INVALID_MODEL_ID`）
@@ -402,7 +407,7 @@ MAX_RPM_PER_CREDENTIAL=60
 
 ```json
 {
-  "logCapacity": 1000
+  "logCapacity": 5000
 }
 ```
 
@@ -485,8 +490,10 @@ API_KEY=sk-xxx ./target/release/kiro2api \
   --credentials data/credentials.json
 ```
 
+> 配置优先级：**命令行参数 > 环境变量 > `config.json` > 内置默认**。`--credentials` 不给时由 `CREDENTIALS_PATH` / `config.json` 的 `credentialsPath` / 默认的 `credentials.json`（相对当前工作目录）决定；用量统计、`api_keys.json` 与余额缓存都落在该文件的父目录里。
+
 > [!TIP]
-> 裸机部署请勿轻易把 `HOST` 改成 `0.0.0.0`。当前 `/admin`、`/user` 面板本体尚未接鉴权，受保护的是 `/api/admin/*`、`/api/user/*` 接口。
+> 裸机部署请勿轻易把 `HOST` 改成 `0.0.0.0`。`/admin`、`/user` 面板本体始终不鉴权，`/api/admin/*`、`/api/user/*` 也只有在配置了 `adminApiKey`/`apiKey` 之后才受保护——一个都不配时管理接口对所有人开放。
 
 ## 上线切换建议
 
@@ -494,7 +501,7 @@ API_KEY=sk-xxx ./target/release/kiro2api \
 
 ## 安全建议
 
-1. **务必设置 API Key**：`API_KEY` 留空时协议端点开放访问，对外部署务必设置
+1. **务必设置 API Key**：`API_KEY` 留空时协议端点开放访问，对外部署务必设置（注意 `.env` 里的空值 `API_KEY=` 会覆盖 `config.json` 的配置，不用就整行注释掉）
 2. **保护管理端**：对外暴露时务必设置 `adminApiKey`（或至少 `apiKey`），否则 `/api/admin/*` 可被用来管理凭据、密钥与设置
 3. **保护凭据**：不要将 `.env`、`credentials.json` 提交到 Git
 4. **谨慎绑定地址**：裸机部署慎改 `HOST=0.0.0.0`，面板本体尚未接鉴权

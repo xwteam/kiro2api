@@ -12,7 +12,7 @@ Access the web panel at `http://localhost:8080` (or your server IP).
 2. Enter your `adminApiKey` (falls back to `apiKey` if unset)
 3. Click **Login**
 
-The key comes from `.env` (`ADMIN_API_KEY` / `API_KEY`) or `config.json`. The `/api/admin/*` endpoints are guarded by this key; the `/api/user/*` endpoints are reached by callers with their own **API-KEY**.
+The key comes from `.env` (`ADMIN_API_KEY` / `API_KEY`) or `config.json`. The `/api/admin/*` endpoints are guarded by this key — but only once one of the two is actually configured; with neither set the admin API is open to anyone. The `/api/user/*` endpoints are reached by callers with their own **API-KEY**.
 
 ### Dashboard
 
@@ -51,7 +51,7 @@ View live server logs:
 5. **Pagination**: Browse older entries page by page
 6. **Download**: Export the current buffer as a `.txt` file
 
-Live logs require `logCapacity > 0` in `config.json` (see the [Deployment Guide](DEPLOY.md)). When set to `0`, log endpoints return `503`.
+Live logs require `logCapacity > 0` in `config.json` (default `5000`; see the [Deployment Guide](DEPLOY.md)). When set to `0`, log endpoints return `503`.
 
 ### Usage Statistics
 

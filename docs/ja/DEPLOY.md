@@ -66,8 +66,11 @@ cp .env.example .env
 
 ```env
 API_KEY=sk-あなたの対外呼び出しキー
-ADMIN_API_KEY=
+# 管理端の独立認証キー。公開デプロイでは必須（未設定だと /api/admin/* が無認証になります）。
+# 不要なら行ごとコメントアウトしてください——空値で書くと config.json 側の管理キーを消してしまいます。
+ADMIN_API_KEY=sk-管理端専用の独立キー
 HOST=0.0.0.0
+# サービスポート。compose のポートマッピングとヘルスチェックもこの値に追従します
 PORT=8080
 REGION=us-east-1
 LOAD_BALANCING_MODE=priority
@@ -80,15 +83,19 @@ CREDENTIALS_PATH=/app/data/credentials.json
 | 変数 | 説明 | デフォルト |
 |------|------|-----------|
 | `API_KEY` | 対外呼び出しキー（空白ならプロトコルエンドポイントが開放され、起動時に警告） | 必須 |
-| `ADMIN_API_KEY` | 管理端の独立認証キー（空白で `API_KEY` にフォールバック） | — |
+| `ADMIN_API_KEY` | 管理端の独立認証キー（この行ごと省略した場合のみ `API_KEY` にフォールバック。`API_KEY` ともども未設定だと `/api/admin/*` は無認証） | — |
 | `HOST` | リッスンアドレス（コンテナイメージには `0.0.0.0` を内蔵） | `127.0.0.1` |
-| `PORT` | サービスポート | 8080 |
+| `PORT` | サービスポート（compose のポートマッピングとヘルスチェックもこの値に追従） | 8080 |
 | `REGION` | 既定の AWS リージョン（アカウントの `profileArn` 内リージョンが優先） | us-east-1 |
 | `LOAD_BALANCING_MODE` | 負荷分散：`priority`（均等ローテーション）/ `balanced`（`weight` による重み付け） | priority |
 | `MAX_RPM_PER_CREDENTIAL` | アカウント当たりの毎分リクエスト上限、`0` = 無制限 | 0 |
-| `CREDENTIALS_PATH` | 認証情報ファイルのパス | /app/data/credentials.json |
+| `CREDENTIALS_PATH` | 認証情報ファイルのパス。使用量統計・`api_keys.json`・残高キャッシュの保存先（このファイルの親ディレクトリ）も決めるため、必ずマウントボリューム内を指すこと | `credentials.json`（イメージは `/app/data/credentials.json` を内蔵） |
 
 > **注意**: 値に引用符は不要です。余分なスペースや改行がないことを確認してください。`logCapacity` は `config.json` でのみ設定します。
+>
+> **キーは必ず設定**: `API_KEY` が空だとプロトコルエンドポイントが開放されます。さらに `ADMIN_API_KEY`・`API_KEY` の両方が未設定だと `/api/admin/*` も無認証で開放され、認証情報・API-KEY・認証設定を誰でも書き換えられます。公開デプロイでは `ADMIN_API_KEY` の設定が必須です。
+>
+> **空値を書かない**: `API_KEY=`・`ADMIN_API_KEY=` のような空値は `config.json` に設定済みのキーを上書きします。使わないなら行ごとコメントアウトしてください。
 
 ### ステップ 4: 認証情報を配置
 
@@ -291,18 +298,13 @@ curl http://localhost:8080/v1/models \
 PORT=8081
 ```
 
-`docker-compose.yml` も更新：
-
-```yaml
-ports:
-  - "8081:8080"
-```
-
 再起動：
 
 ```bash
 docker compose up -d
 ```
+
+> **注意**: 変更は `PORT` の一箇所だけで完結します。アプリのリッスンポート、compose のポートマッピング（`${PORT:-8080}:${PORT:-8080}`）、ヘルスチェックの探測ポートがすべてこの値に追従するため、`docker-compose.yml` を書き換える必要はありません。ベアメタルでも同様で、`PORT` は `config.json` の `port` より優先されます。
 
 ### トークン期限切れ／認証情報の失効
 
@@ -362,7 +364,7 @@ PORT=8080
 REGION=us-east-1
 ```
 
-> **注意**: `ADMIN_API_KEY` を設定すると `/api/admin/*` を `API_KEY` から分離できます。外部公開時は必ず `adminApiKey`（少なくとも `apiKey`）を設定してください。現状 `/admin`・`/user` パネル本体には認証がなく、保護対象は `/api/admin/*`・`/api/user/*` の API 側です。
+> **注意**: `ADMIN_API_KEY` を設定すると `/api/admin/*` を `API_KEY` から分離できます。外部公開時は必ず `adminApiKey`（少なくとも `apiKey`）を設定してください——**どちらも未設定だと `/api/admin/*` は誰でも叩ける状態**で、認証情報・API-KEY・認証設定を自由に書き換えられてしまいます。`/admin`・`/user` パネル本体には常に認証がなく、実際のゲートは `/api/admin/*`・`/api/user/*` の API 側にあります。
 
 ## Docker Compose の詳細設定
 
@@ -377,13 +379,15 @@ services:
       - .env
     environment:
       - TZ=Asia/Shanghai
+    # ホスト側・コンテナ側とも .env の PORT に追従（未設定なら 8080）
     ports:
-      - "8080:8080"
+      - "${PORT:-8080}:${PORT:-8080}"
     volumes:
       - ./data:/app/data           # config.json / credentials.json / ログ / 実行時データ
       - /etc/localtime:/etc/localtime:ro
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/health"]
+      # 探測ポートはアプリと同じ優先順位で解決：PORT 環境変数 > data/config.json の port > 8080
+      test: ["CMD-SHELL", "P=\"$${PORT:-$$(grep -oE '\"port\"[[:space:]]*:[[:space:]]*[0-9]+' /app/data/config.json 2>/dev/null | grep -oE '[0-9]+' | head -1)}\"; wget -q -O /dev/null \"http://localhost:$${P:-8080}/health\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -391,7 +395,7 @@ services:
     restart: unless-stopped
 ```
 
-> **注意**: 永続ボリューム `./data` に `config.json`、`credentials.json`、ログ、実行時データを保存します。イメージには `HEALTHCHECK` と compose の healthcheck が組み込まれており、`restart: unless-stopped` が設定されています。
+> **注意**: 永続ボリューム `./data` に `config.json`、`credentials.json`、ログ、実行時データを保存します。イメージには `HEALTHCHECK` と compose の healthcheck が組み込まれており（探測ポートは `PORT` 環境変数 > `data/config.json` の `port` > `8080` の順で解決され、アプリのリッスンポートと一致します）、`restart: unless-stopped` が設定されています。
 
 ## ログの確認
 
@@ -409,7 +413,7 @@ docker compose logs kiro2api
 
 ### 管理パネルの実時ログ（SSE）
 
-`logCapacity`（`config.json` の環形バッファ行数、既定 `1000`）が `> 0` の場合、管理パネル（`/admin`）のログページで、構造化テーブル + 方向フィルタ + 検索 + ページング + SSE 実時プッシュ + ダウンロードが利用できます。`0` の場合はログ捕捉が無効になり、ログエンドポイントは `503` を返します。
+`logCapacity`（`config.json` の環形バッファ行数、既定 `5000`）が `> 0` の場合、管理パネル（`/admin`）のログページで、構造化テーブル + 方向フィルタ + 検索 + ページング + SSE 実時プッシュ + ダウンロードが利用できます。`0` の場合はログ捕捉が無効になり、ログエンドポイントは `503` を返します。
 
 ## アップデート
 

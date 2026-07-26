@@ -85,10 +85,11 @@ vim .env
 # 필수: 대외 호출용 키 (비워두면 프로토콜 엔드포인트 개방 접근)
 API_KEY=sk-당신의API키
 
-# 선택: 관리 콘솔 독립 키 (비워두면 API_KEY로 대체)
-ADMIN_API_KEY=
+# 관리 콘솔 독립 키 (줄 자체를 쓰지 않아야 API_KEY로 대체됩니다. 빈 값으로 쓰면 config.json의 관리 키를 지우는 셈)
+# 외부 공개 배포 시 필수, 설정하지 않으면 /api/admin/*에 인증이 걸리지 않습니다
+ADMIN_API_KEY=sk-당신의관리자키
 
-# 선택: 서비스 포트 (기본값 8080)
+# 선택: 서비스 포트 (기본값 8080). compose의 포트 매핑과 헬스체크가 이 값을 따르므로 여기만 바꾸면 됩니다
 PORT=8080
 
 # 선택: 기본 AWS region (계정 profileArn 내 region 우선, 기본값 us-east-1)
@@ -106,6 +107,8 @@ MAX_RPM_PER_CREDENTIAL=0
 - 값 앞뒤에 따옴표 불필요
 - 여분의 공백이나 줄바꿈 없어야 함
 - `API_KEY`가 비어 있으면 프로토콜 엔드포인트가 **개방 접근** 상태가 되며 시작 시 경고 출력, 외부 배포 시 반드시 설정
+- `ADMIN_API_KEY`와 `API_KEY`를 모두 설정하지 않으면 `/api/admin/*`도 개방 접근 상태가 되어 자격 증명·인증 키·설정을 누구나 바꿀 수 있으므로, 외부 공개 배포 시에는 `ADMIN_API_KEY`를 반드시 설정
+- `API_KEY=`, `ADMIN_API_KEY=`처럼 **빈 값으로 두지 말 것** — `config.json`에 설정해 둔 키를 덮어씁니다. 쓰지 않을 항목은 줄 전체를 주석 처리
 
 ### 자격 증명 배치
 
@@ -142,7 +145,7 @@ docker compose logs -f
 - 계정 풀 준비 완료 및 리스닝 포트 표시 - 시작 성공
 - 자격 증명 무효 또는 계정 냉각 - 자격 증명 재확인 필요
 
-이미지는 멀티 아키텍처(amd64/arm64)이며, 컨테이너 내부는 non-root 사용자로 실행됩니다: entrypoint가 먼저 root로 마운트된 볼륨을 `chown`한 다음 `gosu`로 권한을 낮춥니다. 이미지에는 `HEALTHCHECK`가 내장되어 있고 `restart: unless-stopped`가 적용됩니다.
+이미지는 멀티 아키텍처(amd64/arm64)이며, 컨테이너 내부는 non-root 사용자로 실행됩니다: entrypoint가 먼저 root로 마운트된 볼륨을 `chown`한 다음 `gosu`로 권한을 낮춥니다. 이미지에는 `HEALTHCHECK`가 내장되어 있으며(프로브 포트는 `PORT` 환경 변수 > `data/config.json`의 `port` > `8080` 순으로 해석되어 애플리케이션 리스닝 포트와 항상 일치), `restart: unless-stopped`가 적용됩니다.
 
 ## 다중 계정 설정
 
@@ -249,6 +252,8 @@ PORT=8081
 
 그 후 `docker compose up -d` 재실행
 
+> `PORT` 한 곳만 바꾸면 됩니다: 애플리케이션 리스닝 포트, compose의 포트 매핑(`${PORT:-8080}:${PORT:-8080}`), 헬스체크 프로브 포트가 모두 이 값을 따르므로 `docker-compose.yml`을 따로 손댈 필요가 없습니다. 베어메탈 배포도 마찬가지이며, `PORT`가 `config.json`의 `port`보다 우선합니다.
+
 ### 인증 실패 (401)
 
 **증상**: 요청 시 `401 Unauthorized` 오류
@@ -266,7 +271,7 @@ curl "http://localhost:8080/v1/models?token=sk-당신의API키"
 ```
 
 2. `/health`, `/v1/ping`은 인증이 필요 없습니다
-3. `/api/admin/*`는 `adminApiKey`(미설정 시 `apiKey`로 대체)로 인증
+3. `/api/admin/*`는 `adminApiKey`(미설정 시 `apiKey`로 대체)로 인증하며, 둘 다 설정하지 않으면 인증 없이 개방됩니다(`/admin`, `/user` 패널 본체는 언제나 인증 없음)
 
 ### 계정 상태 확인
 

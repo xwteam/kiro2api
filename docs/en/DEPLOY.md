@@ -57,13 +57,15 @@ Edit `.env` and set at least one external API key:
 
 ```env
 API_KEY=sk-your-custom-key
-ADMIN_API_KEY=sk-optional-admin-key
+ADMIN_API_KEY=sk-your-admin-key
 ```
 
 **Important notes:**
 - If `API_KEY` is empty, the protocol endpoints are **open access** (a warning is logged at startup) — always set it for externally facing deployments
-- `ADMIN_API_KEY` is optional; when unset it falls back to `API_KEY`
+- Omit the `ADMIN_API_KEY` line and `/api/admin/*` falls back to `API_KEY`; with **neither** key set the admin API is **open access** — anyone can add or delete credentials, rotate the auth keys, and restart the service, so always set `ADMIN_API_KEY` on a public deployment
+- Never write an empty value: `API_KEY=` or `ADMIN_API_KEY=` overrides whatever is already configured in `config.json`. If you don't want a variable, comment the whole line out
 - The container image ships with `HOST=0.0.0.0` built in; for bare-metal runs, do not casually set `HOST=0.0.0.0`
+- The `/admin` and `/user` panels themselves are never gated — the auth gate sits on their `/api/**` endpoints
 
 Place your Kiro credentials in `data/credentials.json` (an array; existing Kiro credentials can be dropped in directly):
 
@@ -235,9 +237,11 @@ lsof -i :8080
 # Kill the process
 kill -9 <PID>
 
-# Or use a different port in docker-compose.yml
-# Change "8080:8080" to "8081:8080"
+# Or move the service to another port — set PORT in .env, then restart
+# PORT=8081
 ```
+
+> One change is enough: the listening port, the compose port mapping (`${PORT:-8080}:${PORT:-8080}`), and the healthcheck probe all follow `PORT` — no need to touch `docker-compose.yml`. The same applies on bare metal, where `PORT` takes precedence over `port` in `config.json`.
 
 ### All Accounts Cooling Down / Disabled
 
@@ -270,18 +274,20 @@ kill -9 <PID>
 
 ## Configuration Reference
 
-Precedence: **environment variables > `config.json` > built-in defaults**. The mounted volume `./data` holds `config.json`, `credentials.json`, logs, and runtime state.
+Precedence: **command-line flags > environment variables > `config.json` > built-in defaults**. There are exactly two command-line flags: `-c/--config` (config file path) and `--credentials` (credentials file path; when omitted, `CREDENTIALS_PATH` / `config.json` / the built-in default decides). The mounted volume `./data` holds `config.json`, `credentials.json`, logs, and runtime state.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `API_KEY` | — | Required: external API key (empty = protocol endpoints open access, warning at startup) |
-| `ADMIN_API_KEY` | Falls back to `API_KEY` | Separate auth key for `/api/admin/*` |
+| `ADMIN_API_KEY` | Falls back to `API_KEY` | Separate auth key for `/api/admin/*`; with neither this nor `API_KEY` set, `/api/admin/*` is open access — mandatory on public deployments |
 | `HOST` | `127.0.0.1` (image ships `0.0.0.0`) | Listen address |
-| `PORT` | 8080 | Service port |
+| `PORT` | 8080 | Service port (the compose port mapping and the healthcheck both follow this value) |
 | `REGION` | us-east-1 | Default AWS region (the region inside an account's `profileArn` takes precedence) |
 | `LOAD_BALANCING_MODE` | priority | Load balancing: `priority` (even round-robin) or `balanced` (weighted by `weight`) |
 | `MAX_RPM_PER_CREDENTIAL` | 0 | Per-account requests-per-minute cap; `0` = unlimited |
-| `CREDENTIALS_PATH` | /app/data/credentials.json | Path to the credentials file |
+| `CREDENTIALS_PATH` | `credentials.json` (image ships `/app/data/credentials.json`) | Path to the credentials file; overridden by the `--credentials` flag |
+
+> The credentials path also decides where usage stats (`stats/`), API-KEY storage (`api_keys.json`), and the balance cache are written — all of them use the parent directory of `credentials.json`. The image default already puts them on the mounted volume; if you set a custom path, keep it inside the volume too, or the data is gone the moment the container is recreated.
 
 **`data/config.json`** (camelCase, all fields optional; `logCapacity` is configured only here):
 
@@ -295,14 +301,14 @@ Precedence: **environment variables > `config.json` > built-in defaults**. The m
   "credentialsPath": "/app/data/credentials.json",
   "loadBalancingMode": "priority",
   "maxRpmPerCredential": 0,
-  "logCapacity": 1000,
+  "logCapacity": 5000,
   "kiroVersion": "0.11.107",
   "systemVersion": "win32#10.0.22631",
   "nodeVersion": "22.22.0"
 }
 ```
 
-- `logCapacity`: size (in lines) of the live-log ring buffer. `> 0` enables log capture (replayed/streamed by the admin panel's Logs page); `0` disables it (log endpoints return `503`). Default `1000`.
+- `logCapacity`: size (in lines) of the live-log ring buffer. `> 0` enables log capture (replayed/streamed by the admin panel's Logs page); `0` disables it (log endpoints return `503`). Default `5000`.
 - `kiroVersion` / `systemVersion` / `nodeVersion`: spoofed UA version numbers injected from config.
 
 ## Docker Compose Reference
@@ -314,7 +320,7 @@ volumes:
   - ./data:/app/data           # Persistent data (config.json, credentials.json, logs, runtime state)
 ```
 
-The image is `ghcr.io/xwteam/kiro2api` (multi-arch amd64 / arm64). Inside the container the process runs as the non-root user `appuser` (UID 1000): `docker-entrypoint.sh` first `chown`s the mounted volume as root, then drops privileges via `gosu` (seamlessly upgrading data created by a legacy root process). The image ships with a `HEALTHCHECK` plus a compose healthcheck, and `restart: unless-stopped`.
+The image is `ghcr.io/xwteam/kiro2api` (multi-arch amd64 / arm64). Inside the container the process runs as the non-root user `appuser` (UID 1000): `docker-entrypoint.sh` first `chown`s the mounted volume as root, then drops privileges via `gosu` (seamlessly upgrading data created by a legacy root process). The image ships with a `HEALTHCHECK` plus a compose healthcheck (the probed port resolves as `PORT` env var > `port` in `data/config.json` > `8080`, so it always matches the port the app listens on), and `restart: unless-stopped`.
 
 Upgrade to a new image:
 ```bash

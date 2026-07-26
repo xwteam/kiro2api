@@ -45,7 +45,7 @@
 > This project is for research and learning purposes only. Please use it responsibly and do not use it for any commercial purposes.
 
 > [!IMPORTANT]
-> When `apiKey`/`API_KEY` is empty, the protocol endpoints are **openly accessible** (startup logs a warning). Always set it for external deployments. The container image ships with `HOST=0.0.0.0` built in; for bare-metal deployments do not casually change `HOST` to `0.0.0.0` (the `/admin` and `/user` panels themselves are not yet gated — what is protected are the `/api/admin/*` and `/api/user/*` endpoints).
+> When `apiKey`/`API_KEY` is empty, the protocol endpoints are **openly accessible** (startup logs a warning). Always set it for external deployments. The admin API `/api/admin/*` is only protected once `adminApiKey` (falling back to `apiKey`) has been configured — **with neither key set, the admin API is as open as the panels are**, and anyone can add or delete credentials and rotate the auth keys; the `/admin` and `/user` panels themselves are never gated. Always set `ADMIN_API_KEY` before putting the service on the public internet. The container image ships with `HOST=0.0.0.0` built in; for bare-metal deployments do not casually change `HOST` to `0.0.0.0`.
 
 > [!TIP]
 > The backend is a Kiro (CodeWhisperer) account pool. **Which models are available depends on the account's subscription tier**: the free tier (KIRO FREE) usually authorizes only `claude-sonnet-4.5`, while opus/GPT and the like require a higher tier — requesting an unsupported model returns a clear `400` (`INVALID_MODEL_ID`) rather than failing silently.
@@ -80,7 +80,7 @@
 ### 🔐 Unified Authentication Gate
 
 - Choose one of three: `Authorization: Bearer` / `x-api-key` / `?token=`, constant-time comparison, `401` on failure
-- `adminApiKey` (falling back to `apiKey`) protects `/api/admin/*`; holders use their own **API-KEY** to reach `/api/user/*`
+- `adminApiKey` (falling back to `apiKey`) protects `/api/admin/*` — when neither is configured the gate runs in open mode; holders use their own **API-KEY** to reach `/api/user/*`
 - Liveness endpoints such as `/health` and `/v1/ping` require no authentication
 
 ### 🔄 Account Pool & Token Self-Healing
@@ -217,7 +217,9 @@ Edit `.env` and set at least one external access key `API_KEY`:
 
 ```env
 API_KEY=sk-your-external-access-key
-ADMIN_API_KEY=optional, separate admin key (empty falls back to API_KEY)
+# Separate admin key; mandatory for public deployments (omit it and /api/admin/* falls back to API_KEY — with neither set it is wide open).
+# Don't need it? Comment the whole line out — an empty value overrides the key already set in config.json.
+ADMIN_API_KEY=sk-your-admin-key
 ```
 
 Put your Kiro account credentials into `data/credentials.json` (an array, existing Kiro credentials can be dropped in directly):
@@ -432,7 +434,7 @@ resp = client.chat.completions.create(
 
 | Method | Endpoint | Function |
 |--------|----------|----------|
-| GET | `/admin` · `/api/admin/*` | Admin panel + admin API (with `adminApiKey`: credential CRUD / login / API-KEY / usage / logs / balance / settings / update check / restart) |
+| GET | `/admin` · `/api/admin/*` | Admin panel + admin API (with `adminApiKey`, open when no key is configured: credential CRUD / login / API-KEY / usage / logs / balance / settings / update check / restart) |
 | GET | `/user` · `/api/user/*` | User panel + API (with the holder's own API-KEY) |
 | GET | `/health` · `/v1/ping` | Liveness (no auth) |
 
@@ -446,20 +448,22 @@ resp = client.chat.completions.create(
 
 ## ⚙ Configuration
 
-Priority: **environment variables > `config.json` > built-in defaults**. The mounted volume `./data` holds `config.json`, `credentials.json`, logs, and runtime state.
+Priority: **command-line flags > environment variables > `config.json` > built-in defaults**. There are exactly two command-line flags: `-c/--config` (config file path) and `--credentials` (credentials file path; when omitted, `CREDENTIALS_PATH` / `config.json` / the built-in default decides). The mounted volume `./data` holds `config.json`, `credentials.json`, logs, and runtime state.
+
+> The credentials path also decides where usage stats (`stats/`), API-KEY storage (`api_keys.json`), and the balance cache are written — all of them use the parent directory of `credentials.json`. The container image ships `CREDENTIALS_PATH=/app/data/credentials.json`, so by default this data lands on the mounted volume; if you point the path somewhere else, point it inside the volume too, or everything is gone the moment the container is recreated.
 
 **Environment variables** (see `.env.example`):
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `API_KEY` | ✅ | — | External access key (empty leaves the protocol endpoints openly accessible, startup warns) |
-| `ADMIN_API_KEY` | ❌ | falls back to `API_KEY` | Separate auth key for the admin side |
+| `ADMIN_API_KEY` | ❌ | falls back to `API_KEY` | Separate auth key for the admin side; with neither this nor `API_KEY` set, `/api/admin/*` is open — mandatory for public deployments |
 | `HOST` | ❌ | `127.0.0.1` (image ships `0.0.0.0`) | Listen address |
-| `PORT` | ❌ | `8080` | Service port |
+| `PORT` | ❌ | `8080` | Service port (the compose port mapping and the healthcheck both follow this value) |
 | `REGION` | ❌ | `us-east-1` | Default AWS region (the region inside the account's `profileArn` takes precedence) |
 | `LOAD_BALANCING_MODE` | ❌ | `priority` | Load balancing: `priority` (equal-weight round-robin) / `balanced` (weighted by weight) |
 | `MAX_RPM_PER_CREDENTIAL` | ❌ | `0` | Per-account per-minute request cap, `0` = unlimited |
-| `CREDENTIALS_PATH` | ❌ | `/app/data/credentials.json` | Credentials file path |
+| `CREDENTIALS_PATH` | ❌ | `credentials.json` (image ships `/app/data/credentials.json`) | Credentials file path; overridden by the `--credentials` flag |
 
 **`data/config.json`** (camelCase, all optional; `logCapacity` is configured here only):
 
@@ -473,21 +477,21 @@ Priority: **environment variables > `config.json` > built-in defaults**. The mou
   "credentialsPath": "/app/data/credentials.json",
   "loadBalancingMode": "priority",
   "maxRpmPerCredential": 0,
-  "logCapacity": 1000,
+  "logCapacity": 5000,
   "kiroVersion": "0.11.107",
   "systemVersion": "win32#10.0.22631",
   "nodeVersion": "22.22.0"
 }
 ```
 
-- `logCapacity`: ring-buffer size for live logs; `>0` enables log capture (admin log-page replay/SSE), `0` disables it (the log endpoint returns 503); default `1000`.
+- `logCapacity`: ring-buffer size for live logs; `>0` enables log capture (admin log-page replay/SSE), `0` disables it (the log endpoint returns 503); default `5000`.
 - `kiroVersion`/`systemVersion`/`nodeVersion`: spoofed UA version numbers, injected from config.
 
 ---
 
 ## ⚠ Important Notes
 
-1. **Always set `API_KEY` for external deployments**: when empty, the protocol endpoints are openly accessible (startup warns). The `/admin` and `/user` panels themselves are not yet gated — what is protected are the `/api/admin/*` and `/api/user/*` endpoints; be careful changing `HOST=0.0.0.0` on bare metal.
+1. **Always set both `API_KEY` and `ADMIN_API_KEY` for external deployments**: with `API_KEY` empty the protocol endpoints are openly accessible (startup warns); with neither `adminApiKey` nor `apiKey` configured, `/api/admin/*` is just as open — credentials, API-KEYs, and the auth settings can all be rewritten by anyone. The `/admin` and `/user` panels themselves are never gated (the real gate sits on their `/api/**` endpoints); be careful changing `HOST=0.0.0.0` on bare metal.
 
 2. **Available models depend on the account subscription tier**: the free tier (KIRO FREE) usually authorizes only `claude-sonnet-4.5`; requesting an unsupported model returns `400` (`INVALID_MODEL_ID`), without blind retries or penalizing accounts.
 

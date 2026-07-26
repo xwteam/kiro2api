@@ -553,7 +553,7 @@ data: {"candidates":[{"content":{"parts":[{"text":"夜"}]}}]}
 
 ## 管理 API
 
-`/admin` 管理パネル（静的、rust-embed 埋め込み）は `/api/admin/*` API で駆動されます。以下のエンドポイントはすべて `adminApiKey`（未設定時は `apiKey` にフォールバック）で認証されます。認証の渡し方はプロトコルゲートと同じです（`Authorization: Bearer` / `x-api-key` / `?token=`。ヘッダーを設定できない SSE ログストリームは `?api_key=`）。レスポンス本体はすべて camelCase で、**access/refresh トークンや鍵を一切含みません**。
+`/admin` 管理パネル（静的、rust-embed 埋め込み）は `/api/admin/*` API で駆動されます。以下のエンドポイントはすべて `adminApiKey`（未設定時は `apiKey` にフォールバック。両方とも未設定なら管理 API はオープンになります——この状態で外部に公開しないでください）で認証されます。認証の渡し方はプロトコルゲートと同じです（`Authorization: Bearer` / `x-api-key` / `?token=`。ヘッダーを設定できない SSE ログストリームは `?api_key=`）。レスポンス本体はすべて camelCase で、**access/refresh トークンや鍵を一切含みません**。
 
 ### GET /api/admin/credentials
 

@@ -45,7 +45,7 @@
 > 本项目仅供研究和学习用途，请合理使用，不要用于任何商业目的。
 
 > [!IMPORTANT]
-> `apiKey`/`API_KEY` 为空时，协议端点**开放访问**（启动会告警）。对外部署务必设置。容器镜像已内置 `HOST=0.0.0.0`；裸机部署请勿轻易把 `HOST` 改成 `0.0.0.0`（当前 `/admin`、`/user` 面板本体尚未接鉴权，受保护的是 `/api/admin/*`、`/api/user/*` 接口）。
+> `apiKey`/`API_KEY` 为空时，协议端点**开放访问**（启动会告警）。对外部署务必设置。管理接口 `/api/admin/*` 只有在配置了 `adminApiKey`（缺省回退 `apiKey`）之后才受保护——**两个 key 都不配时管理接口和面板一样是开放的**，任何人都能增删凭据、改鉴权密钥；`/admin`、`/user` 面板本体则始终不鉴权。部署到公网必须设置 `ADMIN_API_KEY`。容器镜像已内置 `HOST=0.0.0.0`；裸机部署请勿轻易把 `HOST` 改成 `0.0.0.0`。
 
 > [!TIP]
 > 后端为 Kiro（CodeWhisperer）账号池。**可用模型取决于账号订阅档位**：免费档（KIRO FREE）通常只授权 `claude-sonnet-4.5`，opus/GPT 等需更高档位——请求不支持的模型会明确返回 400（`INVALID_MODEL_ID`），而非静默失败。
@@ -80,7 +80,7 @@
 ### 🔐 统一鉴权闸
 
 - 三选一：`Authorization: Bearer` / `x-api-key` / `?token=`，常量时间比较，失败即 `401`
-- `adminApiKey`（缺省回退 `apiKey`）保护 `/api/admin/*`；持有者用自己的 **API-KEY** 访问 `/api/user/*`
+- `adminApiKey`（缺省回退 `apiKey`）保护 `/api/admin/*`，两者都未配置时该闸为开放模式；持有者用自己的 **API-KEY** 访问 `/api/user/*`
 - `/health`、`/v1/ping` 等探活端点不鉴权
 
 ### 🔄 账号池与令牌自愈
@@ -217,7 +217,9 @@ cp .env.example .env
 
 ```env
 API_KEY=sk-你的对外调用密钥
-ADMIN_API_KEY=可选,管理端独立密钥（留空回退用 API_KEY）
+# 管理端独立密钥；公网部署必填（不设则 /api/admin/* 回退用 API_KEY 鉴权，两者都不设即开放）。
+# 不需要就把整行注释掉——写成空值会覆盖 config.json 里已配的密钥。
+ADMIN_API_KEY=sk-你的管理端密钥
 ```
 
 把 Kiro 账号凭据放到 `data/credentials.json`（数组，可直接 drop-in 现有 Kiro 凭据）：
@@ -432,7 +434,7 @@ resp = client.chat.completions.create(
 
 | 方法 | 端点 | 功能 |
 |------|------|------|
-| GET | `/admin` · `/api/admin/*` | 管理面板 + 管理接口（凭 `adminApiKey`：凭据 CRUD / 登录 / API-KEY / 用量 / 日志 / 余额 / 设置 / 检查更新 / 重启） |
+| GET | `/admin` · `/api/admin/*` | 管理面板 + 管理接口（凭 `adminApiKey`，未配置任何 key 时开放：凭据 CRUD / 登录 / API-KEY / 用量 / 日志 / 余额 / 设置 / 检查更新 / 重启） |
 | GET | `/user` · `/api/user/*` | 用户面板 + 接口（凭自身 API-KEY） |
 | GET | `/health` · `/v1/ping` | 探活（不鉴权） |
 
@@ -446,20 +448,22 @@ resp = client.chat.completions.create(
 
 ## ⚙ 配置说明
 
-优先级：**环境变量 > `config.json` > 内置默认**。挂载卷 `./data` 存放 `config.json`、`credentials.json`、日志与运行态。
+优先级：**命令行参数 > 环境变量 > `config.json` > 内置默认**。命令行只有两个参数：`-c/--config`（配置文件路径）与 `--credentials`（凭据文件路径，不给则由 `CREDENTIALS_PATH`/`config.json`/默认值决定）。挂载卷 `./data` 存放 `config.json`、`credentials.json`、日志与运行态。
+
+> 凭据路径同时决定用量统计（`stats/`）、API-KEY 存储（`api_keys.json`）与余额缓存的落盘目录——它们都取 `credentials.json` 的父目录。容器镜像已内置 `CREDENTIALS_PATH=/app/data/credentials.json`，这些数据默认就落在挂载卷里；自定义路径时请一并指向挂载卷，否则容器重建即丢。
 
 **环境变量**（见 `.env.example`）：
 
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `API_KEY` | ✅ | — | 对外调用密钥（留空则协议端点开放访问，启动告警） |
-| `ADMIN_API_KEY` | ❌ | 回退 `API_KEY` | 管理端独立鉴权 key |
+| `ADMIN_API_KEY` | ❌ | 回退 `API_KEY` | 管理端独立鉴权 key；与 `API_KEY` 都不设时 `/api/admin/*` 开放，公网部署必填 |
 | `HOST` | ❌ | `127.0.0.1`（镜像内置 `0.0.0.0`） | 监听地址 |
-| `PORT` | ❌ | `8080` | 服务端口 |
+| `PORT` | ❌ | `8080` | 服务端口（compose 的端口映射与健康检查都跟随该值） |
 | `REGION` | ❌ | `us-east-1` | 默认 AWS region（账号 `profileArn` 内的 region 优先） |
 | `LOAD_BALANCING_MODE` | ❌ | `priority` | 负载均衡：`priority`（等权轮询）/ `balanced`（按 weight 加权） |
 | `MAX_RPM_PER_CREDENTIAL` | ❌ | `0` | 每账号每分钟请求上限，`0` = 无限 |
-| `CREDENTIALS_PATH` | ❌ | `/app/data/credentials.json` | 凭据文件路径 |
+| `CREDENTIALS_PATH` | ❌ | `credentials.json`（镜像内置 `/app/data/credentials.json`） | 凭据文件路径；被命令行 `--credentials` 覆盖 |
 
 **`data/config.json`**（camelCase，均可选；`logCapacity` 仅在此配置）：
 
@@ -473,21 +477,21 @@ resp = client.chat.completions.create(
   "credentialsPath": "/app/data/credentials.json",
   "loadBalancingMode": "priority",
   "maxRpmPerCredential": 0,
-  "logCapacity": 1000,
+  "logCapacity": 5000,
   "kiroVersion": "0.11.107",
   "systemVersion": "win32#10.0.22631",
   "nodeVersion": "22.22.0"
 }
 ```
 
-- `logCapacity`：实时日志环形缓冲条数，`>0` 启用日志捕获（管理面板日志页回放/SSE），`0` 关闭（日志端点返回 503）；默认 `1000`。
+- `logCapacity`：实时日志环形缓冲条数，`>0` 启用日志捕获（管理面板日志页回放/SSE），`0` 关闭（日志端点返回 503）；默认 `5000`。
 - `kiroVersion`/`systemVersion`/`nodeVersion`：伪装 UA 版本号，从配置注入。
 
 ---
 
 ## ⚠ 注意事项
 
-1. **对外部署务必设置 `API_KEY`**：留空时协议端点开放访问（启动会告警）。`/admin`、`/user` 面板本体尚未接鉴权，受保护的是 `/api/admin/*`、`/api/user/*`；裸机部署慎改 `HOST=0.0.0.0`。
+1. **对外部署务必设置 `API_KEY` 与 `ADMIN_API_KEY`**：`API_KEY` 留空时协议端点开放访问（启动会告警）；`adminApiKey`/`apiKey` 都不配时 `/api/admin/*` 同样开放，凭据、API-KEY、鉴权设置都能被任意改写。`/admin`、`/user` 面板本体始终不鉴权（真正的闸在其 `/api/**` 接口上）；裸机部署慎改 `HOST=0.0.0.0`。
 
 2. **可用模型取决于账号订阅档位**：免费档（KIRO FREE）通常只授权 `claude-sonnet-4.5`；请求不支持的模型返回 `400`（`INVALID_MODEL_ID`），不瞎重试、不误伤账号。
 

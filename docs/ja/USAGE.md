@@ -27,7 +27,7 @@ http://サーバーIP:8080/admin
 1. `.env` または `config.json` から `adminApiKey`（未設定の場合は `apiKey`）を確認
 2. パネルに入力してサインイン
 
-> **ヒント**: kiro2api の統一認証は `Authorization: Bearer` / `x-api-key` / `?token=` の 3 通りに対応しています。管理接口（`/api/admin/*`）は `adminApiKey` で保護されます。
+> **ヒント**: kiro2api の統一認証は `Authorization: Bearer` / `x-api-key` / `?token=` の 3 通りに対応しています。管理 API（`/api/admin/*`）は `adminApiKey`（未設定時は `apiKey`）を設定して初めて保護されます——どちらも未設定なら無認証で誰でもアクセスできるため、公開環境では必ず `ADMIN_API_KEY` を設定してください。なおパネル本体（`/admin`・`/user`）に認証はなく、ログイン画面は入力したキーをブラウザに保存して API 呼び出しに使うだけです。
 
 ## パネル機能
 
