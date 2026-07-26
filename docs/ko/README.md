@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.1.4-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.2.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 날짜 | 업데이트 내용 |
 |------|----------|
+| 2026-07-26 | v0.2.0 - 🛠 전체 체인 감사 수정: API-KEY 지출 한도가 **4개 프로토콜 전부**에 적용(이전에는 Anthropic 엔드포인트에서만 유효하여 나머지 3개는 무제한 소비되고 사용량도 0으로 표시됨); 사용자용 API-KEY만 설정된 경우에도 관리 인터페이스가 더 이상 개방되지 않음; 업스트림 오류·스트림 도중 전송 중단·잘림을 어느 프로토콜에서도 정상 완료로 보고하지 않음; 계정 풀 갱신 실패가 풀에 그대로 반영됨; 재시작해도 사용량/과금이 유실되지 않고 원장 파일이 롤백에 안전하게 유지됨; `--credentials`와 `PORT`를 반영하는 헬스 체크가 실제로 동작 |
 | 2026-07-26 | v0.1.4 - 🐛 수정: Anthropic `system` 필드가 콘텐츠 블록 배열(문자열뿐 아니라)을 지원 — Claude Code / 프롬프트 캐싱 SDK가 배열로 보내도 더 이상 422가 발생하지 않음 |
 | 2026-07-26 | v0.1.3 - 일괄 JSON 가져오기가 이제 계정별 실시간 진행 상황을 표시: 진행률 바, 실시간 성공/중복/실패 통계, 계정별 상태 목록(검증 중 → 사용량과 함께 검증 완료 / 중복 / 실패 후 롤백); 검증된 계정은 즉시 저장되므로 가져오기 도중 중단해도 유실되지 않음 |
 | 2026-07-25 | v0.1.2 - 업데이트 대화상자 개편: 업데이트 확인 대화상자가 현지화된 릴리스 노트 + 복사 가능한 업그레이드 명령을 표시, 업데이트가 있으면 버튼이 「vX로 업데이트」로 강조, 순수 HTTP 환경에서 복사 버튼 오류 수정 |
@@ -452,7 +453,7 @@ resp = client.chat.completions.create(
 
 3. **토큰 자가 치유**: 토큰 만료 시 메모리 내에서 자동 갱신하고 `credentials.json`에 원자적으로 저장합니다; 진짜 자격 증명 무효만 영구 비활성화하고, 쿼터/리스크 컨트롤/스로틀은 일률적으로 쿨다운 자가 치유합니다.
 
-4. **스트리밍 출력**: 네 가지 프로토콜 모두 스트리밍을 지원합니다; `stream:false`일 때도 서비스 내부에서는 여전히 이벤트 스트림을 디코딩하고, 수집 완료 후 전체 JSON을 한 번에 반환합니다.
+4. **스트리밍 출력**: 네 가지 프로토콜 모두 스트리밍을 지원합니다; `stream:false`일 때도 서비스 내부에서는 여전히 이벤트 스트림을 디코딩하고, 수집 완료 후 전체 JSON을 한 번에 반환합니다. 업스트림 오류나 스트림 도중의 전송 중단이 발생하면 해당 프로토콜의 오류 이벤트로 스트림을 끝내며, 정상 완료로 위장하지 않습니다; `max_tokens` 도달이나 컨텍스트 소진으로 잘린 경우에도 그 잘림 사유를 그대로 보고합니다.
 
 5. **네트워크 환경**: 배포 서버는 AWS CodeWhisperer/Kiro 엔드포인트(`*.amazonaws.com`)에 액세스할 수 있어야 합니다.
 

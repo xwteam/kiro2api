@@ -87,6 +87,8 @@ Manage the outbound keys you hand to callers:
 5. **Delete Key**: Remove a key permanently
 6. **Inspect Usage**: Reset or browse paginated per-key usage records
 
+Spending limits and expiry are enforced on **all four protocol front ends** (Anthropic / OpenAI / OpenAI-Responses / Gemini) — whichever endpoint a caller uses, the spend is billed to that key and counts against the same limit.
+
 Each key holder can also sign in to the **User Panel** (`/user`) with their own key to review quota and usage.
 
 ### Settings
@@ -105,7 +107,7 @@ Configure runtime behavior:
 
 Manage the service from the top control bar:
 
-- **Restart Service**: Restart the service in one click (useful after configuration changes)
+- **Restart Service**: Restart the service in one click (useful after configuration changes). Shutdown drains in-flight requests within a bounded window (8 seconds) and then exits, so the final usage/billing flush always runs — a restart no longer loses the stats recorded since the last write
 - **Theme**: Toggle between light and dark themes
 - **Language**: Switch the interface language (5 languages)
 - **GitHub**: Jump to the repository
@@ -326,6 +328,9 @@ curl -X POST http://localhost:8080/v1/chat/completions \
     "stream": true
   }'
 ```
+
+> [!NOTE]
+> Streaming is honest about failures on every protocol: if the upstream returns an error, or the connection is interrupted mid-stream, the stream ends with that protocol's own error event (OpenAI/Responses `error`, Anthropic `error`, Gemini error payload) — never with a normal finish. When the answer is cut short by `max_tokens` or an exhausted context, the stream reports the matching truncation reason (`length` / `max_tokens` / `MAX_TOKENS`) instead of a clean stop, so clients can tell "finished" from "cut off".
 
 ## Conversation Context
 

@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.1.4-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.2.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-07-26 | v0.2.0 - 🛡️ 全链路审计修复：API-KEY 消费上限四种协议全部生效（此前只在 Anthropic 端点生效，另外三种可无限消费且用量显示为零）；仅配置用户级 API-KEY 时管理端不再开放；上游报错、流中途传输中断与截断不再被当成正常完成上报；账号池刷新失败回写账号池；用量/账单重启不再丢失、账本文件回滚安全；`--credentials` 与跟随 `PORT` 的健康检查真正生效 |
 | 2026-07-26 | v0.1.4 - 🐛 修复 Anthropic `system` 字段支持内容块数组（不只字符串）——Claude Code / 带 prompt 缓存的 SDK 把 system 发成数组时不再报 422 |
 | 2026-07-26 | v0.1.3 - 📥 批量 JSON 导入改为实时逐条展示进度：进度条、成功/重复/失败实时计数、每行状态列表（验证中 → 已验证并附用量 / 重复 / 失败已回滚）；验证通过的账号即时保存，中途打断也不丢失 |
 | 2026-07-25 | v0.1.2 - 🔔 检查更新弹窗改版：弹窗内展示当前语言的版本更新说明 + 可一键复制的升级命令；有新版本时按钮高亮为「更新到 vX」；修复纯 HTTP 下复制按钮失效 |
@@ -102,7 +103,7 @@
 - **仪表盘**：运行时间实时计时、全局剩余积分、系统信息（版本/Rust/OS/内存/CPU/PID/运行模式）、赞助二维码卡（实时拉取远程配置）、**检查更新**（GitHub Release 比对，弹窗展示当前语言的版本更新说明 + 可一键复制的升级命令）
 - **账号管理**：增删改查、三种交互式登录、批量导入（逐条验活 + 去重）、优先级/权重、余额查询
 - **模型测试**：从面板向任意模型发一条测试请求验证连通性；未创建自定义 key 时默认用主 API-KEY
-- **API-KEY 管理**：发放/禁用/改标签、按 key 用量与分页记录
+- **API-KEY 管理**：发放/禁用/改标签、消费上限与有效期（在四种协议前端统一计量并拦截）、按 key 用量与分页记录
 - **用量统计**：每日/账号维度、含客户端 IP 与账号标签、按日下钻
 - **实时日志**：结构化表格 + 方向过滤 + 搜索 + 分页 + SSE 实时推送 + 下载
 - **设置**：运行期切负载均衡/鉴权密钥、集成示例（协议×语言可复制片段）、**一键重启服务**
@@ -497,7 +498,7 @@ resp = client.chat.completions.create(
 
 3. **令牌自愈**：token 到期自动内存刷新并原子落盘 `credentials.json`；真正的凭据失效才永久禁用，配额/风控/限流一律冷却自愈。
 
-4. **流式输出**：四种协议均支持流式；`stream:false` 时服务内部仍解码事件流，收集完毕后一次性返回完整 JSON。
+4. **流式输出**：四种协议均支持流式；`stream:false` 时服务内部仍解码事件流，收集完毕后一次性返回完整 JSON。上游报错或流传输中途中断时，流会以该协议自身的错误事件收尾，绝不会伪装成一次正常完成；触及 `max_tokens` 或上下文耗尽时，如实回报截断原因。
 
 5. **网络环境**：部署服务器需能访问 AWS CodeWhisperer/Kiro 端点（`*.amazonaws.com`）。
 

@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.1.4-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.2.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-07-26 | v0.2.0 - 🔒 全鏈路審計修復：API-KEY 消費上限現在於 Anthropic / OpenAI / OpenAI-Responses / Gemini 四協議一律生效（此前只在 Anthropic 端點生效，改用其餘三協議即可無限消費，且這些流量的用量顯示為零）；只設定了使用者級 API-KEY 時管理面不再開放；上游錯誤、串流中途傳輸中斷與截斷不再被報成正常完成；帳號池刷新失敗會回饋到池；用量計費不再因重啟遺失、統計檔案保持可回滾；`--credentials` 與跟隨 `PORT` 的健康檢查現在真正生效 |
 | 2026-07-26 | v0.1.4 - 🐛 修復 Anthropic `system` 欄位支援內容區塊陣列（不只字串）——Claude Code / 帶 prompt 快取的 SDK 把 system 發成陣列時不再回 422 |
 | 2026-07-26 | v0.1.3 - 📥 批次 JSON 匯入改為即時逐條進度：進度條、即時累計成功/重複/失敗統計，以及逐條狀態清單（驗證中 → 已驗證並顯示用量 / 重複 / 失敗已回滾）；已驗證帳號即時落盤，匯入途中中斷也不會遺失 |
 | 2026-07-25 | v0.1.2 - 🔄 檢查更新對話框改版：檢查更新對話框改為顯示當前介面語言的發行說明 + 可一鍵複製的升級指令；有更新時按鈕高亮為「更新到 vX」；修復純 HTTP 下複製按鈕失效 |
@@ -105,7 +106,7 @@
 - **儀表板**：執行時間即時計時、全域剩餘積分、系統資訊（版本/Rust/OS/記憶體/CPU/PID/執行模式）、贊助二維碼卡（即時拉取遠端配置）、**檢查更新**（GitHub Release 比對；對話框顯示當前語言的發行說明 + 可複製的升級指令）
 - **帳號管理**：增刪改查、三種互動式登入、批次匯入（逐條探活驗證 + 去重，即時進度條與逐條狀態清單）、優先級/權重、餘額查詢
 - **模型測試**：從面板向任一模型傳送測試請求以驗證連通性；未建立自訂 key 時預設回退主 API 金鑰
-- **API-KEY 管理**：發放/停用/改標籤、按 key 用量與分頁記錄
+- **API-KEY 管理**：發放/停用/改標籤、按 key 用量與分頁記錄；消費上限與用量計量在 Anthropic / OpenAI / OpenAI-Responses / Gemini 四個協議前端一律生效
 - **用量統計**：每日/帳號維度、含客戶端 IP 與帳號標籤、按日下鑽
 - **即時日誌**：結構化表格 + 方向過濾 + 搜尋 + 分頁 + SSE 即時推送 + 下載
 - **設定**：執行期切負載平衡/驗證金鑰、集成範例（協議×語言可複製片段）、**一鍵重啟服務**
@@ -450,7 +451,7 @@ resp = client.chat.completions.create(
 
 3. **令牌自癒**：token 到期自動記憶體刷新並原子落盤 `credentials.json`；真正的憑證失效才永久停用，配額/風控/限流一律冷卻自癒。
 
-4. **串流輸出**：四種協議均支援串流；`stream:false` 時服務內部仍解碼事件流，收集完畢後一次性傳回完整 JSON。
+4. **串流輸出**：四種協議均支援串流；`stream:false` 時服務內部仍解碼事件流，收集完畢後一次性傳回完整 JSON。上游報錯或串流中途傳輸中斷（連線重置 / 讀取逾時 / 分塊未收尾）時，一律以該協議自身的錯誤事件收束（Anthropic `error` 事件、OpenAI 錯誤 chunk 且不補 `[DONE]`、Responses `response.failed`、Gemini 錯誤區塊），**絕不會被當成正常完成**；命中 `max_tokens` 或上下文耗盡時，如實回報截斷原因（`max_tokens` / `length` / `MAX_TOKENS` / `incomplete`）。
 
 5. **網路環境**：部署伺服器需能存取 AWS CodeWhisperer/Kiro 端點（`*.amazonaws.com`）。
 

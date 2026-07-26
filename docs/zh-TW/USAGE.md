@@ -84,6 +84,10 @@ kiro2api 內建靜態管理面板（`/admin`）與使用者面板（`/user`）�
 2. 設定消費上限 / 有效期與標籤
 3. 點擊「儲存」
 
+**消費上限在四協議一律生效：**
+- Anthropic / OpenAI / OpenAI-Responses / **Gemini** 四個協議前端都按鑑權閘解析出的 key 歸屬記帳，額度用盡即返回 `402`
+- 因此無論呼叫方走哪條協議，用量與花費都會如實計入該 key，不存在「換個端點就能繞開上限」的口子
+
 **用量與記錄：**
 - 檢視或清零單 key 的累計用量
 - 瀏覽分頁請求記錄
@@ -353,6 +357,8 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+> 流式回應在上游報錯或**傳輸中途中斷**（連線重置 / 讀取逾時 / 分塊未收尾）時，一律以該協議自身的錯誤事件收束——Anthropic `error` 事件、OpenAI 錯誤 chunk 且不補 `[DONE]`、Responses `response.failed`、Gemini 錯誤區塊（絕不報 `STOP`），逾時映射 `504`、其餘 `502`，**絕不會被當成正常完成**，客戶端的重試邏輯因此能正常觸發。命中 `max_tokens` 或上下文耗盡時，流式與非流式同口徑如實回報截斷原因（`max_tokens` / `length` / `MAX_TOKENS` / `incomplete`）。
+
 ## 令牌自癒與帳號池
 
 kiro2api 無需手動維護 Cookie。Kiro 令牌到期會**自動內存刷新並原子落盤**，帳號池按類別對失敗差異化處置。
@@ -453,7 +459,7 @@ response = client.chat.completions.create(
 ## 常見問題
 
 **Q：如何重啟服務？**
-A：點擊右上角控制欄的「重啟」按鈕，或執行 `docker compose restart`。
+A：點擊右上角控制欄的「重啟」按鈕，或執行 `docker compose restart`。停機時服務會以**最長 8 秒**的排空視窗收束在途請求與管理面的 SSE 長連線，確保用量 / 計費的最終刷盤一定會執行，重啟不丟數據。
 
 **Q：日誌在哪裡？**
 A：在 Web 面板的「日誌」頁面即時檢視（SSE），可下載快照 `.txt`。需 `logCapacity > 0` 才啟用日誌捕獲，設為 `0` 則日誌端點返回 `503`。
