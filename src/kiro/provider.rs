@@ -31,7 +31,9 @@ const ERROR_BODY_CAP: usize = 8 * 1024; // 8 KiB
 ///
 /// 传输中断/读取错误时返回已累积的部分(尽力而为),不 panic:分类对残缺片段仍安全
 /// (命中即升级、不命中即保守)。
-async fn read_body_capped(mut resp: reqwest::Response) -> String {
+///
+/// 控制面(`kiro::refresh`)读刷新端点的错误体时复用同一上限与同一读法,故对 crate 内可见。
+pub(crate) async fn read_body_capped(mut resp: reqwest::Response) -> String {
     let mut buf: Vec<u8> = Vec::new();
     while buf.len() < ERROR_BODY_CAP {
         match resp.chunk().await {
@@ -137,6 +139,33 @@ pub async fn call(
     }
 }
 
+/// 失败分类的"信号强度":数字越大,证据越硬。
+///
+/// - `Transient`:无 HTTP 应答的传输层错误,证据最弱;
+/// - `AuthAmbiguous`:401/403 但体里没有确证;
+/// - `Quota`:上游明确的 429/402(该账号本轮已撞配额墙,应吃长冷却);
+/// - `AuthInvalid`/`InvalidRequest`:上游明确回了作废/确定性拒绝的机器稳定信号。
+fn signal_strength(kind: FailureKind) -> u8 {
+    match kind {
+        FailureKind::Transient => 0,
+        FailureKind::AuthAmbiguous => 1,
+        FailureKind::Quota => 2,
+        FailureKind::AuthInvalid | FailureKind::InvalidRequest => 3,
+    }
+}
+
+/// 多端点回退时合并两次失败的分类:保留**信号更强**的那个。
+///
+/// 先收到的 429(配额,应触发长冷却)若被后一个端点的传输层错误覆盖成 `Transient`,账号就会
+/// 错过长冷却、继续去撞配额墙;故回退过程中只允许分类向上升级,不允许被更弱的信号冲掉。
+fn strongest(a: FailureKind, b: FailureKind) -> FailureKind {
+    if signal_strength(b) > signal_strength(a) {
+        b
+    } else {
+        a
+    }
+}
+
 /// 内部:按给定端点列表尝试,429 回退下一个;返回 Response 或分类失败。
 async fn try_endpoints(
     client: &reqwest::Client,
@@ -162,7 +191,7 @@ async fn try_endpoints(
                 // 其余终态(尤其 401/403)必须**读响应体**再分类,否则真凭据失效信号被丢弃、
                 // AuthInvalid(永久禁用)在生产回退路径同样不可达。读体做单行化 + 截断。
                 if classify(status) == FailureKind::Quota {
-                    last = FailureKind::Quota;
+                    last = strongest(last, FailureKind::Quota);
                     continue; // 429 → 试下一个端点
                 }
                 // #6:分类必须喂**完整原始体**,而非 extract_upstream_message 的有损摘要
@@ -195,7 +224,7 @@ async fn try_endpoints(
                     is_body = e.is_body(),
                     "上游传输层失败,尝试下一个端点"
                 );
-                last = FailureKind::Transient;
+                last = strongest(last, FailureKind::Transient);
                 continue; // 网络错误 → 试下一个端点
             }
         }
@@ -494,6 +523,62 @@ mod tests {
         ];
         let r = try_endpoints(&client, &eps, &cred(), &imp(), b"body").await;
         assert!(matches!(r, Err(FailureKind::Quota)));
+    }
+
+    #[tokio::test]
+    async fn try_endpoints_keeps_quota_over_later_transport_error() {
+        // 先收到 429(配额,应吃长冷却),再在下一个端点上撞传输层错误:分类必须仍是 Quota。
+        // 若被最后一个错误覆盖成 Transient,账号只记 1 个 strike、不进 30 分钟冷却,
+        // 会立刻被重新选中继续撞配额墙。
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let eps = vec![
+            Endpoint {
+                url: format!("{}/a", server.uri()),
+                origin: "AI_EDITOR",
+                target: None,
+            },
+            // 不可达端口 → 传输层错误(Transient),不得把先到的 Quota 冲掉。
+            Endpoint {
+                url: "http://127.0.0.1:1/unreachable".into(),
+                origin: "AI_EDITOR",
+                target: None,
+            },
+        ];
+        let r = try_endpoints(&client, &eps, &cred(), &imp(), b"body").await;
+        assert!(
+            matches!(r, Err(FailureKind::Quota)),
+            "429 的配额信号不得被后续端点的传输错误降级,got {r:?}"
+        );
+    }
+
+    #[test]
+    fn strongest_only_escalates_never_downgrades() {
+        assert_eq!(
+            strongest(FailureKind::Quota, FailureKind::Transient),
+            FailureKind::Quota
+        );
+        assert_eq!(
+            strongest(FailureKind::Transient, FailureKind::Quota),
+            FailureKind::Quota
+        );
+        assert_eq!(
+            strongest(FailureKind::Quota, FailureKind::AuthInvalid),
+            FailureKind::AuthInvalid
+        );
+        assert_eq!(
+            strongest(FailureKind::AuthAmbiguous, FailureKind::Transient),
+            FailureKind::AuthAmbiguous
+        );
+        // 同强度保留先到的那个(回退过程中不做无谓翻转)。
+        assert_eq!(
+            strongest(FailureKind::Quota, FailureKind::Quota),
+            FailureKind::Quota
+        );
     }
 
     #[tokio::test]

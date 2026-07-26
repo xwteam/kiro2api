@@ -195,6 +195,20 @@ pub fn save(path: &str, creds: &[Credential]) -> anyhow::Result<()> {
     let data = serde_json::to_vec_pretty(creds)?;
     // 写失败/中途 panic 时清理残留 tmp,避免堆积;成功 rename 后 tmp 已消失。
     let res = (|| -> std::io::Result<()> {
+        // 目标文件权限继承自 tmp(rename 顶替)。unix 下按 0600 建 tmp:文件里是全部账号的
+        // 明文 access/refresh token,若用 `File::create`(0666 & ~umask,通常落 0644),
+        // 用户手动 chmod 600 过的凭据文件每写一次就被改回全局可读。
+        #[cfg(unix)]
+        let f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
         let f = std::fs::File::create(&tmp)?;
         {
             use std::io::Write;
@@ -212,6 +226,31 @@ pub fn save(path: &str, creds: &[Credential]) -> anyhow::Result<()> {
     // best-effort 清理孤儿 tmp(不影响本次 save 结果)。
     sweep_stale_tmp(path);
     res.map_err(Into::into)
+}
+
+/// 账号 id 高水位的旁挂文件路径:`{path}.next-id`。
+///
+/// 刻意**不**改动 credentials.json 自身的形状——它是与 Kiro 原生凭据文件 drop-in 互通的裸 JSON
+/// 数组(见部署文档),换成对象信封会破坏互通。故把池的 id 高水位写在同目录的旁挂小文件里,
+/// 与凭据在同一次落盘临界区内一起写。
+fn next_id_path(path: &str) -> String {
+    format!("{path}.next-id")
+}
+
+/// 读取持久化的账号 id 高水位;文件缺失或内容非法 → `None`。
+/// 旧安装没有该文件,调用方据此退化为"`max(现有 id)+1`"的原语义(见 [`crate::kiro::pool::Pool::with_next_id`])。
+pub fn load_next_id(path: &str) -> Option<u64> {
+    std::fs::read_to_string(next_id_path(path))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// 落盘账号 id 高水位。best-effort:写失败只记 warn、不使凭据落盘失败——退化后果仅是
+/// 重启后可能复用已删除账号的编号,而凭据本身必须先写成功。
+pub fn save_next_id(path: &str, next_id: u64) {
+    if let Err(e) = std::fs::write(next_id_path(path), next_id.to_string()) {
+        tracing::warn!("持久化账号 id 高水位失败(重启后可能复用已删除的账号编号): {e}");
+    }
 }
 
 /// 序列化持久化活池凭据:在 `persist_lock` 临界区内取池快照 + 原子落盘,单一序列化点。
@@ -233,11 +272,20 @@ pub async fn persist_pool_credentials_serialized(
     path: &str,
 ) -> anyhow::Result<()> {
     let _guard = persist_lock.lock().await;
-    let snapshot = {
+    let (snapshot, next_id) = {
         let pool_lock = pool.lock().await;
-        pool_lock.snapshot_credentials()
+        (pool_lock.snapshot_credentials(), pool_lock.next_id_hint())
     };
-    save(path, &snapshot)
+    let owned_path = path.to_string();
+    // 写盘 + fsync 是阻塞 IO,不能占着 async 运行时的工作线程做(fsync 可长达数十毫秒,
+    // 期间该线程上的所有任务都被卡住)。挪到 blocking 线程池执行。
+    tokio::task::spawn_blocking(move || {
+        save(&owned_path, &snapshot)?;
+        save_next_id(&owned_path, next_id);
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("凭据落盘任务执行失败: {e}"))?
 }
 
 #[cfg(test)]
@@ -480,7 +528,80 @@ mod tests {
             .unwrap();
         let got = load(&p).unwrap();
         assert_eq!(got.len(), 1);
+        // 凭据与 id 高水位在同一次落盘里一起写出,重启后不会复用已删除账号的编号。
+        assert_eq!(load_next_id(&p), Some(2));
         let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(next_id_path(&p));
+    }
+
+    /// 原子写不得放宽凭据文件权限:tmp 按 0600 创建,rename 后目标文件也必须是 0600
+    /// (文件里是全部账号的明文 access/refresh token)。即便目标文件此前是 0644 也要收紧。
+    #[cfg(unix)]
+    #[test]
+    fn save_keeps_credentials_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "kiro2api_cred_mode_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let p = path.to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&p);
+
+        save(&p, &[sample()]).unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "凭据文件必须仅属主可读写,实际 {mode:o}");
+
+        // 覆盖写(rename 顶替)后依然是 0600,不会被 tmp 的默认权限放宽回 0644。
+        save(&p, &[sample()]).unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "覆盖写后权限不得被放宽,实际 {mode:o}");
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(next_id_path(&p));
+    }
+
+    /// 账号 id 高水位旁挂落盘:写入后可读回;文件缺失时返回 None(旧安装平滑降级)。
+    /// credentials.json 本体仍是裸数组,drop-in 互通不受影响。
+    #[test]
+    fn next_id_sidecar_roundtrips_and_degrades_when_absent() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "kiro2api_cred_nextid_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let p = path.to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(next_id_path(&p));
+
+        assert_eq!(load_next_id(&p), None); // 无旁挂文件 → 降级
+        save_next_id(&p, 42);
+        assert_eq!(load_next_id(&p), Some(42));
+        save_next_id(&p, 43);
+        assert_eq!(load_next_id(&p), Some(43));
+
+        // 内容非法 → 视作无记录(不 panic)。
+        std::fs::write(next_id_path(&p), "not-a-number").unwrap();
+        assert_eq!(load_next_id(&p), None);
+
+        // 凭据本体仍是裸 JSON 数组。
+        save(&p, &[sample()]).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            raw.trim_start().starts_with('['),
+            "credentials.json 必须保持裸数组"
+        );
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(next_id_path(&p));
     }
 
     /// 契约 §7:真机 credentials.json 里绝大多数账号没有 `region` 键(只带

@@ -64,10 +64,13 @@ pub async fn refresh_at(
         .await
         .map_err(|_| LoginError::Http)?;
     if !resp.status().is_success() {
-        return Err(LoginError::Upstream(format!(
-            "refresh HTTP {}",
-            resp.status().as_u16()
-        )));
+        let status = resp.status().as_u16();
+        // 非 2xx 必须把**响应体**一并带出:"该 refresh_token 已作废"的确证(invalid_grant /
+        // InvalidGrantException)只活在体里。丢掉体,账号池就只剩一个状态码可看,无从把
+        // "凭据已吊销(应禁用)"与"上游 5xx 抖动(应冷却)"区分开。
+        // 体按数据面既有约定有界读取(≤ERROR_BODY_CAP),避免超大/恶意错误体被无界缓冲。
+        let body = crate::kiro::provider::read_body_capped(resp).await;
+        return Err(LoginError::UpstreamHttp { status, body });
     }
     let r: RefreshResp = resp.json().await.map_err(|_| LoginError::Http)?;
     let mut out = cred.clone();
@@ -268,6 +271,82 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.profile_arn.as_deref(), Some("arn:existing")); // 响应未带则保留旧值
+    }
+
+    /// 非 2xx 必须带出状态码 + 响应体:invalid_grant 这类"refresh_token 已作废"的确证只在体里,
+    /// 丢掉它账号池就无从把永久失效与瞬时故障区分开(会把已吊销账号一直当健康账号选)。
+    #[tokio::test]
+    async fn refresh_non_2xx_carries_status_and_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/refreshToken"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string(r#"{"error":"invalid_grant","error_description":"revoked"}"#),
+            )
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let c = cred(AuthMethod::Social);
+        let r = refresh_at(&client, &format!("{}/refreshToken", server.uri()), &c, 1000).await;
+        match r {
+            Err(LoginError::UpstreamHttp { status, body }) => {
+                assert_eq!(status, 400);
+                assert!(body.contains("invalid_grant"), "原始体必须保留: {body}");
+                // 调用方契约:status + body 一并可用 → 刷新端点分类得 AuthInvalid(永久禁用)。
+                assert_eq!(
+                    crate::kiro::pool::classify_refresh_failure(status, &body),
+                    crate::kiro::pool::FailureKind::AuthInvalid
+                );
+            }
+            other => panic!("expected UpstreamHttp with body, got {other:?}"),
+        }
+    }
+
+    /// 5xx 无确证 → 分类落瞬时类(记 strike / 冷却),不禁用账号。
+    #[tokio::test]
+    async fn refresh_5xx_classifies_as_transient() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/refreshToken"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream unavailable"))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let c = cred(AuthMethod::Social);
+        match refresh_at(&client, &format!("{}/refreshToken", server.uri()), &c, 1000).await {
+            Err(LoginError::UpstreamHttp { status, body }) => {
+                assert_eq!(status, 503);
+                assert_eq!(
+                    crate::kiro::pool::classify_refresh_failure(status, &body),
+                    crate::kiro::pool::FailureKind::Transient
+                );
+            }
+            other => panic!("expected UpstreamHttp, got {other:?}"),
+        }
+    }
+
+    /// 错误体读取有上限(与数据面同一约定),超大错误体不会被无界缓冲。
+    #[tokio::test]
+    async fn refresh_error_body_is_capped() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/refreshToken"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("A".repeat(64 * 1024)))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let c = cred(AuthMethod::Social);
+        match refresh_at(&client, &format!("{}/refreshToken", server.uri()), &c, 1000).await {
+            Err(LoginError::UpstreamHttp { body, .. }) => {
+                assert!(
+                    body.len() <= 8 * 1024,
+                    "体必须被截断,实际 {} 字节",
+                    body.len()
+                );
+            }
+            other => panic!("expected UpstreamHttp, got {other:?}"),
+        }
     }
 
     #[test]

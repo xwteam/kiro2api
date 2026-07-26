@@ -183,6 +183,31 @@ pub fn body_signals_auth_invalid(body: &str) -> bool {
     MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// **刷新端点**(Kiro auth `/refreshToken`、AWS SSO-OIDC `/token`)失败的分类。
+///
+/// 不能直接复用 [`classify_with_body`]:OAuth/OIDC token 端点用 **400 + `error=invalid_grant`**
+/// 表达"该授权已作废",而数据面的 400 是请求错误;若按数据面口径分类,refresh_token 被吊销的
+/// 账号只会被记成一次瞬时失败,继续以健康态被选中、每次都白打一枪注定失败的刷新。
+///
+/// 判定顺序与 [`classify_with_body`] 一致地保守:
+/// 1. 体带**可自愈**信号([`body_signals_recoverable`]:过期/暂停/限流/配额/风控)→ `AuthAmbiguous`;
+/// 2. 体带**真凭据失效**信号([`body_signals_auth_invalid`]:invalid_grant 等)→ `AuthInvalid`(永久禁用);
+/// 3. 402/429 → `Quota`;401/403 但无确证 → `AuthAmbiguous`(冷却,不禁用);
+/// 4. 其余(5xx/网关错误/无体)→ `Transient`(记 strike)。
+pub fn classify_refresh_failure(status: u16, body: &str) -> FailureKind {
+    if body_signals_recoverable(body) {
+        return FailureKind::AuthAmbiguous;
+    }
+    if body_signals_auth_invalid(body) {
+        return FailureKind::AuthInvalid;
+    }
+    match status {
+        402 | 429 => FailureKind::Quota,
+        401 | 403 => FailureKind::AuthAmbiguous,
+        _ => FailureKind::Transient,
+    }
+}
+
 /// 响应体是否带有**配额/额度耗尽**标记(用于非 402/429 状态码上仍能识别配额)。
 pub fn body_signals_quota(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
@@ -194,9 +219,16 @@ pub fn body_signals_quota(body: &str) -> bool {
 
 struct Entry {
     cred: Credential,
+    /// 运行时禁用态。与 `cred.disabled`(待落盘的那份)**始终同步**:两者任一被单独改写,
+    /// 都会让"手工启停/永久禁用"在下一次落盘或下一次重启时静默丢失。
     disabled: bool,
     cooldown_until: u64,
     strikes: u32,
+    /// 最近一次"换新令牌"的尝试因**传输层错误**(连接超时/DNS 失败,无 HTTP 应答)未成行。
+    /// 此时账号从未真的用新令牌重试过,紧随其后的 [`FailureKind::AuthInvalid`] 判定缺乏确证,
+    /// 按本模块"拿不到确证就保守冷却"的纪律降级为 [`FailureKind::AuthAmbiguous`]。
+    /// 一次性:被降级消费、或换新令牌成功写回、或调用成功后清除。
+    unconfirmed_refresh: bool,
     /// 近 RPM_WINDOW_SECS 秒内被 select 选中的时刻集合。
     req_times: Vec<u64>,
     /// 累计被选中次数(用量统计)。
@@ -248,16 +280,33 @@ pub struct Pool {
     cursor: usize,
     /// 每账号每分钟最大请求数;0 = 无限(默认,兼容既有行为)。
     max_rpm: u32,
+    /// 下一个待分配的数值 id(单调递增,删除账号**不回收**其编号)。
+    next_id: u64,
 }
 
 impl Pool {
     pub fn new(creds: Vec<Credential>, mode: LbMode) -> Self {
+        Self::with_next_id(creds, mode, 0)
+    }
+
+    /// 带 id 高水位的构造:`persisted_next_id` 为上次落盘记下的"下一个可用 id"
+    /// (见 [`crate::kiro::credential::load_next_id`]);无该记录时传 0。
+    ///
+    /// 实际起点取 `max(persisted_next_id, max(现有数值 id) + 1)`——旧数据没有高水位记录时
+    /// 平滑退化为原来的 `max+1` 语义,有记录时则连"末号账号已被删除"也不会再复用其编号。
+    pub fn with_next_id(creds: Vec<Credential>, mode: LbMode, persisted_next_id: u64) -> Self {
+        let max_existing = creds
+            .iter()
+            .filter_map(|c| c.id.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
         let entries = creds
             .into_iter()
             .map(|c| Entry {
                 disabled: c.disabled,
                 cooldown_until: 0,
                 strikes: 0,
+                unconfirmed_refresh: false,
                 req_times: Vec::new(),
                 requests: 0,
                 successes: 0,
@@ -271,7 +320,14 @@ impl Pool {
             mode,
             cursor: 0,
             max_rpm: 0,
+            next_id: persisted_next_id.max(max_existing.saturating_add(1)),
         }
+    }
+
+    /// 当前 id 高水位(下一个待分配的数值 id),供落盘时一并持久化
+    /// (见 [`crate::kiro::credential::save_next_id`])。
+    pub fn next_id_hint(&self) -> u64 {
+        self.next_id
     }
 
     /// 无损 setter:设置每账号 RPM 上限(0 = 无限)。不改变 `new` 签名,
@@ -438,19 +494,35 @@ impl Pool {
     // ======================================================================
 
     /// 当前全部凭据快照(顺序即池内顺序),供调用方落盘 credentials.json。
+    ///
+    /// `disabled` 以运行时那份为准写出:落盘路径绝不能拿 `cred` 里可能陈旧的旧值,
+    /// 把刚发生的手工停用/永久禁用覆写回去。
     pub fn snapshot_credentials(&self) -> Vec<Credential> {
-        self.entries.iter().map(|e| e.cred.clone()).collect()
+        self.entries
+            .iter()
+            .map(|e| {
+                let mut c = e.cred.clone();
+                c.disabled = e.disabled;
+                c
+            })
+            .collect()
     }
 
-    /// 为新凭据分配数值 id:已有 id 里能解析为整数的取最大值 +1;空池或全非数值 → "1"。
-    fn next_id(&self) -> String {
-        let max = self
+    /// 为新凭据分配数值 id:取单调递增计数器,并与"现有 id 最大值 +1"取较大者
+    /// (兜住手工编辑 credentials.json 塞进更大 id 的情形)。分配后计数器前进。
+    ///
+    /// 单调:删除账号**不回收**其编号。若按 `max(现有 id)+1` 分配,删掉末号账号后新账号会复用
+    /// 该编号,与"刷新完成后按 id 写回池""按 id 归属用量统计"叠加即张冠李戴。
+    fn alloc_id(&mut self) -> String {
+        let max_existing = self
             .entries
             .iter()
-            .filter_map(|e| e.cred.id.parse::<i64>().ok())
+            .filter_map(|e| e.cred.id.parse::<u64>().ok())
             .max()
             .unwrap_or(0);
-        (max + 1).to_string()
+        let id = self.next_id.max(max_existing.saturating_add(1));
+        self.next_id = id.saturating_add(1);
+        id.to_string()
     }
 
     /// 池中是否已存在相同 `refresh_token` 的凭据(导入去重用);命中返回其 id。
@@ -469,13 +541,14 @@ impl Pool {
     /// 新增一个凭据到活池:分配新数值 id(忽略入参 `cred.id`)、以默认健康态入池。
     /// 返回 (新 id, email);不落盘(调用方用 `snapshot_credentials` 落盘)。
     pub fn add_credential(&mut self, mut cred: Credential) -> (String, Option<String>) {
-        let id = self.next_id();
+        let id = self.alloc_id();
         cred.id = id.clone();
         let email = cred.email.clone();
         self.entries.push(Entry {
             disabled: cred.disabled,
             cooldown_until: 0,
             strikes: 0,
+            unconfirmed_refresh: false,
             req_times: Vec::new(),
             requests: 0,
             successes: 0,
@@ -543,10 +616,39 @@ impl Pool {
             e.cred.access_token = access_token;
             e.cred.refresh_token = refresh_token;
             e.cred.expires_at_unix = expires_at_unix;
+            e.unconfirmed_refresh = false;
             true
         } else {
             false
         }
+    }
+
+    /// 刷新写回(**带身份校验**):仅当目标 entry 的 `refresh_token` 仍等于发起刷新时持有的
+    /// `expected_refresh_token` 才写回;不匹配返回 false 且**不改动**该 entry。
+    ///
+    /// 动机:刷新期间该 id 上的账号可能已被删除、并由新导入的账号占用同一编号。此时按 id 盲写
+    /// 会把旧账号刷来的令牌盖到新账号头上并随后落盘,新账号的 refresh_token 就此静默丢失。
+    /// `refresh_token` 是账号的稳定标识(导入侧已按它去重,见 [`Self::find_id_by_refresh_token`]),
+    /// 故用它比对身份。
+    pub fn update_credential_tokens_checked(
+        &mut self,
+        id: &str,
+        expected_refresh_token: &str,
+        access_token: String,
+        refresh_token: String,
+        expires_at_unix: u64,
+    ) -> bool {
+        let Some(e) = self.find(id) else {
+            return false;
+        };
+        if e.cred.refresh_token != expected_refresh_token {
+            return false;
+        }
+        e.cred.access_token = access_token;
+        e.cred.refresh_token = refresh_token;
+        e.cred.expires_at_unix = expires_at_unix;
+        e.unconfirmed_refresh = false;
+        true
     }
 
     /// 从活池移除一个凭据。返回是否命中并移除。
@@ -580,9 +682,27 @@ impl Pool {
 
     /// 手动启停:按 id 找账号设置 disabled;不动 cooldown/strikes。
     /// 返回是否找到该账号。
+    ///
+    /// 运行时禁用态与待落盘凭据里的那份**一并**改写:只改其中一处,状态要么落不了盘
+    /// (重启即复活),要么被下一次落盘用旧值覆写。
     pub fn set_disabled(&mut self, id: &str, disabled: bool) -> bool {
         if let Some(e) = self.find(id) {
             e.disabled = disabled;
+            e.cred.disabled = disabled;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 记录一次因**传输层错误**(连接超时/DNS 失败,无 HTTP 应答)而未成行的换新令牌尝试。
+    ///
+    /// 该标记会让**紧随其后**的一次 [`FailureKind::AuthInvalid`] 反馈降级为
+    /// [`FailureKind::AuthAmbiguous`](冷却):账号从未真的用新令牌重试过,那次失效判定
+    /// 没有确证。返回是否命中该账号。
+    pub fn note_refresh_transport_failure(&mut self, id: &str) -> bool {
+        if let Some(e) = self.find(id) {
+            e.unconfirmed_refresh = true;
             true
         } else {
             false
@@ -593,6 +713,7 @@ impl Pool {
     pub fn report_success(&mut self, id: &str) {
         if let Some(e) = self.find(id) {
             e.strikes = 0;
+            e.unconfirmed_refresh = false;
             e.successes += 1;
         }
     }
@@ -612,9 +733,19 @@ impl Pool {
     pub fn report_failure(&mut self, id: &str, kind: FailureKind, now_unix: u64) {
         if let Some(e) = self.find(id) {
             e.failures += 1;
+            // 上一次换新令牌的尝试刚因传输层错误未成行 → 这次 AuthInvalid 背后并没有"用新令牌
+            // 重试过"的确证(403 的失效措辞对被服务端轮换掉的 access_token 同样成立,那类账号
+            // 强制刷新即自愈)。按保守纪律降级为冷却,标记一次性消费。
+            let kind = if kind == FailureKind::AuthInvalid && e.unconfirmed_refresh {
+                e.unconfirmed_refresh = false;
+                FailureKind::AuthAmbiguous
+            } else {
+                kind
+            };
             match kind {
                 FailureKind::AuthInvalid => {
                     e.disabled = true;
+                    e.cred.disabled = true;
                 }
                 FailureKind::Quota => {
                     e.cooldown_until = now_unix.saturating_add(QUOTA_COOLDOWN);
@@ -1306,6 +1437,142 @@ mod tests {
         assert_eq!(st[0].strikes, 0);
         // 未知 id → false
         assert!(!p.reset_failures("nope"));
+    }
+
+    #[test]
+    fn classify_refresh_failure_uses_token_endpoint_semantics() {
+        // OAuth/OIDC token 端点用 400 + invalid_grant 表达"授权已作废" → AuthInvalid(永久禁用)。
+        assert_eq!(
+            classify_refresh_failure(400, r#"{"error":"invalid_grant"}"#),
+            FailureKind::AuthInvalid
+        );
+        assert_eq!(
+            classify_refresh_failure(400, r#"{"__type":"InvalidGrantException"}"#),
+            FailureKind::AuthInvalid
+        );
+        // 5xx / 网关错误 → Transient(记 strike,不禁用)。
+        assert_eq!(
+            classify_refresh_failure(503, "upstream unavailable"),
+            FailureKind::Transient
+        );
+        assert_eq!(classify_refresh_failure(0, ""), FailureKind::Transient);
+        // 可自愈信号优先短路 → 冷却,绝不永久禁用。
+        assert_eq!(
+            classify_refresh_failure(400, r#"{"__type":"ThrottlingException"}"#),
+            FailureKind::AuthAmbiguous
+        );
+        // 401/403 但无确证(上游只说 "Bad credentials")→ 冷却,不禁用。
+        assert_eq!(
+            classify_refresh_failure(401, r#"{"message":"Bad credentials"}"#),
+            FailureKind::AuthAmbiguous
+        );
+        assert_eq!(classify_refresh_failure(429, ""), FailureKind::Quota);
+    }
+
+    #[test]
+    fn disabled_state_is_mirrored_into_persisted_snapshot() {
+        // 手工停用与 AuthInvalid 永久禁用都必须同时进入待落盘的凭据,否则重启/下次落盘即丢失。
+        let mut p = Pool::new(vec![cred("a", 1), cred("b", 1)], LbMode::Priority);
+        assert!(p.set_disabled("a", true));
+        let snap = p.snapshot_credentials();
+        assert!(snap.iter().find(|c| c.id == "a").unwrap().disabled);
+        assert!(!snap.iter().find(|c| c.id == "b").unwrap().disabled);
+        // 复活也要落到凭据上。
+        assert!(p.set_disabled("a", false));
+        assert!(!p.snapshot_credentials()[0].disabled);
+        // AuthInvalid 触发的永久禁用同样同步。
+        p.report_failure("b", FailureKind::AuthInvalid, 100);
+        let snap = p.snapshot_credentials();
+        assert!(snap.iter().find(|c| c.id == "b").unwrap().disabled);
+        // 用快照重建池(模拟落盘 → 重启加载):禁用态仍在。
+        let p2 = Pool::new(snap, LbMode::Priority);
+        assert_eq!(p2.active_count(1_000_000), 1);
+    }
+
+    #[test]
+    fn unconfirmed_refresh_downgrades_auth_invalid_to_cooldown() {
+        // 换新令牌因传输层错误未成行 → 紧随其后的 AuthInvalid 缺乏确证,降级为冷却而非永久禁用。
+        let mut p = Pool::new(vec![cred("a", 1)], LbMode::Priority);
+        assert!(p.note_refresh_transport_failure("a"));
+        p.report_failure("a", FailureKind::AuthInvalid, 100);
+        let st = p.stats(100);
+        assert!(!st[0].disabled, "传输层刷新失败后不得永久禁用");
+        assert!(p.select(100).is_some(), "首次降级只记 1 strike,账号仍可用");
+        // 标记是一次性的:再来一次 AuthInvalid(此时已无未成行的刷新)照常永久禁用。
+        p.report_failure("a", FailureKind::AuthInvalid, 100);
+        assert!(p.stats(100)[0].disabled);
+        // 未知 id → false。
+        assert!(!p.note_refresh_transport_failure("nope"));
+    }
+
+    #[test]
+    fn successful_refresh_writeback_clears_unconfirmed_refresh() {
+        // 换新令牌成功写回 → 标记清除,后续真失效判定不再被误降级。
+        let mut p = Pool::new(vec![cred("a", 1)], LbMode::Priority);
+        p.note_refresh_transport_failure("a");
+        assert!(p.update_credential_tokens("a", "new-at".into(), "rt".into(), 9999));
+        p.report_failure("a", FailureKind::AuthInvalid, 100);
+        assert!(p.stats(100)[0].disabled, "标记已清除,应照常永久禁用");
+    }
+
+    #[test]
+    fn next_id_is_monotonic_and_never_reuses_removed_numbers() {
+        let mut p = Pool::new(vec![cred("1", 1), cred("2", 1)], LbMode::Priority);
+        let (id3, _) = p.add_credential(cred("ignored", 1));
+        assert_eq!(id3, "3");
+        // 删掉末号账号后再新增:**不得**复用 3(旧的 max+1 会复用)。
+        assert!(p.remove_credential("3"));
+        let (id4, _) = p.add_credential(cred("ignored", 1));
+        assert_eq!(id4, "4", "已删除的编号不得被复用");
+        // 全删空后仍继续递增。
+        assert!(p.remove_credential("1"));
+        assert!(p.remove_credential("2"));
+        assert!(p.remove_credential("4"));
+        let (id5, _) = p.add_credential(cred("ignored", 1));
+        assert_eq!(id5, "5");
+        assert_eq!(p.next_id_hint(), 6);
+    }
+
+    #[test]
+    fn with_next_id_takes_persisted_high_water_mark() {
+        // 持久化的高水位大于现有 id → 以高水位为准(重启后不复用已删除编号)。
+        let mut p = Pool::with_next_id(vec![cred("2", 1)], LbMode::Priority, 9);
+        assert_eq!(p.next_id_hint(), 9);
+        assert_eq!(p.add_credential(cred("x", 1)).0, "9");
+        // 无高水位记录(旧文件)→ 平滑退化为 max(现有 id)+1。
+        let p2 = Pool::with_next_id(vec![cred("7", 1)], LbMode::Priority, 0);
+        assert_eq!(p2.next_id_hint(), 8);
+        // 高水位落后于现有 id(手工编辑过 credentials.json)→ 取现有 id 最大值 +1。
+        let p3 = Pool::with_next_id(vec![cred("20", 1)], LbMode::Priority, 3);
+        assert_eq!(p3.next_id_hint(), 21);
+    }
+
+    #[test]
+    fn update_credential_tokens_checked_rejects_identity_mismatch() {
+        let mut p = Pool::new(vec![cred("1", 1)], LbMode::Priority);
+        // 身份一致 → 正常写回。
+        assert!(p.update_credential_tokens_checked(
+            "1",
+            "rt",
+            "new-at".into(),
+            "new-rt".into(),
+            9999
+        ));
+        assert_eq!(p.snapshot_credentials()[0].access_token, "new-at");
+        // 该 id 上的账号已换人(refresh_token 不再是发起刷新时那个)→ 拒绝写回、不改动。
+        assert!(!p.update_credential_tokens_checked(
+            "1",
+            "rt",
+            "stale-at".into(),
+            "stale-rt".into(),
+            1
+        ));
+        let snap = p.snapshot_credentials();
+        assert_eq!(snap[0].access_token, "new-at");
+        assert_eq!(snap[0].refresh_token, "new-rt");
+        assert_eq!(snap[0].expires_at_unix, 9999);
+        // 未知 id → false。
+        assert!(!p.update_credential_tokens_checked("nope", "rt", "x".into(), "y".into(), 1));
     }
 
     #[test]

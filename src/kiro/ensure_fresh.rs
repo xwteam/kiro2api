@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 
 use crate::kiro::credential::Credential;
 use crate::kiro::login::LoginError;
-use crate::kiro::pool::Pool;
+use crate::kiro::pool::{FailureKind, Pool, classify_refresh_failure};
 
 /// 单飞刷新协调器:按 `credential_id` 维护一把 per-credential 异步锁。
 ///
@@ -103,18 +103,33 @@ impl RefreshCtx {
 /// 落盘失败**不**使请求失败:内存池已更新,本次调用可用;仅记 warn(不含任何令牌明文)。
 async fn persist_pool_credentials(pool: &Arc<Mutex<Pool>>, ctx: &RefreshCtx) {
     let _guard = ctx.persist_lock.lock().await;
-    let snapshot = {
+    let (snapshot, next_id) = {
         let pool_lock = pool.lock().await;
-        pool_lock.snapshot_credentials()
+        (pool_lock.snapshot_credentials(), pool_lock.next_id_hint())
     };
     // 落盘失败重试至多 3 次(短暂退避),兜住并发 rename 竞争/瞬时 I/O 抖动;
     // 仍失败才 warn(内存池已更新,请求不受影响,下次刷新会再尝试)。
     let mut last_err = None;
     for attempt in 0..3 {
-        match crate::kiro::credential::save(&ctx.credentials_path, &snapshot) {
-            Ok(()) => return,
-            Err(e) => {
+        let path = ctx.credentials_path.clone();
+        let creds = snapshot.clone();
+        // 写盘 + fsync 是阻塞 IO,挪到 blocking 线程池执行,不占 async 运行时的工作线程。
+        let done = tokio::task::spawn_blocking(move || {
+            crate::kiro::credential::save(&path, &creds)?;
+            crate::kiro::credential::save_next_id(&path, next_id);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+        match done {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => {
                 last_err = Some(e);
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+            Err(e) => {
+                last_err = Some(anyhow::anyhow!("凭据落盘任务执行失败: {e}"));
                 if attempt < 2 {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
@@ -128,12 +143,78 @@ async fn persist_pool_credentials(pool: &Arc<Mutex<Pool>>, ctx: &RefreshCtx) {
     }
 }
 
+/// 刷新失败反馈账号池(保鲜路径)。
+///
+/// 池此前对刷新路径的成败一无所知:relay 主路径把 [`EnsureFreshError`] 直接 map 成 RelayError
+/// 提前 return,balance/models 也只把它折成自己的错误,谁都不调 `report_failure`。于是
+/// refresh_token 已被吊销的账号永远显示健康,每次被选中都白打一枪注定失败的刷新。反馈必须发生在
+/// 本模块内部,不能指望调用方。
+///
+/// 分类走 [`classify_refresh_failure`](token 端点用 400 + invalid_grant 表达授权作废,与数据面
+/// 状态码语义不同):确证作废 → `AuthInvalid`(禁用);5xx/无确证 → 记 strike / 冷却。
+/// 传输层错误(连接超时/DNS 失败,无 HTTP 应答)归瞬时类,并额外落一个"换新令牌未成行"的标记。
+async fn report_refresh_failure(
+    pool: &Arc<Mutex<Pool>>,
+    credential_id: &str,
+    err: &LoginError,
+    now_unix: u64,
+) {
+    let mut pool_lock = pool.lock().await;
+    match err {
+        LoginError::UpstreamHttp { status, body } => {
+            pool_lock.report_failure(
+                credential_id,
+                classify_refresh_failure(*status, body),
+                now_unix,
+            );
+        }
+        LoginError::Upstream(msg) => {
+            // 无 HTTP 状态可依,只能据语义短标签判;命不中确证即落瞬时类。
+            pool_lock.report_failure(credential_id, classify_refresh_failure(0, msg), now_unix);
+        }
+        _ => {
+            pool_lock.report_failure(credential_id, FailureKind::Transient, now_unix);
+            pool_lock.note_refresh_transport_failure(credential_id);
+        }
+    }
+}
+
+/// 强制刷新失败反馈账号池(force 路径)。
+///
+/// 与 [`report_refresh_failure`] 的区别:force_refresh 的调用方(relay/balance/models)紧接着
+/// 会**带着原始数据面失败**反馈池,故这里只上报**确证的永久失效**(上游明说 invalid_grant 之类),
+/// 其余不记 strike——否则同一次失败被记两遍,账号会以双倍速度进冷却。
+///
+/// 传输层错误另落"换新令牌未成行"的标记:此时账号从未真的用新令牌重试过,调用方随后回落的
+/// `AuthInvalid` 判定缺乏确证,由池降级为冷却(见 `Pool::report_failure`)。
+async fn report_force_refresh_failure(
+    pool: &Arc<Mutex<Pool>>,
+    credential_id: &str,
+    err: &LoginError,
+    now_unix: u64,
+) {
+    let mut pool_lock = pool.lock().await;
+    match err {
+        LoginError::UpstreamHttp { status, body } => {
+            let kind = classify_refresh_failure(*status, body);
+            if kind == FailureKind::AuthInvalid {
+                pool_lock.report_failure(credential_id, kind, now_unix);
+            }
+        }
+        LoginError::Upstream(_) => {}
+        _ => {
+            pool_lock.note_refresh_transport_failure(credential_id);
+        }
+    }
+}
+
 /// 保鲜失败原因。
 #[derive(Debug)]
 pub enum EnsureFreshError {
     /// 池中找不到该 id(已被删除等)。
     NotFound,
-    /// 上游刷新失败(网络/非 2xx/解析)。
+    /// 上游刷新失败(网络/非 2xx/解析)。返回本错误前账号池已收到相应反馈
+    /// (见 `report_refresh_failure` / `report_force_refresh_failure`),调用方无需再上报。
     Refresh(LoginError),
 }
 
@@ -151,8 +232,10 @@ impl std::error::Error for EnsureFreshError {}
 /// 1. 短暂持锁取该凭据快照(找不到 → `NotFound`)。
 /// 2. 未在 `margin_secs` 内过期 → 原样返回(不发网络)。
 /// 3. 取该凭据的**单飞锁**(同一 id 串行);拿到后**双检**——赢家已换新则直接返回,不重复刷新。
-/// 4. 否则(池锁已释放)向上游刷新一次。
-/// 5. 再短暂持锁把新 access/refresh/过期时刻写回池,并原子落盘 credentials.json。
+/// 4. 否则(池锁已释放)向上游刷新一次;**失败先按响应体分类反馈账号池**再向上抛
+///    (调用方拿到错误就直接 return,不会替我们上报)。
+/// 5. 再短暂持锁把新 access/refresh/过期时刻写回池(写回前校验该编号上仍是同一账号),
+///    并原子落盘 credentials.json。
 /// 6. 返回刷新后的凭据供即时使用。
 ///
 /// 池锁只在取快照/写回时短暂持有,网络 `.await` 期间不持锁;单飞锁(per-credential)可跨网络
@@ -228,21 +311,35 @@ pub async fn ensure_fresh(
         }
     }
 
-    // 4) 刷新(仅持单飞锁,不持池锁)。
-    let refreshed = crate::kiro::refresh::refresh(client, &cred_snapshot, now_unix)
-        .await
-        .map_err(EnsureFreshError::Refresh)?;
+    // 4) 刷新(仅持单飞锁,不持池锁)。失败必须先反馈池再向上抛:调用方拿到
+    //    EnsureFreshError 就直接 return 了,不会替我们上报。
+    let refreshed = match crate::kiro::refresh::refresh(client, &cred_snapshot, now_unix).await {
+        Ok(c) => c,
+        Err(e) => {
+            report_refresh_failure(pool, credential_id, &e, now_unix).await;
+            return Err(EnsureFreshError::Refresh(e));
+        }
+    };
 
     // 5) 写回(短暂持锁)。凭据可能在刷新期间被删,写回未命中不报错——
-    //    刷新结果仍可供本次调用即时使用。
+    //    刷新结果仍可供本次调用即时使用。身份校验见 `update_credential_tokens_checked`:
+    //    该 id 可能已被新账号占用,盲写会把旧账号的令牌盖到新账号上。
     {
         let mut pool_lock = pool.lock().await;
-        pool_lock.update_credential_tokens(
+        let written = pool_lock.update_credential_tokens_checked(
             credential_id,
+            &cred_snapshot.refresh_token,
             refreshed.access_token.clone(),
             refreshed.refresh_token.clone(),
             refreshed.expires_at_unix,
         );
+        if !written {
+            tracing::warn!(
+                event = "refresh_writeback_skipped",
+                credential_id = %credential_id,
+                "刷新写回未命中:该编号上的账号已变更,放弃写回"
+            );
+        }
     }
 
     // 6) 落盘(有 ctx 时;best-effort,失败不使请求失败)。
@@ -270,6 +367,27 @@ pub async fn force_refresh(
     now_unix: u64,
     ctx: Option<&RefreshCtx>,
 ) -> Result<Credential, EnsureFreshError> {
+    force_refresh_with_failed_token(pool, credential_id, client, now_unix, None, ctx).await
+}
+
+/// [`force_refresh`] 的完整形式:`failed_access_token` 为**调用方实际失败时所用的那个**
+/// access_token。
+///
+/// #5:双检基线必须是"失败令牌",而不是本函数入口处的池内快照。上游 401/403 后各消费方陆续进来
+/// 强制刷新,迟到者进入本函数时池内往往已经是别人刚换好的**有效**令牌;若拿入口快照当基线,
+/// 基线与池内当前值当然相等,双检放行 → 又把这枚刚换好的令牌轮换一遍。Social 账号的
+/// refresh_token 单次轮换,这样连锁刷下去既作废彼此的令牌,也徒增上游风控。
+///
+/// 传 `None` 时退化为"以入口快照为基线"的原语义(与 [`force_refresh`] 等价),供尚未传递失败
+/// 令牌的调用点平滑过渡。
+pub async fn force_refresh_with_failed_token(
+    pool: &Arc<Mutex<Pool>>,
+    credential_id: &str,
+    client: &reqwest::Client,
+    now_unix: u64,
+    failed_access_token: Option<&str>,
+    ctx: Option<&RefreshCtx>,
+) -> Result<Credential, EnsureFreshError> {
     // 1) 取快照(短暂持锁)。
     let cred_snapshot = {
         let pool_lock = pool.lock().await;
@@ -279,6 +397,16 @@ pub async fn force_refresh(
             .find(|c| c.id == credential_id)
             .ok_or(EnsureFreshError::NotFound)?
     };
+
+    // 双检基线:调用方失败时用的那个令牌;未提供则退化为入口快照(原语义)。
+    let baseline_token = failed_access_token
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| cred_snapshot.access_token.clone());
+
+    // 1.5) 池内当前令牌已经不是失败令牌 → 别人已经换过新的,直接复用,不再发起刷新。
+    if cred_snapshot.access_token != baseline_token {
+        return Ok(cred_snapshot);
+    }
 
     // 2) 进单飞锁(有 ctx 时)。拿到锁后双检:等待期间赢家可能已强制刷新过。
     //    #4:force 无 expires_soon 门,判"赢家刷过没"不能只看 refresh_token(IdC 不轮换 → 每个输家都
@@ -303,7 +431,7 @@ pub async fn force_refresh(
                 .find(|c| c.id == credential_id)
         };
         if let Some(after) = after
-            && (after.access_token != cred_snapshot.access_token
+            && (after.access_token != baseline_token
                 || after.expires_at_unix > cred_snapshot.expires_at_unix)
         {
             return Ok(after);
@@ -311,19 +439,32 @@ pub async fn force_refresh(
     }
 
     // 3) 无条件刷新(仅持单飞锁,不持池锁),不看 expires_soon。
-    let refreshed = crate::kiro::refresh::refresh(client, &cred_snapshot, now_unix)
-        .await
-        .map_err(EnsureFreshError::Refresh)?;
+    let refreshed = match crate::kiro::refresh::refresh(client, &cred_snapshot, now_unix).await {
+        Ok(c) => c,
+        Err(e) => {
+            report_force_refresh_failure(pool, credential_id, &e, now_unix).await;
+            return Err(EnsureFreshError::Refresh(e));
+        }
+    };
 
-    // 4) 写回(短暂持锁)。凭据可能在刷新期间被删,写回未命中不报错。
+    // 4) 写回(短暂持锁)。凭据可能在刷新期间被删,写回未命中不报错;身份不符(该编号已被
+    //    新账号占用)则放弃写回,免得旧账号的令牌盖掉新账号的凭据并随后落盘。
     {
         let mut pool_lock = pool.lock().await;
-        pool_lock.update_credential_tokens(
+        let written = pool_lock.update_credential_tokens_checked(
             credential_id,
+            &cred_snapshot.refresh_token,
             refreshed.access_token.clone(),
             refreshed.refresh_token.clone(),
             refreshed.expires_at_unix,
         );
+        if !written {
+            tracing::warn!(
+                event = "refresh_writeback_skipped",
+                credential_id = %credential_id,
+                "强制刷新写回未命中:该编号上的账号已变更,放弃写回"
+            );
+        }
     }
 
     // 5) 落盘(有 ctx 时;best-effort)。
@@ -441,7 +582,7 @@ mod tests {
         )));
         let client = reqwest::Client::new();
         let base = format!("{}/refreshToken", server.uri());
-        let out = force_refresh_with_base(&pool, "1", &client, 1000, Some(&base), None)
+        let out = force_refresh_with_base(&pool, "1", &client, 1000, None, Some(&base), None)
             .await
             .unwrap();
         assert_eq!(out.access_token, "fresh-at");
@@ -460,17 +601,19 @@ mod tests {
             LbMode::Priority,
         )));
         let client = reqwest::Client::new();
-        let r = force_refresh_with_base(&pool, "nope", &client, 1000, None, None).await;
+        let r = force_refresh_with_base(&pool, "nope", &client, 1000, None, None, None).await;
         assert!(matches!(r, Err(EnsureFreshError::NotFound)));
     }
 
     /// 测试专用:强制刷新版,允许注入刷新 base(mock 端点)。生产 [`force_refresh`] 用凭据自身端点。
-    /// 与生产 [`force_refresh`] 同构:含 per-credential 单飞锁 + 双检 + 落盘(仅当 `ctx` 为 Some)。
+    /// 与生产 [`force_refresh_with_failed_token`] 同构:含失败令牌基线 + per-credential 单飞锁 +
+    /// 双检 + 失败反馈池 + 身份校验写回 + 落盘(仅当 `ctx` 为 Some)。
     async fn force_refresh_with_base(
         pool: &Arc<Mutex<Pool>>,
         credential_id: &str,
         client: &reqwest::Client,
         now_unix: u64,
+        failed_access_token: Option<&str>,
         base_override: Option<&str>,
         ctx: Option<&RefreshCtx>,
     ) -> Result<Credential, EnsureFreshError> {
@@ -482,6 +625,12 @@ mod tests {
                 .find(|c| c.id == credential_id)
                 .ok_or(EnsureFreshError::NotFound)?
         };
+        let baseline_token = failed_access_token
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| cred_snapshot.access_token.clone());
+        if cred_snapshot.access_token != baseline_token {
+            return Ok(cred_snapshot);
+        }
         let _flight = match ctx {
             Some(c) => Some(
                 c.coordinator
@@ -501,24 +650,30 @@ mod tests {
                     .find(|c| c.id == credential_id)
             };
             if let Some(after) = after
-                && (after.access_token != cred_snapshot.access_token
+                && (after.access_token != baseline_token
                     || after.expires_at_unix > cred_snapshot.expires_at_unix)
             {
                 return Ok(after);
             }
         }
-        let refreshed = match base_override {
-            Some(base) => crate::kiro::refresh::refresh_at(client, base, &cred_snapshot, now_unix)
-                .await
-                .map_err(EnsureFreshError::Refresh)?,
-            None => crate::kiro::refresh::refresh(client, &cred_snapshot, now_unix)
-                .await
-                .map_err(EnsureFreshError::Refresh)?,
+        let attempt = match base_override {
+            Some(base) => {
+                crate::kiro::refresh::refresh_at(client, base, &cred_snapshot, now_unix).await
+            }
+            None => crate::kiro::refresh::refresh(client, &cred_snapshot, now_unix).await,
+        };
+        let refreshed = match attempt {
+            Ok(c) => c,
+            Err(e) => {
+                report_force_refresh_failure(pool, credential_id, &e, now_unix).await;
+                return Err(EnsureFreshError::Refresh(e));
+            }
         };
         {
             let mut pool_lock = pool.lock().await;
-            pool_lock.update_credential_tokens(
+            pool_lock.update_credential_tokens_checked(
                 credential_id,
+                &cred_snapshot.refresh_token,
                 refreshed.access_token.clone(),
                 refreshed.refresh_token.clone(),
                 refreshed.expires_at_unix,
@@ -531,7 +686,8 @@ mod tests {
     }
 
     /// 测试专用:允许注入刷新 base(mock 端点),生产 [`ensure_fresh`] 用凭据自身端点。
-    /// 与生产 [`ensure_fresh`] 同构:含 per-credential 单飞锁 + 双检 + 落盘(仅当 `ctx` 为 Some)。
+    /// 与生产 [`ensure_fresh`] 同构:含 per-credential 单飞锁 + 双检 + 失败反馈池 +
+    /// 身份校验写回 + 落盘(仅当 `ctx` 为 Some)。
     async fn ensure_fresh_with_base(
         pool: &Arc<Mutex<Pool>>,
         credential_id: &str,
@@ -583,18 +739,24 @@ mod tests {
                 }
             }
         }
-        let refreshed = match base_override {
-            Some(base) => crate::kiro::refresh::refresh_at(client, base, &cred_snapshot, now_unix)
-                .await
-                .map_err(EnsureFreshError::Refresh)?,
-            None => crate::kiro::refresh::refresh(client, &cred_snapshot, now_unix)
-                .await
-                .map_err(EnsureFreshError::Refresh)?,
+        let attempt = match base_override {
+            Some(base) => {
+                crate::kiro::refresh::refresh_at(client, base, &cred_snapshot, now_unix).await
+            }
+            None => crate::kiro::refresh::refresh(client, &cred_snapshot, now_unix).await,
+        };
+        let refreshed = match attempt {
+            Ok(c) => c,
+            Err(e) => {
+                report_refresh_failure(pool, credential_id, &e, now_unix).await;
+                return Err(EnsureFreshError::Refresh(e));
+            }
         };
         {
             let mut pool_lock = pool.lock().await;
-            pool_lock.update_credential_tokens(
+            pool_lock.update_credential_tokens_checked(
                 credential_id,
+                &cred_snapshot.refresh_token,
                 refreshed.access_token.clone(),
                 refreshed.refresh_token.clone(),
                 refreshed.expires_at_unix,
@@ -694,7 +856,7 @@ mod tests {
             let base = base.clone();
             let ctx = ctx.clone();
             handles.push(tokio::spawn(async move {
-                force_refresh_with_base(&pool, "1", &client, 1000, Some(&base), Some(&ctx))
+                force_refresh_with_base(&pool, "1", &client, 1000, None, Some(&base), Some(&ctx))
                     .await
                     .unwrap()
             }));
@@ -920,6 +1082,248 @@ mod tests {
         assert_eq!(on_disk[0].expires_at_unix, 1000 + 3600);
 
         let _ = std::fs::remove_file(&p);
+    }
+
+    // ==================== 刷新失败反馈账号池 ====================
+
+    /// 刷新被上游以 invalid_grant 拒绝(refresh_token 已吊销)→ 保鲜内部必须把账号**永久禁用**。
+    /// 修复前:调用方拿到 EnsureFreshError 直接 return,谁也不反馈池,该账号一直显示健康,
+    /// 每次被选中都白打一枪注定失败的刷新。
+    #[tokio::test]
+    async fn refresh_invalid_grant_disables_account_in_pool() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/refreshToken"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string(r#"{"error":"invalid_grant"}"#),
+            )
+            .mount(&server)
+            .await;
+        let pool = Arc::new(Mutex::new(Pool::new(
+            vec![cred("1", 1000, "us-east-1")],
+            LbMode::Priority,
+        )));
+        let client = reqwest::Client::new();
+        let base = format!("{}/refreshToken", server.uri());
+        let r = ensure_fresh_with_base(&pool, "1", &client, 1000, 300, Some(&base), None).await;
+        assert!(matches!(r, Err(EnsureFreshError::Refresh(_))));
+        let mut guard = pool.lock().await;
+        assert_eq!(guard.active_count(1_000_000), 0, "吊销的账号必须被永久禁用");
+        // 禁用态同步到待落盘凭据,重启后不会复活。
+        assert!(guard.snapshot_credentials()[0].disabled);
+        assert!(guard.select(1_000_000).is_none());
+    }
+
+    /// 刷新遇上游 5xx(无确证)→ 记 strike,**不**禁用;连续到阈值才冷却。
+    #[tokio::test]
+    async fn refresh_5xx_records_strike_without_disabling() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/refreshToken"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream unavailable"))
+            .mount(&server)
+            .await;
+        let pool = Arc::new(Mutex::new(Pool::new(
+            vec![cred("1", 1000, "us-east-1")],
+            LbMode::Priority,
+        )));
+        let client = reqwest::Client::new();
+        let base = format!("{}/refreshToken", server.uri());
+        for _ in 0..2 {
+            let r = ensure_fresh_with_base(&pool, "1", &client, 1000, 300, Some(&base), None).await;
+            assert!(matches!(r, Err(EnsureFreshError::Refresh(_))));
+        }
+        let guard = pool.lock().await;
+        let st = guard.stats(1000);
+        assert!(!st[0].disabled, "5xx 不得禁用账号");
+        assert_eq!(st[0].failures, 2);
+        assert_eq!(st[0].strikes, 2, "瞬时类累计 strike(阈值 3 前不冷却)");
+    }
+
+    /// 强制刷新因**传输层错误**未成行 → 池上落"换新令牌未成行"标记,使调用方随后回落的
+    /// AuthInvalid 判定降级为冷却:账号在从未用新令牌重试过的情况下不得被永久禁用。
+    #[tokio::test]
+    async fn force_refresh_transport_failure_downgrades_following_auth_invalid() {
+        let pool = Arc::new(Mutex::new(Pool::new(
+            vec![cred("1", u64::MAX, "us-east-1")],
+            LbMode::Priority,
+        )));
+        let client = reqwest::Client::new();
+        // 不可达端口 → 传输层错误(无 HTTP 应答)。
+        let base = "http://127.0.0.1:1/refreshToken".to_string();
+        let r = force_refresh_with_base(&pool, "1", &client, 1000, None, Some(&base), None).await;
+        assert!(matches!(r, Err(EnsureFreshError::Refresh(_))));
+        {
+            // 传输层失败本身不记 strike(调用方随后会带原始失败反馈池,避免双算)。
+            let guard = pool.lock().await;
+            assert_eq!(guard.stats(1000)[0].failures, 0);
+        }
+        // 调用方回落原判定 AuthInvalid → 因缺乏确证被降级为冷却,不永久禁用。
+        let mut guard = pool.lock().await;
+        guard.report_failure("1", crate::kiro::pool::FailureKind::AuthInvalid, 1000);
+        assert!(
+            !guard.stats(1000)[0].disabled,
+            "从未用新令牌重试过的账号不得被永久禁用"
+        );
+        assert!(guard.select(1000).is_some(), "首次降级只记 1 strike,仍可用");
+    }
+
+    /// 强制刷新被上游以 invalid_grant 拒绝(确证吊销)→ 即便调用方随后自己反馈池,
+    /// 保鲜内部也要立刻禁用该账号。
+    #[tokio::test]
+    async fn force_refresh_invalid_grant_disables_account() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/refreshToken"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string(r#"{"error":"invalid_grant"}"#),
+            )
+            .mount(&server)
+            .await;
+        let pool = Arc::new(Mutex::new(Pool::new(
+            vec![cred("1", u64::MAX, "us-east-1")],
+            LbMode::Priority,
+        )));
+        let client = reqwest::Client::new();
+        let base = format!("{}/refreshToken", server.uri());
+        let r = force_refresh_with_base(&pool, "1", &client, 1000, None, Some(&base), None).await;
+        assert!(matches!(r, Err(EnsureFreshError::Refresh(_))));
+        assert_eq!(pool.lock().await.active_count(1_000_000), 0);
+    }
+
+    // ==================== #5:失败令牌基线 ====================
+
+    /// (#5)迟到的失败者:它失败时用的是旧令牌,但进 force_refresh 时池内早已是别人换好的新令牌。
+    /// 双检基线取"失败令牌"后,应直接复用池内新令牌返回,**一次上游刷新都不发**。
+    /// 修复前基线取自入口快照(= 池内新令牌),两者相等 → 放行 → 把刚换好的令牌再轮换一遍。
+    #[tokio::test]
+    async fn force_refresh_reuses_pool_token_when_already_rotated_by_others() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_mock = hits.clone();
+        Mock::given(method("POST"))
+            .and(path("/refreshToken"))
+            .respond_with(move |_req: &wiremock::Request| {
+                hits_mock.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accessToken": "yet-another-at", "refreshToken": "yet-another-rt",
+                    "expiresIn": 3600
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        // 池内已是别人换好的新令牌("winner-at");本任务失败时用的是 "old-at"。
+        let mut c = cred("1", u64::MAX, "us-east-1");
+        c.access_token = "winner-at".into();
+        let pool = Arc::new(Mutex::new(Pool::new(vec![c], LbMode::Priority)));
+        let client = reqwest::Client::new();
+        let base = format!("{}/refreshToken", server.uri());
+        let ctx = RefreshCtx::new("/nonexistent/kiro2api_failed_token_baseline.json");
+
+        let out = force_refresh_with_base(
+            &pool,
+            "1",
+            &client,
+            1000,
+            Some("old-at"),
+            Some(&base),
+            Some(&ctx),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.access_token, "winner-at", "应复用池内已换好的新令牌");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "池内令牌已不是失败令牌时不得再发起刷新"
+        );
+        // 池内令牌未被再次轮换。
+        assert_eq!(
+            pool.lock().await.snapshot_credentials()[0].access_token,
+            "winner-at"
+        );
+    }
+
+    /// (#5)失败令牌**仍是**池内当前令牌(没人换过)→ 照常刷新一次。
+    #[tokio::test]
+    async fn force_refresh_still_refreshes_when_failed_token_is_current() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/refreshToken"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accessToken": "fresh-at", "refreshToken": "fresh-rt", "expiresIn": 3600
+            })))
+            .mount(&server)
+            .await;
+        let pool = Arc::new(Mutex::new(Pool::new(
+            vec![cred("1", u64::MAX, "us-east-1")],
+            LbMode::Priority,
+        )));
+        let client = reqwest::Client::new();
+        let base = format!("{}/refreshToken", server.uri());
+        let out =
+            force_refresh_with_base(&pool, "1", &client, 1000, Some("old-at"), Some(&base), None)
+                .await
+                .unwrap();
+        assert_eq!(out.access_token, "fresh-at");
+    }
+
+    // ==================== #4:写回前校验身份 ====================
+
+    /// (#4)刷新期间该编号上的账号被换成了另一个(旧账号删除、新账号复用编号):
+    /// 写回必须**放弃**,不得用旧账号刷来的令牌覆盖新账号的凭据(否则新账号 refresh_token 静默丢失)。
+    #[tokio::test]
+    async fn refresh_writeback_is_skipped_when_account_identity_changed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/refreshToken"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accessToken": "fresh-at", "refreshToken": "fresh-rt", "expiresIn": 3600
+            })))
+            .mount(&server)
+            .await;
+        let pool = Arc::new(Mutex::new(Pool::new(
+            vec![cred("1", 1000, "us-east-1")],
+            LbMode::Priority,
+        )));
+        let client = reqwest::Client::new();
+        let base = format!("{}/refreshToken", server.uri());
+
+        // 模拟刷新在飞期间该编号换了账号:池内 1 号已是另一个账号(不同 refresh_token)。
+        {
+            let mut guard = pool.lock().await;
+            assert!(guard.update_credential(
+                "1",
+                crate::kiro::pool::CredentialUpdate {
+                    refresh_token: Some("newcomer-rt".into()),
+                    ..Default::default()
+                }
+            ));
+        }
+        // 用"旧账号"的快照发起写回:身份不符 → 放弃写回。
+        {
+            let mut guard = pool.lock().await;
+            assert!(!guard.update_credential_tokens_checked(
+                "1",
+                "old-rt",
+                "fresh-at".into(),
+                "fresh-rt".into(),
+                4600,
+            ));
+            assert_eq!(guard.snapshot_credentials()[0].refresh_token, "newcomer-rt");
+        }
+
+        // 正常路径(身份一致)仍照常写回。
+        let out = ensure_fresh_with_base(&pool, "1", &client, 1000, 300, Some(&base), None)
+            .await
+            .unwrap();
+        assert_eq!(out.access_token, "fresh-at");
+        assert_eq!(
+            pool.lock().await.snapshot_credentials()[0].refresh_token,
+            "fresh-rt"
+        );
     }
 
     /// 单调纳秒,给测试临时文件名去重。
