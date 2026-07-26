@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.1.2-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.1.3-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-07-26 | v0.1.3 - 📥 批次 JSON 匯入改為即時逐條進度：進度條、即時累計成功/重複/失敗統計，以及逐條狀態清單（驗證中 → 已驗證並顯示用量 / 重複 / 失敗已回滾）；已驗證帳號即時落盤，匯入途中中斷也不會遺失 |
 | 2026-07-25 | v0.1.2 - 🔄 檢查更新對話框改版：檢查更新對話框改為顯示當前介面語言的發行說明 + 可一鍵複製的升級指令；有更新時按鈕高亮為「更新到 vX」；修復純 HTTP 下複製按鈕失效 |
 | 2026-07-25 | v0.1.1 - 🛠 面板與帳號匯入修復：模型測試在未建立自訂 key 時預設回退主 API 金鑰；批次匯入改為逐條「探活驗證 + 去重」；修復批次匯入在較大清單時失敗；使用者面板/全頁 favicon + 128×128 logo 與各語言 README 版本徽章；交叉編譯多架構映像建置 |
 | 2026-07-25 | v0.1.0 - 🚀 首個版本：四協議前端（Anthropic 中樞 + OpenAI / OpenAI-Responses / Gemini）、Kiro 帳號池（多帳號輪詢 / 分級冷卻 / 令牌自癒）、端點回退與跨帳號重試、統一驗證閘、`/admin` 管理面板與 `/user` 使用者面板、每日/帳號用量統計、失敗/限流日誌、帳號餘額快取、即時日誌（SSE）、三種互動式登入流、Docker 多架構（amd64/arm64）交付與 CI |
@@ -101,7 +102,7 @@
 
 - 內建靜態管理台（`/admin`），憑 `adminApiKey` 登入，`/api/admin/*` 豐富介面驅動
 - **儀表板**：執行時間即時計時、全域剩餘積分、系統資訊（版本/Rust/OS/記憶體/CPU/PID/執行模式）、贊助二維碼卡（即時拉取遠端配置）、**檢查更新**（GitHub Release 比對；對話框顯示當前語言的發行說明 + 可複製的升級指令）
-- **帳號管理**：增刪改查、三種互動式登入、批次匯入（逐條探活驗證 + 去重）、優先級/權重、餘額查詢
+- **帳號管理**：增刪改查、三種互動式登入、批次匯入（逐條探活驗證 + 去重，即時進度條與逐條狀態清單）、優先級/權重、餘額查詢
 - **模型測試**：從面板向任一模型傳送測試請求以驗證連通性；未建立自訂 key 時預設回退主 API 金鑰
 - **API-KEY 管理**：發放/停用/改標籤、按 key 用量與分頁記錄
 - **用量統計**：每日/帳號維度、含客戶端 IP 與帳號標籤、按日下鑽

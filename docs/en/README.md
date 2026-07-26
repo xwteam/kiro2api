@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.1.2-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.1.3-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | Date | Update |
 |------|--------|
+| 2026-07-26 | v0.1.3 - Bulk JSON import now shows live per-account progress: a progress bar, running success/duplicate/failed stats, and a per-row status list (verifying → verified with usage / duplicate / failed, rolled back); verified accounts are saved immediately, so interrupting mid-import does not lose them |
 | 2026-07-25 | v0.1.2 - Update dialog revamp: the check-update dialog shows localized release notes + a copyable upgrade command; the button highlights "Update to vX" when an update is available; fixed the copy button over plain HTTP |
 | 2026-07-25 | v0.1.1 - Panel & account-import fixes: Model Test defaults to the master API key; batch import switched to per-item "verify liveness + dedup"; fixed batch import failing on larger lists; user-panel/all-page favicon + 128x128 logo & version badge in every README; cross-compiled multi-arch image build |
 | 2026-07-25 | v0.1.0 - 🚀 First release: four protocol front ends (Anthropic hub + OpenAI / OpenAI-Responses / Gemini), Kiro account pool (multi-account round-robin / tiered cooldown / token self-healing), endpoint fallback and cross-account retry, unified auth gate, `/admin` management panel and `/user` user panel, per-day / per-account usage stats, failure/throttle logs, account balance cache, live logs (SSE), three interactive login flows, Docker multi-arch (amd64/arm64) delivery with CI |

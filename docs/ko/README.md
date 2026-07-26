@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.1.2-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.1.3-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 날짜 | 업데이트 내용 |
 |------|----------|
+| 2026-07-26 | v0.1.3 - 일괄 JSON 가져오기가 이제 계정별 실시간 진행 상황을 표시: 진행률 바, 실시간 성공/중복/실패 통계, 계정별 상태 목록(검증 중 → 사용량과 함께 검증 완료 / 중복 / 실패 후 롤백); 검증된 계정은 즉시 저장되므로 가져오기 도중 중단해도 유실되지 않음 |
 | 2026-07-25 | v0.1.2 - 업데이트 대화상자 개편: 업데이트 확인 대화상자가 현지화된 릴리스 노트 + 복사 가능한 업그레이드 명령을 표시, 업데이트가 있으면 버튼이 「vX로 업데이트」로 강조, 순수 HTTP 환경에서 복사 버튼 오류 수정 |
 | 2026-07-25 | v0.1.1 - 패널 및 계정 가져오기 수정: 모델 테스트가 마스터 API 키로 폴백, 일괄 가져오기를 항목별 「생존 검증 + 중복 제거」로 전환, 대량 목록에서 일괄 가져오기 실패 수정, 사용자 패널/전체 페이지 favicon + 128x128 로고 및 각 README의 버전 배지, 크로스 컴파일 멀티 아키텍처 이미지 빌드 |
 | 2026-07-25 | v0.1.0 - 🚀 첫 릴리스: 4개 프로토콜 프런트엔드(Anthropic 중추 + OpenAI / OpenAI-Responses / Gemini), Kiro 계정 풀(다중 계정 라운드로빈 / 단계별 쿨다운 / 토큰 자가 치유), 엔드포인트 폴백 및 크로스 계정 재시도, 통합 인증 게이트, `/admin` 관리 패널과 `/user` 사용자 패널, 일별/계정별 사용량 통계, 실패/스로틀 로그, 계정 잔액 캐시, 실시간 로그(SSE), 3가지 대화형 로그인 플로우, Docker 멀티 아키텍처(amd64/arm64) 배포 및 CI |
