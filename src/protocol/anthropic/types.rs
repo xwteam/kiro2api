@@ -197,7 +197,10 @@ mod tests {
         // 真实客户端(Claude Code / 带缓存 SDK)把 system 发成带 cache_control 的块数组。
         let raw = r#"{"model":"claude-sonnet-4.5","system":[{"type":"text","text":"you are","cache_control":{"type":"ephemeral"}},{"type":"text","text":" helpful"}],"messages":[{"role":"user","content":"hi"}]}"#;
         let req: MessagesRequest = serde_json::from_str(raw).expect("system 数组应能解析");
-        assert_eq!(req.system.as_ref().map(|s| s.text()).as_deref(), Some("you are helpful"));
+        assert_eq!(
+            req.system.as_ref().map(|s| s.text()).as_deref(),
+            Some("you are helpful")
+        );
     }
 
     #[test]

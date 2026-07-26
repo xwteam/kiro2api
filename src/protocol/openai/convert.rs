@@ -281,7 +281,10 @@ mod tests {
             max_tokens: None,
         };
         let hub = openai_to_hub(req);
-        assert_eq!(hub.system.as_ref().map(|s| s.text()).as_deref(), Some("a\n\nb"));
+        assert_eq!(
+            hub.system.as_ref().map(|s| s.text()).as_deref(),
+            Some("a\n\nb")
+        );
     }
 
     #[test]
