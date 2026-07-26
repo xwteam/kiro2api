@@ -54,18 +54,27 @@ pub struct InlineData {
 }
 
 /// 模型发起的函数调用。
+///
+/// `id` 是可选字段:并行调用同名函数时,客户端靠它把 `functionResponse` 对回具体某次调用。
+/// 客户端不带时由转换层生成确定性 id(见 `convert::ToolIdAlloc`),不回落成函数名本身。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FunctionCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub name: String,
     #[serde(default)]
     pub args: serde_json::Value,
 }
 
 /// 客户端回填的函数执行结果。
+///
+/// `id` 语义同 [`FunctionCall::id`]:带了就用它对回调用,缺失时按同名出现序号配对。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FunctionResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub name: String,
     #[serde(default)]
     pub response: serde_json::Value,
@@ -180,8 +189,22 @@ mod tests {
         let raw = r#"{"functionResponse":{"name":"get_weather","response":{"temp":20}}}"#;
         let part: Part = serde_json::from_str(raw).expect("解析失败");
         let fr = part.function_response.expect("functionResponse 应存在");
+        assert_eq!(fr.id, None);
         assert_eq!(fr.name, "get_weather");
         assert_eq!(fr.response["temp"], 20);
+    }
+
+    #[test]
+    fn parses_function_call_and_response_ids() {
+        let raw = r#"{"functionCall":{"id":"call-1","name":"get_weather","args":{}}}"#;
+        let part: Part = serde_json::from_str(raw).expect("解析失败");
+        let fc = part.function_call.expect("functionCall 应存在");
+        assert_eq!(fc.id.as_deref(), Some("call-1"));
+
+        let raw = r#"{"functionResponse":{"id":"call-1","name":"get_weather","response":{}}}"#;
+        let part: Part = serde_json::from_str(raw).expect("解析失败");
+        let fr = part.function_response.expect("functionResponse 应存在");
+        assert_eq!(fr.id.as_deref(), Some("call-1"));
     }
 
     #[test]
@@ -237,18 +260,40 @@ mod tests {
             text: None,
             inline_data: None,
             function_call: Some(FunctionCall {
+                id: Some("tu1".to_string()),
                 name: "get_weather".to_string(),
                 args: serde_json::json!({"city": "Paris"}),
             }),
             function_response: None,
         };
         let v = serde_json::to_value(&part).expect("序列化失败");
+        assert_eq!(v["functionCall"]["id"], "tu1");
         assert_eq!(v["functionCall"]["name"], "get_weather");
         assert_eq!(v["functionCall"]["args"]["city"], "Paris");
 
         let s = serde_json::to_string(&part).expect("序列化失败");
         assert!(!s.contains("function_call"));
         assert!(!s.contains("inline_data"));
+    }
+
+    /// `id` 为 `None` 时不进线格式(老客户端看不到多余字段)。
+    #[test]
+    fn omits_function_call_id_when_absent() {
+        let part = Part {
+            text: None,
+            inline_data: None,
+            function_call: Some(FunctionCall {
+                id: None,
+                name: "f".to_string(),
+                args: serde_json::json!({}),
+            }),
+            function_response: None,
+        };
+        let s = serde_json::to_string(&part).expect("序列化失败");
+        assert!(
+            !s.contains("\"id\""),
+            "id 为 None 不应出现在线格式;实际:{s}"
+        );
     }
 
     #[test]

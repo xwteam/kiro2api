@@ -9,32 +9,37 @@
 //! 错误体)向外暴露,复用 [`RelayError`] 的分类与 HTTP 状态。
 //!
 //! `streamGenerateContent`:复用 [`select_and_call_with_retry`] 取上游 `reqwest::Response`,`async_stream`
-//! 里 `resp.chunk()` 喂 `StreamDecoder`,逐帧编码为 `GenerateContentResponse` chunk 通过 SSE 下发。
+//! 里 `resp.chunk()` 喂 `StreamDecoder`,逐帧编码为 `GenerateContentResponse` chunk 下发。
 //!
-//! **SSE-vs-JSON-array 取舍**:Gemini `streamGenerateContent` 官方有两种线格式——默认(无
-//! `?alt=sse` 查询参数)是「增量输出的 JSON 数组」`[{chunk},{chunk},...]`;带 `?alt=sse` 才是
-//! `data: {chunk}\n\n` 的标准 SSE。官方各语言 SDK 的流式方法内部一律走 `alt=sse` 这条路径。
-//! 本实现**恒定返回 SSE**(即等价于默认打开 `alt=sse`),与 SDK 的流式调用兼容;裸 HTTP 客户端
-//! 期望默认 JSON 数组线格式的场景**不支持**,是已知的、有意为之的遗留限制(不在本任务范围内补齐)。
+//! **两种线格式**:Gemini `streamGenerateContent` 官方定义了两种——默认(无 `?alt=sse` 查询参数)
+//! 是「增量输出的 JSON 数组」`[{chunk},{chunk},…]`(`application/json`);带 `?alt=sse` 才是
+//! `data: {chunk}\n\n` 的标准 SSE(`text/event-stream`)。官方各语言 SDK 的流式方法内部一律走
+//! `alt=sse`,裸 HTTP 客户端则按默认拿数组。两者只差外层包装,chunk 本身同形,故统一由
+//! [`WireFormat`] 在同一条产出流上选包装(见 [`frame_out`])。
 
 use std::collections::HashMap;
-use std::convert::Infallible;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, State};
-use axum::response::sse::{Event, Sse};
+use axum::body::Bytes;
+use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use serde::Deserialize;
 
+use crate::kiro::convert::{StreamException, Truncation};
 use crate::protocol::anthropic::handler::{
-    MessagesState, RelayError, extract_client_ip, relay_core_attributed, select_and_call_with_retry,
+    CoreOutcome, MessagesState, RelayError, extract_client_ip, relay_core_outcome,
+    select_and_call_with_retry,
 };
-use crate::protocol::gemini::convert::{gemini_to_hub, hub_to_gemini};
+use crate::protocol::gemini::convert::{
+    finish_reason_for_truncation, gemini_to_hub, hub_to_gemini,
+};
 use crate::protocol::gemini::types::{
     Candidate, Content, FunctionCall, GeminiModel, GeminiModelList, GenerateContentRequest,
     GenerateContentResponse, Part, UsageMetadata,
 };
+use crate::server::auth::ApiKeyId;
 
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
@@ -61,6 +66,9 @@ const CHARS_PER_TOKEN: usize = 4;
 struct StreamUsageGuard {
     usage: std::sync::Arc<crate::stats::usage::UsageTracker>,
     credential_id: u32,
+    /// 鉴权闸解析出的 store-key id(0 = 全局 key / 开放模式,无归属)。用量记录归属到它,
+    /// 否则 store key 的消费上限与面板用量全部落空。
+    api_key_id: u32,
     /// 调用方 IP(由 handler 经 `extract_client_ip` 算出;无则 `None`),随用量记录落库。
     client_ip: Option<String>,
     model: String,
@@ -81,6 +89,23 @@ impl StreamUsageGuard {
         self.total_chars >= CHARS_PER_TOKEN || self.metering.is_some()
     }
 
+    /// 本次流的 `(input_tokens, output_tokens)`:优先上游 meteringEvent 的真实计量,
+    /// 逐项回退(input 无从估算 → 0;output → 累计字符数 / [`CHARS_PER_TOKEN`])。
+    /// 记账与收尾 chunk 的 `usageMetadata` 共用它,保证两处口径一致。
+    fn token_counts(&self) -> (u32, u32) {
+        let input = self
+            .metering
+            .as_ref()
+            .and_then(|m| m.input_tokens)
+            .unwrap_or(0);
+        let output = self
+            .metering
+            .as_ref()
+            .and_then(|m| m.output_tokens)
+            .unwrap_or((self.total_chars / CHARS_PER_TOKEN) as u32);
+        (input, output)
+    }
+
     /// 把当前累计量落一条用量(同步组装参数,异步写库经 `tokio::spawn`)。幂等:仅首次生效。
     ///
     /// Drop 安全(#8):`Drop` 可能在 tokio 运行时之外或运行时关停期触发,此时 `tokio::spawn` 会
@@ -92,7 +117,8 @@ impl StreamUsageGuard {
         }
         self.recorded = true;
 
-        let output_tokens = (self.total_chars / CHARS_PER_TOKEN) as i32;
+        let (input_tokens, output_tokens) = self.token_counts();
+        let (input_tokens, output_tokens) = (input_tokens as i32, output_tokens as i32);
         let credits = self.metering.as_ref().map(|m| m.credits);
         let cache_read = self
             .metering
@@ -102,9 +128,14 @@ impl StreamUsageGuard {
             .metering
             .as_ref()
             .and_then(|m| m.cache_creation_input_tokens);
+        // estimated_cost 按定价表由两侧 token 换算(见 stats::pricing);input 侧有真实计量时
+        // 才非 0,与 anthropic 非流式口径一致。
+        let estimated_cost =
+            crate::stats::pricing::calculate_cost(&self.model, input_tokens, output_tokens);
         let usage = self.usage.clone();
         let model = self.model.clone();
-        let (credential_id, now_unix) = (self.credential_id, self.now_unix);
+        let (credential_id, api_key_id, now_unix) =
+            (self.credential_id, self.api_key_id, self.now_unix);
         let client_ip = self.client_ip.clone();
 
         // Drop 里 spawn 前先确认有 tokio 运行时:运行时之外/关停期 spawn 会 panic,Drop 绝不可 panic。
@@ -114,11 +145,11 @@ impl StreamUsageGuard {
                     usage
                         .record_usage_full(
                             credential_id,
-                            0,
+                            api_key_id,
                             model,
-                            0,
+                            input_tokens,
                             output_tokens,
-                            0.0,
+                            estimated_cost,
                             credits,
                             client_ip,
                             cache_read,
@@ -200,25 +231,118 @@ fn unsupported_action_response(action: &str) -> Response {
     (axum::http::StatusCode::BAD_REQUEST, Json(body)).into_response()
 }
 
-/// 流式内核:选-调后,把上游事件流增量编码为 Gemini `GenerateContentResponse` SSE chunk。
+/// 把上游在 200 事件流里下发的 exception 包成 Gemini 错误体。
+///
+/// `code` 用 [`exception_status`](crate::kiro::convert::exception_status) 映射出的 HTTP 码,
+/// `status` 保留上游类型串(`ThrottlingException` 等,比 gRPC 枚举更能指明真因);
+/// 上游没带人类可读消息时用类型串顶上,不留空 message。
+fn exception_error_body(status: u16, e: &StreamException) -> serde_json::Value {
+    let message = if e.message.is_empty() {
+        e.kind.clone()
+    } else {
+        e.message.clone()
+    };
+    serde_json::json!({
+        "error": { "code": status, "message": message, "status": e.kind },
+    })
+}
+
+/// 非流式路径下 exception 的对外响应:按映射出的状态码回 Gemini 错误体
+/// (状态码非法时回落 502,避免 `from_u16` panic)。
+fn exception_to_gemini(status: u16, e: &StreamException) -> Response {
+    let code =
+        axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+    (code, Json(exception_error_body(status, e))).into_response()
+}
+
+/// `streamGenerateContent` 的线格式(见模块文档)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireFormat {
+    /// `?alt=sse`:标准 SSE,每块 `data: {chunk}\n\n`,`text/event-stream`。
+    Sse,
+    /// 默认:增量输出的 JSON 数组 `[{chunk},{chunk},…]`,`application/json`。
+    JsonArray,
+}
+
+/// `?alt=` 查询参数。Gemini 官方只定义了 `sse` 一个取值,其余/缺省即默认 JSON 数组线格式。
+#[derive(Debug, Deserialize)]
+pub struct AltQuery {
+    #[serde(default)]
+    pub alt: Option<String>,
+}
+
+/// `alt` → 线格式(大小写无关;非 `sse` 的取值一律按默认数组处理,不报错)。
+fn wire_format(alt: Option<&str>) -> WireFormat {
+    match alt {
+        Some(a) if a.eq_ignore_ascii_case("sse") => WireFormat::Sse,
+        _ => WireFormat::JsonArray,
+    }
+}
+
+/// 按线格式包装一个已序列化的 chunk:SSE 加 `data: ` 前缀与空行分隔;JSON 数组则首个元素
+/// 前置 `[`、其余前置 `,`(闭合的 `]` 由收尾统一补)。`first` 是数组线格式的分隔状态。
+fn frame_out(wire: WireFormat, first: &mut bool, json: &str) -> Bytes {
+    match wire {
+        WireFormat::Sse => Bytes::from(format!("data: {json}\n\n")),
+        WireFormat::JsonArray => {
+            let sep = if *first { "[" } else { "," };
+            *first = false;
+            Bytes::from(format!("{sep}{json}"))
+        }
+    }
+}
+
+/// 序列化一个 chunk;序列化失败(理论上不会)退化成空串,不 panic。
+fn chunk_json(resp: &GenerateContentResponse) -> String {
+    serde_json::to_string(resp).unwrap_or_default()
+}
+
+/// 纯文本增量 chunk(无 `finishReason`、不含 usage)。
+fn text_chunk(t: String) -> GenerateContentResponse {
+    GenerateContentResponse {
+        candidates: vec![Candidate {
+            content: Content {
+                role: Some("model".to_string()),
+                parts: vec![Part {
+                    text: Some(t),
+                    inline_data: None,
+                    function_call: None,
+                    function_response: None,
+                }],
+            },
+            finish_reason: None,
+            index: 0,
+        }],
+        usage_metadata: None,
+    }
+}
+
+/// 流式内核:选-调后,把上游事件流增量编码为 Gemini `GenerateContentResponse` chunk,
+/// 按 `wire` 选 SSE 或 JSON 数组线格式下发。
 ///
 /// 帧状态机:
 /// - `frame_text_delta` → 立即发一个 chunk:`candidates:[{content:{role:"model",
 ///   parts:[{text:<t>}]},index:0}]`(无 `finishReason`,不含 usage)。
+/// - `metering_frame` → 只记账,不产出 chunk。
+/// - `frame_truncation`(`ContentLengthExceededException` / contextUsage 100%)→ 记下截断,
+///   收尾报 `MAX_TOKENS`。截断不是错误,不打断流。
+/// - `frame_exception`(限流/鉴权/参数等非截断 exception)→ 停止读帧,收尾改发 Gemini 错误块。
+///   与截断严格互斥,不会互相抢帧。
 /// - `tool_use_frame`:**Gemini 流式无参数分片标准**(不同于 OpenAI/Anthropic 逐片 delta),
 ///   故按 `toolUseId` 累积 `name` + 拼接 `input` 片段,直到该 id 的 `stop:true` 帧才一次性
-///   发出一个含完整 `functionCall{name,args}` 的 chunk(`args` 由拼接后的 JSON 字符串解析,
+///   发出一个含完整 `functionCall{id,name,args}` 的 chunk(`args` 由拼接后的 JSON 字符串解析,
 ///   解析失败则退化为 `{}`,面板不 panic)。
-/// - 流结束(`resp.chunk()` 返回 `Ok(None)` 或 `Err`)后,发一个收尾 chunk:
-///   `finishReason:"STOP"` + 近似 `usageMetadata`(MVP:`0`,与非流式 `hub_to_gemini` 的
-///   "近似 usage" 取舍一致,真实值需读 `meteringEvent`,P2 遗留)。
+/// - 流结束(`resp.chunk()` 返回 `Ok(None)` 或 `Err`)后发一个收尾 chunk:`finishReason`
+///   (截断 → `MAX_TOKENS`,否则 `STOP`)+ `usageMetadata`(优先上游 meteringEvent 的真实计量)。
 /// - **无 `[DONE]` 哨兵**——Gemini 流式协议里流的结束就是 chunk 序列的自然终止。
 pub async fn stream_generate_content(
     state: MessagesState,
     hub_req: crate::protocol::anthropic::types::MessagesRequest,
+    api_key_id: u32,
     client_ip: Option<String>,
+    wire: WireFormat,
     now_unix: u64,
-) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>> + use<>>, RelayError> {
+) -> Result<Response, RelayError> {
     let crate::protocol::anthropic::handler::CallOutcome {
         mut resp,
         credential_id,
@@ -228,12 +352,12 @@ pub async fn stream_generate_content(
     let record_model = hub_req.model.clone();
 
     let body = async_stream::stream! {
-        let make = |resp: GenerateContentResponse| Event::default().data(serde_json::to_string(&resp).unwrap_or_default());
         // 用量记账哨兵:累计字符存于此;正常收尾显式 flush,断连/出错时其 Drop 补记(#8/#9/#15)。
         // 必须在读循环之前建立、活到 stream! future 被 drop 为止。
         let mut usage_guard = StreamUsageGuard {
             usage: usage_handle,
             credential_id,
+            api_key_id,
             client_ip,
             model: record_model,
             now_unix: now_unix as i64,
@@ -242,40 +366,41 @@ pub async fn stream_generate_content(
             recorded: false,
         };
 
-        let text_chunk = |t: String| {
-            GenerateContentResponse {
-                candidates: vec![Candidate {
-                    content: Content {
-                        role: Some("model".to_string()),
-                        parts: vec![Part { text: Some(t), inline_data: None, function_call: None, function_response: None }],
-                    },
-                    finish_reason: None,
-                    index: 0,
-                }],
-                usage_metadata: None,
-            }
-        };
-
         let mut dec = crate::kiro::eventstream::decoder::StreamDecoder::new();
         // toolUseId → (name, 拼接中的 input 片段);MVP 单工具轮足够,多工具并发轮各自独立累积。
         let mut tool_names: HashMap<String, String> = HashMap::new();
         let mut tool_args: HashMap<String, String> = HashMap::new();
+        // JSON 数组线格式的元素分隔状态(SSE 下不参与);见 frame_out。
+        let mut first = true;
+        let mut truncation: Option<Truncation> = None;
+        let mut exception: Option<StreamException> = None;
 
-        loop {
+        'read: loop {
             match resp.chunk().await {
                 Ok(Some(chunk)) => {
                     dec.push(&chunk);
                     for frame in dec.drain() {
                         if let Some(t) = crate::kiro::convert::frame_text_delta(&frame) {
                             usage_guard.total_chars += t.chars().count();
-                            yield Ok(make(text_chunk(t)));
+                            let json = chunk_json(&text_chunk(t));
+                            yield Ok::<Bytes, std::io::Error>(frame_out(wire, &mut first, &json));
                             continue;
                         }
                         if let Some(m) = crate::kiro::convert::metering_frame(&frame) {
-                            // meteringEvent(#4):记住真实积分/缓存计费(多个则末次覆盖),收尾时落库。
-                            // 不产出任何 Gemini chunk——纯记账,不影响线格式。
+                            // meteringEvent(#4):记住真实积分/缓存计费与 token 计量(多个则末次
+                            // 覆盖),收尾时既填 usageMetadata 也落库。不产出任何 chunk。
                             usage_guard.metering = Some(m);
                             continue;
+                        }
+                        if let Some(tr) = crate::kiro::convert::frame_truncation(&frame) {
+                            // 截断是正常收尾的一种,只改 finishReason,不打断流(后续帧照常处理)。
+                            truncation = Some(tr);
+                            continue;
+                        }
+                        if let Some(e) = crate::kiro::convert::frame_exception(&frame) {
+                            // 上游中途报错:响应头已发出,改不了状态码,只能发流内错误块后终止。
+                            exception = Some(e);
+                            break 'read;
                         }
                         if let Some(v) = crate::kiro::convert::tool_use_frame(&frame) {
                             let Some(tool_use_id) = v["toolUseId"].as_str() else { continue };
@@ -290,14 +415,18 @@ pub async fn stream_generate_content(
                                 let args_str = tool_args.get(tool_use_id).cloned().unwrap_or_default();
                                 let args = serde_json::from_str::<serde_json::Value>(&args_str)
                                     .unwrap_or_else(|_| serde_json::json!({}));
-                                yield Ok(make(GenerateContentResponse {
+                                let json = chunk_json(&GenerateContentResponse {
                                     candidates: vec![Candidate {
                                         content: Content {
                                             role: Some("model".to_string()),
                                             parts: vec![Part {
                                                 text: None,
                                                 inline_data: None,
-                                                function_call: Some(FunctionCall { name, args }),
+                                                function_call: Some(FunctionCall {
+                                                    id: Some(tool_use_id.to_string()),
+                                                    name,
+                                                    args,
+                                                }),
                                                 function_response: None,
                                             }],
                                         },
@@ -305,7 +434,8 @@ pub async fn stream_generate_content(
                                         index: 0,
                                     }],
                                     usage_metadata: None,
-                                }));
+                                });
+                                yield Ok(frame_out(wire, &mut first, &json));
                             }
                         }
                     }
@@ -315,39 +445,88 @@ pub async fn stream_generate_content(
             }
         }
 
-        yield Ok(make(GenerateContentResponse {
-            candidates: vec![Candidate {
-                content: Content { role: Some("model".to_string()), parts: vec![] },
-                finish_reason: Some("STOP".to_string()),
-                index: 0,
-            }],
-            usage_metadata: Some(UsageMetadata { prompt_token_count: 0, candidates_token_count: 0, total_token_count: 0 }),
-        }));
+        // 收尾块二选一:上游 exception → Gemini 错误块(绝不能报 STOP,否则客户端把"内容缺失"
+        // 当成正常完成);否则正常收尾块,finishReason 按是否命中截断给 MAX_TOKENS / STOP,
+        // usageMetadata 用上游真实计量(缺项才回退估算)。
+        let final_json = match &exception {
+            Some(e) => {
+                let status = crate::kiro::convert::exception_status(&e.kind);
+                tracing::warn!(
+                    event = "upstream_stream_exception",
+                    kind = %e.kind,
+                    status = status,
+                    "上游事件流下发 exception"
+                );
+                exception_error_body(status, e).to_string()
+            }
+            None => {
+                let (prompt_token_count, candidates_token_count) = usage_guard.token_counts();
+                chunk_json(&GenerateContentResponse {
+                    candidates: vec![Candidate {
+                        content: Content { role: Some("model".to_string()), parts: vec![] },
+                        finish_reason: Some(finish_reason_for_truncation(truncation)),
+                        index: 0,
+                    }],
+                    usage_metadata: Some(UsageMetadata {
+                        prompt_token_count,
+                        candidates_token_count,
+                        total_token_count: prompt_token_count.saturating_add(candidates_token_count),
+                    }),
+                })
+            }
+        };
+        yield Ok(frame_out(wire, &mut first, &final_json));
 
-        // 流成功收尾 → 立即用当前累计量记一条用量(input 置 0;output 为字符估算)。flush 幂等并置
-        // recorded,故随后哨兵 Drop 不会重复落库。若客户端在收尾前断连/上游中途出错,则本行不执行,
-        // 由 usage_guard 的 Drop 补记同样的累计量(#8/#9/#15)。
-        usage_guard.flush();
+        // JSON 数组线格式收尾:上面恒发一个元素,故此处必是闭合括号,数组恒合法。
+        if wire == WireFormat::JsonArray {
+            yield Ok(Bytes::from_static(b"]"));
+        }
+
+        // 正常收尾 → 立即用当前累计量记一条用量。flush 幂等并置 recorded,故随后哨兵 Drop
+        // 不会重复落库。上游中途出错的流不在此显式落库:交给哨兵 Drop,由它的
+        // has_meaningful_usage 闸滤掉「一个字都没产出」的零行(#9/#16);已产出内容的则照常补记。
+        // 客户端在收尾前断连时本行同样不执行,走同一条 Drop 补记路径(#8/#9/#15)。
+        if exception.is_none() {
+            usage_guard.flush();
+        }
     };
 
-    Ok(Sse::new(body))
+    let content_type = match wire {
+        WireFormat::Sse => "text/event-stream",
+        WireFormat::JsonArray => "application/json",
+    };
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        axum::body::Body::from_stream(body),
+    )
+        .into_response())
 }
 
 /// axum handler:`POST /v1beta/models/{model_action}`(与 `/gemini/v1beta/models/{model_action}` 共用)。
 ///
 /// `model_action` 形如 `gemini-pro:generateContent`。`generateContent` 走非流式中枢;
-/// `streamGenerateContent` 走 [`stream_generate_content`](真正 SSE,见其文档的 SSE-vs-JSON-array
-/// 取舍说明);其它 action → 400。
+/// `streamGenerateContent` 走 [`stream_generate_content`](线格式由 `?alt=` 决定,见模块文档);
+/// 其它 action → 400。
+///
+/// 鉴权闸(见 `server::auth`)命中 store key 时会把 [`ApiKeyId`] 塞进请求扩展;
+/// 全局 key/开放模式下扩展缺失,归属 id 记 0。两条路径都要归属,否则 store key 的消费上限
+/// 会被绕过、面板上这些流量的用量显示为零。
 pub async fn generate_content(
     State(state): State<MessagesState>,
     Path(model_action): Path<String>,
+    Query(query): Query<AltQuery>,
     connect_info: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    api_key_id: Option<axum::Extension<ApiKeyId>>,
     headers: axum::http::HeaderMap,
     Json(req): Json<GenerateContentRequest>,
 ) -> Response {
     let Some((model, action)) = split_model_action(&model_action) else {
         return bad_model_action_response();
     };
+    let api_key_id = api_key_id.and_then(|axum::Extension(k)| k.0).unwrap_or(0);
     // 客户端 IP:优先 XFF/Real-IP(反代场景),否则 socket 对端地址(见 extract_client_ip)。
     let client_ip = extract_client_ip(&headers, connect_info.map(|axum::Extension(ci)| ci.0));
 
@@ -355,16 +534,20 @@ pub async fn generate_content(
         "generateContent" => {
             let now = now_unix();
             let hub_req = gemini_to_hub(req, model);
-            match relay_core_attributed(&state, hub_req, 0, client_ip, now).await {
-                Ok(resp) => Json(hub_to_gemini(resp)).into_response(),
+            match relay_core_outcome(&state, hub_req, api_key_id, client_ip, now).await {
+                Ok(CoreOutcome::Response(resp)) => Json(hub_to_gemini(resp)).into_response(),
+                // 上游把限流/鉴权/参数错误放在 HTTP 200 的事件流里,必须按其映射出的状态码回错,
+                // 否则客户端拿到的是 200 + 空 candidates,既察觉不到失败也不会重试。
+                Ok(CoreOutcome::Exception { status, e }) => exception_to_gemini(status, &e),
                 Err(e) => relay_error_to_gemini(e),
             }
         }
         "streamGenerateContent" => {
             let now = now_unix();
             let hub_req = gemini_to_hub(req, model);
-            match stream_generate_content(state, hub_req, client_ip, now).await {
-                Ok(sse) => sse.into_response(),
+            let wire = wire_format(query.alt.as_deref());
+            match stream_generate_content(state, hub_req, api_key_id, client_ip, wire, now).await {
+                Ok(resp) => resp,
                 Err(e) => relay_error_to_gemini(e),
             }
         }
@@ -454,6 +637,52 @@ mod tests {
         msg
     }
 
+    /// 构造一条 `:message-type: exception` 帧(带 `:exception-type` 头)——上游把限流/鉴权/
+    /// 参数错误放在 HTTP 200 的事件流里就是这个形状。
+    fn exception_frame(exception_type: &str, payload: &[u8]) -> Vec<u8> {
+        let mut headers = Vec::new();
+        for (name, value) in [
+            (":message-type", "exception"),
+            (":exception-type", exception_type),
+        ] {
+            headers.push(name.len() as u8);
+            headers.extend_from_slice(name.as_bytes());
+            headers.push(7u8);
+            headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            headers.extend_from_slice(value.as_bytes());
+        }
+
+        let headers_len = headers.len() as u32;
+        let total_len = 16 + headers_len + payload.len() as u32;
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&total_len.to_be_bytes());
+        msg.extend_from_slice(&headers_len.to_be_bytes());
+        let prelude_crc = crc32(&msg[0..8]);
+        msg.extend_from_slice(&prelude_crc.to_be_bytes());
+        msg.extend_from_slice(&headers);
+        msg.extend_from_slice(payload);
+        let msg_crc = crc32(&msg);
+        msg.extend_from_slice(&msg_crc.to_be_bytes());
+        msg
+    }
+
+    /// 把流式响应体读成「元素 JSON 列表」:SSE 取 `data: ` 行,JSON 数组线格式整体解析。
+    fn stream_elements(body: &str, wire: WireFormat) -> Vec<serde_json::Value> {
+        match wire {
+            WireFormat::Sse => body
+                .lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .map(|d| serde_json::from_str(d).expect("每个 data 行都应是合法 JSON"))
+                .collect(),
+            WireFormat::JsonArray => serde_json::from_str::<serde_json::Value>(body)
+                .expect("默认线格式应是一个合法 JSON 数组")
+                .as_array()
+                .expect("应为数组")
+                .clone(),
+        }
+    }
+
     fn cred() -> Credential {
         Credential {
             id: "a".into(),
@@ -502,6 +731,28 @@ mod tests {
                     .to_string(),
             ),
         }
+    }
+
+    /// 与 [`state`] 同构,但统计层落在指定目录。按 api-key 归属的断言必须与其它用例隔离:
+    /// 共享 temp-dir 的用量存储会被并发用例写入的记录污染。
+    fn state_with_stats_dir(
+        server_uri: &str,
+        creds: Vec<Credential>,
+        dir: &std::path::Path,
+    ) -> MessagesState {
+        let mut st = state(server_uri, creds);
+        st.stats = crate::stats::StatsManager::load_from_dir(dir);
+        st
+    }
+
+    /// 用一层中间件把 `ApiKeyId(Some(id))` 塞进请求扩展,模拟鉴权闸命中 store key。
+    fn with_api_key_id(app: Router, id: u32) -> Router {
+        app.layer(axum::middleware::from_fn(
+            move |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                req.extensions_mut().insert(ApiKeyId(Some(id)));
+                next.run(req).await
+            },
+        ))
     }
 
     #[test]
@@ -604,12 +855,12 @@ mod tests {
         );
     }
 
-    /// 流式(`streamGenerateContent`)纯文本:两帧 assistantResponseEvent "po"/"ng" →
+    /// 流式(`streamGenerateContent?alt=sse`)纯文本:两帧 assistantResponseEvent "po"/"ng" →
     /// SSE `text/event-stream`,逐帧 `"role":"model"` + `"text":"po"`/`"text":"ng"`(camelCase,
     /// 在 `parts` 里),末尾一个 `"finishReason":"STOP"` 收尾 chunk;**无 `[DONE]`**;不含
-    /// snake_case 键(`finish_reason`)。
+    /// snake_case 键(`finish_reason`)。SSE 需显式 `alt=sse`,默认是 JSON 数组线格式。
     #[tokio::test]
-    async fn stream_generate_content_emits_text_chunks_camel_case_no_done() {
+    async fn stream_generate_content_alt_sse_emits_text_chunks_camel_case_no_done() {
         let server = MockServer::start().await;
         let mut body = event_frame("assistantResponseEvent", br#"{"content":"po"}"#);
         body.extend(event_frame(
@@ -628,7 +879,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/claude-sonnet-4.5:streamGenerateContent")
+                    .uri("/v1beta/models/claude-sonnet-4.5:streamGenerateContent?alt=sse")
                     .header("content-type", "application/json")
                     .body(Body::from(req_body))
                     .unwrap(),
@@ -673,7 +924,7 @@ mod tests {
         assert!(po_pos < ng_pos && ng_pos < finish_pos);
     }
 
-    /// 流式(`streamGenerateContent`)工具轮:6 帧 get_weather toolUseEvent →
+    /// 流式(`streamGenerateContent?alt=sse`)工具轮:6 帧 get_weather toolUseEvent →
     /// Gemini 流式工具参数无分片标准,累积到 stop 帧才发一个完整 `functionCall` chunk;
     /// 末尾 `"finishReason":"STOP"`;无 `[DONE]`。
     #[tokio::test]
@@ -715,7 +966,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/claude-sonnet-4.5:streamGenerateContent")
+                    .uri("/v1beta/models/claude-sonnet-4.5:streamGenerateContent?alt=sse")
                     .header("content-type", "application/json")
                     .body(Body::from(req_body))
                     .unwrap(),
@@ -765,6 +1016,11 @@ mod tests {
         assert_eq!(
             v["candidates"][0]["content"]["parts"][0]["functionCall"]["args"]["city"],
             "Paris"
+        );
+        // 上游 toolUseId 随 functionCall.id 下发,客户端回填 functionResponse 时可精确配对。
+        assert_eq!(
+            v["candidates"][0]["content"]["parts"][0]["functionCall"]["id"],
+            "tu1"
         );
     }
 
@@ -901,5 +1157,423 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["status"], "UNAVAILABLE");
         assert!(v["error"]["message"].is_string());
+    }
+
+    // ==================== 线格式:默认 JSON 数组 vs `?alt=sse` ====================
+
+    #[test]
+    fn wire_format_defaults_to_json_array() {
+        assert_eq!(wire_format(None), WireFormat::JsonArray);
+        assert_eq!(wire_format(Some("")), WireFormat::JsonArray);
+        assert_eq!(wire_format(Some("json")), WireFormat::JsonArray);
+        assert_eq!(wire_format(Some("sse")), WireFormat::Sse);
+        assert_eq!(wire_format(Some("SSE")), WireFormat::Sse);
+    }
+
+    #[test]
+    fn frame_out_wraps_per_wire_format() {
+        let text = |b: &Bytes| String::from_utf8_lossy(b).to_string();
+
+        let mut first = true;
+        assert_eq!(
+            text(&frame_out(WireFormat::Sse, &mut first, "{}")),
+            "data: {}\n\n"
+        );
+        // SSE 不消费数组分隔状态。
+        assert!(first);
+
+        let mut first = true;
+        assert_eq!(
+            text(&frame_out(WireFormat::JsonArray, &mut first, "{}")),
+            "[{}"
+        );
+        assert!(!first);
+        assert_eq!(
+            text(&frame_out(WireFormat::JsonArray, &mut first, "{}")),
+            ",{}"
+        );
+    }
+
+    /// 默认(无 `alt`)线格式:`application/json` + 一个完整的 JSON 数组,末元素带 finishReason。
+    /// 裸 HTTP 客户端按 Gemini 默认契约解析,不应看到 SSE 的 `data: ` 前缀。
+    #[tokio::test]
+    async fn stream_generate_content_default_wire_format_is_json_array() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("assistantResponseEvent", br#"{"content":"po"}"#);
+        body.extend(event_frame(
+            "assistantResponseEvent",
+            br#"{"content":"ng"}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:streamGenerateContent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.contains("application/json"), "content-type = {ct}");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            !s.contains("data: "),
+            "默认线格式不应带 SSE 前缀;实际:\n{s}"
+        );
+
+        let items = stream_elements(&s, WireFormat::JsonArray);
+        assert_eq!(items.len(), 3, "两个文本块 + 一个收尾块;实际:\n{s}");
+        assert_eq!(
+            items[0]["candidates"][0]["content"]["parts"][0]["text"],
+            "po"
+        );
+        assert_eq!(
+            items[1]["candidates"][0]["content"]["parts"][0]["text"],
+            "ng"
+        );
+        assert_eq!(items[2]["candidates"][0]["finishReason"], "STOP");
+    }
+
+    // ==================== 收尾:exception / 截断 / 真实 usage ====================
+
+    /// 上游中途下发非截断 exception(限流):流内发一个 Gemini 错误块并终止,
+    /// **不得**伪装成 `finishReason:"STOP"` 的正常完成。
+    #[tokio::test]
+    async fn stream_exception_frame_yields_error_element_not_stop() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("assistantResponseEvent", br#"{"content":"po"}"#);
+        body.extend(exception_frame(
+            "ThrottlingException",
+            br#"{"message":"slow down"}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:streamGenerateContent?alt=sse")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            !s.contains("\"finishReason\""),
+            "上游出错的流不应带任何 finishReason;实际:\n{s}"
+        );
+
+        let items = stream_elements(&s, WireFormat::Sse);
+        let last = items.last().expect("应至少有一个块");
+        assert_eq!(last["error"]["code"], 429);
+        assert_eq!(last["error"]["status"], "ThrottlingException");
+        assert_eq!(last["error"]["message"], "slow down");
+    }
+
+    /// 上游没带人类可读消息时,错误块的 message 用类型串顶上,不留空串。
+    #[tokio::test]
+    async fn stream_exception_without_message_falls_back_to_kind() {
+        let server = MockServer::start().await;
+        let body = exception_frame("AccessDeniedException", b"not-json");
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:streamGenerateContent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        let items = stream_elements(&s, WireFormat::JsonArray);
+        let last = items.last().expect("应至少有一个块");
+        assert_eq!(last["error"]["code"], 403);
+        assert_eq!(last["error"]["message"], "AccessDeniedException");
+    }
+
+    /// 上游截断(`ContentLengthExceededException`)不是错误,但收尾必须报 `MAX_TOKENS`,
+    /// 否则客户端把"被截断的半截内容"当成完整回答。
+    #[tokio::test]
+    async fn stream_truncation_frame_yields_max_tokens() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("assistantResponseEvent", br#"{"content":"po"}"#);
+        body.extend(exception_frame("ContentLengthExceededException", b"{}"));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:streamGenerateContent?alt=sse")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        let items = stream_elements(&s, WireFormat::Sse);
+        let last = items.last().expect("应至少有一个块");
+        assert_eq!(last["candidates"][0]["finishReason"], "MAX_TOKENS");
+        // 截断走 Truncation 路径,不得被当成 exception 报错。
+        assert!(last["error"].is_null(), "截断不是错误;实际:\n{s}");
+    }
+
+    /// 流式收尾的 usageMetadata 取自上游 meteringEvent 的真实计量,不再恒为 0。
+    #[tokio::test]
+    async fn stream_usage_metadata_uses_metering_tokens() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        body.extend(event_frame(
+            "meteringEvent",
+            br#"{"usage":1.5,"input_tokens":123,"output_tokens":45}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:streamGenerateContent?alt=sse")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        let items = stream_elements(&s, WireFormat::Sse);
+        let last = items.last().expect("应至少有一个块");
+        assert_eq!(last["usageMetadata"]["promptTokenCount"], 123);
+        assert_eq!(last["usageMetadata"]["candidatesTokenCount"], 45);
+        assert_eq!(last["usageMetadata"]["totalTokenCount"], 168);
+    }
+
+    /// 非流式 `promptTokenCount` 同样来自 meteringEvent(核心层回填),不再恒为 0。
+    #[tokio::test]
+    async fn generate_content_usage_metadata_uses_metering_tokens() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        body.extend(event_frame(
+            "meteringEvent",
+            br#"{"usage":1.5,"input_tokens":11,"output_tokens":22}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:generateContent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["usageMetadata"]["promptTokenCount"], 11);
+        assert_eq!(v["usageMetadata"]["candidatesTokenCount"], 22);
+        assert_eq!(v["usageMetadata"]["totalTokenCount"], 33);
+    }
+
+    /// 非流式路径:上游 200 事件流里夹带 exception → 按映射出的状态码回 Gemini 错误体,
+    /// 而不是 200 + 空 candidates。
+    #[tokio::test]
+    async fn generate_content_upstream_exception_yields_mapped_status() {
+        let server = MockServer::start().await;
+        let body = exception_frame("ThrottlingException", br#"{"message":"slow down"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:generateContent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["code"], 429);
+        assert_eq!(v["error"]["status"], "ThrottlingException");
+        assert_eq!(v["error"]["message"], "slow down");
+        assert!(v["candidates"].is_null());
+    }
+
+    // ==================== store-key 归属 ====================
+
+    /// 非流式:handler 从请求扩展读 `ApiKeyId` 并归属用量(此前硬编码 0,
+    /// 导致 store key 的消费上限被绕过、面板用量为零)。
+    #[tokio::test]
+    async fn generate_content_attributes_usage_to_api_key_id() {
+        let server = MockServer::start().await;
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+
+        let dir = std::env::temp_dir().join(format!("kiro2api_gemini_attr_{}", std::process::id()));
+        // 上一轮遗留的记录会污染"某 key 计了几条"的断言,先清干净。
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let st = state_with_stats_dir(&server.uri(), vec![cred()], &dir);
+        let stats = st.stats.clone();
+        let app = with_api_key_id(gemini_router(st), 9);
+
+        let req_body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:generateContent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert_eq!(stats.get_summary_by_api_key(9).await.total_requests, 1);
+        assert_eq!(stats.get_summary_by_api_key(0).await.total_requests, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 流式:记账哨兵同样归属到扩展里的 `ApiKeyId`(记账异步落库,故轮询等待)。
+    #[tokio::test]
+    async fn stream_generate_content_attributes_usage_to_api_key_id() {
+        let server = MockServer::start().await;
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+
+        let dir = std::env::temp_dir().join(format!(
+            "kiro2api_gemini_attr_stream_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let st = state_with_stats_dir(&server.uri(), vec![cred()], &dir);
+        let stats = st.stats.clone();
+        let app = with_api_key_id(gemini_router(st), 11);
+
+        let req_body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:streamGenerateContent?alt=sse")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+
+        let mut ok = false;
+        for _ in 0..50 {
+            if stats.get_summary_by_api_key(11).await.total_requests == 1 {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(ok, "流式用量应归属到 api_key_id=11");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

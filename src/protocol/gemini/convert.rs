@@ -1,8 +1,11 @@
 //! Gemini ↔ 中枢转换自写;形状照 Google 公开规范/中枢既有(`anthropic::types`)。
+use std::collections::HashMap;
+
 use super::types::{
-    Candidate, Content, FunctionCall, GenerateContentRequest, GenerateContentResponse, Part,
-    UsageMetadata,
+    Candidate, Content, FunctionCall, FunctionResponse, GenerateContentRequest,
+    GenerateContentResponse, Part, UsageMetadata,
 };
+use crate::kiro::convert::Truncation;
 use crate::protocol::anthropic::types::{
     Block, ContentIn, InMsg, MessagesRequest, MessagesResponse, OutBlock, SystemPrompt, ToolDef,
 };
@@ -16,8 +19,47 @@ fn response_value_to_text(v: &Value) -> Value {
     }
 }
 
-/// 把单个 Gemini `Part` 转换成 0~1 个中枢 `Block`。
-fn convert_part(part: &Part) -> Option<Block> {
+/// `functionCall` / `functionResponse` 的 `tool_use_id` 分配器。
+///
+/// Gemini 线格式里这两个 part 的 `id` 是可选的:带了就直接用(唯一性由客户端负责);
+/// 缺失时按「函数名 + 该名在本请求内的出现序号」生成——**不能**拿函数名当 id,
+/// 否则同一轮里并行调用同一个函数会产生重复 id,中枢按 id 归并时会把它们并成一条。
+///
+/// 调用与结果各用一套计数器:一次 `functionCall` 之后必跟一次 `functionResponse`,
+/// 两侧同名序号天然对齐,故即便双方都没带 id,tool_use 与 tool_result 仍能配上对。
+/// 生成式 `{name}_{n}`(`n` 为纯数字)在名字集合上是单射,不会与另一函数名撞车。
+#[derive(Default)]
+struct ToolIdAlloc {
+    calls: HashMap<String, u32>,
+    responses: HashMap<String, u32>,
+}
+
+impl ToolIdAlloc {
+    /// 取该函数名的下一个序号并拼出 id(序号自 0 起,确定性、不含随机数)。
+    fn next(counter: &mut HashMap<String, u32>, name: &str) -> String {
+        let n = counter.entry(name.to_string()).or_insert(0);
+        let id = format!("{name}_{n}");
+        *n += 1;
+        id
+    }
+
+    fn call_id(&mut self, call: &FunctionCall) -> String {
+        match call.id.as_deref().filter(|s| !s.is_empty()) {
+            Some(id) => id.to_string(),
+            None => Self::next(&mut self.calls, &call.name),
+        }
+    }
+
+    fn response_id(&mut self, resp: &FunctionResponse) -> String {
+        match resp.id.as_deref().filter(|s| !s.is_empty()) {
+            Some(id) => id.to_string(),
+            None => Self::next(&mut self.responses, &resp.name),
+        }
+    }
+}
+
+/// 把单个 Gemini `Part` 转换成 0~1 个中枢 `Block`;`ids` 供工具 part 取 `tool_use_id`。
+fn convert_part(part: &Part, ids: &mut ToolIdAlloc) -> Option<Block> {
     if let Some(text) = &part.text {
         return Some(Block::Text { text: text.clone() });
     }
@@ -28,14 +70,14 @@ fn convert_part(part: &Part) -> Option<Block> {
     }
     if let Some(call) = &part.function_call {
         return Some(Block::ToolUse {
-            id: call.name.clone(),
+            id: ids.call_id(call),
             name: call.name.clone(),
             input: call.args.clone(),
         });
     }
     if let Some(resp) = &part.function_response {
         return Some(Block::ToolResult {
-            tool_use_id: resp.name.clone(),
+            tool_use_id: ids.response_id(resp),
             content: response_value_to_text(&resp.response),
             is_error: None,
         });
@@ -44,16 +86,29 @@ fn convert_part(part: &Part) -> Option<Block> {
 }
 
 /// 把单个 Gemini `Content` 转换成中枢 `InMsg`(role 映射:`"model"`→`"assistant"`,其余→`"user"`)。
-fn convert_content(content: &Content) -> InMsg {
+fn convert_content(content: &Content, ids: &mut ToolIdAlloc) -> InMsg {
     let role = match content.role.as_deref() {
         Some("model") => "assistant",
         _ => "user",
     };
-    let blocks: Vec<Block> = content.parts.iter().filter_map(convert_part).collect();
+    let blocks: Vec<Block> = content
+        .parts
+        .iter()
+        .filter_map(|p| convert_part(p, ids))
+        .collect();
     InMsg {
         role: role.to_string(),
         content: ContentIn::Blocks(blocks),
     }
+}
+
+/// 读出 `toolConfig.functionCallingConfig.mode`(统一成大写);缺失/形状不符 → `None`。
+fn tool_calling_mode(tool_config: Option<&Value>) -> Option<String> {
+    tool_config?
+        .get("functionCallingConfig")?
+        .get("mode")?
+        .as_str()
+        .map(|s| s.to_ascii_uppercase())
 }
 
 /// 把 Gemini `GenerateContentRequest` 转换成中枢 `MessagesRequest`。
@@ -66,9 +121,16 @@ pub fn gemini_to_hub(req: GenerateContentRequest, model: String) -> MessagesRequ
             .concat()
     });
 
-    let messages: Vec<InMsg> = req.contents.iter().map(convert_content).collect();
+    let mut tool_ids = ToolIdAlloc::default();
+    let messages: Vec<InMsg> = req
+        .contents
+        .iter()
+        .map(|c| convert_content(c, &mut tool_ids))
+        .collect();
 
-    let tools = req.tools.map(|tools| {
+    let mode = tool_calling_mode(req.tool_config.as_ref());
+
+    let mut tools: Option<Vec<ToolDef>> = req.tools.map(|tools| {
         tools
             .into_iter()
             .flat_map(|t| t.function_declarations)
@@ -79,6 +141,13 @@ pub fn gemini_to_hub(req: GenerateContentRequest, model: String) -> MessagesRequ
             })
             .collect()
     });
+
+    // `mode: "NONE"` = 本轮禁止调用函数。Kiro 数据面 wire 没有 tool_choice 之类的字段
+    // (见 `kiro::convert::anthropic_to_kiro`),唯一能忠实兑现这个约束的手段就是不下发
+    // 工具规格。`AUTO` 即默认行为;`ANY`(强制至少调一次)在 wire 上无从表达,只能照默认走。
+    if mode.as_deref() == Some("NONE") {
+        tools = None;
+    }
 
     let max_tokens = req
         .generation_config
@@ -92,7 +161,10 @@ pub fn gemini_to_hub(req: GenerateContentRequest, model: String) -> MessagesRequ
         max_tokens,
         stream: None,
         tools,
-        tool_choice: req.tool_config,
+        // toolConfig 故意不塞进 tool_choice:中枢的 tool_choice 是 Anthropic 形状,这里拿到的是
+        // Gemini 原始形状,直通只会让下游误以为已生效;而 Kiro 数据面 wire 本就没有对应字段,
+        // 转发到底也是空转。唯一可兑现的 `NONE` 已在上面以「不下发工具」如实落地。
+        tool_choice: None,
     }
 }
 
@@ -111,6 +183,18 @@ pub fn finish_reason_gemini(stop: Option<&str>) -> Option<String> {
     )
 }
 
+/// 把流式读帧时探到的上游截断信号映射成 Gemini `finishReason`。
+///
+/// 流式没有中枢 `stop_reason` 可用(帧是逐个到的),故按 [`Truncation`] 直接判:
+/// 命中任一截断 → `"MAX_TOKENS"`,否则 `"STOP"`。与 [`finish_reason_gemini`] 同一口径。
+pub fn finish_reason_for_truncation(truncation: Option<Truncation>) -> String {
+    match truncation {
+        Some(_) => "MAX_TOKENS",
+        None => "STOP",
+    }
+    .to_string()
+}
+
 /// 把中枢 `MessagesResponse` 转换成 Gemini `GenerateContentResponse`。
 pub fn hub_to_gemini(resp: MessagesResponse) -> GenerateContentResponse {
     let parts: Vec<Part> = resp
@@ -123,10 +207,13 @@ pub fn hub_to_gemini(resp: MessagesResponse) -> GenerateContentResponse {
                 function_call: None,
                 function_response: None,
             },
-            OutBlock::ToolUse { name, input, .. } => Part {
+            // 把中枢 tool_use_id 原样带进 `functionCall.id`:客户端回填 functionResponse 时
+            // 带上它,就能在并行同名调用里精确配对(缺 id 才回落到按同名序号配对)。
+            OutBlock::ToolUse { id, name, input } => Part {
                 text: None,
                 inline_data: None,
                 function_call: Some(FunctionCall {
+                    id: Some(id.clone()),
                     name: name.clone(),
                     args: input.clone(),
                 }),
@@ -163,7 +250,7 @@ mod tests {
     use super::*;
     use crate::protocol::anthropic::types::Usage;
     use crate::protocol::gemini::types::{
-        FunctionDeclaration, FunctionResponse, GeminiTool, GenerationConfig, InlineData,
+        FunctionDeclaration, GeminiTool, GenerationConfig, InlineData,
     };
 
     fn user_content(text: &str) -> Content {
@@ -250,6 +337,7 @@ mod tests {
         assert_eq!(hub.messages[0].text(), "hey");
     }
 
+    /// 无 id 的 functionCall:id 由「函数名 + 序号」生成,**不**等于函数名本身。
     #[test]
     fn gemini_to_hub_function_call_part_becomes_tool_use_block() {
         let req = GenerateContentRequest {
@@ -259,6 +347,7 @@ mod tests {
                     text: None,
                     inline_data: None,
                     function_call: Some(FunctionCall {
+                        id: None,
                         name: "get_weather".to_string(),
                         args: json!({"city": "Paris"}),
                     }),
@@ -275,12 +364,160 @@ mod tests {
             ContentIn::Blocks(blocks) => match &blocks[0] {
                 Block::ToolUse { id, name, input } => {
                     assert_eq!(name, "get_weather");
-                    assert_eq!(id, "get_weather");
+                    assert_eq!(id, "get_weather_0");
                     assert_eq!(input["city"], "Paris");
                 }
                 other => panic!("应为 ToolUse,实际: {other:?}"),
             },
             other => panic!("应为 Blocks,实际: {other:?}"),
+        }
+    }
+
+    /// 同一轮里并行调用同名函数:两次调用必须拿到**不同**的 tool_use_id,
+    /// 否则中枢按 id 归并会把两次调用并成一条。
+    #[test]
+    fn gemini_to_hub_parallel_same_name_calls_get_distinct_ids() {
+        let call = |city: &str| Part {
+            text: None,
+            inline_data: None,
+            function_call: Some(FunctionCall {
+                id: None,
+                name: "get_weather".to_string(),
+                args: json!({"city": city}),
+            }),
+            function_response: None,
+        };
+        let req = GenerateContentRequest {
+            contents: vec![Content {
+                role: Some("model".to_string()),
+                parts: vec![call("Paris"), call("Rome")],
+            }],
+            system_instruction: None,
+            tools: None,
+            tool_config: None,
+            generation_config: None,
+        };
+        let hub = gemini_to_hub(req, "m".to_string());
+        let ContentIn::Blocks(blocks) = &hub.messages[0].content else {
+            panic!("应为 Blocks");
+        };
+        let ids: Vec<&str> = blocks
+            .iter()
+            .map(|b| match b {
+                Block::ToolUse { id, .. } => id.as_str(),
+                other => panic!("应为 ToolUse,实际: {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec!["get_weather_0", "get_weather_1"]);
+    }
+
+    /// 客户端自带 id 时优先使用它(不再被函数名覆盖)。
+    #[test]
+    fn gemini_to_hub_prefers_client_supplied_tool_ids() {
+        let req = GenerateContentRequest {
+            contents: vec![
+                Content {
+                    role: Some("model".to_string()),
+                    parts: vec![Part {
+                        text: None,
+                        inline_data: None,
+                        function_call: Some(FunctionCall {
+                            id: Some("call-42".to_string()),
+                            name: "get_weather".to_string(),
+                            args: json!({}),
+                        }),
+                        function_response: None,
+                    }],
+                },
+                Content {
+                    role: Some("user".to_string()),
+                    parts: vec![Part {
+                        text: None,
+                        inline_data: None,
+                        function_call: None,
+                        function_response: Some(FunctionResponse {
+                            id: Some("call-42".to_string()),
+                            name: "get_weather".to_string(),
+                            response: json!("ok"),
+                        }),
+                    }],
+                },
+            ],
+            system_instruction: None,
+            tools: None,
+            tool_config: None,
+            generation_config: None,
+        };
+        let hub = gemini_to_hub(req, "m".to_string());
+        let ContentIn::Blocks(call_blocks) = &hub.messages[0].content else {
+            panic!("应为 Blocks");
+        };
+        let ContentIn::Blocks(resp_blocks) = &hub.messages[1].content else {
+            panic!("应为 Blocks");
+        };
+        match (&call_blocks[0], &resp_blocks[0]) {
+            (Block::ToolUse { id, .. }, Block::ToolResult { tool_use_id, .. }) => {
+                assert_eq!(id, "call-42");
+                assert_eq!(tool_use_id, "call-42");
+            }
+            other => panic!("应为 ToolUse + ToolResult,实际: {other:?}"),
+        }
+    }
+
+    /// 双方都没带 id 时,调用与结果各自按同名序号计数,仍能配上对。
+    #[test]
+    fn gemini_to_hub_pairs_generated_ids_across_turns() {
+        let call = || Part {
+            text: None,
+            inline_data: None,
+            function_call: Some(FunctionCall {
+                id: None,
+                name: "f".to_string(),
+                args: json!({}),
+            }),
+            function_response: None,
+        };
+        let result = || Part {
+            text: None,
+            inline_data: None,
+            function_call: None,
+            function_response: Some(FunctionResponse {
+                id: None,
+                name: "f".to_string(),
+                response: json!("ok"),
+            }),
+        };
+        let req = GenerateContentRequest {
+            contents: vec![
+                Content {
+                    role: Some("model".to_string()),
+                    parts: vec![call(), call()],
+                },
+                Content {
+                    role: Some("user".to_string()),
+                    parts: vec![result(), result()],
+                },
+            ],
+            system_instruction: None,
+            tools: None,
+            tool_config: None,
+            generation_config: None,
+        };
+        let hub = gemini_to_hub(req, "m".to_string());
+        let ContentIn::Blocks(call_blocks) = &hub.messages[0].content else {
+            panic!("应为 Blocks");
+        };
+        let ContentIn::Blocks(resp_blocks) = &hub.messages[1].content else {
+            panic!("应为 Blocks");
+        };
+        for i in 0..2 {
+            match (&call_blocks[i], &resp_blocks[i]) {
+                (Block::ToolUse { id, .. }, Block::ToolResult { tool_use_id, .. }) => {
+                    assert_eq!(id, &format!("f_{i}"));
+                    assert_eq!(tool_use_id, id);
+                }
+                other => panic!("应为 ToolUse + ToolResult,实际: {other:?}"),
+            }
         }
     }
 
@@ -294,6 +531,7 @@ mod tests {
                     inline_data: None,
                     function_call: None,
                     function_response: Some(FunctionResponse {
+                        id: None,
                         name: "get_weather".to_string(),
                         response: json!({"temp": 20}),
                     }),
@@ -312,7 +550,7 @@ mod tests {
                     content,
                     is_error,
                 } => {
-                    assert_eq!(tool_use_id, "get_weather");
+                    assert_eq!(tool_use_id, "get_weather_0");
                     assert_eq!(*is_error, None);
                     // 非字符串 response 应被字符串化为 JSON 文本
                     assert!(content.is_string());
@@ -335,6 +573,7 @@ mod tests {
                     inline_data: None,
                     function_call: None,
                     function_response: Some(FunctionResponse {
+                        id: None,
                         name: "f".to_string(),
                         response: json!("ok"),
                     }),
@@ -454,9 +693,55 @@ mod tests {
         let gemini = hub_to_gemini(resp);
         let part = &gemini.candidates[0].content.parts[0];
         let call = part.function_call.as_ref().expect("function_call 应存在");
+        // 中枢 tool_use_id 随 functionCall.id 下发,供客户端回填时精确配对。
+        assert_eq!(call.id.as_deref(), Some("tu1"));
         assert_eq!(call.name, "get_weather");
         assert_eq!(call.args["city"], "Paris");
         assert_eq!(gemini.candidates[0].finish_reason.as_deref(), Some("STOP"));
+    }
+
+    /// toolConfig 不再直通中枢 `tool_choice`(它是 Anthropic 形状且全链路无人消费,
+    /// 直通只会让下游误以为已生效)。
+    #[test]
+    fn gemini_to_hub_does_not_forward_tool_config_as_tool_choice() {
+        let req = GenerateContentRequest {
+            contents: vec![user_content("hi")],
+            system_instruction: None,
+            tools: Some(vec![GeminiTool {
+                function_declarations: vec![FunctionDeclaration {
+                    name: "f".to_string(),
+                    description: None,
+                    parameters: json!({}),
+                }],
+            }]),
+            tool_config: Some(json!({"functionCallingConfig": {"mode": "ANY"}})),
+            generation_config: None,
+        };
+        let hub = gemini_to_hub(req, "m".to_string());
+        assert_eq!(hub.tool_choice, None);
+        // ANY 无从在 wire 上表达,工具照常下发。
+        assert_eq!(hub.tools.expect("tools 应存在").len(), 1);
+    }
+
+    /// `mode: "NONE"`(禁止调用函数)以「不下发工具规格」如实兑现,不再静默失效。
+    #[test]
+    fn gemini_to_hub_mode_none_drops_tools() {
+        let req = GenerateContentRequest {
+            contents: vec![user_content("hi")],
+            system_instruction: None,
+            tools: Some(vec![GeminiTool {
+                function_declarations: vec![FunctionDeclaration {
+                    name: "f".to_string(),
+                    description: None,
+                    parameters: json!({}),
+                }],
+            }]),
+            tool_config: Some(json!({"functionCallingConfig": {"mode": "none"}})),
+            generation_config: None,
+        };
+        let hub = gemini_to_hub(req, "m".to_string());
+        assert_eq!(hub.tools, None);
+        assert_eq!(hub.tool_choice, None);
     }
 
     #[test]
@@ -482,6 +767,32 @@ mod tests {
         assert_eq!(
             finish_reason_gemini(Some("model_context_window_exceeded")).as_deref(),
             Some("MAX_TOKENS")
+        );
+    }
+
+    /// 流式收尾:探到截断信号报 MAX_TOKENS,没探到才是 STOP。
+    #[test]
+    fn finish_reason_for_truncation_maps_both_kinds() {
+        assert_eq!(finish_reason_for_truncation(None), "STOP");
+        assert_eq!(
+            finish_reason_for_truncation(Some(Truncation::MaxTokens)),
+            "MAX_TOKENS"
+        );
+        assert_eq!(
+            finish_reason_for_truncation(Some(Truncation::ContextWindow)),
+            "MAX_TOKENS"
+        );
+    }
+
+    #[test]
+    fn tool_calling_mode_reads_nested_mode() {
+        let cfg = json!({"functionCallingConfig": {"mode": "any"}});
+        assert_eq!(tool_calling_mode(Some(&cfg)).as_deref(), Some("ANY"));
+        assert_eq!(tool_calling_mode(None), None);
+        assert_eq!(tool_calling_mode(Some(&json!({}))), None);
+        assert_eq!(
+            tool_calling_mode(Some(&json!({"functionCallingConfig": {}}))),
+            None
         );
     }
 }
