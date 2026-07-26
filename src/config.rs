@@ -57,45 +57,51 @@ impl Default for Config {
     }
 }
 
+/// **内置默认层**的凭据路径:相对文件名 `credentials.json` 就近解析到配置文件所在目录。
+///
+/// 凭据路径的父目录同时承载用量统计 / api_keys.json / 余额缓存,容器里必须落在挂载卷内,
+/// 否则重建即丢。容器以 `-c /app/data/config.json` 启动,故就近解析后默认落在 `/app/data/`
+/// (卷内)——无需在镜像里烘焙 `ENV CREDENTIALS_PATH`,那会让环境变量层**凌驾于 config.json
+/// 之上**,把用户在 config.json 里设的自定义路径静默改道。
+///
+/// 只作用于"默认层":config.json 写了 credentialsPath、或设了 `CREDENTIALS_PATH` / `--credentials`
+/// 时都不会走到这里。配置文件本身是无目录的相对名(裸机默认 `config.json`)时原样返回,裸机行为不变。
+pub fn default_credentials_beside_config(config_path: &str) -> String {
+    let builtin = Config::default().credentials_path;
+    match Path::new(config_path).parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            dir.join(&builtin).to_string_lossy().into_owned()
+        }
+        _ => builtin,
+    }
+}
+
 impl Config {
     pub fn load(path: &str) -> anyhow::Result<Config> {
-        let mut cfg: Config = match std::fs::read_to_string(path) {
-            Ok(s) => serde_json::from_str(&s)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
+        // 同时留一份原始 JSON:判"credentialsPath 这个键在文件里到底有没有出现"。
+        // 不能拿"值 == 内置默认"来判——那会误伤显式写了 `"credentialsPath": "credentials.json"`
+        // 的用户,把他们的数据目录静默搬到配置文件旁边。
+        let (mut cfg, explicit_credentials): (Config, bool) = match std::fs::read_to_string(path) {
+            Ok(s) => {
+                let cfg: Config = serde_json::from_str(&s)?;
+                let explicit = serde_json::from_str::<serde_json::Value>(&s)
+                    .ok()
+                    .and_then(|v| v.get("credentialsPath").cloned())
+                    .is_some();
+                (cfg, explicit)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Config::default(), false),
             Err(e) => return Err(e.into()),
         };
-        // 未显式配置 credentialsPath 时,把内置默认就近解析到配置文件所在目录
+        // 文件里没写 credentialsPath 时,把内置默认就近解析到配置文件所在目录
         // (必须在 apply_env_overrides 之前:它只是"默认层",不能盖过 env/config.json)。
-        cfg.resolve_default_credentials_beside_config(path);
+        if !explicit_credentials {
+            cfg.credentials_path = default_credentials_beside_config(path);
+        }
         cfg.apply_env_overrides();
         // 记录本配置文件路径,供运行期改写(auth-keys / load-balancing)原子落盘定位。
         cfg.config_path = path.to_string();
         Ok(cfg)
-    }
-
-    /// 把**内置默认**的凭据路径(相对文件名 `credentials.json`)就近解析到配置文件所在目录。
-    ///
-    /// 凭据路径的父目录同时承载用量统计 / api_keys.json / 余额缓存,容器里必须落在挂载卷内,
-    /// 否则重建即丢。容器以 `-c /app/data/config.json` 启动,故就近解析后默认落在
-    /// `/app/data/`(卷内)——无需在镜像里烘焙 `ENV CREDENTIALS_PATH`,那会让环境变量层
-    /// **凌驾于 config.json 之上**,把用户在 config.json 里设的自定义路径静默改道。
-    ///
-    /// 仅在"值仍等于内置默认"时生效,故显式配置(config.json / env / CLI)一律不受影响;
-    /// 配置文件本身是无目录的相对名(裸机默认 `config.json`)时是 no-op,裸机行为不变。
-    fn resolve_default_credentials_beside_config(&mut self, config_path: &str) {
-        if self.credentials_path != Config::default().credentials_path {
-            return; // 已显式配置 → 不碰
-        }
-        let Some(dir) = Path::new(config_path).parent() else {
-            return;
-        };
-        if dir.as_os_str().is_empty() {
-            return; // 无目录部分(如 "config.json")→ 保持相对名,行为不变
-        }
-        self.credentials_path = dir
-            .join(&self.credentials_path)
-            .to_string_lossy()
-            .into_owned();
     }
 
     fn apply_env_overrides(&mut self) {
@@ -237,6 +243,48 @@ pub fn shared_runtime_config(cfg: &Config) -> SharedRuntimeConfig {
 
 #[cfg(test)]
 mod tests {
+    /// 回归:config.json **显式**写了 credentialsPath(哪怕值恰好等于内置默认名)时,
+    /// 绝不能被"就近解析"搬到配置文件旁边——那会让老部署的数据目录静默换位置。
+    #[test]
+    fn explicit_credentials_path_is_never_relocated() {
+        let dir = std::env::temp_dir().join(format!("k2a_cfg_explicit_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("config.json");
+        std::fs::write(&cfg_path, r#"{"credentialsPath":"credentials.json"}"#).unwrap();
+        let c = super::Config::load(cfg_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            c.credentials_path, "credentials.json",
+            "显式配置必须原样保留(相对当前工作目录),不得被搬到 config.json 旁边"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归:文件里**没写** credentialsPath 时,默认就近落到配置文件所在目录
+    /// (容器 -c /app/data/config.json → /app/data/credentials.json,在挂载卷内)。
+    #[test]
+    fn absent_credentials_path_defaults_beside_config() {
+        let dir = std::env::temp_dir().join(format!("k2a_cfg_absent_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("config.json");
+        std::fs::write(&cfg_path, r#"{"port":8990}"#).unwrap();
+        let c = super::Config::load(cfg_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            c.credentials_path,
+            dir.join("credentials.json").to_string_lossy(),
+            "缺省时必须就近解析到配置文件目录,否则容器里会落到卷外"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 无目录部分的配置名(裸机默认 `config.json`)保持原相对名,裸机行为不变。
+    #[test]
+    fn bare_config_name_keeps_relative_default() {
+        assert_eq!(
+            super::default_credentials_beside_config("config.json"),
+            "credentials.json"
+        );
+    }
+
     use super::*;
 
     #[test]

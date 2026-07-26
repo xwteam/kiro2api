@@ -408,7 +408,7 @@ resp = client.chat.completions.create(
 
 優先順位：**コマンドライン引数 > 環境変数 > `config.json` > 組み込み既定**。コマンドライン引数は 2 つだけです：`-c/--config`（設定ファイルのパス）と `--credentials`（認証情報ファイルのパス。省略時は `CREDENTIALS_PATH`/`config.json`/既定値で決まります）。マウントボリューム `./data` に `config.json`、`credentials.json`、ログと実行状態を格納します。
 
-> 認証情報のパスは、使用量統計（`stats/`）・API-KEY ストア（`api_keys.json`）・残高キャッシュの保存先ディレクトリも決めます——いずれも `credentials.json` の親ディレクトリを使うためです。コンテナイメージには `CREDENTIALS_PATH=/app/data/credentials.json` が組み込まれているので、既定ではこれらもマウントボリュームに落ちます。パスを変更する場合はマウントボリューム内を指すようにしてください。さもないとコンテナを作り直した時点で消えます。
+> 認証情報のパスは、使用量統計（`stats/`）・API-KEY ストア（`api_keys.json`）・残高キャッシュの保存先ディレクトリも決めます——いずれも `credentials.json` の親ディレクトリを使うためです。組み込み既定の認証情報パスは `-c` で渡した設定ファイルのあるディレクトリを基準に解決され、コンテナは `-c /app/data/config.json` で起動するので、既定ではこれらもマウントボリュームに落ちます。パスを変更する場合はマウントボリューム内を指すようにしてください。さもないとコンテナを作り直した時点で消えます。
 
 **環境変数**（`.env.example` 参照）：
 
@@ -421,7 +421,7 @@ resp = client.chat.completions.create(
 | `REGION` | ❌ | `us-east-1` | 既定 AWS region（アカウント `profileArn` 内の region が優先） |
 | `LOAD_BALANCING_MODE` | ❌ | `priority` | 負荷分散：`priority`（等重みローテーション）/ `balanced`（weight による加重） |
 | `MAX_RPM_PER_CREDENTIAL` | ❌ | `0` | アカウントあたり毎分のリクエスト上限、`0` = 無制限 |
-| `CREDENTIALS_PATH` | ❌ | `credentials.json`（イメージは `/app/data/credentials.json` 組み込み） | 認証情報ファイルのパス；コマンドラインの `--credentials` が優先 |
+| `CREDENTIALS_PATH` | ❌ | `credentials.json`（`-c` の設定ファイルと同じディレクトリを基準に解決；コンテナでは `/app/data/credentials.json`） | 認証情報ファイルのパス；コマンドラインの `--credentials` が優先 |
 
 **`data/config.json`**（camelCase、すべて任意；`logCapacity` はここでのみ設定）：
 

@@ -428,7 +428,7 @@ resp = client.chat.completions.create(
 
 优先级：**命令行参数 > 环境变量 > `config.json` > 内置默认**。命令行只有两个参数：`-c/--config`（配置文件路径）与 `--credentials`（凭据文件路径，不给则由 `CREDENTIALS_PATH`/`config.json`/默认值决定）。挂载卷 `./data` 存放 `config.json`、`credentials.json`、日志与运行态。
 
-> 凭据路径同时决定用量统计（`stats/`）、API-KEY 存储（`api_keys.json`）与余额缓存的落盘目录——它们都取 `credentials.json` 的父目录。容器镜像已内置 `CREDENTIALS_PATH=/app/data/credentials.json`，这些数据默认就落在挂载卷里；自定义路径时请一并指向挂载卷，否则容器重建即丢。
+> 凭据路径同时决定用量统计（`stats/`）、API-KEY 存储（`api_keys.json`）与余额缓存的落盘目录——它们都取 `credentials.json` 的父目录。内置默认值解析在 `-c` 指定的配置文件所在目录下，容器以 `-c /app/data/config.json` 启动，因此默认落点就是 `/app/data/credentials.json`，这些数据默认就落在挂载卷里；自定义路径时请一并指向挂载卷，否则容器重建即丢。
 
 **环境变量**（见 `.env.example`）：
 
@@ -441,7 +441,7 @@ resp = client.chat.completions.create(
 | `REGION` | ❌ | `us-east-1` | 默认 AWS region（账号 `profileArn` 内的 region 优先） |
 | `LOAD_BALANCING_MODE` | ❌ | `priority` | 负载均衡：`priority`（等权轮询）/ `balanced`（按 weight 加权） |
 | `MAX_RPM_PER_CREDENTIAL` | ❌ | `0` | 每账号每分钟请求上限，`0` = 无限 |
-| `CREDENTIALS_PATH` | ❌ | `credentials.json`（镜像内置 `/app/data/credentials.json`） | 凭据文件路径；被命令行 `--credentials` 覆盖 |
+| `CREDENTIALS_PATH` | ❌ | `credentials.json`，解析在 `-c` 配置文件所在目录（容器内即 `/app/data/credentials.json`） | 凭据文件路径；被命令行 `--credentials` 覆盖 |
 
 **`data/config.json`**（camelCase，均可选；`logCapacity` 仅在此配置）：
 

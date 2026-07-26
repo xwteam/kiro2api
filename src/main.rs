@@ -12,9 +12,11 @@ fn resolve_credentials_path(cfg: &mut config::Config, args: &cli::Cli) {
     if let Some(path) = cli_credentials.filter(|s| !s.is_empty()) {
         cfg.credentials_path = path.to_string();
     }
-    // 空值(如 .env 里写了 `CREDENTIALS_PATH=`)会让数据目录退化成当前工作目录,兜回内置默认。
+    // 空值(如 config.json 里写了 `"credentialsPath": ""`)会让数据目录退化成当前工作目录。
+    // 兜底必须走**与默认层同一套**的就近解析:直接取 `Config::default()` 的裸相对名会绕过它,
+    // 容器里就落到 /app/credentials.json(卷外),重建即丢——正是本次要堵的坑。
     if cfg.credentials_path.trim().is_empty() {
-        cfg.credentials_path = config::Config::default().credentials_path;
+        cfg.credentials_path = config::default_credentials_beside_config(&args.config);
     }
 }
 

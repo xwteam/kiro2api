@@ -450,7 +450,7 @@ resp = client.chat.completions.create(
 
 Priority: **command-line flags > environment variables > `config.json` > built-in defaults**. There are exactly two command-line flags: `-c/--config` (config file path) and `--credentials` (credentials file path; when omitted, `CREDENTIALS_PATH` / `config.json` / the built-in default decides). The mounted volume `./data` holds `config.json`, `credentials.json`, logs, and runtime state.
 
-> The credentials path also decides where usage stats (`stats/`), API-KEY storage (`api_keys.json`), and the balance cache are written — all of them use the parent directory of `credentials.json`. The container image ships `CREDENTIALS_PATH=/app/data/credentials.json`, so by default this data lands on the mounted volume; if you point the path somewhere else, point it inside the volume too, or everything is gone the moment the container is recreated.
+> The credentials path also decides where usage stats (`stats/`), API-KEY storage (`api_keys.json`), and the balance cache are written — all of them use the parent directory of `credentials.json`. The built-in default resolves next to the config file given by `-c`, and the container starts with `-c /app/data/config.json`, so by default this data lands on the mounted volume; if you point the path somewhere else, point it inside the volume too, or everything is gone the moment the container is recreated.
 
 **Environment variables** (see `.env.example`):
 
@@ -463,7 +463,7 @@ Priority: **command-line flags > environment variables > `config.json` > built-i
 | `REGION` | ❌ | `us-east-1` | Default AWS region (the region inside the account's `profileArn` takes precedence) |
 | `LOAD_BALANCING_MODE` | ❌ | `priority` | Load balancing: `priority` (equal-weight round-robin) / `balanced` (weighted by weight) |
 | `MAX_RPM_PER_CREDENTIAL` | ❌ | `0` | Per-account per-minute request cap, `0` = unlimited |
-| `CREDENTIALS_PATH` | ❌ | `credentials.json` (image ships `/app/data/credentials.json`) | Credentials file path; overridden by the `--credentials` flag |
+| `CREDENTIALS_PATH` | ❌ | `credentials.json`, resolved next to the `-c` config file (so `/app/data/credentials.json` in the container) | Credentials file path; overridden by the `--credentials` flag |
 
 **`data/config.json`** (camelCase, all optional; `logCapacity` is configured here only):
 

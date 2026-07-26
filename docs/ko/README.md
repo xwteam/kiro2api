@@ -405,7 +405,7 @@ resp = client.chat.completions.create(
 
 우선순위: **명령줄 인자 > 환경 변수 > `config.json` > 내장 기본값**. 명령줄 인자는 두 개뿐입니다: `-c/--config`(설정 파일 경로)와 `--credentials`(자격 증명 파일 경로, 주지 않으면 `CREDENTIALS_PATH`/`config.json`/기본값 순으로 결정). 마운트 볼륨 `./data`에 `config.json`, `credentials.json`, 로그 및 런타임 상태가 저장됩니다.
 
-> 자격 증명 경로는 사용량 통계(`stats/`), API-KEY 저장소(`api_keys.json`), 잔액 캐시가 기록되는 디렉터리까지 함께 결정합니다 — 모두 `credentials.json`의 상위 디렉터리를 사용합니다. 컨테이너 이미지에는 `CREDENTIALS_PATH=/app/data/credentials.json`이 내장되어 있어 이 데이터도 기본적으로 마운트 볼륨에 저장됩니다. 경로를 직접 지정할 때는 반드시 마운트 볼륨 안을 가리키게 하십시오. 그러지 않으면 컨테이너를 다시 만드는 순간 유실됩니다.
+> 자격 증명 경로는 사용량 통계(`stats/`), API-KEY 저장소(`api_keys.json`), 잔액 캐시가 기록되는 디렉터리까지 함께 결정합니다 — 모두 `credentials.json`의 상위 디렉터리를 사용합니다. 내장 기본값은 `-c`로 지정한 설정 파일이 있는 디렉터리를 기준으로 결정되며, 컨테이너는 `-c /app/data/config.json`으로 기동하므로 기본 경로가 `/app/data/credentials.json`, 즉 마운트 볼륨 안이 됩니다. 경로를 직접 지정할 때는 반드시 마운트 볼륨 안을 가리키게 하십시오. 그러지 않으면 컨테이너를 다시 만드는 순간 유실됩니다.
 
 **환경 변수**(`.env.example` 참조):
 
@@ -418,7 +418,7 @@ resp = client.chat.completions.create(
 | `REGION` | ❌ | `us-east-1` | 기본 AWS region(계정 `profileArn` 내 region 우선) |
 | `LOAD_BALANCING_MODE` | ❌ | `priority` | 부하 분산: `priority`(등가 순환) / `balanced`(weight 가중치) |
 | `MAX_RPM_PER_CREDENTIAL` | ❌ | `0` | 계정당 분당 요청 상한, `0` = 무제한 |
-| `CREDENTIALS_PATH` | ❌ | `credentials.json`(이미지 내장 `/app/data/credentials.json`) | 자격 증명 파일 경로; 명령줄 `--credentials`가 우선 |
+| `CREDENTIALS_PATH` | ❌ | `credentials.json`(`-c` 설정 파일과 같은 디렉터리 기준, 컨테이너에서는 `/app/data/credentials.json`) | 자격 증명 파일 경로; 명령줄 `--credentials`가 우선 |
 
 **`data/config.json`**(camelCase, 모두 선택; `logCapacity`는 여기서만 설정):
 

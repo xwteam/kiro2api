@@ -1,5 +1,5 @@
 //! Gemini ↔ 中枢转换自写;形状照 Google 公开规范/中枢既有(`anthropic::types`)。
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::types::{
     Candidate, Content, FunctionCall, FunctionResponse, GenerateContentRequest,
@@ -31,42 +31,70 @@ fn response_value_to_text(v: &Value) -> Value {
 /// Google SDK 的惯用法是把模型那条 Content **原样**塞回历史、再追加一条只有 `name`+`response`
 /// 的 `functionResponse`(不回带 id)。于是调用侧取到真 id(如 `tooluse_abc`)、结果侧却生成
 /// `{name}_{n}`,两边对不上 —— 中枢按 id 配对,工具结果就成了没人认领的孤儿,模型会反复重发
-/// 同一个调用。改为回填后:客户端回带 id → 精确配对(并行同名调用也不串);不回带 id → 按同名
-/// 第 n 次调用positional 配对(正是 Gemini 语义);历史里压根没有对应调用 → 才回落 `{name}_{n}`。
+/// 同一个调用。改为回填后:客户端回带 id → 精确配对(并行同名调用也不串);不回带 id → 在
+/// **最近一轮仍有未认领同名调用**的那轮里按顺序配(带 id 的结果也会占位,故两种结果混用不错位;
+/// 按轮收窄则使"并行调用只被答了一部分"时不会被那个永不被答的旧调用一直拽住);
+/// 历史里压根没有对应调用 → 才回落 `{name}_{n}`。
 /// 生成式 `{name}_{n}`(`n` 为纯数字)在名字集合上是单射,不会与另一函数名撞车。
 #[derive(Default)]
 struct ToolIdAlloc {
-    /// 每个函数名已出现过的 `functionCall` id,按出现顺序;结果侧缺 id 时据此回填。
-    calls_by_name: HashMap<String, Vec<String>>,
-    /// 每个函数名已消费掉的 `functionResponse` 个数(即下一个该配第几次调用)。
-    responses_seen: HashMap<String, usize>,
+    /// 每个函数名出现过的 `functionCall`,记 `(轮次, id)`;结果侧缺 id 时据此回填。
+    /// 轮次 = 该调用所在 `Content` 在 `contents` 里的下标。
+    calls_by_name: HashMap<String, Vec<(usize, String)>>,
+    /// 已被某条 `functionResponse` 认领的调用 id。**带 id 的结果同样计入**,否则同一轮里
+    /// 混用"带 id / 不带 id"两种结果时,不带 id 的那条会被错配到已认领的调用上。
+    claimed: HashSet<String>,
+    /// 历史里找不到可配调用时的回落序号(按函数名各自计数,保持确定性)。
+    orphan_seen: HashMap<String, usize>,
+    /// 当前正在转换的 `Content` 下标,由 [`gemini_to_hub`] 逐条推进。
+    turn: usize,
 }
 
 impl ToolIdAlloc {
     fn call_id(&mut self, call: &FunctionCall) -> String {
+        let turn = self.turn;
         let seen = self.calls_by_name.entry(call.name.clone()).or_default();
         let id = match call.id.as_deref().filter(|s| !s.is_empty()) {
             Some(id) => id.to_string(),
             // 缺 id:按同名出现序号生成,保证并行同名调用彼此不同 id。
             None => format!("{}_{}", call.name, seen.len()),
         };
-        seen.push(id.clone());
+        seen.push((turn, id.clone()));
         id
     }
 
     fn response_id(&mut self, resp: &FunctionResponse) -> String {
+        // 客户端回带了 id:直接用(最精确),并标记该调用已被认领。
         if let Some(id) = resp.id.as_deref().filter(|s| !s.is_empty()) {
-            return id.to_string(); // 客户端回带了 id:直接用,最精确
+            self.claimed.insert(id.to_string());
+            return id.to_string();
         }
-        let n = self.responses_seen.entry(resp.name.clone()).or_insert(0);
+        // 缺 id:在**最近一轮仍有未认领同名调用**的那轮里,取其中第一个未认领的。
+        //
+        // 为何要按轮次收窄而不是全局取第一个未认领:并行调用可能只被答了一部分(用户拒绝其中
+        // 一个、或历史被压缩),那个永不被答的调用会一直排在最前,把后续每一条无 id 的结果都
+        // 拽回旧轮次——模型于是收不到新调用的结果、反复重发,正是本修复要消灭的症状。按轮次
+        // 收窄后:同轮并行调用仍按出现顺序依次配对(常规场景不变),跨轮则优先配最近那轮。
+        let pick = self.calls_by_name.get(&resp.name).and_then(|calls| {
+            let latest_open = calls
+                .iter()
+                .filter(|(_, id)| !self.claimed.contains(id))
+                .map(|(t, _)| *t)
+                .next_back()?;
+            calls
+                .iter()
+                .find(|(t, id)| *t == latest_open && !self.claimed.contains(id))
+                .map(|(_, id)| id.clone())
+        });
+        if let Some(id) = pick {
+            self.claimed.insert(id.clone());
+            return id;
+        }
+        // 历史里没有可配的同名调用(客户端只发结果不发调用)→ 保持原生成式。
+        let n = self.orphan_seen.entry(resp.name.clone()).or_insert(0);
         let idx = *n;
         *n += 1;
-        self.calls_by_name
-            .get(&resp.name)
-            .and_then(|ids| ids.get(idx))
-            .cloned()
-            // 历史里没有第 idx 次同名调用(客户端只发结果不发调用)→ 保持原生成式。
-            .unwrap_or_else(|| format!("{}_{}", resp.name, idx))
+        format!("{}_{}", resp.name, idx)
     }
 }
 
@@ -134,10 +162,15 @@ pub fn gemini_to_hub(req: GenerateContentRequest, model: String) -> MessagesRequ
     });
 
     let mut tool_ids = ToolIdAlloc::default();
+    // 逐条推进轮次下标:无 id 的 functionResponse 据此优先配"最近一轮仍未被答"的同名调用。
     let messages: Vec<InMsg> = req
         .contents
         .iter()
-        .map(|c| convert_content(c, &mut tool_ids))
+        .enumerate()
+        .map(|(turn, c)| {
+            tool_ids.turn = turn;
+            convert_content(c, &mut tool_ids)
+        })
         .collect();
 
     let mode = tool_calling_mode(req.tool_config.as_ref());
@@ -347,6 +380,153 @@ mod tests {
         assert_eq!(
             result_id, call_id,
             "结果侧缺 id 时必须回填成同名调用的真实 id,否则工具配对断裂"
+        );
+    }
+
+    /// 回归:同一轮里**混用**"带 id / 不带 id"两种 functionResponse 时不得错位。
+    ///
+    /// 带 id 的结果必须同样"占位"(标记该调用已被认领),否则后面不带 id 的结果会被
+    /// 错配到已被认领的那次调用上,两条结果指向同一个 tool_use_id。
+    /// 回归:并行同名调用**只被答了一部分**时,后续无 id 的结果必须配到"最近一轮"的新调用,
+    /// 而不是被那个永不被答的旧调用一直拽住。
+    ///
+    /// 场景(审查员实测过的 S2):模型并行发 A、B 两次 read_file;用户拒了 B,只答了 A;下一轮
+    /// 模型又发 C,客户端答 C 但不带 id。若全局取"第一个未认领"会配到 B —— C 永远收不到结果,
+    /// 模型于是反复重发 C,正是本修复要消灭的症状。
+    #[test]
+    fn idless_response_prefers_latest_open_turn() {
+        fn call(id: &str) -> Part {
+            Part {
+                text: None,
+                inline_data: None,
+                function_call: Some(FunctionCall {
+                    id: Some(id.to_string()),
+                    name: "read_file".to_string(),
+                    args: json!({}),
+                }),
+                function_response: None,
+            }
+        }
+        fn resp(id: Option<&str>) -> Part {
+            Part {
+                text: None,
+                inline_data: None,
+                function_call: None,
+                function_response: Some(FunctionResponse {
+                    id: id.map(str::to_string),
+                    name: "read_file".to_string(),
+                    response: json!({}),
+                }),
+            }
+        }
+        let hub = gemini_to_hub(
+            GenerateContentRequest {
+                contents: vec![
+                    // 轮 0:并行发 A、B
+                    Content {
+                        role: Some("model".to_string()),
+                        parts: vec![call("A"), call("B")],
+                    },
+                    // 轮 1:只答了 A(B 被用户拒绝,没有对应结果)
+                    Content {
+                        role: Some("user".to_string()),
+                        parts: vec![resp(Some("A"))],
+                    },
+                    // 轮 2:模型又发 C
+                    Content {
+                        role: Some("model".to_string()),
+                        parts: vec![call("C")],
+                    },
+                    // 轮 3:答 C,但不带 id
+                    Content {
+                        role: Some("user".to_string()),
+                        parts: vec![resp(None)],
+                    },
+                ],
+                system_instruction: None,
+                tools: None,
+                tool_config: None,
+                generation_config: None,
+            },
+            "claude-sonnet-4.5".to_string(),
+        );
+        let ContentIn::Blocks(blocks) = &hub.messages[3].content else {
+            panic!("最后一条应为块数组");
+        };
+        let id = blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .expect("应有 tool_result");
+        assert_eq!(
+            id, "C",
+            "无 id 的结果必须配最近一轮的 C,而不是被没人答的 B 拽住"
+        );
+    }
+
+    #[test]
+    fn mixed_id_and_idless_responses_do_not_collide() {
+        fn call(id: &str) -> Part {
+            Part {
+                text: None,
+                inline_data: None,
+                function_call: Some(FunctionCall {
+                    id: Some(id.to_string()),
+                    name: "f".to_string(),
+                    args: json!({}),
+                }),
+                function_response: None,
+            }
+        }
+        fn resp(id: Option<&str>) -> Part {
+            Part {
+                text: None,
+                inline_data: None,
+                function_call: None,
+                function_response: Some(FunctionResponse {
+                    id: id.map(str::to_string),
+                    name: "f".to_string(),
+                    response: json!({}),
+                }),
+            }
+        }
+        let hub = gemini_to_hub(
+            GenerateContentRequest {
+                contents: vec![
+                    // 两次并行同名调用,各带真 id
+                    Content {
+                        role: Some("model".to_string()),
+                        parts: vec![call("x1"), call("x2")],
+                    },
+                    // 第一条结果回带 id=x1,第二条不带 id → 必须落到 x2
+                    Content {
+                        role: Some("user".to_string()),
+                        parts: vec![resp(Some("x1")), resp(None)],
+                    },
+                ],
+                system_instruction: None,
+                tools: None,
+                tool_config: None,
+                generation_config: None,
+            },
+            "claude-sonnet-4.5".to_string(),
+        );
+        let ContentIn::Blocks(blocks) = &hub.messages[1].content else {
+            panic!("结果消息应为块数组");
+        };
+        let ids: Vec<String> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["x1".to_string(), "x2".to_string()],
+            "带 id 的结果必须占位,否则无 id 的那条会错配回 x1"
         );
     }
 

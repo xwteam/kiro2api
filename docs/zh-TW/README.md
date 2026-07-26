@@ -403,7 +403,7 @@ resp = client.chat.completions.create(
 
 優先級：**命令列參數 > 環境變數 > `config.json` > 內建預設**。命令列只有兩個參數：`-c/--config`（設定檔路徑）與 `--credentials`（憑證檔案路徑，不給則由 `CREDENTIALS_PATH`/`config.json`/預設值決定）。掛載卷 `./data` 存放 `config.json`、`credentials.json`、日誌與執行態。
 
-> 憑證路徑同時決定用量統計（`stats/`）、API-KEY 儲存（`api_keys.json`）與餘額快取的落盤目錄——它們都取 `credentials.json` 的上層目錄。容器映像已內建 `CREDENTIALS_PATH=/app/data/credentials.json`，這些資料預設就落在掛載卷裡；自訂路徑時請一併指向掛載卷，否則容器重建即遺失。
+> 憑證路徑同時決定用量統計（`stats/`）、API-KEY 儲存（`api_keys.json`）與餘額快取的落盤目錄——它們都取 `credentials.json` 的上層目錄。內建預設值會相對 `-c` 指定的設定檔所在目錄解析，而容器以 `-c /app/data/config.json` 啟動，預設憑證路徑因此落在 `/app/data/credentials.json`，這些資料預設就落在掛載卷裡；自訂路徑時請一併指向掛載卷，否則容器重建即遺失。
 
 **環境變數**（見 `.env.example`）：
 
@@ -416,7 +416,7 @@ resp = client.chat.completions.create(
 | `REGION` | ❌ | `us-east-1` | 預設 AWS region（帳號 `profileArn` 內的 region 優先） |
 | `LOAD_BALANCING_MODE` | ❌ | `priority` | 負載平衡：`priority`（等權輪詢）/ `balanced`（按 weight 加權） |
 | `MAX_RPM_PER_CREDENTIAL` | ❌ | `0` | 每帳號每分鐘請求上限，`0` = 無限 |
-| `CREDENTIALS_PATH` | ❌ | `credentials.json`（映像內建 `/app/data/credentials.json`） | 憑證檔案路徑；被命令列 `--credentials` 覆蓋 |
+| `CREDENTIALS_PATH` | ❌ | `credentials.json`（相對 `-c` 設定檔所在目錄解析，容器內即 `/app/data/credentials.json`） | 憑證檔案路徑；被命令列 `--credentials` 覆蓋 |
 
 **`data/config.json`**（camelCase，均可選；`logCapacity` 僅在此配置）：
 
