@@ -132,11 +132,23 @@ pub fn dirty_channel() -> (DirtyFlag, FlushHandle) {
 /// 启动后台刷盘任务:每 `interval_secs` 拍检查脏标记;脏则调用 `snapshot()` 取内存
 /// 快照,`spawn_blocking` 写盘。`rx` 关闭(所有 DirtyFlag 被 drop)时做最后一次刷盘并退出。
 ///
-/// `snapshot` 返回 `Some(bytes-serializable)`;为让类型简单,这里接收一个已序列化好的
-/// `Vec<u8>` 生成闭包 —— 由调用方在持锁下拿快照并序列化,避免把锁类型泄漏到本模块。
+/// `snapshot` 返回已序列化好的 `Vec<u8>` —— 由调用方在持锁下拿快照并序列化,避免把锁
+/// 类型泄漏到本模块。需要"本轮不写盘"的语义时用 [`spawn_flush_loop_opt`]。
 pub fn spawn_flush_loop<F>(path: PathBuf, handle: FlushHandle, interval_secs: u64, snapshot: F)
 where
     F: Fn() -> Vec<u8> + Send + Sync + 'static,
+{
+    spawn_flush_loop_opt(path, handle, interval_secs, move || Some(snapshot()));
+}
+
+/// 同 [`spawn_flush_loop`],但快照闭包返回 `Option<Vec<u8>>`:`None` = **本轮跳过写盘**,
+/// 磁盘保留上一次成功落盘的内容。
+///
+/// 供两类场景用:快照源已析构(后台任务只持 `Weak`,升级失败),或序列化失败——
+/// 两种情况下都绝不能把空内容原子覆写上去。
+pub fn spawn_flush_loop_opt<F>(path: PathBuf, handle: FlushHandle, interval_secs: u64, snapshot: F)
+where
+    F: Fn() -> Option<Vec<u8>> + Send + Sync + 'static,
 {
     let FlushHandle { dirty, mut rx } = handle;
     let snapshot = Arc::new(snapshot);
@@ -163,7 +175,7 @@ where
 
 async fn flush_if_dirty<F>(path: &Path, dirty: &AtomicBool, snapshot: &Arc<F>)
 where
-    F: Fn() -> Vec<u8> + Send + Sync + 'static,
+    F: Fn() -> Option<Vec<u8>> + Send + Sync + 'static,
 {
     // 抢占式清脏:先置 false,期间的新写会再次置脏、下拍再落。
     // 快照生成(可能持阻塞读锁)与落盘都在 spawn_blocking 内完成,避免在 async
@@ -171,9 +183,9 @@ where
     if dirty.swap(false, Ordering::AcqRel) {
         let path = path.to_path_buf();
         let snapshot = snapshot.clone();
-        let res = tokio::task::spawn_blocking(move || {
-            let bytes = snapshot();
-            write_bytes_atomic(&path, &bytes)
+        let res = tokio::task::spawn_blocking(move || match snapshot() {
+            Some(bytes) => write_bytes_atomic(&path, &bytes),
+            None => Ok(()),
         })
         .await;
         match res {
@@ -190,10 +202,30 @@ where
     }
 }
 
-/// 原子写已序列化好的字节:写唯一临时文件 → fsync → rename 覆盖。
+/// rename 之后 fsync 父目录:让"文件名指向新 inode"这条目录项本身落盘。只 fsync 数据
+/// 文件不够——目录项未落盘时,崩溃后该名字可能仍指向 rename 前的旧 inode,本次刷盘整体回退。
 ///
-/// 持久性:rename 前对 tmp 文件 `sync_all`(fsync),确保进程/系统崩溃后要么完整旧
-/// 文件、要么完整新文件,绝不半写或丢失已提交的用量/计费数据。tmp 路径按 pid+计数器
+/// best-effort:打开/同步目录失败不使写盘失败(目录已 rename 成功,数据在页缓存中仍可见)。
+#[cfg(unix)]
+fn fsync_parent_dir(path: &Path) {
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if let Ok(f) = std::fs::File::open(dir) {
+        let _ = f.sync_all();
+    }
+}
+
+/// 非 unix 平台无"目录 fd fsync"语义,空实现。
+#[cfg(not(unix))]
+fn fsync_parent_dir(_path: &Path) {}
+
+/// 原子写已序列化好的字节:写唯一临时文件 → fsync → rename 覆盖 → fsync 父目录。
+///
+/// 持久性:rename 前对 tmp 文件 `sync_all`(fsync)保证内容已落盘;rename 后再 fsync
+/// 父目录(unix)保证新目录项本身也落盘。二者齐备,进程/系统崩溃后要么完整旧文件、
+/// 要么完整新文件,不会半写、也不会整体回退到上一版。tmp 路径按 pid+计数器
 /// 唯一化,并发写彼此隔离。写失败/中途出错清理残留 tmp。
 ///
 /// #10:每次写盘顺手清理同目录下遗留的**孤儿** `{path}.tmp.*`(此前进程在 tmp 写完与
@@ -214,6 +246,7 @@ pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         }
         f.sync_all()?; // fsync:数据落盘后再 rename
         std::fs::rename(&tmp, path)?;
+        fsync_parent_dir(path); // 目录项落盘,rename 不会在崩溃后回退
         Ok(())
     })();
     if res.is_err() {
@@ -291,6 +324,50 @@ mod tests {
         assert!(path.exists(), "目标文件应写入成功");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_into_nested_dir_and_dir_fsync_tolerates_bare_name() {
+        use std::time::SystemTime;
+        let dir = std::env::temp_dir().join(format!(
+            "kiro2api_persist_dirsync_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // 目标目录尚不存在:写盘应自行创建、rename 后 fsync 父目录,不因此失败。
+        let path = dir.join("nested").join("stats.json");
+        write_bytes_atomic(&path, b"[1,2,3]").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"[1,2,3]".to_vec());
+        // 无父目录的裸文件名:fsync 回落到 "." ,不 panic、不报错。
+        fsync_parent_dir(Path::new("stats.json"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn flush_loop_skips_write_when_snapshot_is_none() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("kiro2api_flush_skip_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // 先落一份已知内容,模拟"上一次成功刷盘"。
+        atomic_write_json(&path, &vec![7u32]).unwrap();
+
+        let (flag, handle) = dirty_channel();
+        // 快照源已消失 → None:即便置脏也不得把空内容覆写上去。
+        spawn_flush_loop_opt(path.clone(), handle, 1, || None);
+        flag.mark_dirty();
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+        let got: Option<Vec<u32>> = read_json(&path).unwrap();
+        assert_eq!(got, Some(vec![7]), "快照返回 None 时磁盘内容必须原样保留");
+
+        // 通道关闭走的最后一次刷盘同样不得覆写。
+        drop(flag);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let got2: Option<Vec<u32>> = read_json(&path).unwrap();
+        assert_eq!(got2, Some(vec![7]));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

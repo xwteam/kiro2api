@@ -109,6 +109,21 @@ impl BalanceCache {
         self.dirty.mark_dirty();
     }
 
+    /// 失效某凭据的缓存条目;返回是否确有条目被移除。
+    ///
+    /// 凭据被删除/替换时必须调用:凭据 id 会被后续新增的凭据复用,残留条目会让新账号
+    /// 在 TTL 内(最长 5 分钟)显示已删账号的余额与订阅档位。移除后置脏,落盘同步跟进。
+    pub async fn invalidate(&self, id: &str) -> bool {
+        let removed = {
+            let mut map = self.inner.write().await;
+            map.remove(id).is_some()
+        };
+        if removed {
+            self.dirty.mark_dirty();
+        }
+        removed
+    }
+
     /// 只读读取某凭据缓存里的订阅标题(subscription tier),要求缓存条目仍新鲜。
     /// 纯缓存读、绝不触发上游(语义与 [`get_fresh`] 一致):
     /// - 条目缺失 / 已过期 → `None`;
@@ -226,6 +241,27 @@ mod tests {
         assert_eq!(got[0].1.fetched_at_unix, 1000);
         // 空列表 → 空结果。
         assert!(cache.get_fresh_for_ids(&[], 1299).await.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn invalidate_drops_entry_so_reused_id_starts_clean() {
+        let dir = std::env::temp_dir().join(format!("kiro2api_bal_inv_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let cache = BalanceCache::load_from_dir(&dir);
+        cache.put("7", snap(1000)).await;
+        cache.put("8", snap(1000)).await;
+        // 凭据 7 被删除 → 失效其缓存;同 id 的新凭据不得继承旧余额/订阅档位。
+        assert!(cache.invalidate("7").await);
+        assert!(cache.get_fresh("7", 1100).await.is_none());
+        assert!(cache.tier_of("7", 1100).await.is_none());
+        // 其它凭据不受影响
+        assert!(cache.get_fresh("8", 1100).await.is_some());
+        assert_eq!(cache.len().await, 1);
+        // 重复失效/未知 id → false
+        assert!(!cache.invalidate("7").await);
+        assert!(!cache.invalidate("999").await);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

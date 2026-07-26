@@ -1,22 +1,39 @@
 //! 用量记录存储:按凭据分桶、每凭据 LRU 上限、CST 日聚合、分页查询。
 //!
-//! 内存布局:`RwLock<Vec<UsageRecord>>`(全量单向量,按 created_at 追加)。查询侧
-//! 在读锁下过滤/排序/分页;写侧在写锁下追加 + 单次 `retain` 逐凭据裁到上限。
-//! 落盘由 `persist` 层的脏标记 + 5s 定时器驱动,热路径不做 I/O。
+//! 内存布局:`RwLock<UsageState>` —— 原始记录(全量单向量,按 created_at 追加)+ 每凭据
+//! 存活计数 + **每日汇总**。查询侧在读锁下过滤/排序/分页;写侧在写锁下追加,超额记录累计
+//! 到阈值才做一次全表压实(把逐次插入的 O(n) 扫描摊销掉)。
+//!
+//! 每日汇总(`daily`)记的是**已被淘汰**的原始记录在当日(CST)的累计:记录淘汰前先并入
+//! 汇总,汇总自身按天保留(上限 [`DAILY_ROLLUP_MAX_DAYS`] 天)、不随原始记录淘汰,故
+//! [`UsageTracker::daily_rollup`] = 存活记录聚合 + 已淘汰累计,长窗口统计才有真正的兜底。
+//!
+//! 落盘由 `persist` 层的脏标记 + 5s 定时器驱动,热路径不做 I/O;后台任务只持 `Weak`,
+//! 停机时的最终刷盘由 [`UsageTracker::flush_now`] 显式驱动。
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::stats::model::{UsageRecord, cst_daykey};
-use crate::stats::persist::{DirtyFlag, dirty_channel, read_json, spawn_flush_loop};
+use crate::stats::persist::{
+    DirtyFlag, dirty_channel, read_json, spawn_flush_loop_opt, write_bytes_atomic,
+};
 
 /// 每凭据用量记录上限(超出淘汰最旧)。
 pub const USAGE_CAP_PER_CREDENTIAL: usize = 10_000;
 /// 单日记录导出上限(端点 6 契约:max 2000)。
 pub const DAILY_RECORDS_MAX: usize = 2_000;
+/// 每日汇总保留天数上限(超出丢最旧的日)。每天一条定长累计(几十字节),
+/// 400 天 ≈ 十几 KB,内存可忽略,且足够覆盖最长的 30d 窗口查询。
+pub const DAILY_ROLLUP_MAX_DAYS: usize = 400;
+/// 触发一次全表压实的超额条数:超过每凭据上限的记录先累计,攒够该阈值才压实一次,
+/// 把"每次插入都全表扫描"摊销成每 `EVICT_BATCH` 次插入一次 O(n)。
+/// 代价是记录数会短暂超出上限最多 `EVICT_BATCH` 条(纯内存冗余,查询口径不受影响)。
+const EVICT_BATCH: usize = 256;
 
 /// 一页记录 + 分页元信息。
 #[derive(Debug, Clone)]
@@ -154,33 +171,275 @@ impl ApiKeyUsageSummary {
     }
 }
 
+/// 已淘汰原始记录在某 CST 日的累计。当日总量 = 存活记录当日聚合 + 本累计。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+struct DayArchive {
+    requests: u64,
+    cost: f64,
+    credits: f64,
+}
+
+impl DayArchive {
+    /// 并入一条即将被淘汰的记录。credits 缺失记 0(与其它聚合口径一致)。
+    fn absorb(&mut self, r: &UsageRecord) {
+        self.requests += 1;
+        self.cost += r.estimated_cost;
+        self.credits += r.credits_used.unwrap_or(0.0);
+    }
+}
+
+/// 锁内状态:原始记录 + 每凭据存活计数 + 待压实超额数 + 每日汇总。
+#[derive(Default)]
+struct UsageState {
+    records: Vec<UsageRecord>,
+    /// credential_id → 存活记录条数。增量维护,免去每次插入的全表扫描。
+    counts: HashMap<u32, usize>,
+    /// 已超出每凭据上限、尚未压实的记录数。
+    overflow: usize,
+    /// CST 日键 → 已淘汰记录的当日累计(按键升序即按日期升序,便于裁最旧的日)。
+    daily: BTreeMap<String, DayArchive>,
+}
+
+impl UsageState {
+    /// 由落盘内容构造:重算计数,并把超限部分(旧文件可能是别的上限写的)立即压实。
+    fn from_persisted(p: PersistedUsage, cap: usize) -> Self {
+        let mut st = Self {
+            records: p.records,
+            counts: HashMap::new(),
+            overflow: 0,
+            daily: p.daily,
+        };
+        st.recount(cap);
+        st.compact(cap);
+        st.trim_daily();
+        st
+    }
+
+    /// 追加一条记录;仅当超额攒够 [`EVICT_BATCH`] 才做一次全表压实。
+    fn push(&mut self, rec: UsageRecord, cap: usize) {
+        let c = self.counts.entry(rec.credential_id).or_insert(0);
+        *c += 1;
+        if *c > cap {
+            self.overflow += 1;
+        }
+        self.records.push(rec);
+        if self.overflow >= EVICT_BATCH {
+            self.compact(cap);
+        }
+    }
+
+    /// 逐凭据裁到 `cap`:单次 O(n) 从后往前保留每凭据最新 `cap` 条,**被淘汰的记录先
+    /// 并入当日汇总**再丢弃(汇总因此不随原始记录淘汰而丢失)。
+    /// 记录整体按 created_at 追加(近似有序),从尾扫描按凭据计数即可。
+    fn compact(&mut self, cap: usize) {
+        if self.overflow == 0 {
+            return;
+        }
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        // 从最新(尾)往最旧(头)扫,标记每凭据超过 cap 的旧记录待删。
+        let mut keep = vec![true; self.records.len()];
+        for i in (0..self.records.len()).rev() {
+            let c = counts.entry(self.records[i].credential_id).or_insert(0);
+            *c += 1;
+            if *c > cap {
+                keep[i] = false;
+            }
+        }
+        let old = std::mem::take(&mut self.records);
+        let mut kept = Vec::with_capacity(old.len());
+        for (i, r) in old.into_iter().enumerate() {
+            if keep[i] {
+                kept.push(r);
+            } else {
+                self.daily
+                    .entry(cst_daykey(r.created_at_unix))
+                    .or_default()
+                    .absorb(&r);
+            }
+        }
+        self.records = kept;
+        self.trim_daily();
+        self.recount(cap);
+    }
+
+    /// 每日汇总只保留最近 [`DAILY_ROLLUP_MAX_DAYS`] 天(BTreeMap 键序即日期序)。
+    fn trim_daily(&mut self) {
+        while self.daily.len() > DAILY_ROLLUP_MAX_DAYS {
+            self.daily.pop_first();
+        }
+    }
+
+    /// 全量重算每凭据计数与待压实超额数(压实后、批量删除后调用)。
+    fn recount(&mut self, cap: usize) {
+        self.counts.clear();
+        for r in &self.records {
+            *self.counts.entry(r.credential_id).or_insert(0) += 1;
+        }
+        self.overflow = self.counts.values().map(|c| c.saturating_sub(cap)).sum();
+    }
+
+    /// 锁内低成本快照:只克隆,序列化留到锁外做。
+    fn to_persisted(&self) -> PersistedUsage {
+        PersistedUsage {
+            records: self.records.clone(),
+            daily: self.daily.clone(),
+        }
+    }
+}
+
+/// 落盘结构(v1):原始记录 + 已淘汰记录的每日累计。
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistedUsage {
+    records: Vec<UsageRecord>,
+    #[serde(default)]
+    daily: BTreeMap<String, DayArchive>,
+}
+
+/// 落盘文件的兼容外壳:v1 为对象,更早的版本落的是裸记录数组。
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PersistedFile {
+    Structured(PersistedUsage),
+    /// 旧格式:`[UsageRecord, ...]`,无每日汇总。
+    Legacy(Vec<UsageRecord>),
+}
+
+impl From<PersistedFile> for PersistedUsage {
+    fn from(f: PersistedFile) -> Self {
+        match f {
+            PersistedFile::Structured(p) => p,
+            PersistedFile::Legacy(records) => PersistedUsage {
+                records,
+                daily: BTreeMap::new(),
+            },
+        }
+    }
+}
+
+/// 载入落盘文件:
+/// - 不存在 → 空库(首次运行的正常路径,静默);
+/// - 存在但读取/解析失败 → **error 日志 + 把损坏文件改名备份**后按空库继续,
+///   绝不让随后的原子写静默覆盖掉可能可挽救的历史。
+fn load_persisted(path: &Path) -> PersistedUsage {
+    match read_json::<PersistedFile>(path) {
+        Ok(Some(f)) => f.into(),
+        Ok(None) => PersistedUsage::default(),
+        Err(e) => {
+            let backup = corrupt_backup_path(path);
+            match std::fs::rename(path, &backup) {
+                Ok(()) => tracing::error!(
+                    path = %path.display(),
+                    backup = %backup.display(),
+                    error = %e,
+                    "用量记录文件损坏或不兼容,已改名备份,按空库继续"
+                ),
+                Err(re) => tracing::error!(
+                    path = %path.display(),
+                    error = %e,
+                    rename_error = %re,
+                    "用量记录文件损坏或不兼容,且备份改名失败,按空库继续(下次刷盘将覆盖该文件)"
+                ),
+            }
+            PersistedUsage::default()
+        }
+    }
+}
+
+/// 损坏文件的备份路径:`{path}.corrupt.{unix秒}.{序号}`,取第一个不存在的候选,
+/// 保证同秒内多次备份互不覆盖。全部候选都被占用时回落到最后一个。
+fn corrupt_backup_path(path: &Path) -> PathBuf {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let with_suffix = |n: u32| {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(format!(".corrupt.{secs}.{n}"));
+        PathBuf::from(s)
+    };
+    for n in 0..100 {
+        let cand = with_suffix(n);
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    with_suffix(99)
+}
+
+/// 序列化落盘快照:紧凑 JSON(该文件只供本程序回读,pretty 只是徒增写盘量)。
+/// 序列化失败(如出现非有限浮点)返回 `None` —— 本轮跳过写盘,保留磁盘上一版本,
+/// 而不是把空内容原子覆写上去。
+fn serialize_snapshot(snap: &PersistedUsage) -> Option<Vec<u8>> {
+    match serde_json::to_vec(snap) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            tracing::error!(error = %e, "用量记录序列化失败,本轮跳过刷盘");
+            None
+        }
+    }
+}
+
 /// 用量追踪器。`Arc<UsageTracker>` 可在 relay 与 admin 间共享。
 pub struct UsageTracker {
-    records: RwLock<Vec<UsageRecord>>,
+    state: RwLock<UsageState>,
     dirty: DirtyFlag,
+    /// 落盘路径,供 [`flush_now`](Self::flush_now) 在停机流程里显式刷盘。
+    path: PathBuf,
 }
 
 impl UsageTracker {
-    /// 从 `path` 载入(不存在则空),并启动后台刷盘任务。
+    /// 从 `path` 载入(不存在则空;损坏则备份后按空库继续),并启动后台刷盘任务。
     pub fn load(path: PathBuf) -> Arc<Self> {
-        let initial: Vec<UsageRecord> = read_json(&path).ok().flatten().unwrap_or_default();
+        let initial = UsageState::from_persisted(load_persisted(&path), USAGE_CAP_PER_CREDENTIAL);
         let (dirty, handle) = dirty_channel();
         let tracker = Arc::new(Self {
-            records: RwLock::new(initial),
+            state: RwLock::new(initial),
             dirty,
+            path: path.clone(),
         });
-        let snap = tracker.clone();
-        spawn_flush_loop(
+        // 后台任务只持 Weak:持 Arc 会与 tracker 构成自引用环,`DirtyFlag` 永不析构、
+        // 通道永不关闭,"关闭时最终刷盘"分支不可达。停机刷盘走显式的 `flush_now`。
+        let weak = Arc::downgrade(&tracker);
+        spawn_flush_loop_opt(
             path,
             handle,
             crate::stats::persist::FLUSH_INTERVAL_SECS,
             move || {
+                let tracker = weak.upgrade()?;
                 // 同步取快照:阻塞式读锁(在 spawn_blocking 线程里,可接受)。
-                let guard = snap.records.blocking_read();
-                serde_json::to_vec_pretty(&*guard).unwrap_or_else(|_| b"[]".to_vec())
+                // 锁内只克隆,序列化移到锁外,避免每 5s 在读锁里做全量 JSON 序列化。
+                let snap = {
+                    let guard = tracker.state.blocking_read();
+                    guard.to_persisted()
+                };
+                drop(tracker);
+                serialize_snapshot(&snap)
             },
         );
         tracker
+    }
+
+    /// 立即把当前用量记录与每日汇总同步落盘(原子写),不等后台去抖定时器。
+    ///
+    /// 停机流程的最终刷盘入口:后台任务只在每 5s 的拍子上落盘,进程退出时最近一拍
+    /// 之后的记录尚在内存,须由停机流程显式调用本方法(`stats.usage.flush_now().await`)。
+    /// 失败只记 error 日志,不 panic、不阻断停机。
+    pub async fn flush_now(&self) {
+        let snap = {
+            let guard = self.state.read().await;
+            guard.to_persisted()
+        };
+        let path = self.path.clone();
+        let res = tokio::task::spawn_blocking(move || match serde_json::to_vec(&snap) {
+            Ok(bytes) => write_bytes_atomic(&path, &bytes),
+            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(error = %e, "用量记录最终刷盘失败"),
+            Err(e) => tracing::error!(error = %e, "用量记录最终刷盘任务 join 失败"),
+        }
     }
 
     /// 记录一条用量(热路径,fire-and-forget)。追加后按凭据裁到上限,置脏。
@@ -285,9 +544,8 @@ impl UsageTracker {
             latency_ms,
         };
         {
-            let mut guard = self.records.write().await;
-            guard.push(rec);
-            evict_per_credential(&mut guard, USAGE_CAP_PER_CREDENTIAL);
+            let mut guard = self.state.write().await;
+            guard.push(rec, USAGE_CAP_PER_CREDENTIAL);
         }
         self.dirty.mark_dirty();
     }
@@ -299,8 +557,9 @@ impl UsageTracker {
         page: usize,
         page_size: usize,
     ) -> Page<UsageRecord> {
-        let guard = self.records.read().await;
+        let guard = self.state.read().await;
         let mut filtered: Vec<UsageRecord> = guard
+            .records
             .iter()
             .filter(|r| r.credential_id == credential_id)
             .cloned()
@@ -313,9 +572,9 @@ impl UsageTracker {
     /// 某凭据当日(CST,以 `now_unix` 定"今天")聚合。
     pub async fn today_summary(&self, credential_id: u32, now_unix: i64) -> DaySummary {
         let today = cst_daykey(now_unix);
-        let guard = self.records.read().await;
+        let guard = self.state.read().await;
         let mut s = DaySummary::default();
-        for r in guard.iter() {
+        for r in guard.records.iter() {
             if r.credential_id == credential_id && cst_daykey(r.created_at_unix) == today {
                 s.total_requests += 1;
                 s.total_input_tokens += r.input_tokens as i64;
@@ -328,10 +587,27 @@ impl UsageTracker {
     }
 
     /// 全部 CST 日的全局聚合,按日期降序(最新在前)。
+    ///
+    /// 口径 = **存活原始记录**当日聚合 + **已淘汰记录**的当日累计(见模块头)。后者独立
+    /// 留存、不随每凭据 LRU 淘汰而消失,故本汇总恒 ≥ 直接扫原始记录的结果,长窗口
+    /// (7d/30d)的兜底补齐才真正生效。tokens 无当日累计,故此结构只给 requests/cost/credits。
+    ///
+    /// 注意:已并入汇总的历史累计不随 `reset_*` 回退(汇总是跨凭据/跨 key 的全局口径)。
     pub async fn daily_rollup(&self) -> Vec<DailyRollup> {
-        let guard = self.records.read().await;
+        let guard = self.state.read().await;
         let mut by_day: HashMap<String, DailyRollup> = HashMap::new();
-        for r in guard.iter() {
+        for (date, a) in guard.daily.iter() {
+            by_day.insert(
+                date.clone(),
+                DailyRollup {
+                    date: date.clone(),
+                    total_requests: a.requests,
+                    total_cost: a.cost,
+                    total_credits: a.credits,
+                },
+            );
+        }
+        for r in guard.records.iter() {
             let day = cst_daykey(r.created_at_unix);
             let e = by_day.entry(day.clone()).or_insert(DailyRollup {
                 date: day,
@@ -358,18 +634,19 @@ impl UsageTracker {
     ///
     /// 注意:原始记录按凭据有 `USAGE_CAP_PER_CREDENTIAL` 上限,极长窗口(如 30d)下
     /// 高流量凭据的最旧记录可能已被淘汰,故此方法只保证"未被淘汰的原始记录"精确求和;
-    /// handler 侧对长窗口会用每日汇总(`daily_rollup`)交叉校验/兜底补齐(见 handler 注释)。
+    /// handler 侧对长窗口会用每日汇总(`daily_rollup`,含已淘汰记录的当日累计)交叉校验/
+    /// 兜底补齐(见 handler 注释)。
     pub async fn range_summary(
         &self,
         since_unix: i64,
         until_unix: i64,
         bucket_secs: i64,
     ) -> (RangeSummary, Vec<UsageBucket>) {
-        let guard = self.records.read().await;
+        let guard = self.state.read().await;
         let mut s = RangeSummary::default();
         // 桶:bucket_start_unix → (requests, cost, credits)
         let mut buckets: HashMap<i64, (u64, f64, f64)> = HashMap::new();
-        for r in guard.iter() {
+        for r in guard.records.iter() {
             if r.created_at_unix < since_unix || r.created_at_unix > until_unix {
                 continue;
             }
@@ -415,9 +692,9 @@ impl UsageTracker {
         since_unix: i64,
         until_unix: i64,
     ) -> HashMap<String, (u64, f64, f64)> {
-        let guard = self.records.read().await;
+        let guard = self.state.read().await;
         let mut by_day: HashMap<String, (u64, f64, f64)> = HashMap::new();
-        for r in guard.iter() {
+        for r in guard.records.iter() {
             if r.created_at_unix < since_unix || r.created_at_unix > until_unix {
                 continue;
             }
@@ -438,8 +715,9 @@ impl UsageTracker {
         page: usize,
         page_size: usize,
     ) -> Page<UsageRecord> {
-        let guard = self.records.read().await;
+        let guard = self.state.read().await;
         let mut filtered: Vec<UsageRecord> = guard
+            .records
             .iter()
             .filter(|r| cst_daykey(r.created_at_unix) == date)
             .cloned()
@@ -457,10 +735,10 @@ impl UsageTracker {
 
     /// 单个 API-KEY 的用量聚合;无任何记录时返回全零(非 None,便于 handler 直接输出)。
     pub async fn summary_for_api_key(&self, api_key_id: u32) -> ApiKeyUsageSummary {
-        let guard = self.records.read().await;
+        let guard = self.state.read().await;
         let mut s = ApiKeyUsageSummary::new(api_key_id);
         let mut by_model: HashMap<String, ModelAgg> = HashMap::new();
-        for r in guard.iter() {
+        for r in guard.records.iter() {
             if r.api_key_id == api_key_id {
                 s.accumulate(r, &mut by_model);
             }
@@ -471,9 +749,9 @@ impl UsageTracker {
 
     /// 所有出现过的 API-KEY 的用量聚合(按 api_key_id 升序);不含 id=0 的无归属记录。
     pub async fn summaries_by_api_key(&self) -> Vec<ApiKeyUsageSummary> {
-        let guard = self.records.read().await;
+        let guard = self.state.read().await;
         let mut acc: HashMap<u32, (ApiKeyUsageSummary, HashMap<String, ModelAgg>)> = HashMap::new();
-        for r in guard.iter() {
+        for r in guard.records.iter() {
             if r.api_key_id == 0 {
                 continue;
             }
@@ -501,8 +779,9 @@ impl UsageTracker {
         page: usize,
         page_size: usize,
     ) -> Page<UsageRecord> {
-        let guard = self.records.read().await;
+        let guard = self.state.read().await;
         let mut filtered: Vec<UsageRecord> = guard
+            .records
             .iter()
             .filter(|r| r.api_key_id == api_key_id)
             .cloned()
@@ -513,13 +792,29 @@ impl UsageTracker {
     }
 
     /// 删除某 API-KEY 的全部用量记录;返回删除条数。置脏触发落盘。
+    /// 已并入每日汇总的历史累计(已淘汰部分)不回退,见 [`daily_rollup`](Self::daily_rollup)。
     pub async fn reset_api_key(&self, api_key_id: u32) -> usize {
+        self.retain_records(|r| r.api_key_id != api_key_id).await
+    }
+
+    /// 删除某凭据的全部用量记录;返回删除条数。凭据被删除/替换时调用,避免数值 id
+    /// 复用后新凭据继承已删账号的用量历史。已并入每日汇总的历史累计不回退。
+    pub async fn reset_credential(&self, credential_id: u32) -> usize {
+        self.retain_records(|r| r.credential_id != credential_id)
+            .await
+    }
+
+    /// 按谓词保留记录,返回删除条数;有删除则重算计数并置脏。
+    async fn retain_records(&self, keep: impl Fn(&UsageRecord) -> bool) -> usize {
         let removed;
         {
-            let mut guard = self.records.write().await;
-            let before = guard.len();
-            guard.retain(|r| r.api_key_id != api_key_id);
-            removed = before - guard.len();
+            let mut guard = self.state.write().await;
+            let before = guard.records.len();
+            guard.records.retain(|r| keep(r));
+            removed = before - guard.records.len();
+            if removed > 0 {
+                guard.recount(USAGE_CAP_PER_CREDENTIAL);
+            }
         }
         if removed > 0 {
             self.dirty.mark_dirty();
@@ -529,43 +824,18 @@ impl UsageTracker {
 
     /// 当前记录总条数(测试/观测用)。
     pub async fn len(&self) -> usize {
-        self.records.read().await.len()
+        self.state.read().await.records.len()
     }
 
     /// 是否为空。
     pub async fn is_empty(&self) -> bool {
-        self.records.read().await.is_empty()
+        self.state.read().await.records.is_empty()
     }
 }
 
 /// 按 created_at 降序(最新在前);同刻按插入顺序稳定。
 fn sort_desc(v: &mut [UsageRecord]) {
     v.sort_by(|a, b| b.created_at_unix.cmp(&a.created_at_unix));
-}
-
-/// 逐凭据裁剪到 `cap`:单次 O(n) 从后往前保留每凭据最新 `cap` 条,删更旧的。
-/// 记录整体按 created_at 追加(近似有序),从尾扫描按凭据计数即可。
-fn evict_per_credential(v: &mut Vec<UsageRecord>, cap: usize) {
-    // 快速路径:没有任何凭据可能超限时直接返回。
-    if v.len() <= cap {
-        return;
-    }
-    let mut counts: HashMap<u32, usize> = HashMap::new();
-    // 从最新(尾)往最旧(头)扫,标记每凭据超过 cap 的旧记录待删。
-    let mut keep = vec![true; v.len()];
-    for i in (0..v.len()).rev() {
-        let c = counts.entry(v[i].credential_id).or_insert(0);
-        *c += 1;
-        if *c > cap {
-            keep[i] = false;
-        }
-    }
-    let mut idx = 0;
-    v.retain(|_| {
-        let k = keep[idx];
-        idx += 1;
-        k
-    });
 }
 
 /// 通用分页的公开封装,供 eventlog 等同层模块复用。
@@ -645,24 +915,32 @@ mod tests {
     }
 
     #[test]
-    fn evict_keeps_newest_per_credential() {
-        // cred 1 放 5 条(at 1..=5),cred 2 放 2 条;cap=3
-        let mut v = vec![
-            rec(1, 1, 0.0, 0),
-            rec(1, 2, 0.0, 0),
-            rec(2, 10, 0.0, 0),
-            rec(1, 3, 0.0, 0),
-            rec(1, 4, 0.0, 0),
-            rec(2, 11, 0.0, 0),
-            rec(1, 5, 0.0, 0),
-        ];
-        evict_per_credential(&mut v, 3);
-        let cred1: Vec<i64> = v
+    fn compact_keeps_newest_per_credential_and_archives_evicted() {
+        // cred 1 放 5 条(at 1..=5,cost 1.0/条),cred 2 放 2 条;cap=3
+        let mut st = UsageState::default();
+        for r in [
+            rec(1, 1, 1.0, 0),
+            rec(1, 2, 1.0, 0),
+            rec(2, 10, 1.0, 0),
+            rec(1, 3, 1.0, 0),
+            rec(1, 4, 1.0, 0),
+            rec(2, 11, 1.0, 0),
+            rec(1, 5, 1.0, 0),
+        ] {
+            st.push(r, 3);
+        }
+        // cred1 超限 2 条,但未到批量阈值 → 尚未压实
+        assert_eq!(st.overflow, 2);
+        assert_eq!(st.records.len(), 7);
+        st.compact(3);
+        let cred1: Vec<i64> = st
+            .records
             .iter()
             .filter(|r| r.credential_id == 1)
             .map(|r| r.created_at_unix)
             .collect();
-        let cred2: Vec<i64> = v
+        let cred2: Vec<i64> = st
+            .records
             .iter()
             .filter(|r| r.credential_id == 2)
             .map(|r| r.created_at_unix)
@@ -671,6 +949,59 @@ mod tests {
         assert_eq!(cred1, vec![3, 4, 5]);
         // cred2 未超限,全留
         assert_eq!(cred2, vec![10, 11]);
+        // 被淘汰的 2 条先并入当日汇总,不再凭空消失
+        let day = cst_daykey(1);
+        assert_eq!(st.daily.get(&day).unwrap().requests, 2);
+        assert!((st.daily.get(&day).unwrap().cost - 2.0).abs() < 1e-9);
+        // 压实后计数归位、无待压实超额
+        assert_eq!(st.overflow, 0);
+        assert_eq!(st.counts.get(&1).copied(), Some(3));
+        assert_eq!(st.counts.get(&2).copied(), Some(2));
+    }
+
+    #[test]
+    fn push_defers_compaction_until_batch_threshold() {
+        let cap = 2usize;
+        let mut st = UsageState::default();
+        // 攒到差一条触发阈值:此前一次全表压实都不做(避免每插一条扫全表)。
+        for i in 0..(cap + EVICT_BATCH - 1) as i64 {
+            st.push(rec(1, 1000 + i, 1.0, 0), cap);
+        }
+        assert_eq!(st.records.len(), cap + EVICT_BATCH - 1);
+        assert_eq!(st.overflow, EVICT_BATCH - 1);
+        assert!(st.daily.is_empty());
+        // 再插一条达阈值 → 压实一次,超出上限的记录全部并入当日汇总
+        st.push(rec(1, 1000 + (cap + EVICT_BATCH - 1) as i64, 1.0, 0), cap);
+        assert_eq!(st.records.len(), cap);
+        assert_eq!(st.overflow, 0);
+        let day = cst_daykey(1000);
+        assert_eq!(st.daily.get(&day).unwrap().requests, EVICT_BATCH as u64);
+    }
+
+    #[test]
+    fn daily_archive_trims_to_max_days() {
+        let mut st = UsageState::default();
+        // 造 MAX+5 天的汇总(每天一条),裁剪后只留最近 MAX 天。
+        for d in 0..(DAILY_ROLLUP_MAX_DAYS + 5) as i64 {
+            st.daily.insert(
+                cst_daykey(d * 86400),
+                DayArchive {
+                    requests: 1,
+                    cost: 1.0,
+                    credits: 0.0,
+                },
+            );
+        }
+        st.trim_daily();
+        assert_eq!(st.daily.len(), DAILY_ROLLUP_MAX_DAYS);
+        // 最旧的 5 天被丢弃,最新一天保留
+        assert!(!st.daily.contains_key(&cst_daykey(0)));
+        assert!(!st.daily.contains_key(&cst_daykey(4 * 86400)));
+        assert!(st.daily.contains_key(&cst_daykey(5 * 86400)));
+        assert!(
+            st.daily
+                .contains_key(&cst_daykey((DAILY_ROLLUP_MAX_DAYS as i64 + 4) * 86400))
+        );
     }
 
     #[tokio::test]
@@ -893,6 +1224,181 @@ mod tests {
         // 单日记录
         let recs = t.records_for_day("2026-06-27", 1, 10).await;
         assert_eq!(recs.total, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn daily_rollup_includes_evicted_archive() {
+        let path =
+            std::env::temp_dir().join(format!("kiro2api_usage_arch_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let t = UsageTracker::load(path.clone());
+        let d27 = chrono::DateTime::parse_from_rfc3339("2026-06-27T02:00:00Z")
+            .unwrap()
+            .timestamp(); // 27 CST
+        t.record_usage(1, "m".into(), 1, 1, 2.0, None, None, None, d27)
+            .await;
+        // 模拟这一日另有 3 条记录早已被 LRU 淘汰(淘汰前已并入当日汇总)。
+        {
+            let mut guard = t.state.write().await;
+            guard.daily.insert(
+                "2026-06-27".into(),
+                DayArchive {
+                    requests: 3,
+                    cost: 3.0,
+                    credits: 1.5,
+                },
+            );
+            // 另一天:该日记录全被淘汰,存活记录里已无此日 —— 汇总仍须给出该日。
+            guard.daily.insert(
+                "2026-06-20".into(),
+                DayArchive {
+                    requests: 5,
+                    cost: 5.0,
+                    credits: 0.0,
+                },
+            );
+        }
+        let roll = t.daily_rollup().await;
+        assert_eq!(roll.len(), 2);
+        // 降序:27 在前;当日 = 存活 1 条 + 已淘汰 3 条
+        assert_eq!(roll[0].date, "2026-06-27");
+        assert_eq!(roll[0].total_requests, 4);
+        assert!((roll[0].total_cost - 5.0).abs() < 1e-9);
+        assert!((roll[0].total_credits - 1.5).abs() < 1e-9);
+        // 全被淘汰的那天不因原始记录消失而丢失(长窗口兜底的关键)
+        assert_eq!(roll[1].date, "2026-06-20");
+        assert_eq!(roll[1].total_requests, 5);
+        // 原始记录聚合仍只看存活记录(兜底靠二者之差)
+        let raw = t.raw_daily_agg_in_window(d27 - 86400, d27 + 86400).await;
+        assert_eq!(raw.get("2026-06-27").copied().unwrap().0, 1);
+        assert!(!raw.contains_key("2026-06-20"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn flush_now_persists_records_and_daily_across_reload() {
+        let name = format!("kiro2api_usage_flushnow_{}.json", std::process::id());
+        let path = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_file(&path);
+        {
+            let t = UsageTracker::load(path.clone());
+            t.record_usage(3, "m".into(), 10, 20, 0.25, None, None, None, 1000)
+                .await;
+            {
+                let mut guard = t.state.write().await;
+                guard.daily.insert(
+                    "1970-01-01".into(),
+                    DayArchive {
+                        requests: 7,
+                        cost: 7.0,
+                        credits: 3.5,
+                    },
+                );
+            }
+            // 不等 5s 定时器:停机流程显式刷盘。
+            t.flush_now().await;
+            // 紧凑序列化(机器读文件),不含 pretty 的换行缩进。
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(!raw.contains("\n  "), "落盘应为紧凑 JSON: {raw}");
+            drop(t);
+        }
+        // 重新载入:原始记录与每日汇总都要回来。
+        let t2 = UsageTracker::load(path.clone());
+        assert_eq!(t2.len().await, 1);
+        let roll = t2.daily_rollup().await;
+        assert_eq!(roll.len(), 1);
+        assert_eq!(roll[0].date, "1970-01-01");
+        // 1 条存活(1000 秒属 1970-01-01 CST)+ 7 条已淘汰
+        assert_eq!(roll[0].total_requests, 8);
+        assert!((roll[0].total_credits - 3.5).abs() < 1e-9);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn dropping_tracker_does_not_clobber_persisted_file() {
+        let path =
+            std::env::temp_dir().join(format!("kiro2api_usage_drop_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let t = UsageTracker::load(path.clone());
+        t.record_usage(1, "m".into(), 1, 1, 1.0, None, None, None, 1000)
+            .await;
+        t.flush_now().await;
+        // 丢弃最后一个强引用:后台任务只持 Weak → 通道关闭、任务退出,
+        // 且最后一次刷盘拿不到快照时必须跳过写盘,而不是把空库覆写上去。
+        drop(t);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let t2 = UsageTracker::load(path.clone());
+        assert_eq!(t2.len().await, 1, "进程内丢弃 tracker 不得清空已落盘记录");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn corrupt_file_is_backed_up_not_silently_overwritten() {
+        let dir =
+            std::env::temp_dir().join(format!("kiro2api_usage_corrupt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("usage_records.json");
+        std::fs::write(&path, b"{ this is not valid json").unwrap();
+
+        let t = UsageTracker::load(path.clone());
+        assert!(t.is_empty().await);
+        // 原文件被改名备份走,内容原样保留;原路径不再存在(下次刷盘才会新建)。
+        assert!(!path.exists(), "损坏文件必须改名,不能留在原地被静默覆盖");
+        let backups: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains(".corrupt."))
+            .collect();
+        assert_eq!(backups.len(), 1, "应有且仅有一个备份文件");
+        assert_eq!(
+            std::fs::read(&backups[0]).unwrap(),
+            b"{ this is not valid json".to_vec()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn loads_legacy_bare_array_file() {
+        let path =
+            std::env::temp_dir().join(format!("kiro2api_usage_legacy_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // 旧版本落的是裸数组(无每日汇总),必须仍能载入且不触发损坏备份。
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&vec![rec(1, 1000, 1.0, 5), rec(2, 1001, 2.0, 6)]).unwrap(),
+        )
+        .unwrap();
+        let t = UsageTracker::load(path.clone());
+        assert_eq!(t.len().await, 2);
+        let roll = t.daily_rollup().await;
+        assert_eq!(roll.len(), 1);
+        assert_eq!(roll[0].total_requests, 2);
+        assert!(path.exists(), "旧格式不是损坏文件,不应被改名备份");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn reset_credential_clears_only_that_credential() {
+        let path =
+            std::env::temp_dir().join(format!("kiro2api_usage_resetc_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let t = UsageTracker::load(path.clone());
+        t.record_usage(1, "m".into(), 1, 1, 1.0, None, None, None, 1000)
+            .await;
+        t.record_usage(1, "m".into(), 1, 1, 1.0, None, None, None, 1001)
+            .await;
+        t.record_usage(2, "m".into(), 1, 1, 1.0, None, None, None, 1002)
+            .await;
+        // 凭据 1 被删除 → 清其用量历史,避免 id 复用后被新凭据继承。
+        assert_eq!(t.reset_credential(1).await, 2);
+        assert_eq!(t.records_for_credential(1, 1, 10).await.total, 0);
+        assert_eq!(t.records_for_credential(2, 1, 10).await.total, 1);
+        // 计数随之收敛,重复删除返回 0。
+        assert_eq!(t.reset_credential(1).await, 0);
+        assert_eq!(t.len().await, 1);
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -64,13 +64,28 @@ impl ModelsCache {
         map.get(id).is_some_and(|s| s.is_fresh(now_unix))
     }
 
-    /// 所有账号仍新鲜缓存的并集:按规范化 id 去重(先出现者优先),再按 id 升序排序。
+    /// 失效某凭据的缓存条目;返回是否确有条目被移除。
+    ///
+    /// 凭据被删除/替换时必须调用:凭据 id 会被后续新增的凭据复用,残留条目会让新账号
+    /// 在 TTL 内(最长 30 分钟)沿用已删账号的模型清单,并混入 `get_union` 的并集。
+    pub async fn invalidate(&self, id: &str) -> bool {
+        let mut map = self.inner.write().await;
+        map.remove(id).is_some()
+    }
+
+    /// 所有账号仍新鲜缓存的并集:按规范化 id 去重,再按 id 升序排序。
     /// 空缓存/全过期时返回空 Vec(调用方据此回落静态目录)。
+    ///
+    /// 去重优先级按**凭据 id 字典序升序**取先出现者:同一模型被多个账号报告且
+    /// `max_tokens`/`rate_multiplier` 不一致时,恒取凭据 id 最小的那份。直接迭代
+    /// `HashMap` 的话顺序随机,同一模型的这两个字段会在两次调用间抖动。
     pub async fn get_union(&self, now_unix: u64) -> Vec<ModelInfo> {
         let map = self.inner.read().await;
+        let mut entries: Vec<(&String, &ModelsSnapshot)> = map.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut out: Vec<ModelInfo> = Vec::new();
-        for snap in map.values() {
+        for (_, snap) in entries {
             if !snap.is_fresh(now_unix) {
                 continue;
             }
@@ -206,5 +221,56 @@ mod tests {
     async fn empty_cache_union_is_empty() {
         let cache = ModelsCache::new();
         assert!(cache.get_union(1000).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn union_dedupe_is_deterministic_across_cache_instances() {
+        // 同一模型被两个账号报告、字段不同:必须恒取凭据 id 最小("a")的那份,
+        // 不随 HashMap 的随机迭代序在两次(两个进程/两个实例)之间抖动。
+        let mut a_first = info("claude-sonnet-5", "anthropic", 200_000);
+        a_first.rate_multiplier = Some(1.0);
+        let mut b_second = info("claude-sonnet-5", "anthropic", 8_192);
+        b_second.rate_multiplier = Some(9.0);
+        // 每个 HashMap 实例有独立的随机哈希种子,多建几个实例即可暴露顺序依赖。
+        for round in 0..16 {
+            let cache = ModelsCache::new();
+            // 插入顺序也交替,确保结果只由 id 序决定。
+            if round % 2 == 0 {
+                cache.put("a", vec![a_first.clone()], 1000).await;
+                cache.put("b", vec![b_second.clone()], 1000).await;
+            } else {
+                cache.put("b", vec![b_second.clone()], 1000).await;
+                cache.put("a", vec![a_first.clone()], 1000).await;
+            }
+            let union = cache.get_union(1000).await;
+            assert_eq!(union.len(), 1);
+            assert_eq!(
+                union[0].max_tokens, 200_000,
+                "第 {round} 轮取到了非最小 id 的那份"
+            );
+            assert_eq!(union[0].rate_multiplier, Some(1.0));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalidate_drops_entry_and_removes_it_from_union() {
+        let cache = ModelsCache::new();
+        cache
+            .put("7", vec![info("gone-model", "kiro", 0)], 1000)
+            .await;
+        cache
+            .put("8", vec![info("kept-model", "kiro", 0)], 1000)
+            .await;
+        // 凭据 7 被删除 → 其模型清单立即失效,同 id 的新凭据不得继承。
+        assert!(cache.invalidate("7").await);
+        assert!(cache.get_fresh("7", 1000).await.is_none());
+        assert!(!cache.is_fresh("7", 1000).await);
+        let union = cache.get_union(1000).await;
+        assert_eq!(union.len(), 1);
+        assert_eq!(union[0].id, "kept-model");
+        // 重复失效/未知 id → false
+        assert!(!cache.invalidate("7").await);
+        assert!(!cache.invalidate("999").await);
+        assert_eq!(cache.len().await, 1);
     }
 }

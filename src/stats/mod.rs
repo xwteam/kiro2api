@@ -57,6 +57,16 @@ impl StatsManager {
         })
     }
 
+    /// 停机时的最终刷盘:把用量记录与每日汇总同步落盘(原子写),不等 5s 去抖定时器。
+    ///
+    /// 优雅停机(SIGTERM/Ctrl-C)流程应在退出前 `await` 本方法(`stats.flush_now().await`),
+    /// 否则最近一拍之后的用量与计费记录只在内存里,重启即丢。失败只记 error 日志,不阻断停机。
+    ///
+    /// 口径:只刷用量记录(计费相关);失败/限流事件日志仍由各自后台任务按拍落盘。
+    pub async fn flush_now(&self) {
+        self.usage.flush_now().await;
+    }
+
     /// 记录一次失败(401/403)。响应体截断到 2000 字符。热路径 fire-and-forget。
     pub async fn record_failure(
         &self,
@@ -185,6 +195,25 @@ mod tests {
         assert_eq!(tp.items[0].status_code, 429);
         assert_eq!(tp.items[0].request_type, "mcp");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn manager_flush_now_persists_usage_for_shutdown() {
+        let dir = std::env::temp_dir().join(format!("kiro2api_statsflush_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        {
+            let mgr = StatsManager::load_from_dir(&dir);
+            mgr.usage
+                .record_usage(1, "m".into(), 10, 20, 0.5, None, None, None, 1000)
+                .await;
+            // 停机流程的最终刷盘:不等 5s 去抖定时器。
+            mgr.flush_now().await;
+        }
+        // 重新载入应看到刚才那条(否则重启会丢最近几秒的用量/计费)。
+        let reloaded = StatsManager::load_from_dir(&dir);
+        assert_eq!(reloaded.usage.len().await, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
