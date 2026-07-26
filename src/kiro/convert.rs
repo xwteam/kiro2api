@@ -4,6 +4,9 @@
 //! `tool_use`(历史)/ `image` 内容块,以及工具规格 `tools`→`spectask`);
 //! Kiro 事件流帧(已解码为 [`Message`])→ Anthropic `MessagesResponse`(响应侧
 //! `tool_use` 块见后续任务)。
+//!
+//! 上游在 200 事件流里下发的错误(非截断类 exception 帧)不进响应体,而是经
+//! [`extract_exception`] / [`exception_status`] 交给协议层转成对外错误状态码。
 
 use std::fmt;
 
@@ -152,19 +155,42 @@ fn map_tools(tools: &[ToolDef]) -> Vec<ToolSpec> {
         .collect()
 }
 
-/// 把 `tool_result` 块的 `content`(字符串或文本块数组)拍平成纯文本(照观测)。
+/// 把 `tool_result` 块的 `content`(字符串或内容块数组)拍平成纯文本(照观测)。
+///
+/// 数组元素的处理:带 `text` 的块取其文本;裸字符串取自身;图片块在此跳过——
+/// 图片另走 [`message_images`] 提到消息级 `images`(Kiro 的 `toolResults.content`
+/// 只收文本,塞不进图片,更不能把 base64 当正文喂给模型);其余无法识别的块按
+/// 紧凑 JSON 原样带上,不静默丢。
 fn tool_result_text(content: &serde_json::Value) -> String {
     if let Some(s) = content.as_str() {
         return s.to_string();
     }
-    if let Some(arr) = content.as_array() {
-        return arr
-            .iter()
-            .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .concat();
-    }
-    String::new()
+    let Some(arr) = content.as_array() else {
+        return String::new();
+    };
+    arr.iter()
+        .filter_map(|v| {
+            if let Some(t) = v.get("text").and_then(|t| t.as_str()) {
+                return Some(t.to_string());
+            }
+            if let Some(s) = v.as_str() {
+                return Some(s.to_string());
+            }
+            if v.is_null() || is_image_block(v) {
+                return None;
+            }
+            Some(v.to_string())
+        })
+        .collect::<Vec<_>>()
+        .concat()
+}
+
+/// 内容块是否为图片块(Anthropic 的 `image`,或 OpenAI 形状的 `image_url`)。
+fn is_image_block(v: &serde_json::Value) -> bool {
+    matches!(
+        v.get("type").and_then(|t| t.as_str()),
+        Some("image" | "image_url")
+    )
 }
 
 /// 从一条消息里提取所有 `Block::ToolResult`,映射成 Kiro `ToolResultWire` 列表。
@@ -214,45 +240,106 @@ fn message_tool_uses(msg: &InMsg) -> Vec<ToolUseWire> {
         .collect()
 }
 
-/// 从一条消息里提取所有 `Block::Image`,映射成 Kiro `ImageBlock` 列表。
+/// 把一个 Anthropic 图片 `source` 对象映射成 Kiro `ImageBlock`。
 ///
 /// Kiro 数据面只接受内联 base64(`source.type=="base64"`)。遇到远程图片
 /// (Anthropic 的 `source.type=="url"`,或任何带 http(s) `url` 字段的图片源)
 /// 一律 **报错**(`ConvertError::RemoteImageUrl`)而不是静默丢弃——否则视觉
 /// 请求会悄悄丢图、模型收不到图片。OpenAI/Gemini 前端把无法内联的远程图片
 /// 编码成 `{"type":"url","url":...}` 转到这里统一拦截。
+/// 既非 base64 也非可识别远程 URL 的源(空/未知)→ `Ok(None)`,无图可传。
+fn image_from_source(source: &serde_json::Value) -> Result<Option<ImageBlock>, ConvertError> {
+    let is_url_type = source.get("type").and_then(|t| t.as_str()) == Some("url");
+    let url_field = source.get("url").and_then(|u| u.as_str());
+    if is_url_type || url_field.map(is_remote_url).unwrap_or(false) {
+        let u = url_field.unwrap_or("").to_string();
+        return Err(ConvertError::RemoteImageUrl(u));
+    }
+    if source.get("type").and_then(|t| t.as_str()) != Some("base64") {
+        return Ok(None);
+    }
+    let format = source
+        .get("media_type")
+        .and_then(|m| m.as_str())
+        .map(|m| m.strip_prefix("image/").unwrap_or(m).to_string())
+        .unwrap_or_default();
+    let bytes = source
+        .get("data")
+        .and_then(|d| d.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok(Some(ImageBlock {
+        format,
+        source: ImageSource { bytes },
+    }))
+}
+
+/// 解析 `data:<mime>;base64,<data>` 形式的 data URL,失败返回 `None`。
+fn parse_data_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (mime, data) = rest.split_once(";base64,")?;
+    Some((mime.to_string(), data.to_string()))
+}
+
+/// 从 `tool_result` 块的 `content` 里挑出内嵌的图片块,追加进 `out`。
+///
+/// 与顶层图片同一套策略(见 [`image_from_source`]):内联 base64 透传、远程 URL 报错。
+/// Kiro 的 `toolResults.content` 只有文本字段,故图片提到消息级 `images` 通道下发。
+/// 认两种形状:Anthropic 的 `{"type":"image","source":{…}}` 与 OpenAI 的
+/// `{"type":"image_url","image_url":{"url":…}}`(后者 data URL 就地内联)。
+fn collect_tool_result_images(
+    content: &serde_json::Value,
+    out: &mut Vec<ImageBlock>,
+) -> Result<(), ConvertError> {
+    let Some(arr) = content.as_array() else {
+        return Ok(());
+    };
+    for v in arr {
+        if !is_image_block(v) {
+            continue;
+        }
+        let source = match v.get("source") {
+            Some(s) => s.clone(),
+            None => {
+                let Some(url) = v
+                    .get("image_url")
+                    .and_then(|iu| iu.get("url").or(Some(iu)))
+                    .and_then(|u| u.as_str())
+                else {
+                    continue;
+                };
+                match parse_data_url(url) {
+                    Some((mime, data)) => {
+                        serde_json::json!({"type": "base64", "media_type": mime, "data": data})
+                    }
+                    None => serde_json::json!({"type": "url", "url": url}),
+                }
+            }
+        };
+        if let Some(img) = image_from_source(&source)? {
+            out.push(img);
+        }
+    }
+    Ok(())
+}
+
+/// 从一条消息里提取所有图片(顶层 `Block::Image` + `tool_result` 内嵌的 `image` 块),
+/// 映射成 Kiro `ImageBlock` 列表。两者走同一处理路径:能内联就透传、远程 URL 就报错。
 fn message_images(msg: &InMsg) -> Result<Vec<ImageBlock>, ConvertError> {
     let ContentIn::Blocks(blocks) = &msg.content else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
     for b in blocks {
-        let Block::Image { source } = b else { continue };
-        // 远程 URL(显式 type=="url" 或带 http(s) 的 url 字段)→ 报错。
-        let is_url_type = source.get("type").and_then(|t| t.as_str()) == Some("url");
-        let url_field = source.get("url").and_then(|u| u.as_str());
-        if is_url_type || url_field.map(is_remote_url).unwrap_or(false) {
-            let u = url_field.unwrap_or("").to_string();
-            return Err(ConvertError::RemoteImageUrl(u));
+        match b {
+            Block::Image { source } => {
+                if let Some(img) = image_from_source(source)? {
+                    out.push(img);
+                }
+            }
+            Block::ToolResult { content, .. } => collect_tool_result_images(content, &mut out)?,
+            _ => {}
         }
-        if source.get("type").and_then(|t| t.as_str()) != Some("base64") {
-            // 既非 base64 也非可识别的远程 URL:跳过(空/未知源,无图可传)。
-            continue;
-        }
-        let format = source
-            .get("media_type")
-            .and_then(|m| m.as_str())
-            .map(|m| m.strip_prefix("image/").unwrap_or(m).to_string())
-            .unwrap_or_default();
-        let bytes = source
-            .get("data")
-            .and_then(|d| d.as_str())
-            .unwrap_or_default()
-            .to_string();
-        out.push(ImageBlock {
-            format,
-            source: ImageSource { bytes },
-        });
     }
     Ok(out)
 }
@@ -262,15 +349,26 @@ fn is_remote_url(s: &str) -> bool {
     s.starts_with("http://") || s.starts_with("https://")
 }
 
+/// 末条消息是 assistant 预填(prefill)时补给 `currentMessage` 的续写指令。
+///
+/// Kiro 的 `currentMessage` 只能是 `userInputMessage`,而预填属于助手轮次,
+/// 只能落在 `history` 里;为了让上游接着预填往下写,当前轮补一条最小指令。
+const PREFILL_CONTINUATION: &str = "Continue.";
+
 /// 把 Anthropic `/v1/messages` 请求转换为 Kiro 数据面请求体。
 ///
 /// - 模型映射失败 → `Err(ConvertError::UnknownModel)`。
 /// - `system`(若存在)前置到首条消息的文本前面。
 /// - 末条消息作为 `currentMessage.userInputMessage`,其余进入 `history`
 ///   (`assistant` 角色 → `AssistantResponseMessage`,否则 → `UserInputMessage`)。
+/// - 末条消息若是 `assistant`(预填/prefill):整条进 `history` 的
+///   `assistantResponseMessage`(连同其 `tool_use` 块),`currentMessage` 用
+///   `PREFILL_CONTINUATION` 续写指令占位——助手文本不能冒充用户输入。
 /// - 有 `tools` → `agentTaskType="spectask"` 且当前消息上下文带映射后的工具规格;无 tools → `"vibe"`。
 /// - `tool_result` / `tool_use` / `image` 内容块(照契约/观测)分别映射进对应消息的
 ///   `toolResults` / `toolUses` / `images`。
+/// - `max_tokens` / `tool_choice`:Kiro 数据面 wire(见 `kiro::wire`)没有任何对应字段,
+///   故意不转发;上游只在自己命中预算时用 `ContentLengthExceededException` 帧回报截断。
 pub fn anthropic_to_kiro(
     req: &MessagesRequest,
     profile_arn: Option<&str>,
@@ -299,11 +397,23 @@ pub fn anthropic_to_kiro(
         })
         .collect();
 
-    let (history_msgs, last) = texts.split_at(texts.len() - 1);
-    let last_text = last[0].clone();
+    // 末条为 assistant 预填 → 它也进 history(助手轮次),当前轮改用续写指令;
+    // 否则照旧:末条即本轮用户输入,前面的进 history。
     let last_msg = &req.messages[req.messages.len() - 1];
+    let is_prefill = last_msg.role == "assistant";
+    let history_len = if is_prefill {
+        req.messages.len()
+    } else {
+        req.messages.len() - 1
+    };
 
-    let history: Vec<HistoryItem> = req.messages[..req.messages.len() - 1]
+    let (history_msgs, tail) = texts.split_at(history_len);
+    let last_text = match tail.first() {
+        Some(t) => t.clone(),
+        None => PREFILL_CONTINUATION.to_string(),
+    };
+
+    let history: Vec<HistoryItem> = req.messages[..history_len]
         .iter()
         .zip(history_msgs.iter())
         .map(|(msg, text)| {
@@ -349,8 +459,12 @@ pub fn anthropic_to_kiro(
     let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
     let agent_task_type = if has_tools { "spectask" } else { "vibe" }.to_string();
 
-    let current_tool_results = message_tool_results(last_msg);
-    let current_images = message_images(last_msg)?;
+    // 预填时末条消息已归入 history,当前轮只有续写指令,不带工具结果/图片。
+    let (current_tool_results, current_images) = if is_prefill {
+        (Vec::new(), Vec::new())
+    } else {
+        (message_tool_results(last_msg), message_images(last_msg)?)
+    };
 
     Ok(KiroRequest {
         conversation_state: ConversationState {
@@ -456,6 +570,92 @@ pub fn extract_truncation(frames: &[Message]) -> Option<Truncation> {
     frames.iter().find_map(frame_truncation)
 }
 
+/// 由 [`frame_truncation`] 认领的截断类 `:exception-type`——它们是正常的截断信号,
+/// 不是错误,故一律不进 [`frame_exception`](两者严格互斥)。
+const TRUNCATION_EXCEPTION_TYPES: [&str; 1] = ["ContentLengthExceededException"];
+
+/// 上游在 200 事件流中下发的非截断类 exception 帧。
+///
+/// AWS event-stream 的错误在响应头(200)之后才以 `:message-type == "exception"` 帧下发,
+/// 因此"HTTP 200 + 空内容"其实可能是限流/鉴权/参数错误。协议层必须在把帧序列还原成
+/// 响应之前先查这个契约,按 [`exception_status`] 映射出对外状态码,而不是回 200 + `end_turn`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamException {
+    /// `:exception-type` 头(如 `"ThrottlingException"`);头缺失时退而取帧体的
+    /// `__type` / `code`,再取不到则为 `"UnknownException"`。
+    pub kind: String,
+    /// 帧体里的人类可读消息(`message` / `Message` 字段),取不到则为空串。
+    pub message: String,
+}
+
+/// 从帧 payload 里尽力取人类可读消息;非法 JSON / 无该字段 → 空串(不 panic)。
+fn exception_message(payload: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| {
+            v.get("message")
+                .or_else(|| v.get("Message"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default()
+}
+
+/// 从单个事件帧探测非截断类 exception;非 exception 帧、或截断类 exception 一律 `None`。
+///
+/// 与 [`frame_truncation`] 严格互斥:凡是 [`frame_truncation`] 认下的帧(含
+/// `ContentLengthExceededException` 与 contextUsage 判出的窗口耗尽)都在这里放行,
+/// 由既有 Truncation 路径处理。payload 非法 JSON 不影响判定(仅消息取空串)。
+pub fn frame_exception(frame: &Message) -> Option<StreamException> {
+    if header_str(frame, ":message-type") != Some("exception") {
+        return None;
+    }
+    if frame_truncation(frame).is_some() {
+        return None;
+    }
+    let kind = header_str(frame, ":exception-type")
+        .map(|s| s.to_string())
+        .or_else(|| {
+            let v: serde_json::Value = serde_json::from_slice(&frame.payload).ok()?;
+            v.get("__type")
+                .or_else(|| v.get("code"))
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "UnknownException".to_string());
+    // 头缺失、类型从帧体里读出来的情况下也要挡住截断类,保证与 Truncation 路径不重叠。
+    if TRUNCATION_EXCEPTION_TYPES.contains(&kind.as_str()) {
+        return None;
+    }
+    Some(StreamException {
+        kind,
+        message: exception_message(&frame.payload),
+    })
+}
+
+/// 遍历一批帧,取出首个非截断类 exception。无 → `None`。
+pub fn extract_exception(frames: &[Message]) -> Option<StreamException> {
+    frames.iter().find_map(frame_exception)
+}
+
+/// 把 exception 类型映射为对外 HTTP 状态码(本模块不依赖 axum,返回裸 `u16`)。
+///
+/// 限流类 → 429、鉴权类 → 403、参数校验类 → 400,其余一律 502(上游故障)。
+/// 匹配按大小写无关的子串判定,兼容 `ThrottlingException` / `ThrottledException`
+/// 之类的同族命名。
+pub fn exception_status(kind: &str) -> u16 {
+    let k = kind.to_lowercase();
+    if k.contains("throttl") {
+        429
+    } else if k.contains("accessdenied") || k.contains("unauthorized") {
+        403
+    } else if k.contains("validation") {
+        400
+    } else {
+        502
+    }
+}
+
 /// 从单个事件帧取出增量文本(仅 `assistantResponseEvent` 且 payload 有 `content` 字符串时)。
 pub fn frame_text_delta(frame: &Message) -> Option<String> {
     if event_type(frame) != Some("assistantResponseEvent") {
@@ -475,14 +675,25 @@ pub fn new_message_id() -> String {
 /// 从 `meteringEvent` 帧提取的真实计费数据(照观测的数据面契约)。
 ///
 /// 字段:`credits` = 上游 payload 的 `usage`(真实积分消耗,f64);
+/// `input_tokens` / `output_tokens` = 上游真实 token 计量(带则透传,用于回填响应 usage);
 /// `cache_read_input_tokens` / `cache_creation_input_tokens` = 若 payload 带则透传。
 /// 上游 payload 的键既可能是 snake_case(`cache_read_input_tokens`)也可能是
 /// camelCase(`cacheReadInputTokens`),两种都接。
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeteringUsage {
     pub credits: f64,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
     pub cache_read_input_tokens: Option<i32>,
     pub cache_creation_input_tokens: Option<i32>,
+}
+
+/// 取一个非负整数字段:snake_case 优先、回退 camelCase;负数/非数字/缺失 → `None`。
+fn u32_field(v: &serde_json::Value, snake: &str, camel: &str) -> Option<u32> {
+    v.get(snake)
+        .or_else(|| v.get(camel))
+        .and_then(|n| n.as_u64())
+        .map(|n| n.min(u32::MAX as u64) as u32)
 }
 
 /// 从单个事件帧解析 `meteringEvent`:仅当 `:event-type == "meteringEvent"` 且
@@ -493,6 +704,9 @@ pub fn metering_frame(frame: &Message) -> Option<MeteringUsage> {
     }
     let v: serde_json::Value = serde_json::from_slice(&frame.payload).ok()?;
     let credits = v.get("usage").and_then(|u| u.as_f64())?;
+    // 真实 token 计量:同样 snake_case 优先、回退 camelCase;缺失则由调用方回退估算。
+    let input_tokens = u32_field(&v, "input_tokens", "inputTokens");
+    let output_tokens = u32_field(&v, "output_tokens", "outputTokens");
     // 缓存 token 字段:snake_case 优先,回退 camelCase。
     let read = v
         .get("cache_read_input_tokens")
@@ -506,6 +720,8 @@ pub fn metering_frame(frame: &Message) -> Option<MeteringUsage> {
         .map(|n| n as i32);
     Some(MeteringUsage {
         credits,
+        input_tokens,
+        output_tokens,
         cache_read_input_tokens: read,
         cache_creation_input_tokens: creation,
     })
@@ -603,7 +819,13 @@ impl ToolUseAccum {
 /// [`Truncation::MaxTokens`] → `"max_tokens"`、[`Truncation::ContextWindow`] →
 /// `"model_context_window_exceeded"`;否则 `"end_turn"`。
 ///
-/// `output_tokens` 仍用全文字符数 / 4 近似估算(工具参数不计入,MVP)。
+/// `usage` 优先用 `meteringEvent` 的真实计量([`extract_metering`]);上游没发或没带
+/// token 字段时才回退到 `input_tokens=0`、`output_tokens=` 全文字符数 / 4 的估算
+/// (工具参数不计入)。
+///
+/// **本函数不表达错误**:上游在 200 事件流里下发的非截断 exception 帧(限流/鉴权/参数)
+/// 会让帧序列既无文本也无工具,这里只会还原成空内容 + `end_turn`。协议层必须先查
+/// [`extract_exception`],命中就按 [`exception_status`] 回错误,不要把它当正常响应下发。
 pub fn kiro_events_to_anthropic(frames: &[Message], model: &str) -> MessagesResponse {
     let mut full_text = String::new();
     let mut tools = ToolUseAccum::new();
@@ -620,8 +842,14 @@ pub fn kiro_events_to_anthropic(frames: &[Message], model: &str) -> MessagesResp
 
     let truncation = extract_truncation(frames);
 
-    // TODO(P2): 读取 meteringEvent 取真实 usage(现 input_tokens=0、output≈字符数/4 为占位)
-    let output_tokens = (full_text.chars().count() / 4) as u32;
+    // usage:meteringEvent 的真实计量优先,缺哪项就单独回退该项的估算
+    // (input 无从估算 → 0;output → 全文字符数 / 4)。
+    let metering = extract_metering(frames);
+    let input_tokens = metering.as_ref().and_then(|m| m.input_tokens).unwrap_or(0);
+    let output_tokens = metering
+        .as_ref()
+        .and_then(|m| m.output_tokens)
+        .unwrap_or_else(|| (full_text.chars().count() / 4) as u32);
 
     let has_tools = !tools.order.is_empty();
     let mut content: Vec<OutBlock> = Vec::new();
@@ -653,7 +881,7 @@ pub fn kiro_events_to_anthropic(frames: &[Message], model: &str) -> MessagesResp
         content,
         stop_reason: Some(stop_reason.to_string()),
         usage: Usage {
-            input_tokens: 0,
+            input_tokens,
             output_tokens,
         },
     }
@@ -701,7 +929,7 @@ mod tests {
         }
     }
 
-    fn exception_frame(exception_type: &str) -> Message {
+    fn exception_frame_with(exception_type: &str, payload: &str) -> Message {
         Message {
             headers: vec![
                 Header {
@@ -713,7 +941,22 @@ mod tests {
                     value: HeaderValue::Str(exception_type.to_string()),
                 },
             ],
-            payload: b"{}".to_vec(),
+            payload: payload.as_bytes().to_vec(),
+        }
+    }
+
+    fn exception_frame(exception_type: &str) -> Message {
+        exception_frame_with(exception_type, "{}")
+    }
+
+    /// 只有 `:message-type` 没有 `:exception-type` 的 exception 帧(类型只能从帧体里读)。
+    fn untyped_exception_frame(payload: &str) -> Message {
+        Message {
+            headers: vec![Header {
+                name: ":message-type".to_string(),
+                value: HeaderValue::Str("exception".to_string()),
+            }],
+            payload: payload.as_bytes().to_vec(),
         }
     }
 
@@ -1475,6 +1718,7 @@ mod tests {
 
     #[test]
     fn frame_truncation_ignores_other_exception_types() {
+        // 非截断类 exception 不是截断信号,归 frame_exception 认领(见错误契约用例)。
         assert_eq!(
             frame_truncation(&exception_frame("ThrottlingException")),
             None
@@ -1587,5 +1831,411 @@ mod tests {
             .as_ref()
             .expect("images 应存在");
         assert_eq!(images[0].source.bytes, "AAAA");
+    }
+
+    // --- tool_result 内嵌图片/非文本内容:与顶层图片同策略,不静默丢弃 ---
+
+    #[test]
+    fn tool_result_nested_base64_image_goes_to_message_images() {
+        let req = base_req(vec![blocks_msg(
+            "user",
+            vec![Block::ToolResult {
+                tool_use_id: "tu1".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "shot:"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+                ]),
+                is_error: None,
+            }],
+        )]);
+
+        let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
+
+        let current = &kiro.conversation_state.current_message.user_input_message;
+        let images = current.images.as_ref().expect("内嵌图片应提到 images");
+        assert_eq!(images[0].format, "png");
+        assert_eq!(images[0].source.bytes, "AAAA");
+        // 图片走 images 通道,文本侧只保留文本块(不把 base64 塞进 toolResults)。
+        let results = current
+            .user_input_message_context
+            .tool_results
+            .as_ref()
+            .expect("tool_results 应存在");
+        assert_eq!(results[0].content[0].text, "shot:");
+    }
+
+    #[test]
+    fn tool_result_nested_image_in_history_also_goes_to_images() {
+        let req = base_req(vec![
+            blocks_msg(
+                "user",
+                vec![Block::ToolResult {
+                    tool_use_id: "tu1".to_string(),
+                    content: serde_json::json!([
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "BBBB"}}
+                    ]),
+                    is_error: None,
+                }],
+            ),
+            msg("assistant", "ok"),
+            msg("user", "continue"),
+        ]);
+
+        let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
+
+        match &kiro.conversation_state.history[0] {
+            HistoryItem::UserInputMessage { user_input_message } => {
+                let images = user_input_message
+                    .images
+                    .as_ref()
+                    .expect("历史里的内嵌图片也应保留");
+                assert_eq!(images[0].format, "jpeg");
+                assert_eq!(images[0].source.bytes, "BBBB");
+            }
+            other => panic!("首条历史应为 UserInputMessage,实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_nested_remote_image_url_errors_not_dropped() {
+        let req = base_req(vec![blocks_msg(
+            "user",
+            vec![Block::ToolResult {
+                tool_use_id: "tu1".to_string(),
+                content: serde_json::json!([
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}
+                ]),
+                is_error: None,
+            }],
+        )]);
+
+        let err = anthropic_to_kiro(&req, None).expect_err("tool_result 内的远程图片也应报错");
+        assert_eq!(
+            err,
+            ConvertError::RemoteImageUrl("https://example.com/a.png".to_string())
+        );
+    }
+
+    #[test]
+    fn tool_result_nested_openai_image_url_block_handled_like_top_level() {
+        // data URL → 就地内联;远程 http(s) → 报错(与顶层图片同策略,都不静默丢)。
+        let inline = base_req(vec![blocks_msg(
+            "user",
+            vec![Block::ToolResult {
+                tool_use_id: "tu1".to_string(),
+                content: serde_json::json!([
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,CCCC"}}
+                ]),
+                is_error: None,
+            }],
+        )]);
+        let kiro = anthropic_to_kiro(&inline, None).expect("转换应成功");
+        let images = kiro
+            .conversation_state
+            .current_message
+            .user_input_message
+            .images
+            .as_ref()
+            .expect("data URL 图片应内联进 images");
+        assert_eq!(images[0].format, "png");
+        assert_eq!(images[0].source.bytes, "CCCC");
+
+        let remote = base_req(vec![blocks_msg(
+            "user",
+            vec![Block::ToolResult {
+                tool_use_id: "tu1".to_string(),
+                content: serde_json::json!([
+                    {"type": "image_url", "image_url": {"url": "https://example.com/b.png"}}
+                ]),
+                is_error: None,
+            }],
+        )]);
+        assert_eq!(
+            anthropic_to_kiro(&remote, None).expect_err("远程图片应报错"),
+            ConvertError::RemoteImageUrl("https://example.com/b.png".to_string())
+        );
+    }
+
+    #[test]
+    fn tool_result_unknown_block_kept_as_json_text() {
+        let req = base_req(vec![blocks_msg(
+            "user",
+            vec![Block::ToolResult {
+                tool_use_id: "tu1".to_string(),
+                content: serde_json::json!([{"type": "json", "data": {"rows": 2}}, "裸串"]),
+                is_error: None,
+            }],
+        )]);
+
+        let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
+
+        let results = kiro
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+            .as_ref()
+            .expect("tool_results 应存在");
+        assert!(results[0].content[0].text.contains("rows"));
+        assert!(results[0].content[0].text.contains("裸串"));
+    }
+
+    // --- 末条 assistant 预填(prefill)→ 进 history,不当用户输入 ---
+
+    #[test]
+    fn trailing_assistant_prefill_goes_to_history_with_tool_uses() {
+        let req = base_req(vec![
+            msg("user", "q"),
+            blocks_msg(
+                "assistant",
+                vec![
+                    Block::Text {
+                        text: "开头".to_string(),
+                    },
+                    Block::ToolUse {
+                        id: "tu1".to_string(),
+                        name: "get_weather".to_string(),
+                        input: serde_json::json!({"city": "Paris"}),
+                    },
+                ],
+            ),
+        ]);
+
+        let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
+
+        assert_eq!(kiro.conversation_state.history.len(), 2);
+        match &kiro.conversation_state.history[1] {
+            HistoryItem::AssistantResponseMessage {
+                assistant_response_message,
+            } => {
+                assert_eq!(assistant_response_message.content, "开头");
+                let tool_uses = assistant_response_message
+                    .tool_uses
+                    .as_ref()
+                    .expect("预填里的 tool_use 应保留");
+                assert_eq!(tool_uses[0].tool_use_id, "tu1");
+                assert_eq!(tool_uses[0].name, "get_weather");
+                assert_eq!(tool_uses[0].input["city"], "Paris");
+            }
+            other => panic!("末条预填应进 history 的 AssistantResponseMessage,实际: {other:?}"),
+        }
+        // currentMessage 只剩续写指令:助手文本不能冒充用户输入。
+        let current = &kiro.conversation_state.current_message.user_input_message;
+        assert_eq!(current.content, PREFILL_CONTINUATION);
+        assert!(!current.content.contains("开头"));
+    }
+
+    #[test]
+    fn single_assistant_prefill_message_still_converts() {
+        let req = base_req(vec![msg("assistant", "只有预填")]);
+
+        let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
+
+        assert_eq!(kiro.conversation_state.history.len(), 1);
+        assert_eq!(
+            kiro.conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            PREFILL_CONTINUATION
+        );
+    }
+
+    #[test]
+    fn trailing_user_message_still_becomes_current_message() {
+        // 回归:末条是 user 时切分不变(history 少一条,当前轮为末条文本)。
+        let req = base_req(vec![
+            msg("user", "a"),
+            msg("assistant", "b"),
+            msg("user", "c"),
+        ]);
+
+        let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
+
+        assert_eq!(kiro.conversation_state.history.len(), 2);
+        assert_eq!(
+            kiro.conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "c"
+        );
+    }
+
+    // --- meteringEvent 真实 token 计量 → 回填 usage ---
+
+    #[test]
+    fn metering_frame_extracts_real_token_counts() {
+        let snake = event_frame(
+            "meteringEvent",
+            r#"{"usage":1.0,"input_tokens":1200,"output_tokens":34}"#,
+        );
+        let m = metering_frame(&snake).expect("应解析出 meteringEvent");
+        assert_eq!(m.input_tokens, Some(1200));
+        assert_eq!(m.output_tokens, Some(34));
+
+        let camel = event_frame(
+            "meteringEvent",
+            r#"{"usage":1.0,"inputTokens":7,"outputTokens":8}"#,
+        );
+        let m = metering_frame(&camel).expect("应解析出 meteringEvent");
+        assert_eq!(m.input_tokens, Some(7));
+        assert_eq!(m.output_tokens, Some(8));
+
+        // 不带 token 字段 → None,由调用方回退估算。
+        let bare = event_frame("meteringEvent", r#"{"usage":1.0}"#);
+        let m = metering_frame(&bare).expect("应解析出 meteringEvent");
+        assert_eq!(m.input_tokens, None);
+        assert_eq!(m.output_tokens, None);
+    }
+
+    #[test]
+    fn response_usage_backfilled_from_metering_event() {
+        let frames = vec![
+            event_frame("assistantResponseEvent", r#"{"content":"pong"}"#),
+            event_frame(
+                "meteringEvent",
+                r#"{"usage":2.0,"input_tokens":1234,"output_tokens":56}"#,
+            ),
+        ];
+
+        let resp = kiro_events_to_anthropic(&frames, "claude-sonnet-4.5");
+
+        assert_eq!(resp.usage.input_tokens, 1234);
+        assert_eq!(resp.usage.output_tokens, 56);
+    }
+
+    #[test]
+    fn response_usage_falls_back_to_char_estimate_without_metering() {
+        let frames = vec![event_frame(
+            "assistantResponseEvent",
+            r#"{"content":"pongpong"}"#,
+        )];
+
+        let resp = kiro_events_to_anthropic(&frames, "claude-sonnet-4.5");
+
+        assert_eq!(resp.usage.input_tokens, 0);
+        assert_eq!(resp.usage.output_tokens, 2);
+    }
+
+    // --- 200 事件流内的非截断 exception 帧(错误契约) ---
+
+    #[test]
+    fn frame_exception_detects_throttling_with_message() {
+        let f = exception_frame_with("ThrottlingException", r#"{"message":"Too many requests"}"#);
+        assert_eq!(
+            frame_exception(&f),
+            Some(StreamException {
+                kind: "ThrottlingException".to_string(),
+                message: "Too many requests".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn frame_exception_accepts_capital_message_and_tolerates_bad_payload() {
+        let cap = exception_frame_with("ValidationException", r#"{"Message":"bad input"}"#);
+        assert_eq!(
+            frame_exception(&cap).expect("应识别 exception").message,
+            "bad input"
+        );
+
+        // payload 不是合法 JSON:消息留空,但异常本身不能被吞掉。
+        let bad = exception_frame_with("InternalServerException", "not json");
+        let e = frame_exception(&bad).expect("payload 非法也要报出异常");
+        assert_eq!(e.kind, "InternalServerException");
+        assert_eq!(e.message, "");
+    }
+
+    #[test]
+    fn frame_exception_excludes_truncation_exception() {
+        // 截断类 exception 归 frame_truncation 管,两条路径互斥、不重叠。
+        let f = exception_frame("ContentLengthExceededException");
+        assert_eq!(frame_exception(&f), None);
+        assert_eq!(frame_truncation(&f), Some(Truncation::MaxTokens));
+
+        // 头缺失、类型写在帧体里的截断类同样要挡住。
+        let untyped = untyped_exception_frame(r#"{"__type":"ContentLengthExceededException"}"#);
+        assert_eq!(frame_exception(&untyped), None);
+    }
+
+    #[test]
+    fn frame_exception_none_for_non_exception_frames() {
+        assert_eq!(
+            frame_exception(&event_frame(
+                "assistantResponseEvent",
+                r#"{"content":"hi"}"#
+            )),
+            None
+        );
+        assert_eq!(
+            frame_exception(&event_frame(
+                "contextUsageEvent",
+                r#"{"contextUsagePercentage":100.0}"#
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn frame_exception_falls_back_to_payload_type_then_unknown() {
+        let typed =
+            untyped_exception_frame(r#"{"__type":"ThrottlingException","message":"slow down"}"#);
+        let e = frame_exception(&typed).expect("应从帧体读出类型");
+        assert_eq!(e.kind, "ThrottlingException");
+        assert_eq!(e.message, "slow down");
+        assert_eq!(exception_status(&e.kind), 429);
+
+        let anon = untyped_exception_frame("not json");
+        let e = frame_exception(&anon).expect("类型未知也不能吞掉");
+        assert_eq!(e.kind, "UnknownException");
+        assert_eq!(exception_status(&e.kind), 502);
+    }
+
+    #[test]
+    fn extract_exception_finds_first_exception_in_frames() {
+        let frames = vec![
+            event_frame("assistantResponseEvent", r#"{"content":"hi"}"#),
+            exception_frame_with("AccessDeniedException", r#"{"message":"no"}"#),
+            exception_frame_with("ThrottlingException", "{}"),
+        ];
+        let e = extract_exception(&frames).expect("应取到首个 exception");
+        assert_eq!(e.kind, "AccessDeniedException");
+        assert_eq!(exception_status(&e.kind), 403);
+
+        // 只有截断类 exception 时不算错误。
+        assert_eq!(
+            extract_exception(&[exception_frame("ContentLengthExceededException")]),
+            None
+        );
+    }
+
+    #[test]
+    fn exception_status_maps_known_kinds() {
+        assert_eq!(exception_status("ThrottlingException"), 429);
+        assert_eq!(exception_status("ThrottledException"), 429);
+        assert_eq!(exception_status("AccessDeniedException"), 403);
+        assert_eq!(exception_status("UnauthorizedException"), 403);
+        assert_eq!(exception_status("ValidationException"), 400);
+        assert_eq!(exception_status("InternalServerException"), 502);
+        assert_eq!(exception_status(""), 502);
+    }
+
+    #[test]
+    fn exception_only_stream_is_not_a_silent_empty_success() {
+        // 200 + 只有 exception 帧:帧循环还原不出任何内容,契约必须把错误交给协议层,
+        // 否则客户端收到的是"空响应"而不是 429。
+        let frames = vec![exception_frame_with(
+            "ThrottlingException",
+            r#"{"message":"rate exceeded"}"#,
+        )];
+
+        let e = extract_exception(&frames).expect("应报出 exception");
+        assert_eq!(exception_status(&e.kind), 429);
+        assert_eq!(e.message, "rate exceeded");
+
+        let resp = kiro_events_to_anthropic(&frames, "claude-sonnet-4.5");
+        assert!(matches!(&resp.content[0], OutBlock::Text { text } if text.is_empty()));
     }
 }
