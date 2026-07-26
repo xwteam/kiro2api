@@ -749,7 +749,7 @@ pub async fn server_info(State(state): State<MessagesState>) -> Json<ServerInfoR
         os: os_string(),
         memory_used_bytes: read_process_rss_bytes(),
         memory_total_bytes: read_mem_total_bytes(),
-        cpu_percent: sample_process_cpu_percent(),
+        cpu_percent: sample_process_cpu_percent().await,
         run_mode: detect_run_mode(),
         pid: std::process::id(),
         uptime_secs: crate::server::server_uptime_secs(),
@@ -865,12 +865,24 @@ pub struct RestartResponse {
     pub message: String,
 }
 
+/// 进程退出前的收尾:把统计的去抖缓冲立刻落盘。
+///
+/// `std::process::exit` 不跑析构、也不给后台刷盘循环最后一拍的机会,不在此显式刷盘就会丢掉
+/// 最近一个去抖周期(约 5s)内的用量/计费记录。刷盘失败由统计层自行记 error 日志,
+/// 这里不阻断退出。
+async fn flush_stats_before_exit(stats: &crate::stats::StatsManager) {
+    stats.usage.flush_now().await;
+}
+
 /// POST `/api/admin/restart?confirm=true`:二次确认后退出进程,由容器 `restart` 策略拉起。
 ///
 /// 需 `confirm=true` 防误触(与 gemini2api 同,避免单击即中断可用性)。确认后先返回响应,再由
-/// 后台任务延时 0.5s `exit(0)`——容器以 `restart: unless-stopped` 运行,退出即被重新拉起。
-/// 裸机运行(无守护)则等价于停止:此时应由 systemd/supervisor 保活。
-pub async fn restart_server(Query(q): Query<RestartQuery>) -> Response {
+/// 后台任务延时 0.5s、把统计刷盘后 `exit(0)`——容器以 `restart: unless-stopped` 运行,退出即被
+/// 重新拉起。裸机运行(无守护)则等价于停止:此时应由 systemd/supervisor 保活。
+pub async fn restart_server(
+    State(state): State<MessagesState>,
+    Query(q): Query<RestartQuery>,
+) -> Response {
     if !q.confirm {
         return (
             StatusCode::BAD_REQUEST,
@@ -882,10 +894,12 @@ pub async fn restart_server(Query(q): Query<RestartQuery>) -> Response {
     }
     tracing::warn!(
         event = "admin_restart",
-        "管理员触发重启:0.5s 后退出进程,交由容器/守护拉起"
+        "管理员触发重启:0.5s 后刷盘统计并退出进程,交由容器/守护拉起"
     );
-    tokio::spawn(async {
+    let stats = state.stats.clone();
+    tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        flush_stats_before_exit(&stats).await;
         std::process::exit(0);
     });
     (
@@ -1004,9 +1018,12 @@ fn cpu_busy_percent(t0: CpuTimes, t1: CpuTimes) -> f64 {
 /// 再采样,按 (Δtotal−Δidle)/Δtotal*100 计算全机忙碌率,保留 1 位小数、钳制 [0,100]。
 /// 读不到 /proc/stat(非 Linux/无 /proc)→ None。用系统级而非本进程,避免"中转多数
 /// 时间空闲 → 本进程 CPU 恒 ~0%"看起来像坏了的观感。
-fn sample_process_cpu_percent() -> Option<f64> {
+///
+/// 采样窗口须让出 worker(`tokio::time::sleep`):同步 sleep 会占住整条 tokio 工作线程,
+/// 使同线程上的其它请求陪等这 100ms。两次 /proc 读取是极短的内存文件读,不必外抛到阻塞线程池。
+async fn sample_process_cpu_percent() -> Option<f64> {
     let t0 = read_proc_stat_cpu()?;
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let t1 = read_proc_stat_cpu()?;
     Some(cpu_busy_percent(t0, t1))
 }
@@ -2430,7 +2447,11 @@ pub async fn update_credential(
     .into_response()
 }
 
-/// `DELETE /api/admin/credentials/{id}`:从活池移除 → 落盘。未知 id → 404。
+/// `DELETE /api/admin/credentials/{id}`:从活池移除 → 落盘 → 失效该 id 的余额/模型缓存。
+/// 未知 id → 404。
+///
+/// 缓存以凭据 id 为键:id 会被后续新增凭据复用,残留条目会让新凭据显示上一位主人的
+/// 余额与模型清单,故删除后必须同步失效(两个缓存都是纯内存/本地快照,失效不触上游)。
 pub async fn delete_credential(
     State(state): State<MessagesState>,
     Path(id): Path<String>,
@@ -2446,6 +2467,8 @@ pub async fn delete_credential(
     if let Err(e) = persist_pool_credentials(&state).await {
         return persist_failed(&e);
     }
+    state.balance.invalidate(&id).await;
+    state.models_cache.invalidate(&id).await;
     Json(SuccessResponse {
         success: true,
         message: "credential deleted".into(),
@@ -2897,9 +2920,32 @@ pub struct BuilderIdPollResponse {
     pub email: Option<String>,
 }
 
+/// 设备码轮询错误是否为**确证的终态**——只有终态才允许销毁登录会话。
+///
+/// 终态 = 用户拒绝(access_denied)、设备码过期(expired_token)、上游明确回的其它 OAuth
+/// 错误码(invalid_client / invalid_grant…),以及请求本身非法(BadCallback,设备码流不产生)。
+/// 其余一律按瞬态处理:传输层抖动、应答体无法解析、429 与 5xx 都可能发生在用户已经在浏览器
+/// 点了授权之后,销毁会话会让他从头再来一遍;会话另有 ~600s TTL 兜底,多留一会儿代价有限。
+/// 新增的错误变体默认落入瞬态一侧,方向上偏保守(宁可多轮询,不可误销毁)。
+fn is_terminal_poll_error(e: &LoginError) -> bool {
+    matches!(
+        e,
+        LoginError::Denied
+            | LoginError::Expired
+            | LoginError::Upstream(_)
+            | LoginError::BadCallback
+    )
+}
+
+/// 瞬态轮询失败是否该让前端拉长间隔:429/5xx 说明上游正被打疼,退避再问。
+fn should_back_off(e: &LoginError) -> bool {
+    matches!(e, LoginError::UpstreamHttp { status, .. } if *status == 429 || *status >= 500)
+}
+
 /// `POST /api/admin/login/builderid/poll`:非消费读取会话,轮询一次设备码换 token。
 /// pending → 继续等;slow_down → 回退间隔;成功 → 落库并清会话回 completed;
 /// denied/expired → 清会话并以 400/410 语义化(前端按 status 文案提示)。
+/// 瞬态失败(网络抖动/不可解析应答/429/5xx)→ 保留会话并回 200 非终态,让前端继续轮询。
 pub async fn login_builderid_poll(
     State(state): State<MessagesState>,
     Json(req): Json<BuilderIdPollRequest>,
@@ -2948,8 +2994,32 @@ pub async fn login_builderid_poll(
             email: None,
         })
         .into_response(),
+        Err(e) if !is_terminal_poll_error(&e) => {
+            // 瞬态:会话原样保留(用户可能已在浏览器点了授权),回一个非终态让前端接着轮询。
+            let back_off = should_back_off(&e);
+            tracing::warn!(
+                event = "builderid_poll_transient",
+                error = %login_error_str(&e),
+                back_off,
+                "设备码轮询瞬态失败,保留会话继续轮询"
+            );
+            let (status, interval) = if back_off {
+                ("slow_down", entry.pending.interval_secs.saturating_add(5))
+            } else {
+                ("pending", entry.pending.interval_secs)
+            };
+            Json(BuilderIdPollResponse {
+                success: true,
+                completed: false,
+                status: status.into(),
+                interval: Some(interval),
+                credential_id: None,
+                email: None,
+            })
+            .into_response()
+        }
         Err(e) => {
-            // 终态:清会话并语义化错误。
+            // 确证终态:清会话并语义化错误。
             state.builderid_sessions.remove(&req.session_id);
             login_upstream_error(&e)
         }
@@ -3010,15 +3080,19 @@ pub struct IamSsoCompleteRequest {
     pub callback_url: String,
 }
 
-/// `POST /api/admin/login/iam-sso/complete`:消费会话,解析回调 URL(校验 state 防 CSRF)、
+/// `POST /api/admin/login/iam-sso/complete`:非消费读取会话,解析回调 URL(校验 state 防 CSRF)、
 /// 授权码 + verifier 换 token、落库。返回 `AddCredentialResponse`(camelCase)。
 /// 未知/过期会话 → 404;回调非法/state 不符 → 400;上游失败 → 502。
+///
+/// 会话只在换 token 成功后才消费:粘错回调 URL(400)或换 token 撞上瞬态失败(502)时会话
+/// 仍在,用户改一下就能重试,不必从 `/start` 重走一遍。授权码本身一次性,成功后立刻
+/// `remove` 使会话失效,同一 sessionId 无法被重放去换第二份凭据。
 pub async fn login_iam_sso_complete(
     State(state): State<MessagesState>,
     Json(req): Json<IamSsoCompleteRequest>,
 ) -> Response {
     let now = now_unix();
-    let Some(entry) = state.iam_sso_sessions.take(&req.session_id, now) else {
+    let Some(entry) = state.iam_sso_sessions.get(&req.session_id, now) else {
         return login_session_not_found();
     };
     // 解析回调:error 优先 → state CSRF → code。
@@ -3041,6 +3115,8 @@ pub async fn login_iam_sso_complete(
     .await
     {
         Ok(minted) => {
+            // 授权码已兑换:此刻消费会话(防重放),再落库。
+            state.iam_sso_sessions.remove(&req.session_id);
             let cred = minted_to_credential(minted, now);
             match add_credential_to_pool_and_persist(&state, cred).await {
                 Ok((id, email, is_dup)) => Json(AddCredentialResponse {
@@ -3058,6 +3134,7 @@ pub async fn login_iam_sso_complete(
                 Err(e) => persist_failed(&e),
             }
         }
+        // 换 token 失败(含瞬态):会话保留,用户可原样重试或换一个回调 URL 再试。
         Err(e) => login_upstream_error(&e),
     }
 }
@@ -3171,6 +3248,9 @@ fn login_error_str(e: &LoginError) -> String {
             } else {
                 format!("上游返回 HTTP {status}: {body}")
             }
+        }
+        LoginError::Transient { status, detail } => {
+            format!("上游暂时不可用(HTTP {status}),可稍后重试: {detail}")
         }
         LoginError::Pending => "授权待批准".to_string(),
         LoginError::SlowDown => "轮询过快,请放慢".to_string(),
@@ -5115,11 +5195,12 @@ mod tests {
         assert!(v["failed"].as_array().unwrap().is_empty());
     }
 
+    /// 瞬态失败(上游不可达)必须保留会话:用户可能已经在浏览器点了授权,
+    /// 一次网络抖动不能把他打回 /start 重来。poll 命中会话(非 404),回非终态让前端接着轮询。
+    /// 完整成功链见 kiro::login::builderid 的 wiremock 单测。
     #[tokio::test]
-    async fn builderid_poll_hits_session_then_upstream_unreachable_is_502() {
-        // 预置一个 Builder-ID 会话,poll 命中会话(非 404);上游不可达 → 502,终态清会话。
-        // 完整成功链见 kiro::login::builderid 的 wiremock 单测。
-        let state = state_with(vec![], cfg_with_temp_creds());
+    async fn builderid_poll_transient_upstream_failure_keeps_session() {
+        let state = state_with_unreachable_upstream(cfg_with_temp_creds());
         let pending = crate::kiro::login::builderid::Pending {
             user_code: "ABCD-1234".into(),
             verification_uri: "https://view.awsapps.com/start/#/device".into(),
@@ -5128,21 +5209,16 @@ mod tests {
             client_id: "cid".into(),
             client_secret: "csec".into(),
         };
-        let session_id = state.builderid_sessions.put(
+        let sessions = state.builderid_sessions.clone();
+        let session_id = sessions.put(
             BuilderIdSession {
                 pending,
                 region: "us-east-1".into(),
             },
             super::now_unix(),
         );
-        assert!(
-            state
-                .builderid_sessions
-                .get(&session_id, super::now_unix())
-                .is_some()
-        );
         let app = admin_api_router(state);
-        let (st, _v) = send(
+        let (st, v) = send(
             &app,
             Method::POST,
             "/api/admin/login/builderid/poll",
@@ -5150,7 +5226,16 @@ mod tests {
         )
         .await;
         assert_ne!(st, HttpStatusCode::NOT_FOUND);
-        assert_eq!(st, HttpStatusCode::BAD_GATEWAY);
+        // 非终态:前端据此按 interval 继续轮询(非 2xx 会让前端停在错误上)。
+        assert_eq!(st, HttpStatusCode::OK, "{v}");
+        assert_eq!(v["completed"], false);
+        assert_eq!(v["status"], "pending");
+        assert_eq!(v["interval"], 5);
+        // 会话仍在,下一拍还能接着轮询。
+        assert!(
+            sessions.get(&session_id, super::now_unix()).is_some(),
+            "瞬态失败不得销毁登录会话"
+        );
     }
 
     // ============ 系统指标解析器单测 ============
@@ -5241,5 +5326,231 @@ mod tests {
         };
         // Δtotal=1000,Δidle=0(saturating)→ busy=100.0
         assert_eq!(super::cpu_busy_percent(t0, t1), 100.0);
+    }
+
+    /// 采样窗口必须让出 worker:单线程运行时上两次并发采样应当重叠完成(约 100ms),
+    /// 同步 sleep 则会串成约 200ms —— 那正是"一个请求卡住同线程其它请求"的现场。
+    #[tokio::test]
+    async fn cpu_sampling_window_does_not_block_the_worker() {
+        let began = std::time::Instant::now();
+        let _ = tokio::join!(
+            super::sample_process_cpu_percent(),
+            super::sample_process_cpu_percent()
+        );
+        let elapsed = began.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(190),
+            "两次并发采样耗时 {elapsed:?},采样窗口仍在阻塞线程"
+        );
+    }
+
+    // ============ 重启前刷盘 / 登录会话韧性 / 删除后缓存失效 ============
+
+    /// 建一个"上游必然不可达"的 state:出站全部指向本地无人监听的代理端口,使登录流的
+    /// 网络调用确定性地以传输层错误告终 —— 既不打真实 AWS,也不看 CI 有没有网。
+    fn state_with_unreachable_upstream(cfg: Config) -> MessagesState {
+        let mut state = state_with(vec![], cfg);
+        state.client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:1").expect("proxy url"))
+            .build()
+            .expect("client");
+        state
+    }
+
+    /// 唯一临时目录(每测试隔离)。
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro2api_admin_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 退出前必须把去抖窗口内的记录落盘:后台刷盘每约 5s 才一拍,restart 直接 exit(0)
+    /// 不会给它最后一拍的机会,不显式刷盘就静默丢掉最近这批用量/计费。
+    #[tokio::test]
+    async fn flush_stats_before_exit_persists_debounced_records() {
+        let dir = tmp_dir("flush_exit");
+        let stats = StatsManager::load_from_dir(&dir);
+        stats
+            .usage
+            .record_usage(
+                7,
+                "claude-sonnet-4".into(),
+                10,
+                20,
+                0.5,
+                None,
+                None,
+                None,
+                1_700_000_000,
+            )
+            .await;
+        let path = dir.join("usage_records.json");
+        // 去抖窗口内:后台循环还没到下一拍,盘上什么都没有。
+        assert!(!path.exists(), "去抖窗口内不该已落盘");
+        super::flush_stats_before_exit(&stats).await;
+        let disk = std::fs::read_to_string(&path).expect("退出前刷盘应已写出 usage_records.json");
+        assert!(disk.contains("claude-sonnet-4"), "落盘内容缺记录: {disk}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn restart_without_confirm_is_400_and_does_not_exit() {
+        let app = admin_api_router(state_with(vec![], cfg_with_temp_creds()));
+        let (st, v) = send(&app, Method::POST, "/api/admin/restart", None).await;
+        assert_eq!(st, HttpStatusCode::BAD_REQUEST);
+        assert_eq!(v["error"]["type"], "confirmation_required");
+    }
+
+    /// 只有确证终态才允许销毁设备码会话;瞬态一侧的判定要覆盖网络抖动、不可解析应答与 429/5xx。
+    #[test]
+    fn only_definitive_states_are_terminal_for_device_poll() {
+        assert!(super::is_terminal_poll_error(&LoginError::Denied));
+        assert!(super::is_terminal_poll_error(&LoginError::Expired));
+        assert!(super::is_terminal_poll_error(&LoginError::Upstream(
+            "invalid_client".into()
+        )));
+        assert!(super::is_terminal_poll_error(&LoginError::BadCallback));
+        // 传输层抖动 / 应答体不可解析 → 瞬态。
+        assert!(!super::is_terminal_poll_error(&LoginError::Http));
+        // 429 与 5xx → 瞬态,且需退避。
+        for status in [429u16, 500, 503] {
+            let e = LoginError::UpstreamHttp {
+                status,
+                body: String::new(),
+            };
+            assert!(!super::is_terminal_poll_error(&e), "status={status}");
+            assert!(super::should_back_off(&e), "status={status}");
+        }
+        assert!(!super::should_back_off(&LoginError::Http));
+    }
+
+    /// 粘错回调 URL(state 不符)→ 400,但会话保留,用户改一下就能重试。
+    #[tokio::test]
+    async fn iam_sso_complete_bad_callback_keeps_session_for_retry() {
+        let state = state_with(vec![], cfg_with_temp_creds());
+        let sessions = state.iam_sso_sessions.clone();
+        let session_id = sessions.put(
+            IamSsoSession {
+                auth: crate::kiro::login::iam_sso::AuthStart {
+                    authorize_url: "https://oidc.us-east-1.amazonaws.com/authorize".into(),
+                    verifier: "verifier".into(),
+                    state: "expected-state".into(),
+                    client_id: "cid".into(),
+                    client_secret: "csec".into(),
+                },
+                region: "us-east-1".into(),
+            },
+            super::now_unix(),
+        );
+        let app = admin_api_router(state);
+        let (st, v) = send(
+            &app,
+            Method::POST,
+            "/api/admin/login/iam-sso/complete",
+            Some(&format!(
+                r#"{{"sessionId":"{session_id}","callbackUrl":"http://127.0.0.1/oauth/callback?code=c&state=WRONG"}}"#
+            )),
+        )
+        .await;
+        assert_eq!(st, HttpStatusCode::BAD_REQUEST);
+        assert_eq!(v["success"], false);
+        assert!(
+            sessions.get(&session_id, super::now_unix()).is_some(),
+            "校验回调失败不得消费会话"
+        );
+    }
+
+    /// 回调合法但换 token 撞上瞬态失败(上游不可达)→ 502,会话仍保留供重试。
+    #[tokio::test]
+    async fn iam_sso_complete_transient_token_exchange_keeps_session() {
+        let state = state_with_unreachable_upstream(cfg_with_temp_creds());
+        let sessions = state.iam_sso_sessions.clone();
+        let session_id = sessions.put(
+            IamSsoSession {
+                auth: crate::kiro::login::iam_sso::AuthStart {
+                    authorize_url: "https://oidc.us-east-1.amazonaws.com/authorize".into(),
+                    verifier: "verifier".into(),
+                    state: "expected-state".into(),
+                    client_id: "cid".into(),
+                    client_secret: "csec".into(),
+                },
+                region: "us-east-1".into(),
+            },
+            super::now_unix(),
+        );
+        let app = admin_api_router(state);
+        let (st, _v) = send(
+            &app,
+            Method::POST,
+            "/api/admin/login/iam-sso/complete",
+            Some(&format!(
+                r#"{{"sessionId":"{session_id}","callbackUrl":"http://127.0.0.1/oauth/callback?code=c&state=expected-state"}}"#
+            )),
+        )
+        .await;
+        assert_eq!(st, HttpStatusCode::BAD_GATEWAY);
+        assert!(
+            sessions.get(&session_id, super::now_unix()).is_some(),
+            "换 token 瞬态失败不得消费会话"
+        );
+    }
+
+    /// 删除凭据后,按 id 键控的余额/模型缓存必须同步失效 —— id 会被新凭据复用,
+    /// 残留条目会让新账号显示上一位主人的余额与模型清单。
+    #[tokio::test]
+    async fn delete_credential_invalidates_balance_and_models_cache() {
+        let cfg = cfg_with_temp_creds();
+        let path = cfg.credentials_path.clone();
+        let state = state_with(vec![cred("77991")], cfg);
+        let now = super::now_unix();
+        let balance = state.balance.clone();
+        let models = state.models_cache.clone();
+        balance
+            .put(
+                "77991",
+                crate::balance::BalanceSnapshot {
+                    subscription_title: Some("KIRO PRO+".into()),
+                    current_usage: 1.0,
+                    usage_limit: 100.0,
+                    remaining: 99.0,
+                    usage_percentage: 1.0,
+                    next_reset_at: None,
+                    fetched_at_unix: now,
+                },
+            )
+            .await;
+        models
+            .put(
+                "77991",
+                vec![crate::models_cache::ModelInfo {
+                    id: "claude-sonnet-4".into(),
+                    display_name: "Claude Sonnet 4".into(),
+                    owned_by: "anthropic".into(),
+                    max_tokens: 8192,
+                    rate_multiplier: None,
+                }],
+                now,
+            )
+            .await;
+        let app = admin_api_router(state);
+        let (st, _v) = send(&app, Method::DELETE, "/api/admin/credentials/77991", None).await;
+        assert_eq!(st, HttpStatusCode::OK);
+        assert!(
+            balance.get_fresh("77991", now).await.is_none(),
+            "删除凭据后余额缓存应已失效"
+        );
+        assert!(
+            models.get_fresh("77991", now).await.is_none(),
+            "删除凭据后模型缓存应已失效"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

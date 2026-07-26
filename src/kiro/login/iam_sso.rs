@@ -1,5 +1,8 @@
 //! IAM Identity Center 登录:授权码(RFC 6749)+ PKCE S256(RFC 7636)+ AWS SSO-OIDC。
-use super::{LoginError, MintedCredential, SCOPES, new_state, pkce_pair, read_upstream_json};
+use super::{
+    LoginError, MintedCredential, SCOPES, effective_expires_in, new_state, pkce_pair,
+    read_upstream_json,
+};
 use serde::Deserialize;
 use url::Url;
 
@@ -125,11 +128,19 @@ pub async fn complete(
         .await
         .map_err(|_| LoginError::Http)?;
     let t: TokenResp = read_upstream_json(resp).await?;
+    // 没有 refreshToken 的凭据永远刷不动:轮到它就换号重试,池里只有它时请求直接失败;
+    // 且空串会让按 refresh_token 去重失效,重复登录会堆出多条死账号。授权码此刻已被上游
+    // 消费,重试也换不回来,故按终态报错而不是落库。
+    if t.refresh_token.trim().is_empty() {
+        return Err(LoginError::Upstream(
+            "upstream returned no refreshToken".to_string(),
+        ));
+    }
     Ok(MintedCredential {
         // IdC 数据面认 idToken(JWT);缺省才回落 accessToken。
         access_token: t.id_token.unwrap_or(t.access_token),
         refresh_token: t.refresh_token,
-        expires_in_secs: t.expires_in,
+        expires_in_secs: effective_expires_in(t.expires_in),
         region: region.to_string(),
         // 首刷走 SSO-OIDC refresh_token 授权须重放这对客户端凭据(auth=Idc)。
         client_id: s.client_id.clone(),
@@ -265,5 +276,61 @@ mod tests {
         assert_eq!(cred.access_token, "jwt-idtok"); // 采 idToken
         assert_eq!(cred.client_id, "cid");
         assert_eq!(cred.client_secret, "csec");
+    }
+
+    /// 上游漏回 refreshToken 时必须报错,而不是铸出一条永远刷不动、且因空串去重失效
+    /// 会被重复堆积的死凭据。
+    #[tokio::test]
+    async fn complete_requires_refresh_token() {
+        for body in [
+            serde_json::json!({"accessToken": "atok", "expiresIn": 3600}),
+            serde_json::json!({"accessToken": "atok", "refreshToken": "", "expiresIn": 3600}),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+            let client = reqwest::Client::new();
+            let s = AuthStart {
+                authorize_url: "x".into(),
+                verifier: "ver".into(),
+                state: "S".into(),
+                client_id: "cid".into(),
+                client_secret: "csec".into(),
+            };
+            let e = complete(&client, &server.uri(), "us-east-1", &s, "code123")
+                .await
+                .unwrap_err();
+            assert!(matches!(e, LoginError::Upstream(m) if m.contains("refreshToken")));
+        }
+    }
+
+    /// `expiresIn` 缺失时 serde 默认得到 0——直接落库会让凭据一写盘就判过期,每个请求
+    /// 触发一次刷新。须回落到保守短有效期。
+    #[tokio::test]
+    async fn complete_missing_expires_in_falls_back_to_short_ttl() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accessToken": "atok", "refreshToken": "rtok"
+            })))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let s = AuthStart {
+            authorize_url: "x".into(),
+            verifier: "ver".into(),
+            state: "S".into(),
+            client_id: "cid".into(),
+            client_secret: "csec".into(),
+        };
+        let cred = complete(&client, &server.uri(), "us-east-1", &s, "code123")
+            .await
+            .unwrap();
+        assert_eq!(cred.expires_in_secs, super::super::FALLBACK_EXPIRES_IN_SECS);
+        assert!(cred.expires_in_secs > 0);
     }
 }

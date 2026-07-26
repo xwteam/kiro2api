@@ -48,6 +48,13 @@ pub enum LoginError {
         status: u16,
         body: String,
     },
+    /// 瞬态故障:上游限流(429)/5xx,或非 2xx 却给不出可解析的错误体(代理塞回 HTML
+    /// 错误页、应答被截断等)。此时**判不出终态**,调用方应退避重试而非销毁登录会话。
+    /// `detail` 带失败环节与上游摘要;状态码在 `status` 里,渲染时二者都要带出。
+    Transient {
+        status: u16,
+        detail: String,
+    },
     Pending,
     SlowDown,
     Expired,
@@ -55,8 +62,35 @@ pub enum LoginError {
     BadCallback,
 }
 
+impl LoginError {
+    /// 是否属于"再试一次仍可能成功"的非终态。设备码轮询/批量导入据此决定继续退避重试,
+    /// 还是判定终态并销毁登录会话——把瞬态故障当终态会让用户已在浏览器点过的授权白费。
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            LoginError::Http
+                | LoginError::Pending
+                | LoginError::SlowDown
+                | LoginError::Transient { .. }
+        )
+    }
+}
+
 /// 应答体摘要上限(字符),防日志/对外串过长。
 const BODY_SNIPPET_MAX: usize = 200;
+
+/// 上游未回 `expiresIn` 时的保守回落有效期(秒)。不能取 0——0 会让凭据一落盘就被判为
+/// 已过期,每个请求都触发一次刷新,形成刷新风暴;短有效期只是让首次使用前多刷一次。
+pub(crate) const FALLBACK_EXPIRES_IN_SECS: u64 = 300;
+
+/// `expiresIn` 缺失时 serde 默认得到 0,回落到保守短有效期。
+pub(crate) fn effective_expires_in(raw: u64) -> u64 {
+    if raw == 0 {
+        FALLBACK_EXPIRES_IN_SECS
+    } else {
+        raw
+    }
+}
 
 /// 从上游应答体提取简明错误信息:优先 JSON 的 `message`/`error`/`__type`/`error_description`
 /// 字段,否则取原文前若干字符;并做单行化 + 截断。
@@ -211,6 +245,32 @@ mod tests {
         assert_eq!(
             extract_upstream_message(&long).chars().count(),
             BODY_SNIPPET_MAX
+        );
+    }
+
+    #[test]
+    fn retryable_covers_transient_states_only() {
+        assert!(LoginError::Pending.is_retryable());
+        assert!(LoginError::SlowDown.is_retryable());
+        assert!(LoginError::Http.is_retryable());
+        assert!(
+            LoginError::Transient {
+                status: 502,
+                detail: "bad gateway".into()
+            }
+            .is_retryable()
+        );
+        // 终态:重试也不会变好,须销毁会话/丢弃该行。
+        assert!(!LoginError::Expired.is_retryable());
+        assert!(!LoginError::Denied.is_retryable());
+        assert!(!LoginError::BadCallback.is_retryable());
+        assert!(!LoginError::Upstream("invalid_grant".into()).is_retryable());
+        assert!(
+            !LoginError::UpstreamHttp {
+                status: 404,
+                body: "not found".into()
+            }
+            .is_retryable()
         );
     }
 
