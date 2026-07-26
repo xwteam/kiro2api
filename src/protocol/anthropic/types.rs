@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 pub struct MessagesRequest {
     pub model: String,
     #[serde(default)]
-    pub system: Option<String>,
+    pub system: Option<SystemPrompt>,
     pub messages: Vec<InMsg>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
@@ -16,6 +16,38 @@ pub struct MessagesRequest {
     pub tools: Option<Vec<ToolDef>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+}
+
+/// `system` 字段:裸字符串**或**内容块数组。Anthropic 规范二者都允许——真实客户端
+/// (Claude Code、带 prompt 缓存的 SDK)会把 system 发成 `[{"type":"text","text":"…",
+/// "cache_control":{…}}]` 数组;只接受字符串会 422。用 `#[serde(untagged)]` 两者都吃,
+/// 额外字段(cache_control 等)serde 默认忽略。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SystemPrompt {
+    Text(String),
+    Blocks(Vec<SystemBlock>),
+}
+
+/// system 内容块;只关心 `text`,其它字段(type/cache_control…)忽略。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SystemBlock {
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+impl SystemPrompt {
+    /// 拍平成纯文本(拼接所有文本块;裸字符串即自身)。
+    pub fn text(&self) -> String {
+        match self {
+            SystemPrompt::Text(s) => s.clone(),
+            SystemPrompt::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| b.text.as_deref())
+                .collect::<Vec<_>>()
+                .concat(),
+        }
+    }
 }
 
 /// 工具定义(照 Anthropic 公开规范)。
@@ -153,11 +185,19 @@ mod tests {
         let raw = r#"{"model":"claude-sonnet-4.5","system":"s","messages":[{"role":"user","content":"hi"}],"max_tokens":100}"#;
         let req: MessagesRequest = serde_json::from_str(raw).expect("解析失败");
         assert_eq!(req.model, "claude-sonnet-4.5");
-        assert_eq!(req.system.as_deref(), Some("s"));
+        assert_eq!(req.system.as_ref().map(|s| s.text()).as_deref(), Some("s"));
         assert_eq!(req.max_tokens, Some(100));
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].role, "user");
         assert_eq!(req.messages[0].text(), "hi");
+    }
+
+    #[test]
+    fn parses_system_as_content_block_array() {
+        // 真实客户端(Claude Code / 带缓存 SDK)把 system 发成带 cache_control 的块数组。
+        let raw = r#"{"model":"claude-sonnet-4.5","system":[{"type":"text","text":"you are","cache_control":{"type":"ephemeral"}},{"type":"text","text":" helpful"}],"messages":[{"role":"user","content":"hi"}]}"#;
+        let req: MessagesRequest = serde_json::from_str(raw).expect("system 数组应能解析");
+        assert_eq!(req.system.as_ref().map(|s| s.text()).as_deref(), Some("you are helpful"));
     }
 
     #[test]

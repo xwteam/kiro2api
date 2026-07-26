@@ -4,7 +4,7 @@ use super::types::{
     UsageMetadata,
 };
 use crate::protocol::anthropic::types::{
-    Block, ContentIn, InMsg, MessagesRequest, MessagesResponse, OutBlock, ToolDef,
+    Block, ContentIn, InMsg, MessagesRequest, MessagesResponse, OutBlock, SystemPrompt, ToolDef,
 };
 use serde_json::{Value, json};
 
@@ -87,7 +87,7 @@ pub fn gemini_to_hub(req: GenerateContentRequest, model: String) -> MessagesRequ
 
     MessagesRequest {
         model,
-        system,
+        system: system.map(SystemPrompt::Text),
         messages,
         max_tokens,
         stream: None,
@@ -196,7 +196,7 @@ mod tests {
             generation_config: None,
         };
         let hub = gemini_to_hub(req, "claude-sonnet-4.5".to_string());
-        assert_eq!(hub.system.as_deref(), Some("s"));
+        assert_eq!(hub.system.as_ref().map(|s| s.text()).as_deref(), Some("s"));
         let last = hub.messages.last().expect("应有消息");
         assert_eq!(last.role, "user");
         assert_eq!(last.text(), "hi");

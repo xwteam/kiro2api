@@ -4,7 +4,7 @@ use super::types::{
     OpenAiUsage, RespMessage, ToolCall, ToolCallFunction,
 };
 use crate::protocol::anthropic::types::{
-    Block, ContentIn, InMsg, MessagesRequest, MessagesResponse, OutBlock, ToolDef,
+    Block, ContentIn, InMsg, MessagesRequest, MessagesResponse, OutBlock, SystemPrompt, ToolDef,
 };
 use serde_json::{Value, json};
 
@@ -139,7 +139,7 @@ pub fn openai_to_hub(req: ChatCompletionRequest) -> MessagesRequest {
 
     MessagesRequest {
         model: req.model,
-        system,
+        system: system.map(SystemPrompt::Text),
         messages,
         max_tokens: req.max_tokens,
         stream: req.stream,
@@ -263,7 +263,7 @@ mod tests {
             max_tokens: None,
         };
         let hub = openai_to_hub(req);
-        assert_eq!(hub.system.as_deref(), Some("s"));
+        assert_eq!(hub.system.as_ref().map(|s| s.text()).as_deref(), Some("s"));
         assert_eq!(hub.messages.len(), 1);
         let last = hub.messages.last().expect("应有消息");
         assert_eq!(last.role, "user");
@@ -281,7 +281,7 @@ mod tests {
             max_tokens: None,
         };
         let hub = openai_to_hub(req);
-        assert_eq!(hub.system.as_deref(), Some("a\n\nb"));
+        assert_eq!(hub.system.as_ref().map(|s| s.text()).as_deref(), Some("a\n\nb"));
     }
 
     #[test]

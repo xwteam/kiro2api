@@ -1038,8 +1038,8 @@ fn count_content_chars(content: &crate::protocol::anthropic::types::ContentIn) -
 pub async fn count_tokens(Json(req): Json<MessagesRequest>) -> Json<CountTokensResponse> {
     let mut chars = req
         .system
-        .as_deref()
-        .map(|s| s.chars().count())
+        .as_ref()
+        .map(|s| s.text().chars().count())
         .unwrap_or(0);
     let mut images = 0usize;
 

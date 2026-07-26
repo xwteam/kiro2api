@@ -289,7 +289,7 @@ pub fn anthropic_to_kiro(
         .map(|(i, msg)| {
             let text = msg.text();
             if i == 0 {
-                match &req.system {
+                match req.system.as_ref().map(|s| s.text()) {
                     Some(sys) if !sys.is_empty() => format!("{sys}\n\n{text}"),
                     _ => text,
                 }
@@ -663,7 +663,7 @@ pub fn kiro_events_to_anthropic(frames: &[Message], model: &str) -> MessagesResp
 mod tests {
     use super::*;
     use crate::kiro::eventstream::header::{Header, HeaderValue};
-    use crate::protocol::anthropic::types::{Block, ContentIn, InMsg, ToolDef};
+    use crate::protocol::anthropic::types::{Block, ContentIn, InMsg, SystemPrompt, ToolDef};
 
     fn msg(role: &str, text: &str) -> InMsg {
         InMsg {
@@ -858,7 +858,7 @@ mod tests {
     fn converts_request_with_system_and_history() {
         let req = MessagesRequest {
             model: "sonnet".to_string(),
-            system: Some("S".to_string()),
+            system: Some(SystemPrompt::Text("S".to_string())),
             messages: vec![msg("user", "a"), msg("assistant", "b"), msg("user", "c")],
             max_tokens: None,
             stream: None,

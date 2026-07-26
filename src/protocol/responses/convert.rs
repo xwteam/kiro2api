@@ -4,7 +4,7 @@ use super::types::{
     ResponsesInput, ResponsesRequest, ResponsesTool, ResponsesUsage,
 };
 use crate::protocol::anthropic::types::{
-    Block, ContentIn, InMsg, MessagesRequest, MessagesResponse, OutBlock, ToolDef,
+    Block, ContentIn, InMsg, MessagesRequest, MessagesResponse, OutBlock, SystemPrompt, ToolDef,
 };
 use serde_json::{Value, json};
 use std::fmt;
@@ -134,7 +134,7 @@ pub fn responses_to_hub(req: ResponsesRequest) -> Result<MessagesRequest, Respon
 
     Ok(MessagesRequest {
         model: req.model,
-        system: req.instructions,
+        system: req.instructions.map(SystemPrompt::Text),
         messages,
         max_tokens: req.max_output_tokens,
         stream: req.stream,
@@ -211,7 +211,7 @@ mod tests {
             previous_response_id: None,
         };
         let hub = responses_to_hub(req).expect("应转换成功");
-        assert_eq!(hub.system.as_deref(), Some("s"));
+        assert_eq!(hub.system.as_ref().map(|s| s.text()).as_deref(), Some("s"));
         assert_eq!(hub.messages.len(), 1);
         assert_eq!(hub.messages[0].role, "user");
         assert_eq!(hub.messages[0].text(), "hi");
