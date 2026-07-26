@@ -3,11 +3,12 @@
 //!   - 成功 → 产出消息,缓冲头前移 total_len;
 //!   - Truncated → 数据还不够,等下次 push;
 //!   - CrcMismatch/BadHeader → 判定缓冲头 1 字节为噪声,丢弃它并重试(逐字节再同步),
-//!     累计坏帧计数,超过自设上限则清空缓冲防呆。
+//!     累计坏帧计数,单轮丢弃过多则本轮收工,只丢已扫描的噪声。
 use super::Error;
 use super::frame::{MAX_FRAME_SIZE, Message, parse_one};
 
-/// 连续坏字节的容忍上限(自设):超过则清空缓冲,避免无限累积。
+/// 单轮 drain 逐字节再同步的扫描预算(自设):达到上限即本轮收工,避免一次调用在
+/// 纯噪声上无限试探。已扫描的噪声照常丢弃,未扫描的字节留给下一轮继续同步。
 const RESYNC_BUDGET: usize = 4096;
 
 /// 内部缓冲上限(自设)。任何单帧都 <= `MAX_FRAME_SIZE`(见 frame.rs),因此
@@ -51,10 +52,12 @@ impl StreamDecoder {
                         self.errors = self.errors.saturating_add(1);
                         self.dropped_since_progress += 1;
                         if self.dropped_since_progress >= RESYNC_BUDGET {
-                            // 防呆:噪声太多,放弃当前缓冲。
-                            self.buf.clear();
+                            // 本轮扫描预算耗尽:只丢弃已扫描过的噪声前缀(由下方统一
+                            // drain 完成),未扫描的字节保留 —— 噪声之后可能已经躺着
+                            // 合法帧,整体清空会把它们一并丢掉。本轮至少推进
+                            // RESYNC_BUDGET 字节,不会原地打转。
                             self.dropped_since_progress = 0;
-                            return out;
+                            break;
                         }
                     } else {
                         break;
@@ -66,10 +69,10 @@ impl StreamDecoder {
         if start > 0 {
             self.buf.drain(0..start);
         }
-        // 缓冲上限防护:走到这里剩余缓冲要么是"某帧的合法前缀(Truncated,等更多字节)",
-        // 要么是"末尾一小段无法判定的噪声"。任何合法帧都 <= MAX_FRAME_SIZE,因此残留缓冲
-        // 一旦超过 MAX_BUFFER_SIZE,就不可能再凑成合法帧(纯属噪声/攻击流),清空防呆,
-        // 避免内存无限增长(DoS)。
+        // 缓冲上限防护:走到这里剩余缓冲是"某帧的合法前缀(Truncated,等更多字节)"、
+        // "末尾一小段无法判定的噪声",或"本轮再同步预算没扫完的字节"。任何合法帧都
+        // <= MAX_FRAME_SIZE,因此残留缓冲一旦超过 MAX_BUFFER_SIZE,就不可能再凑成合法帧
+        // (纯属噪声/攻击流),清空防呆,避免内存无限增长(DoS)。
         if self.buf.len() > MAX_BUFFER_SIZE {
             self.buf.clear();
             self.dropped_since_progress = 0;
@@ -154,6 +157,58 @@ mod tests {
         assert!(d.errors() >= 1);
     }
 
+    // 整帧字节齐全、两处 CRC 均正确,但 headers 段内部自截断:headers_len=5,
+    // 段内首字节声称 name_len=6,已越过段尾。
+    fn frame_with_overrun_headers(payload: &[u8]) -> Vec<u8> {
+        let headers = [6u8, b'a', b'b', b'c', b'd'];
+        let hlen = headers.len() as u32;
+        let total = 16 + hlen + payload.len() as u32;
+        let mut m = Vec::new();
+        m.extend_from_slice(&total.to_be_bytes());
+        m.extend_from_slice(&hlen.to_be_bytes());
+        let pc = crc32(&m[0..8]);
+        m.extend_from_slice(&pc.to_be_bytes());
+        m.extend_from_slice(&headers);
+        m.extend_from_slice(payload);
+        let mc = crc32(&m);
+        m.extend_from_slice(&mc.to_be_bytes());
+        m
+    }
+
+    #[test]
+    fn skips_frame_with_overrun_headers() {
+        // 这种坏帧的字节已全部到齐,headers 段又是定长的,再等更多字节也补不齐:
+        // 必须走重新同步跳过它,否则解码器停在这里,其后的合法帧永远出不来,
+        // 缓冲还会一路堆到上限被整体丢弃。
+        let mut d = StreamDecoder::new();
+        let mut buf = frame_with_overrun_headers(b"junk");
+        buf.extend_from_slice(&frame(b"ok"));
+        d.push(&buf);
+        let msgs = d.drain();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].payload, b"ok");
+        assert!(d.errors() >= 1);
+        // 坏帧被逐字节跳过、合法帧被消费,缓冲不残留。
+        assert_eq!(d.buf_len_for_test(), 0);
+    }
+
+    #[test]
+    fn resync_budget_keeps_unscanned_bytes() {
+        // 噪声长度超过单轮扫描预算:本轮只丢弃已扫描的那 RESYNC_BUDGET 字节,
+        // 噪声之后已经到达的合法帧必须留在缓冲里,下一轮仍能被解出来。
+        let mut d = StreamDecoder::new();
+        let mut buf = vec![0u8; RESYNC_BUDGET + 100]; // 全零 prelude 的 CRC 必不匹配
+        buf.extend_from_slice(&frame(b"late"));
+        d.push(&buf);
+
+        assert!(d.drain().is_empty()); // 本轮预算全花在噪声上
+        assert_eq!(d.buf_len_for_test(), buf.len() - RESYNC_BUDGET);
+
+        let msgs = d.drain();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].payload, b"late");
+    }
+
     // 构造一个"prelude_crc 合法但 total_len 巨大"的 12 字节 prelude。
     // prelude_crc 只覆盖前 8 字节,故这种损坏/攻击 prelude 能越过 CRC 校验。
     fn oversized_prelude(total_len: u32, headers_len: u32) -> Vec<u8> {
@@ -190,9 +245,11 @@ mod tests {
         // drain 后应被清空(MAX_BUFFER_SIZE 防呆),而不是一直驻留内存。
         let mut d = StreamDecoder::new();
         // 用重复的合法 prelude_crc 的坏 prelude 拼成超大噪声,确保不会意外解析成帧。
+        // 单轮 drain 只丢弃扫描过的 RESYNC_BUDGET 字节噪声,故噪声要比上限多出这一段,
+        // 残留才会真正越过 MAX_BUFFER_SIZE、触发防呆清空。
         let chunk = oversized_prelude(u32::MAX, 0);
         let mut big = Vec::new();
-        while big.len() <= MAX_BUFFER_SIZE {
+        while big.len() <= MAX_BUFFER_SIZE + 2 * RESYNC_BUDGET {
             big.extend_from_slice(&chunk);
         }
         d.push(&big);

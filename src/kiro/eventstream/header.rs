@@ -90,11 +90,23 @@ fn read_value(c: &mut Cursor, value_type: u8) -> Result<HeaderValue, Error> {
     })
 }
 
+/// 单帧 header 条数上限(自设)。
+///
+/// headers 段本身只受 headers_length(u32)约束,而单条 header 最小仅 3 字节
+/// (name_len=1 + 1 字节名字 + bool 类型,无取值字节)。逼近单帧上限的 headers 段
+/// 因此能展开出数百万个 `Header`,每个都带独立分配的 `String`,线上字节被放大成
+/// 数十倍的堆内存(内存放大 / OOM)。AWS 事件流实际用到的 header 数是个位数,
+/// 取一个宽松但安全的上限,超限判为坏帧,交由上层重新同步。
+pub const MAX_HEADERS: usize = 128;
+
 /// 解析整个 header 段(buf 恰为 headers_length 字节)。
 pub fn parse_headers(buf: &[u8]) -> Result<Vec<Header>, Error> {
     let mut c = Cursor::new(buf);
     let mut out = Vec::new();
     while c.pos < buf.len() {
+        if out.len() >= MAX_HEADERS {
+            return Err(Error::BadHeader);
+        }
         let name_len = c.u8()? as usize;
         let name = core::str::from_utf8(c.take(name_len)?)
             .map_err(|_| Error::BadHeader)?
@@ -147,6 +159,33 @@ mod tests {
         let b = vec![1u8, b'x', 99u8];
         assert_eq!(
             parse_headers(&b),
+            Err(crate::kiro::eventstream::Error::BadHeader)
+        );
+    }
+
+    // 拼 n 条最小 header:name_len=1 + 名字 + BoolTrue(无取值字节),每条 3 字节。
+    fn minimal_headers(n: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        for _ in 0..n {
+            b.push(1u8);
+            b.push(b'x');
+            b.push(0u8); // value_type = bool true
+        }
+        b
+    }
+
+    #[test]
+    fn header_count_at_limit_ok() {
+        let hs = parse_headers(&minimal_headers(MAX_HEADERS)).unwrap();
+        assert_eq!(hs.len(), MAX_HEADERS);
+    }
+
+    #[test]
+    fn too_many_headers_errors() {
+        // 每条 header 只占 3 字节线上字节却各自分配一个 String,条数不设限时
+        // 一个大 headers 段可把内存放大数十倍;超过上限直接判坏帧。
+        assert_eq!(
+            parse_headers(&minimal_headers(MAX_HEADERS + 1)),
             Err(crate::kiro::eventstream::Error::BadHeader)
         );
     }

@@ -63,7 +63,13 @@ pub fn parse_one(buf: &[u8]) -> Result<(Message, usize), Error> {
 
     let headers_start = PRELUDE_LEN;
     let headers_end = headers_start + headers_len;
-    let headers = parse_headers(&buf[headers_start..headers_end])?;
+    // 走到这里整帧字节已全部到齐,headers 段是一段定长切片:段内声明的长度越过段尾
+    // 属格式错误,再多等字节也补不齐。因此把 header 解析的 Truncated 收敛为 BadHeader,
+    // 让上层走重新同步;若原样传播 Truncated,上层会一直等一个永远凑不齐的段而停滞。
+    let headers = parse_headers(&buf[headers_start..headers_end]).map_err(|e| match e {
+        Error::Truncated => Error::BadHeader,
+        other => other,
+    })?;
     let payload = buf[headers_end..total_len - TRAILER_LEN].to_vec();
 
     Ok((Message { headers, payload }, total_len))
@@ -96,6 +102,23 @@ mod tests {
         msg.extend_from_slice(&headers);
         msg.extend_from_slice(payload);
         let msg_crc = crc32(&msg); // 覆盖到此为止(去掉末 4 字节前的全部)
+        msg.extend_from_slice(&msg_crc.to_be_bytes());
+        msg
+    }
+
+    // 用给定的原始 headers 段字节构造帧,两处 CRC 均按规范正确计算。
+    fn build_frame_raw(headers: &[u8], payload: &[u8]) -> Vec<u8> {
+        let headers_len = headers.len() as u32;
+        let total_len = 16 + headers_len + payload.len() as u32;
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&total_len.to_be_bytes());
+        msg.extend_from_slice(&headers_len.to_be_bytes());
+        let prelude_crc = crc32(&msg[0..8]);
+        msg.extend_from_slice(&prelude_crc.to_be_bytes());
+        msg.extend_from_slice(headers);
+        msg.extend_from_slice(payload);
+        let msg_crc = crc32(&msg);
         msg.extend_from_slice(&msg_crc.to_be_bytes());
         msg
     }
@@ -177,6 +200,24 @@ mod tests {
         assert_eq!(parse_one(&buf), Err(Error::BadHeader));
         // 缓冲从未增长到 total_len 规模(此处 buf 仍只有 prelude 大小)。
         assert!(buf.len() < MAX_FRAME_SIZE);
+    }
+
+    #[test]
+    fn headers_overrun_in_complete_frame_is_bad_header() {
+        // headers_len=5,而段内首字节声称 name_len=6,已越过段尾;整帧字节齐全、
+        // 两处 CRC 也都正确。这属于格式错误而非数据不足:必须返回 BadHeader 触发
+        // 上层重新同步,返回 Truncated 会让解码器永远等一个定长段补齐(永久停滞)。
+        let frame = build_frame_raw(&[6u8, b'a', b'b', b'c', b'd'], b"payload");
+        assert_eq!(parse_one(&frame), Err(Error::BadHeader));
+    }
+
+    #[test]
+    fn header_value_overrun_in_complete_frame_is_bad_header() {
+        // 同一类越界的另一处入口:name 合法,但 string 取值声称 16 字节,
+        // 段内实际只剩 2 字节。同样应判坏帧。
+        let headers = [1u8, b'x', 7u8, 0x00, 0x10, b'a', b'b'];
+        let frame = build_frame_raw(&headers, b"payload");
+        assert_eq!(parse_one(&frame), Err(Error::BadHeader));
     }
 
     #[test]
