@@ -51,16 +51,19 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates wget gosu \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 1000 appuser
-ENV HOST=0.0.0.0
+# 凭据路径走环境变量而非启动命令的 --credentials:命令行优先级最高,写死在 CMD 里会让
+# 用户在 .env 里设的 CREDENTIALS_PATH 静默失效。默认值指向挂载卷 /app/data——凭据以及
+# 由其父目录推断的用量统计 / api_keys.json / 余额缓存都必须落在卷内,否则容器重建即丢。
+ENV HOST=0.0.0.0 \
+    CREDENTIALS_PATH=/app/data/credentials.json
 WORKDIR /app
 COPY --from=builder /build/kiro2api /usr/local/bin/kiro2api
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh && mkdir -p /app/data && chown -R appuser:appuser /app
-EXPOSE 8990
-# Probe the port the app actually binds — read it from the mounted config.json
-# (falls back to 8080 if the file is absent), so the check tracks the runtime
-# port instead of a hard-coded guess.
+EXPOSE 8080
+# 探活端口按与应用完全相同的优先级解析:PORT 环境变量 > 挂载的 config.json 里的 port > 8080。
+# 少了 PORT 这一层,用户按文档改端口后健康检查仍打旧端口,容器会永远 unhealthy。
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-    CMD P=$(grep -oE '"port"[[:space:]]*:[[:space:]]*[0-9]+' /app/data/config.json 2>/dev/null | grep -oE '[0-9]+' | head -1); wget -q -O /dev/null "http://localhost:${P:-8080}/health" || exit 1
+    CMD P="${PORT:-$(grep -oE '"port"[[:space:]]*:[[:space:]]*[0-9]+' /app/data/config.json 2>/dev/null | grep -oE '[0-9]+' | head -1)}"; wget -q -O /dev/null "http://localhost:${P:-8080}/health" || exit 1
 ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["kiro2api", "-c", "/app/data/config.json", "--credentials", "/app/data/credentials.json"]
+CMD ["kiro2api", "-c", "/app/data/config.json"]

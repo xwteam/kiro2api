@@ -203,7 +203,7 @@
   var API_KEY_PLACEHOLDER = 'YOUR_API_KEY';
 
   function apiOrigin() {
-    return (typeof window !== 'undefined' && window.location && window.location.origin) || 'http://localhost:8990';
+    return (typeof window !== 'undefined' && window.location && window.location.origin) || 'http://localhost:8080';
   }
 
   // 返回 { '<proto>-<lang>': '代码串' }。base 由 origin 推导:OpenAI=/v1、Anthropic=根(SDK
