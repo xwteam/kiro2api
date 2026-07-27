@@ -550,9 +550,11 @@ const MAX_BAD_APIKEY_LOGS: usize = 20;
 /// 1. **原样备份**(复制而非改名):存成 `{path}.corrupt.{unix秒}.{序号}`,原文件留在原处供人工
 ///    修复,备份档任凭后续任何原子写都覆不掉;
 /// 2. **逐条抢救**:文件本体还是 JSON(新版对象 / 旧版裸数组)时按条反序列化,坏条目跳过、
-///    好 key 照常入库 —— 1 条坏 key 不再拖垮另外 999 条,客户继续能用;
+///    好 key 照常入库 —— 1 条坏 key 不再拖垮另外 999 条,客户继续能用;整份文件连 JSON 都不是
+///    (多打一个逗号 / 写盘中途被截断)时再退一步,按原始字节切片抢救(见 `salvage_from_raw_bytes`);
 /// 3. **大声报错**并抬高 `next_id` 下界:坏条目进不了内存,但它占用过的 id 仍要计入下界,
 ///    否则新建 key 会复用该 id、直接继承前任的用量明细与累计消费(跨客户串账,见 `create` 注释)。
+///    这条下界对上面两种抢救路径都必须成立——用量账本是另一份文件,它不会跟着 api_keys.json 一起坏。
 fn load_keys_resilient(path: &Path) -> (Vec<ApiKey>, u32) {
     let err = match read_json::<ApiKeyFile>(path) {
         Ok(Some(ApiKeyFile::Versioned(f))) => return (f.keys, f.next_id),
@@ -605,7 +607,7 @@ struct SalvagedKeys {
 }
 
 /// 逐条抢救:文件本体仍是 JSON 时按条反序列化,坏条目跳过并报错。
-/// 整份文件连 JSON 都解析不出(语法错/被截断)时全空——此时只剩备份档可人工修复。
+/// 整份文件连 JSON 都解析不出(语法错/被截断)时退到 [`salvage_from_raw_bytes`] 扫原始字节。
 fn salvage_api_keys(raw: &[u8]) -> SalvagedKeys {
     let empty = SalvagedKeys {
         keys: Vec::new(),
@@ -618,9 +620,9 @@ fn salvage_api_keys(raw: &[u8]) -> SalvagedKeys {
         Err(e) => {
             tracing::error!(
                 error = %e,
-                "api_keys.json 连 JSON 都解析不出(语法错误/文件被截断),无法逐条抢救;原文件已备份,请人工修复"
+                "api_keys.json 连 JSON 都解析不出(语法错误/文件被截断),改按原始字节逐块抢救;原文件已备份"
             );
-            return empty;
+            return salvage_from_raw_bytes(raw);
         }
     };
     let (entries, stored_next_id) = match value {
@@ -680,6 +682,126 @@ fn salvage_api_keys(raw: &[u8]) -> SalvagedKeys {
         total,
         skipped,
     }
+}
+
+/// 整份文件连 JSON 都解析不出时(手工编辑多打一个逗号、写盘中途被截断)的兜底抢救:
+/// 绕开 JSON 解析器,直接在原始字节上切出成对闭合的 `{...}` 片段逐个反序列化,
+/// 并把幸存字节里出现过的 `next_id` / `id` 数值统统计入 `next_id` 下界。
+///
+/// 为什么非做不可:这两种坏法里 key 明文和 id 都还原封不动地躺在文件里,断的只是外层语法。
+/// 早先「解析不出就整体放弃」的做法会让 `next_id` 一路退回 1,而用量账本是**另一份文件、
+/// 不会跟着一起坏**。于是管理员补发的第一条 key 拿到 1 号,当场继承原 1 号客户幸存在账本里
+/// 的调用明细(IP/模型/费用跨用户泄露)与累计消费(可能一上来就撞上限 402)——正是 `create`
+/// 注释里写死的那条硬约束被破。顺带把完整条目捞回来,客户也不必集体 401 等人工修文件。
+///
+/// 取舍是**宁可高估不可低估**:扫描是纯文本匹配,理论上某条 key 的 name 里塞一段形如
+/// `"id": 999` 的文本会把下界抬高。抬高只是白白跳过几个号,而低估就是跨客户串账。
+fn salvage_from_raw_bytes(raw: &[u8]) -> SalvagedKeys {
+    // 坏文件可能连 UTF-8 都不合法(截断在多字节字符中间);lossy 只影响那几个字节,
+    // 不妨碍定位 `{` `}` `"` 这些 ASCII 记号。
+    let text = String::from_utf8_lossy(raw);
+    let stored_next_id = max_u32_field_in_text(&text, "next_id");
+    // 出现过的 id 一律占号:哪怕对应条目已被截断得反序列化不出来,它也曾经发给过某个客户。
+    let mut max_id = max_u32_field_in_text(&text, "id");
+    let mut keys = Vec::new();
+    let mut total = 0usize;
+    let mut skipped = 0usize;
+    for fragment in innermost_json_objects(&text) {
+        total += 1;
+        match serde_json::from_str::<ApiKey>(fragment) {
+            Ok(k) => {
+                max_id = max_id.max(k.id);
+                keys.push(k);
+            }
+            Err(e) => {
+                skipped += 1;
+                if skipped <= MAX_BAD_APIKEY_LOGS {
+                    // 与逐条抢救同规:只打序号与错误,**绝不打印 key 明文或 name**。
+                    tracing::error!(
+                        index = total - 1,
+                        error = %e,
+                        "该字节片段不是可用的 API-KEY 条目,已跳过"
+                    );
+                }
+            }
+        }
+    }
+    SalvagedKeys {
+        keys,
+        next_id: stored_next_id.max(max_id.saturating_add(1)),
+        total,
+        skipped,
+    }
+}
+
+/// 在原始文本里扫某个 JSON 字段名(形如 `"字段名" : 123`)出现过的最大 u32 值;没扫到返回 0。
+/// 只服务于「文件已不是合法 JSON」的兜底路径。
+///
+/// 字段名连引号整体匹配,故 `"id"` 不会误命中 `"bound_credential_ids"` 或 `"next_id"`
+/// (那里 `id` 前面的字符不是引号)。放不进 u32 的数值直接忽略:`ApiKey::id` 就是 u32,
+/// 比它大的数绝不可能是本程序发出去过的 id,不需要占号,更不该被截断成小 id 去撞真号。
+fn max_u32_field_in_text(text: &str, field: &str) -> u32 {
+    let needle = format!("\"{field}\"");
+    let mut max = 0u32;
+    for (pos, _) in text.match_indices(needle.as_str()) {
+        let rest = text[pos + needle.len()..].trim_start();
+        let Some(rest) = rest.strip_prefix(':') else {
+            continue;
+        };
+        let digits: String = rest
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if let Ok(v) = digits.parse::<u32>() {
+            max = max.max(v);
+        }
+    }
+    max
+}
+
+/// 在原始文本里切出所有**成对闭合且内部不含子对象**的 `{...}` 片段(按 JSON 词法跳过字符串
+/// 字面量与转义),即"最内层对象"。
+///
+/// 为什么只要最内层:api_keys.json 的 key 条目里没有对象型字段,故最内层对象恰好就是一条 key;
+/// 而外层的 `{"next_id":..,"keys":[..]}` 在"数组末尾多一个逗号"这种坏法下同样是闭合的,不排掉
+/// 它就会被当成一条坏条目、把日志里的条目数算错。被截断得没闭合的片段自然落选——它占的 id
+/// 由 [`max_u32_field_in_text`] 兜住。
+fn innermost_json_objects(text: &str) -> Vec<&str> {
+    // 栈元素 =(该对象 `{` 的字节下标, 其内部是否已出现过闭合的子对象)
+    let mut stack: Vec<(usize, bool)> = Vec::new();
+    let mut out: Vec<&str> = Vec::new();
+    let (mut in_string, mut escaped) = (false, false);
+    for (i, &c) in text.as_bytes().iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_string = true,
+            b'{' => stack.push((i, false)),
+            b'}' => {
+                // 多出来的右括号(残文件里常见)无处配对,直接忽略。
+                if let Some((start, has_child)) = stack.pop() {
+                    if !has_child {
+                        // `{` 与 `}` 都是 ASCII,切片两端必落在字符边界上。
+                        out.push(&text[start..=i]);
+                    }
+                    if let Some(parent) = stack.last_mut() {
+                        parent.1 = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// 把当前(解析不了的)api_keys.json **原样复制**一份到 `{path}.corrupt.{unix秒}.{序号}`。
@@ -1423,6 +1545,132 @@ mod tests {
         let backups = corrupt_backups(&dir);
         assert_eq!(backups.len(), 1, "坏文件必须被备份:{backups:?}");
         assert_eq!(std::fs::read(&backups[0]).unwrap(), broken.as_bytes());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归:手工编辑多打一个逗号(整份文件已不是合法 JSON)时,条目本身仍是完整的,
+    /// 必须逐条抢救出来继续鉴权,且 `next_id` 不得回退到 1。
+    ///
+    /// 为什么这条盯的是"观察得到的后果"而不是内部变量:
+    /// - 客户视角:三条 key 还能不能换来 200 —— 空载入意味着全部客户当场 401;
+    /// - 运营视角:管理面新建的下一条 key 拿到几号 —— 拿到 1 号就等于继承了原 1 号客户
+    ///   幸存在 usage 账本里的调用明细与累计消费(跨客户串账,可能一上来就 402)。
+    #[test]
+    fn trailing_comma_file_salvages_keys_and_does_not_recycle_ids() {
+        let dir = unique_temp_dir("trailing_comma");
+        let path = dir.join("api_keys.json");
+        // 三条完好的 key,只是数组末尾被手工编辑多留了一个逗号。
+        let broken = r#"{
+          "next_id": 4,
+          "keys": [
+            {"id":1,"key":"sk-aaa","name":"0001","enabled":true,"created_at":"2026-07-20T00:00:00Z"},
+            {"id":2,"key":"sk-bbb","name":"0002","enabled":true,"created_at":"2026-07-20T00:00:00Z"},
+            {"id":3,"key":"sk-ccc","name":"0003","enabled":true,"created_at":"2026-07-20T00:00:00Z"},
+          ]
+        }"#;
+        std::fs::write(&path, broken).unwrap();
+
+        let store = ApiKeyStore::load(&path);
+        let now = ts("2026-07-21T00:00:00Z");
+        // 客户可见后果:三条 key 照常鉴权,不是全员 401。
+        assert_eq!(store.len(), 3, "条目本身完好,必须全部抢救出来");
+        for (plain, want) in [("sk-aaa", 1u32), ("sk-bbb", 2), ("sk-ccc", 3)] {
+            match store.validate(plain, now) {
+                ApiKeyAuthResult::Valid { id, .. } => assert_eq!(id, want, "{plain}"),
+                other => panic!("{plain} 应仍可鉴权,实际 {other:?}"),
+            }
+        }
+        // 运营可见后果:下一条新 key 拿 4 号,绝不回头复用 1/2/3。
+        let k = store.create("new".into(), None, None, None, None, None, now);
+        assert_eq!(k.id, 4, "next_id 不得回退,否则新 key 继承前任用量与消费");
+
+        // 原文件留在原处供人工修复,并已原样备份。
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        assert_eq!(corrupt_backups(&dir).len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归:文件被截断(尾部条目写了一半)时,幸存字节里完整的条目要抢救出来,
+    /// 且 `next_id` 要采信幸存字节里的 `next_id`,而不是回退到 1。
+    #[test]
+    fn truncated_file_salvages_complete_entries_and_keeps_next_id() {
+        let dir = unique_temp_dir("truncated_salvage");
+        let path = dir.join("api_keys.json");
+        // next_id=7,前两条完整,第三条写到一半就断了。
+        let broken = concat!(
+            r#"{"next_id":7,"keys":["#,
+            r#"{"id":1,"key":"sk-aaa","name":"0001","enabled":true,"created_at":"2026-07-20T00:00:00Z"},"#,
+            r#"{"id":2,"key":"sk-bbb","name":"0002","enabled":true,"created_at":"2026-07-20T00:00:00Z"},"#,
+            r#"{"id":3,"key":"sk-ccc","name":"0003","enab"#
+        );
+        std::fs::write(&path, broken).unwrap();
+
+        let store = ApiKeyStore::load(&path);
+        let now = ts("2026-07-21T00:00:00Z");
+        assert_eq!(store.len(), 2, "截断点之前的完整条目必须抢救出来");
+        assert!(matches!(
+            store.validate("sk-aaa", now),
+            ApiKeyAuthResult::Valid { id: 1, .. }
+        ));
+        assert!(matches!(
+            store.validate("sk-bbb", now),
+            ApiKeyAuthResult::Valid { id: 2, .. }
+        ));
+        // 幸存字节里白纸黑字写着 next_id=7,新 key 必须从 7 起。
+        let k = store.create("new".into(), None, None, None, None, None, now);
+        assert_eq!(k.id, 7, "幸存字节里的 next_id 必须被采信");
+        assert_eq!(corrupt_backups(&dir).len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归:旧版裸数组被截断(没有 `next_id` 字段可采信)时,下界要由幸存字节里
+    /// **出现过的最大 id** 推出——包括那条被截断得抢救不出来的条目的 id。
+    #[test]
+    fn truncated_legacy_array_reserves_ids_of_unsalvageable_entries() {
+        let dir = unique_temp_dir("truncated_legacy");
+        let path = dir.join("api_keys.json");
+        // 裸数组、无 next_id;id=9 的那条只剩个开头,抢救不出来但 id 必须占住。
+        let broken = concat!(
+            r#"[{"id":1,"key":"sk-aaa","name":"0001","enabled":true,"created_at":"2026-07-20T00:00:00Z"},"#,
+            r#"{"id":9,"key":"sk-b"#
+        );
+        std::fs::write(&path, broken).unwrap();
+
+        let store = ApiKeyStore::load(&path);
+        let now = ts("2026-07-21T00:00:00Z");
+        assert_eq!(store.len(), 1);
+        assert!(matches!(
+            store.validate("sk-aaa", now),
+            ApiKeyAuthResult::Valid { id: 1, .. }
+        ));
+        let k = store.create("new".into(), None, None, None, None, None, now);
+        assert_eq!(k.id, 10, "残缺条目占用过的 id=9 同样不得回收复用");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归:按原始字节抢救时,`bound_credential_ids` 里的**凭据** id 是另一套号段,
+    /// 不得被当成 API-KEY id 去抬高下界(否则新 key 的号会莫名其妙跳到四位数)。
+    #[test]
+    fn raw_salvage_ignores_bound_credential_ids_when_reserving_ids() {
+        let dir = unique_temp_dir("raw_bound_ids");
+        let path = dir.join("api_keys.json");
+        // 被截断且 next_id 字段还没写到:下界只能由 API-KEY id 推出。
+        let broken = concat!(
+            r#"{"keys":[{"id":2,"key":"sk-aaa","name":"0001","enabled":true,"#,
+            r#""created_at":"2026-07-20T00:00:00Z","bound_credential_ids":[1000]},"#,
+            r#"{"id":3,"key":"sk-b"#
+        );
+        std::fs::write(&path, broken).unwrap();
+
+        let store = ApiKeyStore::load(&path);
+        let now = ts("2026-07-21T00:00:00Z");
+        assert_eq!(store.len(), 1);
+        let k = store.create("new".into(), None, None, None, None, None, now);
+        assert_eq!(k.id, 4, "下界应由最大 API-KEY id(3)推出,而不是凭据 id 1000");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
