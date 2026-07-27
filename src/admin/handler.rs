@@ -3,6 +3,7 @@
 //! 全部输出经过脱敏:`AccountStat` 本身不携带 token(见 `kiro::pool`),
 //! `AdminConfigView` 只出 `api_key_set`/`admin_api_key_set` 布尔,绝不出 key 明文。
 
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
@@ -248,6 +249,8 @@ fn build_static_model_list() -> Vec<ModelItem> {
 ///
 /// 惰性回填:并集为空且池里有账号时,后台先按 TTL 触发一次实拉(不阻塞本次响应),
 /// 使下一次请求能拿到动态清单;本次仍以静态目录兜底,保证前端始终有数据。
+/// 回填是**单飞 + 有界 + 带冷却**的(见 [`LazyRefreshGate`] / [`lazy_refresh_sweep`]):
+/// 本端点被前端每次渲染仪表盘都会打一遍,不能让每个请求各起一轮全池扫描。
 pub async fn models(State(state): State<MessagesState>) -> Json<ModelsResponse> {
     let now = now_unix();
     let union = state.models_cache.get_union(now).await;
@@ -266,24 +269,179 @@ pub async fn models(State(state): State<MessagesState>) -> Json<ModelsResponse> 
     })
 }
 
-/// 后台惰性回填:对池内每个未禁用且缓存已过期/缺失的账号实拉一次 `ListAvailableModels`。
-/// fire-and-forget,不阻塞请求;失败仅记 warn(下次再试)。
-fn spawn_lazy_refresh(state: MessagesState, now: u64) {
-    tokio::spawn(async move {
-        let creds = {
-            let pool = state.pool.lock().await;
-            pool.snapshot_credentials()
-        };
-        for cred in creds {
-            if cred.disabled {
-                continue;
-            }
-            if state.models_cache.is_fresh(&cred.id, now).await {
-                continue;
-            }
-            // 惰性回填 fire-and-forget:失败已在 refresh_one 记 WARN,此处忽略结果。
-            let _ = refresh_one(&state, &cred, now).await;
+/// 惰性回填的失败上限:本轮失败累计到此数即停。
+///
+/// 上游整体故障时(账号被封 / 区域抖动 / 额度耗尽)没有任何账号会成功,成功类上限
+/// ([`DISCOVERY_SUCCESS_CAP`] / [`DISCOVERY_STALL_LIMIT`])一个都不会触发,少了这道闸
+/// 一轮扫描就会把全池上千账号挨个打一遍。
+const LAZY_REFRESH_FAILURE_CAP: usize = 8;
+
+/// 惰性回填的冷却:一轮扫描结束后这段时间内不再起新的一轮。
+///
+/// 为什么必须有:模型缓存纯内存,回填失败时并集恒为空,于是**每次**请求都会走到回填。
+/// 只有单飞没有冷却的话,上一轮刚结束下一次仪表盘渲染就能再起一轮 = 负缓存缺失下的
+/// 无限重扫。取 60s:上游真恢复时最迟一分钟就能回填上,对上游又只是每分钟至多一轮。
+const LAZY_REFRESH_COOLDOWN_SECS: u64 = 60;
+
+/// 惰性回填闸门:进程级**单飞 + 冷却 + 轮转游标**。
+///
+/// 背景:`ModelsCache` 纯内存不落盘,进程重启后并集必为空,`GET /api/admin/models` 又是
+/// 前端每次渲染仪表盘都打的端点。旧实现无任何互斥与上限——N 个并发请求就起 N 轮全池扫描,
+/// 每轮对上千账号各发一次 `ListAvailableModels`(还可能各带一次令牌刷新),足以打爆上游并
+/// 招来风控。闸门保证:同一时刻至多一轮扫描,且一轮结束后 [`LAZY_REFRESH_COOLDOWN_SECS`]
+/// 内不再起新轮。
+///
+/// 用进程级 `static` 而非 state 字段:`MessagesState` 由 relay/admin 共用且本模块不改它;
+/// 一个进程只服务一个池,进程级单飞与"每个池一份"等价。
+struct LazyRefreshGate {
+    /// 是否已有一轮扫描在跑(CAS 抢占,输的一方直接放弃、连 task 都不 spawn)。
+    in_flight: AtomicBool,
+    /// 下一次允许起扫描的 unix 秒(上一轮结束时刻 + 冷却);0 = 从未跑过,立即可起。
+    next_allowed_unix: AtomicU64,
+    /// 全池轮转游标:下一轮从上一轮停下的位置继续。
+    ///
+    /// 没有它的话,上游只对池首那几个账号持续失败时(封号/额度耗尽),失败上限会让**每一轮**
+    /// 都反复重试同样那几个坏账号,后面的好账号永远轮不到、并集永久为空——那才是真正的回归。
+    cursor: AtomicUsize,
+}
+
+impl LazyRefreshGate {
+    const fn new() -> Self {
+        Self {
+            in_flight: AtomicBool::new(false),
+            next_allowed_unix: AtomicU64::new(0),
+            cursor: AtomicUsize::new(0),
         }
+    }
+
+    /// 抢扫描权:仍在冷却窗口内 / 已有一轮在跑 → `None`;抢到 → `Some(本轮起始游标)`。
+    fn try_acquire(&self, now: u64) -> Option<usize> {
+        if now < self.next_allowed_unix.load(Ordering::Acquire) {
+            return None;
+        }
+        // CAS false→true:并发请求里只有一个能成功,其余立刻返回(这就是单飞)。
+        if self
+            .in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        Some(self.cursor.load(Ordering::Relaxed))
+    }
+
+    /// 一轮扫描结束:推进轮转游标、起冷却窗口、最后才释放单飞标志。
+    /// 顺序不可颠倒——先释放的话,并发请求可能在冷却窗口写入前抢到扫描权、绕过冷却。
+    fn finish(&self, now: u64, scanned: usize) {
+        self.cursor.fetch_add(scanned, Ordering::Relaxed);
+        self.next_allowed_unix.store(
+            now.saturating_add(LAZY_REFRESH_COOLDOWN_SECS),
+            Ordering::Release,
+        );
+        self.in_flight.store(false, Ordering::Release);
+    }
+}
+
+/// 进程内唯一的惰性回填闸门。
+static LAZY_REFRESH_GATE: LazyRefreshGate = LazyRefreshGate::new();
+
+/// 扫描许可(RAII):Drop 时结算闸门。用守卫而非收尾代码,是为了扫描中途 panic
+/// 也能释放单飞标志——否则闸门被永久卡死,惰性回填此后再不会发生。
+struct LazyRefreshPermit {
+    gate: &'static LazyRefreshGate,
+    /// 本轮在池内走过的位置数(扫描结束前回填;panic 时保持 0 = 游标不推进,下轮重来)。
+    scanned: usize,
+}
+
+impl Drop for LazyRefreshPermit {
+    fn drop(&mut self) {
+        // 冷却从"扫描真正结束"起算,故这里取当下时刻而非请求进来时的 now。
+        self.gate.finish(now_unix(), self.scanned);
+    }
+}
+
+/// 一轮有界惰性回填的结果(供闸门推进游标;字段亦被测试用来断言上限确实生效)。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct LazySweepOutcome {
+    /// 实际向上游发起实拉的账号数(受各上限约束)。
+    attempts: usize,
+    /// 本轮在池内走过的位置数(含被跳过的禁用/缓存仍新鲜账号),用于推进轮转游标。
+    scanned: usize,
+    successes: usize,
+    failures: usize,
+}
+
+/// 后台惰性回填:从 `start` 起在池内**轮转**扫描,跳过禁用/缓存仍新鲜的账号,对其余账号
+/// 逐个实拉一次 `ListAvailableModels`。失败仅记 warn(已在 `refresh_one` 内记),下轮再试。
+///
+/// 上限与 [`refresh_all_models`] 的"有界发现"同口径(别让隐式触发的回填比管理员显式点的
+/// 批量刷新还猛):
+/// - 成功累计到 [`DISCOVERY_SUCCESS_CAP`] 即停;
+/// - 并集连续 [`DISCOVERY_STALL_LIMIT`] 次成功无增长即停(其余账号的档位很可能已被涵盖);
+/// - 失败累计到 [`LAZY_REFRESH_FAILURE_CAP`] 即停(上游整体故障时不再往下打)。
+async fn lazy_refresh_sweep(state: &MessagesState, now: u64, start: usize) -> LazySweepOutcome {
+    let creds = {
+        let pool = state.pool.lock().await;
+        pool.snapshot_credentials()
+    };
+    let mut out = LazySweepOutcome::default();
+    if creds.is_empty() {
+        return out;
+    }
+    let len = creds.len();
+    let start = start % len;
+    let mut stall = 0usize;
+    for off in 0..len {
+        if out.successes >= DISCOVERY_SUCCESS_CAP
+            || out.failures >= LAZY_REFRESH_FAILURE_CAP
+            || stall >= DISCOVERY_STALL_LIMIT
+        {
+            break;
+        }
+        out.scanned = off + 1;
+        let cred = &creds[(start + off) % len];
+        if cred.disabled {
+            continue;
+        }
+        if state.models_cache.is_fresh(&cred.id, now).await {
+            continue;
+        }
+        out.attempts += 1;
+        let before = state.models_cache.get_union(now).await.len();
+        // 惰性回填 fire-and-forget:失败已在 refresh_one 记 WARN,此处只计数。
+        match refresh_one(state, cred, now).await {
+            Ok(_) => {
+                out.successes += 1;
+                let after = state.models_cache.get_union(now).await.len();
+                if after > before {
+                    stall = 0;
+                } else {
+                    stall += 1;
+                }
+            }
+            Err(_) => out.failures += 1,
+        }
+    }
+    out
+}
+
+/// 起一轮后台惰性回填(fire-and-forget,不阻塞请求)。
+/// 抢不到闸门(已有一轮在跑 / 仍在冷却)时直接返回,连 task 都不 spawn。
+fn spawn_lazy_refresh(state: MessagesState, now: u64) {
+    let Some(start) = LAZY_REFRESH_GATE.try_acquire(now) else {
+        return;
+    };
+    // 守卫在 spawn **之前**建好再 move 进任务:这样任务哪怕(运行时关停时)一次都没被 poll
+    // 就被丢弃,守卫也会随之 Drop 并释放闸门,不会把单飞标志永久留在 true。
+    let permit = LazyRefreshPermit {
+        gate: &LAZY_REFRESH_GATE,
+        scanned: 0,
+    };
+    tokio::spawn(async move {
+        let mut permit = permit;
+        let outcome = lazy_refresh_sweep(&state, now, start).await;
+        // 结算信息交给守卫:正常结束推进游标,中途 panic 则按 scanned=0 只释放不推进。
+        permit.scanned = outcome.scanned;
     });
 }
 
@@ -1745,7 +1903,7 @@ impl BalanceView {
 /// 单个凭据的上游剩余额度(getUsageLimits)。命中 5 分钟 TTL 缓存直接返回;
 /// miss/过期则实拉上游、归约成快照回填缓存再返回。
 ///
-/// 凭据(含 token)从磁盘 `credentials.json` 按 id 取(池不外泄 token,且本模块不改池)。
+/// 存在性判定走**内存池**(令牌由 `ensure_fresh` 从活池取,本模块不外泄也不改池)。
 /// 未知 id → 404;上游失败 → 502(不落缓存,前端"全局积分"侧静默跳过该项)。
 pub async fn credential_balance(
     State(state): State<MessagesState>,
@@ -1756,9 +1914,20 @@ pub async fn credential_balance(
     if let Some(snap) = state.balance.get_fresh(&id, now).await {
         return Json(BalanceView::from_snapshot(&id, &snap)).into_response();
     }
-    // miss/过期:先确认该 id 存在(从磁盘,保持"未知 id → 404"的既有语义)。
-    let creds = crate::kiro::credential::load(&state.cfg.credentials_path).unwrap_or_default();
-    if !creds.iter().any(|c| c.id == id) {
+    // miss/过期:先确认该 id 存在,保持"未知 id → 404"的既有语义。
+    //
+    // 这里**不读盘**:`credential::load` 是同步 `std::fs::read_to_string` + 全量 serde 解析,
+    // 直接跑在 Tokio worker 上阻塞调度;而仪表盘"全局积分"会给每个账号并发打一次本端点,
+    // 冷缓存时等于把 MB 级 credentials.json 读+解析上千遍。改判内存池:池是凭据的权威副本
+    // (admin 增删改一律先落池再落盘),`rpm_of` 对未知 id 返回 None、对已禁用账号照样返回
+    // Some,与旧的磁盘全量判定等价,且零克隆零 I/O。顺带修掉一个真 bug:旧写法
+    // `load(..).unwrap_or_default()` 会把"文件读失败/解析失败"吞成空列表,于是所有账号的
+    // 余额查询统统误报 404。
+    let exists = {
+        let pool = state.pool.lock().await;
+        pool.rpm_of(&id, now).is_some()
+    };
+    if !exists {
         return not_found(&id);
     }
     // 集中保鲜实拉:ensure_fresh 从活池取凭据、即将过期则刷新并写回池(令牌与 relay/models
@@ -3842,6 +4011,151 @@ mod tests {
         assert_eq!(data[1]["owned_by"], "anthropic");
         assert_eq!(data[1]["rate_multiplier"], 1.3);
         assert_eq!(data[2]["id"], "gpt-5.6-sol");
+    }
+
+    /// 造 n 个上游确定性不可达的账号(不可解析 host → 传输层立刻失败,绝不打真 AWS)。
+    fn unreachable_creds(n: usize) -> Vec<Credential> {
+        (0..n)
+            .map(|i| {
+                let mut c = cred(&i.to_string());
+                c.region = "invalid-region-does-not-resolve".into();
+                c
+            })
+            .collect()
+    }
+
+    /// 惰性回填必须有界:上游整体故障(封号/区域抖动/额度耗尽)时没有任何账号会成功,
+    /// 成功类上限一个都不会触发。旧实现没有失败上限 → 一轮回填把全池挨个打一遍
+    /// (生产 ~1000 账号)。断言:在失败上限处停手,而不是走完整池。
+    #[tokio::test]
+    async fn lazy_refresh_sweep_stops_at_failure_cap_instead_of_walking_whole_pool() {
+        let pool_size = super::LAZY_REFRESH_FAILURE_CAP * 3;
+        let state = state_with(unreachable_creds(pool_size), cfg_with_temp_creds());
+        let out = super::lazy_refresh_sweep(&state, super::now_unix(), 0).await;
+        assert_eq!(
+            out.attempts,
+            super::LAZY_REFRESH_FAILURE_CAP,
+            "上游整体失败时必须在失败上限处停手: {out:?}"
+        );
+        assert_eq!(out.failures, super::LAZY_REFRESH_FAILURE_CAP);
+        assert_eq!(out.successes, 0);
+        assert!(
+            out.scanned < pool_size,
+            "不得走完整池: scanned={} pool={pool_size}",
+            out.scanned
+        );
+    }
+
+    /// 惰性回填必须从给定游标起**轮转**扫描,否则坏账号前缀会把后面的好账号永久挡住
+    /// (失败上限在同一批坏账号处反复停手,并集永远为空)。
+    /// 用"缓存已新鲜的账号被跳过"制造可观测差异:同一个池,起点不同 → 走过的位置数不同。
+    #[tokio::test]
+    async fn lazy_refresh_sweep_honors_rotating_start_offset() {
+        let skipped = 4usize;
+        let pool_size = super::LAZY_REFRESH_FAILURE_CAP + skipped;
+        let state = state_with(unreachable_creds(pool_size), cfg_with_temp_creds());
+        let now = super::now_unix();
+        // 前 4 个账号缓存仍新鲜 → 扫描时被跳过(不发上游请求,但占位置)。
+        for i in 0..skipped {
+            state
+                .models_cache
+                .put(
+                    i.to_string(),
+                    vec![crate::models_cache::ModelInfo {
+                        id: format!("m-{i}"),
+                        display_name: "m".into(),
+                        owned_by: "kiro".into(),
+                        max_tokens: 0,
+                        rate_multiplier: None,
+                    }],
+                    now,
+                )
+                .await;
+        }
+        // 起点 0:先跳过 4 个,再打 8 个(失败上限)→ 走过 12 个位置。
+        let from_head = super::lazy_refresh_sweep(&state, now, 0).await;
+        assert_eq!(from_head.attempts, super::LAZY_REFRESH_FAILURE_CAP);
+        assert_eq!(from_head.scanned, pool_size, "起点 0 应走过全部位置");
+        // 起点 4(上一轮停下处):直接打 8 个 → 只走过 8 个位置,证明起点确实生效。
+        let from_offset = super::lazy_refresh_sweep(&state, now, skipped).await;
+        assert_eq!(from_offset.attempts, super::LAZY_REFRESH_FAILURE_CAP);
+        assert_eq!(
+            from_offset.scanned,
+            super::LAZY_REFRESH_FAILURE_CAP,
+            "起点应从游标处开始,而不是恒从池首重来: {from_offset:?}"
+        );
+    }
+
+    /// 闸门三件事:并发单飞(N 个并发请求只起 1 轮扫描)、一轮结束后有冷却窗口
+    /// (并集恒为空时不至于每次仪表盘渲染都再起一轮)、游标随轮次前移。
+    #[test]
+    fn lazy_refresh_gate_is_single_flight_with_cooldown_and_rotating_cursor() {
+        let gate = super::LazyRefreshGate::new();
+        assert_eq!(gate.try_acquire(1_000), Some(0), "首个请求应拿到扫描权");
+        assert!(
+            gate.try_acquire(1_000).is_none(),
+            "并发的第二个请求不得再起一轮全池扫描"
+        );
+        // 一轮结束(走过 5 个位置)
+        gate.finish(1_000, 5);
+        assert!(
+            gate.try_acquire(1_000 + super::LAZY_REFRESH_COOLDOWN_SECS - 1)
+                .is_none(),
+            "冷却窗口内不得再起新一轮"
+        );
+        assert_eq!(
+            gate.try_acquire(1_000 + super::LAZY_REFRESH_COOLDOWN_SECS),
+            Some(5),
+            "冷却结束后可再起,且从上一轮停下的位置继续"
+        );
+    }
+
+    /// 余额端点的"未知 id → 404"判定必须查内存池,不许读盘:
+    /// 旧实现 `credential::load(..).unwrap_or_default()` 会把"文件不存在/读失败/解析失败"
+    /// 吞成空列表,于是池内真实存在的账号也被误报 404(且每次 miss 都同步阻塞读一遍 MB 级文件)。
+    #[tokio::test]
+    async fn balance_endpoint_existence_check_uses_pool_not_disk() {
+        // 测试用 BalanceCache 共用 temp_dir 且会落盘,固定 id 会命中别的测试/上一轮跑留下的
+        // 新鲜快照(直接 200 返回、走不到存在性判定),故用每次唯一的 id。
+        let id = format!(
+            "9{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                % 1_000_000_000
+        );
+        let mut c = cred(&id);
+        c.region = "invalid-region-does-not-resolve".into();
+        let cfg = cfg_with_temp_creds();
+        // 该路径下并无落盘文件(等价于读盘拿不到内容的情形)。
+        assert!(!std::path::Path::new(&cfg.credentials_path).exists());
+        let state = state_with(vec![c], cfg);
+        assert!(
+            state
+                .balance
+                .get_fresh(&id, super::now_unix())
+                .await
+                .is_none(),
+            "前置条件:余额缓存里不得有该 id 的新鲜快照,否则测不到存在性判定"
+        );
+        let app = admin_api_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/admin/credentials/{id}/balance"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            HttpStatusCode::NOT_FOUND,
+            "池内存在的账号不得因读不到 credentials.json 被误报 404"
+        );
+        // 账号存在 → 走到上游实拉,上游不可达 → 502(而非 404)。
+        assert_eq!(resp.status(), HttpStatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]

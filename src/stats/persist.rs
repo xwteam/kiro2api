@@ -230,6 +230,25 @@ fn fsync_parent_dir(_path: &Path) {}
 ///
 /// #10:每次写盘顺手清理同目录下遗留的**孤儿** `{path}.tmp.*`(此前进程在 tmp 写完与
 /// rename 之间崩溃留下的),仅清足够旧的,不碰并发写者正在写的新 tmp。
+/// 建仅属主可读写(0600)的新文件。unix 用 `OpenOptions::mode`(创建即定权限,无竞态窗口);
+/// 其它平台回落 `File::create`(Windows 无 unix 权限位,由 ACL 管辖)。
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::create(path)
+    }
+}
+
 pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = tmp_path(path);
     if let Some(parent) = path.parent()
@@ -238,7 +257,11 @@ pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let res = (|| -> std::io::Result<()> {
-        let f = std::fs::File::create(&tmp)?;
+        // 以 0600 创建临时文件:本助手写的是应用私有数据,其中 api_keys.json 装着**全部
+        // 用户 API-KEY 明文**。`File::create` 会取 0666&~umask(通常 0644),等于每次刷盘
+        // 都把文件放宽成全局可读,运营者手动 chmod 600 过也会被下一次写盘改回去。
+        // rename 保留 tmp 的权限位,故权限必须在建 tmp 时就定死(与 credential.rs 同规约)。
+        let f = create_private(&tmp)?;
         {
             let mut w = std::io::BufWriter::new(&f);
             w.write_all(bytes)?;
@@ -259,6 +282,31 @@ pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// 回归:原子写产出的文件必须是 0600,且**覆盖写后也不得被放宽**。
+    ///
+    /// 本助手写 api_keys.json(全部用户 API-KEY 明文)与 config.json(主/管理员密钥明文)。
+    /// 曾用 `File::create`,权限取 0666&~umask(通常 0644)——运营者手动 chmod 600 过,
+    /// 下一次刷盘又给改回全局可读。
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("k2a_perm_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("secrets.json");
+
+        super::write_bytes_atomic(&p, b"{\"k\":1}").unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "含密文件必须仅属主可读写,实际 {mode:o}");
+
+        // 覆盖写:rename 会把 tmp 的权限带过来,故第二次写同样不能放宽。
+        super::write_bytes_atomic(&p, b"{\"k\":2}").unwrap();
+        let mode2 = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode2, 0o600, "覆盖写后权限不得被放宽,实际 {mode2:o}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

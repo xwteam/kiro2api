@@ -6,6 +6,7 @@ use crate::kiro::pool::{LbMode, Pool};
 use crate::protocol::anthropic::handler::{MessagesState, messages_router};
 use crate::webui;
 use axum::{Json, Router, routing::get};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -44,16 +45,106 @@ pub fn build_router_with_logs(
 /// 与 [`build_router_with_logs`] 完全相同的路由,但额外交出内部构造的 `StatsManager` 句柄。
 /// `serve()` 据此在收到停机信号后触发统计最终刷盘——统计层由 `build_router*` 内部构造,
 /// 外部拿不到句柄就无法在退出前落盘。
+///
+/// 保留此签名只为兼容既有调用方;需要**完整**的停机刷盘(统计 + API-KEY)请用
+/// [`build_router_with_persist_handles`],它交出的 [`PersistHandles`] 覆盖全部去抖存储。
 pub fn build_router_with_handles(
     cfg: Arc<Config>,
     log_capture: Option<Arc<crate::logcap::LogCapture>>,
 ) -> (Router, Arc<crate::stats::StatsManager>) {
+    let (router, handles) = build_router_with_persist_handles(cfg, log_capture);
+    (router, handles.stats)
+}
+
+/// 停机 / 管理面重启前必须**显式**落盘的持久化句柄集合。
+///
+/// 这些存储统一走 `stats::persist` 的「改内存 + 置脏 + 约 5s 去抖批量落盘」模型:置脏通知本身
+/// **不写盘**,只有下一拍定时器才写(见 `stats::persist::spawn_flush_loop`)。故进程退出
+/// (SIGTERM/Ctrl-C,或管理面重启端点的 `std::process::exit`——它连析构都不跑)时若不显式刷一次,
+/// 落在两拍之间的写就只在内存里,重启即回滚。
+pub struct PersistHandles {
+    /// 用量 / 计费统计:丢一拍 = 少算这段时间的钱。
+    pub stats: Arc<crate::stats::StatsManager>,
+    /// API-KEY 存储:丢一拍的后果更重——**刚吊销的 key 会随旧文件复活**(重启后照样鉴权通过),
+    /// 刚建出并交给用户的 key 则凭空消失(用户拿着新 key 直接 401)。
+    pub api_keys: Arc<crate::apikey::ApiKeyStore>,
+    /// `api_keys.json` 路径:停机落盘前据此判磁盘上那份是否还解析得动(见 [`PersistHandles::flush_before_exit`])。
+    pub api_keys_path: PathBuf,
+}
+
+impl PersistHandles {
+    /// 退出前的最终刷盘:把去抖窗口(约 5s)内尚未落盘的写立刻同步落下去。
+    ///
+    /// 两项之间无依赖;任一失败只记 error、绝不阻断停机(停机路径宁可少落一项,也不能卡住不退)。
+    pub async fn flush_before_exit(&self) {
+        // 用量/计费:去抖窗口内的记录只在内存里,不刷就少算钱。
+        self.stats.flush_now().await;
+        // API-KEY:create/update/delete/disable 都只 `mark_dirty()`,真正写盘要等下一拍定时器。
+        if !self.api_keys_overwrite_is_safe() {
+            tracing::error!(
+                path = %self.api_keys_path.display(),
+                "磁盘上的 api_keys.json 存在却解析不动,且内存里一把 key 都没有:跳过停机落盘,以免用空存储把这份仍可人工挽救的文件覆盖掉"
+            );
+            return;
+        }
+        let store = self.api_keys.clone();
+        // `save_now` 是同步写 + fsync(可长达数十毫秒),不能占着 async 工作线程做。
+        match tokio::task::spawn_blocking(move || store.save_now()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(
+                error = %e,
+                "API-KEY 停机落盘失败:最近约 5s 内的密钥增删将在重启后回滚(已吊销的 key 可能复活)"
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                "API-KEY 停机落盘任务执行失败:最近约 5s 内的密钥增删将在重启后回滚(已吊销的 key 可能复活)"
+            ),
+        }
+    }
+
+    /// 停机落盘的自保阀:仅当「内存里一把 key 都没有」**且**「磁盘上的 api_keys.json 存在却
+    /// 解析不动」时返回 false。
+    ///
+    /// 这一组合说明启动时那份文件根本没被读进内存(`ApiKeyStore::load` 对解析失败是静默按空继续的),
+    /// 此刻用空存储原子覆写,等于把仅存的、也许还能人工挽救的密钥文件抹掉——正是本轮要堵的那类坑。
+    /// 其余情形一律照写:内存里有 key 时,那份内存态才是最新真源。
+    fn api_keys_overwrite_is_safe(&self) -> bool {
+        if !self.api_keys.is_empty() {
+            return true;
+        }
+        match std::fs::read(&self.api_keys_path) {
+            // 文件不存在/读不到:写下去覆盖不掉任何内容。
+            Err(_) => true,
+            // 空文件(或只有空白):同样没有可挽救的内容。
+            Ok(raw) if raw.iter().all(|b| b.is_ascii_whitespace()) => true,
+            // 能解析成 JSON = 启动时的空存储是文件真实内容(或无关形状),覆写无损失。
+            Ok(raw) => serde_json::from_slice::<serde_json::Value>(&raw).is_ok(),
+        }
+    }
+}
+
+/// 与 [`build_router_with_handles`] 相同的路由,但交出全部需要在退出前落盘的句柄。
+pub fn build_router_with_persist_handles(
+    cfg: Arc<Config>,
+    log_capture: Option<Arc<crate::logcap::LogCapture>>,
+) -> (Router, PersistHandles) {
     // 捕获进程启动时刻(幂等):admin system-info 端点据此算 uptimeSecs。
     // 首次调用置入,后续调用(如测试重复建 router)不覆盖,保留最早时刻。
     let _ = SERVER_START.get_or_init(Instant::now);
-    // 从配置路径加载凭据;文件不存在/解析失败均回落空池,
-    // /v1/messages 遇空池返回 503(不影响 health/webui 路由,默认配置测试保持全绿)。
-    let creds = credential::load(&cfg.credentials_path).unwrap_or_default();
+    // 从配置路径加载凭据;文件不存在回落空池,/v1/messages 遇空池返回 503
+    // (不影响 health/webui 路由,默认配置测试保持全绿)。
+    // **解析失败不再静默当空池**:先原样备份、再逐条抢救、并大声报错,见 load_credentials_resilient。
+    let creds = load_credentials_resilient(&cfg.credentials_path);
+    // 启动期把账号数写进日志:池为 0 时运营者据此一眼分清「文件没放/里面没账号」与
+    // 「文件坏了被抢救成 0」(后者上面已有逐条 error 明细),不必对着面板的 total:0 猜。
+    if creds.is_empty() {
+        tracing::warn!(
+            path = %cfg.credentials_path,
+            "账号池为空:四条协议端点将一律返回 503(若刚才有凭据解析报错,请先按其提示修文件,别在管理面重新加账号——写入会用空池整份覆写)"
+        );
+    } else {
+        tracing::info!(path = %cfg.credentials_path, accounts = creds.len(), "已载入账号凭据");
+    }
     // 账号 id 高水位:读上次落盘值,使"已删除账号的编号"重启后也不被复用。
     // 旧安装没有该旁挂文件 → `None` → 传 0,由 `with_next_id` 平滑退化为 `max(现有 id)+1`
     // 的原语义。不接这一步的话高水位只写不读,重启即退回复用编号(旧令牌覆盖新账号凭据)。
@@ -70,8 +161,9 @@ pub fn build_router_with_handles(
     let stats = crate::stats::StatsManager::load_from_credentials_path(&cfg.credentials_path);
     // API-KEY 存储:数据目录同 stats,由 credentials_path 父目录推断 api_keys.json。
     // auth 闸 / relay 归属 / admin / user 共用同一 Arc<ApiKeyStore>(后续阶段接入消费方)。
-    let api_keys =
-        crate::apikey::ApiKeyStore::load(crate::apikey::api_keys_path_from(&cfg.credentials_path));
+    // 路径单独留一份:停机落盘的自保阀要按它判磁盘文件是否还解析得动(store 自己不外露路径)。
+    let api_keys_path = crate::apikey::api_keys_path_from(&cfg.credentials_path);
+    let api_keys = crate::apikey::ApiKeyStore::load(api_keys_path.clone());
     // 余额缓存(Phase 4):与 stats 同数据目录,载入 kiro_balance_cache.json 并启动去抖刷盘。
     // admin 余额端点读缓存(5 分钟 TTL)/回填;relay 数据面不消费。
     let balance = crate::balance::BalanceCache::load_from_credentials_path(&cfg.credentials_path);
@@ -179,7 +271,213 @@ pub fn build_router_with_handles(
         .merge(protocol)
         .merge(admin)
         .merge(user);
-    (router, stats)
+    (
+        router,
+        PersistHandles {
+            stats,
+            api_keys,
+            api_keys_path,
+        },
+    )
+}
+
+/// 凭据文件逐条抢救时,最多逐条打印多少条坏账号的明细(其余只计入总数)。
+/// 上限的理由:生产 credentials.json 有约千条账号,整体格式走样时不能让启动日志被刷爆
+/// (日志同时进实时日志面板的环形缓冲,刷爆等于把别的线索一起冲掉)。
+const MAX_BAD_CREDENTIAL_LOGS: usize = 20;
+
+/// 载入账号池凭据——**解析失败绝不静默当空池**。
+///
+/// 为什么不能再写 `credential::load(..).unwrap_or_default()`:生产的 credentials.json 是运营者
+/// 手工放置 / drop-in 的大数组(约 1000 个账号、数 MB),而 `load` 是整份文件 all-or-nothing 的
+/// serde —— 任何**一条**账号写坏(`expiresAt` 不是 RFC3339、缺 `accessToken`/`refreshToken`、
+/// `authMethod` 不是 social/idc、数组里多一个逗号)都会让整份文件解析失败。旧写法把 `Err` 丢掉:
+/// 进程带着 0 账号池启动、日志里一个字都没有,运营者只看到 relay 全 503、面板 `total: 0`,于是
+/// 「那就重新加一个账号」——admin 侧的原子落盘会用内存里的空池整份覆写 credentials.json,
+/// 约千个账号的 refreshToken 当场蒸发且不可逆。
+///
+/// 故这里做三件事(与 `stats::usage` 对损坏文件的处理同规格):
+/// 1. **原样备份**:把当前文件复制成 `{path}.corrupt.{unix秒}.{序号}`,此后任何原子写都覆不掉它;
+/// 2. **逐条抢救**:文件本体仍是 JSON 数组时按条反序列化,坏条目跳过、好账号照常入池
+///    (1 条坏账号不再拖垮另外 999 个,中转继续可用);
+/// 3. **大声报错**:error 日志给出坏条目位置、备份路径与后果说明,让运营者知道该修文件而非重加账号。
+fn load_credentials_resilient(path: &str) -> Vec<credential::Credential> {
+    let err = match credential::load(path) {
+        // 正常路径(含文件不存在 → 空池)原样返回,不做任何额外 IO。
+        Ok(creds) => return creds,
+        Err(e) => e,
+    };
+    // 走到这里说明文件存在但读不动/解析不了。原始字节备份与逐条抢救都要用,只读一次。
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(read_err) => {
+            tracing::error!(
+                path = %path,
+                error = %err,
+                read_error = %read_err,
+                "credentials.json 读取失败,账号池按空启动;修好之前请勿在管理面增删账号——任何写入都会用空池整份覆写该文件"
+            );
+            return Vec::new();
+        }
+    };
+    let backup = backup_corrupt_credentials(path, &raw);
+    let (creds, total, skipped) = salvage_credentials(&raw);
+    tracing::error!(
+        path = %path,
+        error = %err,
+        entries_total = total,
+        salvaged = creds.len(),
+        skipped = skipped,
+        backup = backup
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<备份失败>".to_string()),
+        "credentials.json 解析失败:已原样备份并逐条抢救可用账号;请按上面的逐条报错修好坏条目后重启,期间在管理面增删账号会用当前(可能不完整的)池覆写该文件"
+    );
+    creds
+}
+
+/// 逐条抢救:文件本体仍是 JSON 数组时按条反序列化,坏条目跳过并报错。
+/// 返回 `(可用凭据, 条目总数, 跳过条数)`;整份文件连数组都解析不出(语法错/被截断)时全空。
+fn salvage_credentials(raw: &[u8]) -> (Vec<credential::Credential>, usize, usize) {
+    let entries: Vec<serde_json::Value> = match serde_json::from_slice(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "credentials.json 连 JSON 数组都解析不出(语法错误/文件被截断),无法逐条抢救;原文件已备份,请人工修复"
+            );
+            return (Vec::new(), 0, 0);
+        }
+    };
+    let total = entries.len();
+    let mut out = Vec::with_capacity(total);
+    let mut skipped = 0usize;
+    for (index, entry) in entries.into_iter().enumerate() {
+        // 定位信息只取 id(和数组下标),**绝不打印 token/邮箱**——这些日志会进实时日志面板与文件。
+        let id_hint = entry
+            .get("id")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<无 id>".to_string());
+        match serde_json::from_value::<credential::Credential>(entry) {
+            Ok(c) => out.push(c),
+            Err(e) => {
+                skipped += 1;
+                if skipped <= MAX_BAD_CREDENTIAL_LOGS {
+                    tracing::error!(
+                        index = index,
+                        id = %id_hint,
+                        error = %e,
+                        "该账号条目解析失败,已跳过(其余账号照常入池)"
+                    );
+                }
+            }
+        }
+    }
+    (out, total, skipped)
+}
+
+/// 把当前(解析不了的)凭据文件**原样复制**一份到 `{path}.corrupt.{unix秒}.{序号}`。
+///
+/// 为什么是复制而不是像 `stats::usage` 那样改名:credentials.json 是账号池的唯一真源。改名走人,
+/// 下次重启连「逐条抢救」都没得救(文件已不在原处),且管理面第一次落盘就会把仅剩的内存池写成
+/// 新文件。复制则两头都保住:原文件留在原地供人工修复,备份档任凭后续原子写也覆不掉。
+///
+/// 幂等:同一份坏内容已经备份过(存在字节完全相同的 `.corrupt.*`)就不再重复备份,
+/// 否则容器反复重启会在数据盘上堆出一摞数 MB 的副本。
+fn backup_corrupt_credentials(path: &str, raw: &[u8]) -> Option<PathBuf> {
+    if let Some(existing) = existing_identical_backup(path, raw) {
+        return Some(existing);
+    }
+    let backup = corrupt_backup_path(Path::new(path));
+    let res = (|| -> std::io::Result<()> {
+        // 文件里是全部账号的明文 access/refresh token:与 `credential::save` 同规,按 0600 建,
+        // 不能用默认权限(0644)把凭据副本变成全局可读。`create_new` 保证绝不顶掉已有备份。
+        #[cfg(unix)]
+        let f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&backup)?
+        };
+        #[cfg(not(unix))]
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)?;
+        {
+            use std::io::Write;
+            let mut w = std::io::BufWriter::new(&f);
+            w.write_all(raw)?;
+            w.flush()?;
+        }
+        f.sync_all() // fsync:备份的意义就在于机器随后掉电也还在
+    })();
+    match res {
+        Ok(()) => Some(backup),
+        Err(e) => {
+            tracing::error!(
+                path = %path,
+                backup = %backup.display(),
+                error = %e,
+                "损坏的 credentials.json 备份失败:原文件仍在原处,但管理面的下一次写入会覆盖它,请先手工另存一份"
+            );
+            None
+        }
+    }
+}
+
+/// 损坏文件的备份路径:`{path}.corrupt.{unix秒}.{序号}`,取第一个尚不存在的候选
+/// (与 `stats::usage::corrupt_backup_path` 同规格),保证同秒内多次备份互不覆盖。
+fn corrupt_backup_path(path: &Path) -> PathBuf {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let with_suffix = |n: u32| {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(format!(".corrupt.{secs}.{n}"));
+        PathBuf::from(s)
+    };
+    for n in 0..100 {
+        let cand = with_suffix(n);
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    with_suffix(99)
+}
+
+/// 找同目录下内容与 `raw` 逐字节相同的既有 `{basename}.corrupt.*` 备份(有则本次不必再备份)。
+/// 先比长度再比内容:长度不同直接跳过,避免为每个候选都读一遍数 MB 的文件。
+fn existing_identical_backup(path: &str, raw: &[u8]) -> Option<PathBuf> {
+    let p = Path::new(path);
+    let (dir, file_name) = (p.parent()?, p.file_name()?.to_string_lossy().into_owned());
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let prefix = format!("{file_name}.corrupt.");
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let same_len = entry
+            .metadata()
+            .map(|m| m.len() == raw.len() as u64)
+            .unwrap_or(false);
+        if same_len
+            && std::fs::read(entry.path())
+                .map(|b| b == raw)
+                .unwrap_or(false)
+        {
+            return Some(entry.path());
+        }
+    }
+    None
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -317,7 +615,7 @@ pub async fn serve(
         tracing::warn!("{w}");
     }
     let addr = format!("{}:{}", cfg.host, cfg.port);
-    let (app, stats) = build_router_with_handles(Arc::new(cfg), log_capture);
+    let (app, persist) = build_router_with_persist_handles(Arc::new(cfg), log_capture);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("kiro2api listening on {addr}");
     // `into_make_service_with_connect_info` 使各 handler 可经 `ConnectInfo<SocketAddr>`
@@ -355,8 +653,12 @@ pub async fn serve(
         );
     }
     // 无论是干净排空还是窗口到期,最终刷盘都必须跑且只跑一次:把去抖窗口内(约 5s)
-    // 未落盘的用量写下去,否则每次停机都静默丢这一段。
-    stats.flush_now().await;
+    // 未落盘的写全部落下去,否则每次停机都静默丢这一段。
+    //
+    // 范围不能只有统计:API-KEY 的增删同样是「置脏 + 等下一拍」,而它丢一拍是安全问题——
+    // 管理员刚吊销的 key 会随旧 api_keys.json 复活、重启后继续鉴权通过(见 PersistHandles)。
+    // 后台刷盘任务本身指望不上:进程退出时 tokio 运行时随之销毁,那一拍根本轮不到。
+    persist.flush_before_exit().await;
     tracing::info!("kiro2api 已停止");
     // 服务器自身的错误(accept 失败等,极罕见)放到刷盘之后再上抛,
     // 避免用 `?` 提前返回把统计吞掉。
@@ -912,6 +1214,213 @@ mod tests {
         assert!(out.is_none(), "窗口到期必须放弃等待");
         // 确实等满了窗口(留调度余量,只校验下界)。
         assert!(started.elapsed() >= Duration::from_millis(60));
+    }
+
+    /// 每个测试独占的临时目录(pid + 纳秒,互不串扰)。
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro2api_srv_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 目录下的损坏备份文件列表(`*.corrupt.*`)。
+    fn corrupt_backups(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains(".corrupt."))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// 两条好账号中间夹一条坏账号(`expiresAt` 不是 RFC3339)——生产最常见的坏法:
+    /// 整份 credentials.json 因**一条**账号写坏而 serde 全盘失败。
+    const MIXED_CREDENTIALS_JSON: &str = r#"[
+  {"id": 1, "accessToken": "at-1", "refreshToken": "rt-1", "expiresAt": "2099-01-01T00:00:00Z", "authMethod": "social"},
+  {"id": 2, "accessToken": "at-2", "refreshToken": "rt-2", "expiresAt": "never", "authMethod": "social"},
+  {"id": 3, "accessToken": "at-3", "refreshToken": "rt-3", "expiresAt": "2099-01-01T00:00:00Z", "authMethod": "idc"}
+]"#;
+
+    /// 关键回归:一条坏账号不得把整个池吃成 0,且坏文件必须先被原样备份。
+    /// 旧写法 `credential::load(..).unwrap_or_default()` 会静默返回空池 —— 运营者据此
+    /// "重新加账号",admin 的原子落盘随即用空池整份覆写掉约千个账号的凭据。
+    #[test]
+    fn corrupt_credentials_file_is_backed_up_and_salvaged_entry_by_entry() {
+        let dir = unique_temp_dir("credsalvage");
+        let path = dir.join("credentials.json");
+        std::fs::write(&path, MIXED_CREDENTIALS_JSON).unwrap();
+        let p = path.to_str().unwrap();
+
+        // 前提:整份文件确实解析不了(证明"一条拖垮全部"这个前提成立)。
+        assert!(credential::load(p).is_err());
+
+        let creds = load_credentials_resilient(p);
+        assert_eq!(creds.len(), 2, "坏条目只能吃掉它自己,其余账号必须照常入池");
+        assert_eq!(creds[0].id, "1");
+        assert_eq!(creds[1].id, "3");
+
+        // 原文件仍留在原处:供人工修复,且下次重启还能再抢救一次。
+        assert!(path.exists(), "凭据本体不得被改名带走");
+        // 备份存在且与原文件逐字节相同——此后管理面的任何原子写都覆不掉它。
+        let backups = corrupt_backups(&dir);
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert_eq!(
+            std::fs::read(&backups[0]).unwrap(),
+            MIXED_CREDENTIALS_JSON.as_bytes()
+        );
+        // 备份里是明文 token,权限必须仅属主可读写。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&backups[0]).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "凭据备份必须 0600,实际 {mode:o}");
+        }
+
+        // 再来一次(模拟容器反复重启):同一份坏内容不重复堆备份,不把数据盘撑爆。
+        let again = load_credentials_resilient(p);
+        assert_eq!(again.len(), 2);
+        assert_eq!(corrupt_backups(&dir).len(), 1, "同一份坏内容不应重复备份");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 语法层面就坏了(数组多一个逗号)时逐条抢救无从下手,但**备份必须照做** ——
+    /// 这正是"管理面下一次写入会把整份账号文件覆盖掉"的高危场景。
+    #[test]
+    fn syntactically_broken_credentials_are_backed_up_even_when_nothing_can_be_salvaged() {
+        let dir = unique_temp_dir("credsyntax");
+        let path = dir.join("credentials.json");
+        let broken = r#"[
+  {"id": 1, "accessToken": "at-1", "refreshToken": "rt-1", "expiresAt": "2099-01-01T00:00:00Z", "authMethod": "social"},
+]"#;
+        std::fs::write(&path, broken).unwrap();
+        let p = path.to_str().unwrap();
+
+        let creds = load_credentials_resilient(p);
+        assert!(
+            creds.is_empty(),
+            "语法错时抢救不出账号(合理),但不能悄无声息"
+        );
+        let backups = corrupt_backups(&dir);
+        assert_eq!(backups.len(), 1, "坏文件必须先备份再继续:{backups:?}");
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), broken.as_bytes());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 接线回归:坏凭据文件下 `build_router` 起来的进程,管理面看到的账号数必须是抢救出的 2,
+    /// 而不是 0(0 会把运营者引向"重新加账号",从而覆写掉整份账号文件)。
+    #[tokio::test]
+    async fn router_boots_with_salvaged_pool_when_credentials_file_is_corrupt() {
+        let dir = unique_temp_dir("credrouter");
+        let path = dir.join("credentials.json");
+        std::fs::write(&path, MIXED_CREDENTIALS_JSON).unwrap();
+
+        let cfg = Config {
+            credentials_path: path.to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+        let app = build_router(Arc::new(cfg));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/credentials")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["total"], 2, "坏一条不该让整池归零:{v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 关键回归:API-KEY 的增删只置脏、要等下一拍(约 5s)才落盘,故停机前必须显式刷。
+    /// 不刷的后果:管理员刚吊销的 key 会随旧 api_keys.json 复活(重启后继续鉴权通过),
+    /// 刚建出交给用户的 key 则凭空消失(用户拿着新 key 直接 401)。
+    #[tokio::test]
+    async fn shutdown_flush_persists_api_key_create_and_revocation() {
+        let dir = unique_temp_dir("keyflush");
+        let creds_path = dir.join("credentials.json").to_string_lossy().into_owned();
+        let cfg = Config {
+            credentials_path: creds_path,
+            ..Config::default()
+        };
+        let (_app, persist) = build_router_with_persist_handles(Arc::new(cfg), None);
+
+        let key = persist.api_keys.create(
+            "k1".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            chrono::Utc::now(),
+        );
+        // 去抖窗口内确实还没落盘(证明这一拍真的丢得掉;此处到断言之间无 await,
+        // 后台刷盘任务不可能插进来,断言是确定性的)。
+        assert!(
+            !persist.api_keys_path.exists(),
+            "新建 key 本就该等下一拍才落盘,这里若已存在说明前提变了"
+        );
+
+        persist.flush_before_exit().await;
+        let after_create = std::fs::read_to_string(&persist.api_keys_path).unwrap();
+        assert!(
+            after_create.contains(&key.key),
+            "停机刷盘必须落下新建的 key,否则管理员刚发出的 key 重启后 401"
+        );
+
+        // 吊销后同样必须落盘,否则重启即复活 —— 这是安全问题,不只是丢数据。
+        assert!(persist.api_keys.delete(key.id));
+        persist.flush_before_exit().await;
+        let after_delete = std::fs::read_to_string(&persist.api_keys_path).unwrap();
+        assert!(
+            !after_delete.contains(&key.key),
+            "已吊销的 key 不得在重启后复活"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 自保阀:磁盘上的 api_keys.json 解析不动(启动时被静默按空载入)且内存里一把 key 都没有时,
+    /// 停机刷盘必须**跳过**写入 —— 否则空存储会把这份仍可人工挽救的密钥文件当场抹掉。
+    #[tokio::test]
+    async fn shutdown_flush_does_not_clobber_unparseable_api_keys_file() {
+        let dir = unique_temp_dir("keyguard");
+        let creds_path = dir.join("credentials.json").to_string_lossy().into_owned();
+        let broken = b"{ this is not json";
+        std::fs::write(dir.join("api_keys.json"), broken).unwrap();
+
+        let cfg = Config {
+            credentials_path: creds_path,
+            ..Config::default()
+        };
+        let (_app, persist) = build_router_with_persist_handles(Arc::new(cfg), None);
+        assert!(persist.api_keys.is_empty(), "损坏文件会被静默载成空 store");
+
+        persist.flush_before_exit().await;
+        assert_eq!(
+            std::fs::read(&persist.api_keys_path).unwrap(),
+            broken,
+            "损坏的密钥文件不得被空存储覆盖"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 日志捕获未接线(build_router 默认 None)时,日志端点在通过鉴权后返回 503。

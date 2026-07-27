@@ -784,6 +784,27 @@
   var gcInFlight = false;
   var gcColdStartDone = false;   // guard: only auto-fan-out once per empty cache
 
+  // 余额扇出的并发上限。
+  //
+  // 为什么必须有上限:冷启动(容器刚重启,共享 BalanceCache 是空的)会**无人点击**
+  // 就自动扇出一次,给池内每个启用账号打一发 GET /credentials/{id}/balance;缓存
+  // miss 的那一发在后端直通上游(credential_balance → fetch_usage_limits_fresh →
+  // ensure_fresh + getUsageLimits),还可能顺带刷新令牌。生产池有上千个账号,老写法
+  // 的 Promise.allSettled(全量 map) 等于**一瞬间对 AWS 打出上千并发**,极易撞限流/
+  // 风控——这正是账号页那套"一次只发一个"的扇出刻意要避开的事。
+  //
+  // 为什么取一个小常数而不是照账号页完全串行:仪表盘这一轮是渲染时自动触发的,
+  // 串行跑上千个账号要十几分钟,「全局积分」会长时间停在 …;并发 4 对上游依旧是
+  // 可忽略的压力(与人手点几下同量级),却快 4 倍。改这个常数即可整体调松/调紧。
+  var GC_FANOUT_CONCURRENCY = 4;
+
+  // 扇出令牌:自增即作废在飞的那一轮(切走仪表盘 / 401 掉线 / 又点了一次刷新)。
+  var gcFanoutToken = 0;
+
+  // 401/403 = admin key 已失效:api.js 收到这两个状态码时已经清掉本地钥匙并弹出
+  // 登录浮层了,这里只需要认出它。
+  function isAuthError(e) { return !!e && (e.status === 401 || e.status === 403); }
+
   // Cache-first read used on every render. Reads the aggregate; on a cold start
   // (empty cache) does exactly one active refresh to seed the shared cache.
   async function loadGlobalCredits() {
@@ -805,6 +826,9 @@
   // fan-out. This is the only path that hits upstream. It populates the shared
   // BalanceCache; we then re-read the aggregate so the displayed number + meta
   // come from the same shared source the Accounts page sees.
+  //
+  // 并发受 GC_FANOUT_CONCURRENCY 限制、可被令牌取消、撞 401/403 立刻整轮停,
+  // 细节见 fanoutBalances。
   async function refreshGlobalCredits(btn) {
     if (gcInFlight) return;
     if (!lastCreds || !Array.isArray(lastCreds.credentials)) {
@@ -813,22 +837,76 @@
     }
     var enabled = lastCreds.credentials.filter(function (c) { return !c.disabled; });
 
+    var token = ++gcFanoutToken;
     gcInFlight = true;
     if (btn) btn.disabled = true;
-    els.globalCredits.textContent = '…';
+    if (els.globalCredits) els.globalCredits.textContent = '…';
 
     try {
-      if (enabled.length) {
-        await Promise.allSettled(enabled.map(function (c) {
-          return K.api.get('/credentials/' + encodeURIComponent(c.id) + '/balance');
-        }));
+      var res = enabled.length
+        ? await fanoutBalances(enabled, token)
+        : { aborted: false, cancelled: false };
+
+      // 本轮已被作废(切走了仪表盘 / 又点了一次刷新):什么都别画,画了也是覆盖新一轮。
+      // 同时把冷启动闸放回去 —— 这一轮没跑完,不该算"种子已播过";否则用户刚进仪表盘
+      // 就切走、回来后「全局积分」会一直空着,除非手点刷新。(真跑完但全军覆没的情况
+      // 走的是下面的正常分支,闸保持关闭,不会每次渲染都重扇一遍。)
+      if (res.cancelled || token !== gcFanoutToken) { gcColdStartDone = false; return; }
+
+      if (res.aborted) {
+        // 撞 401/403 中止:钥匙已被 api.js 清掉,这时**绝不能**再去读聚合端点——
+        // 那一发同样会 401,又触发一次登录浮层重弹(清空并抢占输入框焦点)。
+        // 同时放开冷启动闸:本轮没能把共享缓存喂上,重新登录后的第一次渲染
+        // 还得允许再补一次种子,否则「全局积分」会一直空到有人手点刷新。
+        gcColdStartDone = false;
+        if (els.globalCredits) els.globalCredits.textContent = '—';
+        return;
       }
+
       // Re-read the shared aggregate now that the cache is populated.
       paintGlobalCredits(await readGlobalAggregate());
     } finally {
       gcInFlight = false;
       if (btn) btn.disabled = false;
     }
+  }
+
+  // 有界 + 可取消的余额扇出:最多 GC_FANOUT_CONCURRENCY 发同时在飞,完成一发才补
+  // 下一发(工作者池,不是一次性 map 出上千个 Promise)。返回 { aborted, cancelled }:
+  //   aborted   — 撞到 401/403,剩下的账号一发都不再打;
+  //   cancelled — 令牌被顶掉(离开仪表盘 / 新一轮刷新),静默停工。
+  //
+  // 为什么"撞 401 就必须整轮停":api.js 每收到一个 401 都会清本地 key 并调
+  // onUnauthorized 重弹登录浮层,而浮层每次弹出都会清空并抢占登录输入框的焦点。
+  // 若照旧把剩余上千个请求发完,它们会在几秒内**全部**401,登录框被反复清空/抢焦点,
+  // 运维根本打不进钥匙、进不来后台。
+  async function fanoutBalances(list, token) {
+    var i = 0;   // 共享游标:每个工作者取一个账号,取完即止
+    var state = { aborted: false, cancelled: false };
+
+    // 用 while + await 领取下一个账号(而不是 .then(worker) 递归):上千个账号
+    // 递归链会一路挂着上千层 promise,循环则是常数内存。
+    async function worker() {
+      while (true) {
+        if (state.aborted) return;
+        if (token !== gcFanoutToken) { state.cancelled = true; return; }
+        if (i >= list.length) return;
+        var c = list[i++];
+        try {
+          await K.api.get('/credentials/' + encodeURIComponent(c.id) + '/balance');
+        } catch (e) {
+          // 单个账号 502 / 网络错只是跳过:聚合端点本来就会略过没有新鲜缓存的账号。
+          // 只有鉴权失败才意味着"这一轮再打下去毫无意义且有害"。
+          if (isAuthError(e)) { state.aborted = true; return; }
+        }
+      }
+    }
+
+    var n = Math.min(GC_FANOUT_CONCURRENCY, list.length);
+    var running = [];
+    for (var k = 0; k < n; k++) running.push(worker());
+    await Promise.all(running);
+    return state;
   }
 
   // READ-ONLY aggregate over the shared cache. Does NOT hit upstream.
@@ -871,7 +949,13 @@
   // ---------------- register + expose ----------------
   K.sections.dashboard = {
     init: init,
-    onShow: function () { render(); }
+    onShow: function () { render(); },
+    // 离开仪表盘时作废在飞的余额扇出。两个场景都需要它:
+    //  ① 切到账号页 —— 账号页自己也会串行扇出一遍同一批账号(共享同一份
+    //     BalanceCache),放任仪表盘那轮继续跑就是双份上游压力 + 重复劳动;
+    //  ② 401 掉线 —— app.js 的 onUnauthorized 会主动调当前分区的 onHide,
+    //     这里停掉后台请求,登录浮层才不会被后续 401 反复重弹、抢走输入焦点。
+    onHide: function () { gcFanoutToken++; }
   };
 
   window.renderDashboard = function () {

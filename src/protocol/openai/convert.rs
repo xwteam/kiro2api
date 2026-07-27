@@ -127,7 +127,58 @@ fn convert_message(msg: &ChatMessage) -> Option<InMsg> {
     })
 }
 
+/// 把中枢 `ContentIn` 归一成块序列;裸字符串 → 单个文本块(空串不产块,免得凭空多出空文本块)。
+fn into_blocks(content: ContentIn) -> Vec<Block> {
+    match content {
+        ContentIn::Text(s) if s.is_empty() => Vec::new(),
+        ContentIn::Text(s) => vec![Block::Text { text: s }],
+        ContentIn::Blocks(blocks) => blocks,
+    }
+}
+
+/// 这条消息里是否已有非空文本块(决定合并时要不要补空行分隔)。
+fn has_text(blocks: &[Block]) -> bool {
+    blocks
+        .iter()
+        .any(|b| matches!(b, Block::Text { text } if !text.is_empty()))
+}
+
+/// 把 `next` 并进相邻的同角色消息 `prev`(块序列顺接,顺序即客户端给的顺序)。
+///
+/// 两边都有文本时,在 `next` 的首个非空文本块前补 `\n\n`:中枢 `InMsg::text()` 是无缝
+/// concat,不补分隔会把两轮文本粘成一个词(`"hi"+"there"` → `"hithere"`);`\n\n` 与本文件
+/// 多段 system 的 `join("\n\n")` 口径一致。工具结果/图片块不参与文本拍平,故纯工具结果的
+/// 合并不会平白多出空行。
+fn merge_same_role(prev: &mut InMsg, next: InMsg) {
+    let mut blocks = into_blocks(std::mem::replace(
+        &mut prev.content,
+        ContentIn::Blocks(Vec::new()),
+    ));
+    let mut incoming = into_blocks(next.content);
+    if has_text(&blocks) {
+        for block in incoming.iter_mut() {
+            if let Block::Text { text } = block
+                && !text.is_empty()
+            {
+                text.insert_str(0, "\n\n");
+                break;
+            }
+        }
+    }
+    blocks.append(&mut incoming);
+    prev.content = ContentIn::Blocks(blocks);
+}
+
 /// 把 OpenAI `ChatCompletionRequest` 转换成中枢 `MessagesRequest`。
+///
+/// **相邻同角色消息必须合并成一轮**:OpenAI 线格式把一次并行工具调用的应答拆成 N 条独立的
+/// `role:"tool"` 消息(一条 assistant `tool_calls:[c1,c2]` 后面跟两条 tool 消息),而中枢/
+/// Anthropic 口径是「同一条用户消息里放齐所有 tool_result」,下游 `anthropic_to_kiro` 又是把
+/// 中枢消息 1:1 铺进 Kiro history、末条当 currentMessage。逐条不合并的话,声明了两个 toolUses
+/// 的助手轮后面只跟着带一个 toolResult 的用户轮,另一个 toolResult 被挤到 currentMessage,
+/// 配对被拆散、history 还以用户轮收尾(user/assistant 交替也断了),上游会当成工具调用未被应答。
+/// 合并同样兜住「工具结果后又追一条 user 文本」「客户端把助手文本与 tool_calls 拆成两条 assistant」
+/// 这些同类写法。
 pub fn openai_to_hub(req: ChatCompletionRequest) -> MessagesRequest {
     let mut system_parts: Vec<String> = Vec::new();
     let mut messages: Vec<InMsg> = Vec::new();
@@ -143,7 +194,12 @@ pub fn openai_to_hub(req: ChatCompletionRequest) -> MessagesRequest {
             continue;
         }
         if let Some(hub_msg) = convert_message(msg) {
-            messages.push(hub_msg);
+            // 只在角色相邻相同时合并;单条消息(happy path)原样入列,连 ContentIn::Text
+            // 都不块化,形状与改动前完全一致。
+            match messages.last_mut() {
+                Some(prev) if prev.role == hub_msg.role => merge_same_role(prev, hub_msg),
+                _ => messages.push(hub_msg),
+            }
         }
     }
 
@@ -278,6 +334,64 @@ mod tests {
             content: Some(OpenAiContent::Text(text.to_string())),
             tool_calls: None,
             tool_call_id: None,
+        }
+    }
+
+    /// 一条带若干并行 tool_calls 的 assistant 消息(OpenAI 客户端回灌上一轮时的写法)。
+    fn assistant_tool_calls_msg(calls: &[(&str, &str, &str)]) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls: Some(
+                calls
+                    .iter()
+                    .map(|(id, name, args)| ToolCall {
+                        id: (*id).to_string(),
+                        kind: "function".to_string(),
+                        function: OaToolCallFunction {
+                            name: (*name).to_string(),
+                            arguments: (*args).to_string(),
+                        },
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+        }
+    }
+
+    /// 一条 `role:"tool"` 的工具结果消息。
+    fn tool_msg(call_id: &str, text: &str) -> ChatMessage {
+        ChatMessage {
+            role: "tool".to_string(),
+            content: Some(OpenAiContent::Text(text.to_string())),
+            tool_calls: None,
+            tool_call_id: Some(call_id.to_string()),
+        }
+    }
+
+    fn req_with(messages: Vec<ChatMessage>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "gpt-4o".to_string(),
+            messages,
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            stream_options: None,
+            max_tokens: None,
+        }
+    }
+
+    /// 取出一条中枢消息里的工具结果 id 列表(顺序敏感)。
+    fn tool_result_ids(msg: &InMsg) -> Vec<String> {
+        match &msg.content {
+            ContentIn::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    Block::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                    _ => None,
+                })
+                .collect(),
+            ContentIn::Text(_) => Vec::new(),
         }
     }
 
@@ -707,6 +821,171 @@ mod tests {
             Some("stop")
         );
         assert_eq!(finish_reason_from_stop(None).as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn openai_to_hub_parallel_tool_results_merge_into_one_user_message() {
+        // 并行工具调用回灌:OpenAI 线格式规定「一条 assistant(tool_calls:[c1,c2]) + 两条
+        // 独立的 role:"tool"」。若逐条各自成一条中枢消息,声明了两个 toolUses 的助手轮
+        // 后面就只跟着带一个 toolResult 的用户轮,配对被拆散。
+        let req = req_with(vec![
+            user_msg("weather in Paris and Tokyo?"),
+            assistant_tool_calls_msg(&[
+                ("c1", "get_weather", "{\"city\":\"Paris\"}"),
+                ("c2", "get_weather", "{\"city\":\"Tokyo\"}"),
+            ]),
+            tool_msg("c1", "sunny"),
+            tool_msg("c2", "rainy"),
+        ]);
+        let hub = openai_to_hub(req);
+
+        assert_eq!(hub.messages.len(), 3, "两条 tool 消息必须并成一条用户轮");
+        assert_eq!(hub.messages[0].role, "user");
+        assert_eq!(hub.messages[1].role, "assistant");
+        assert_eq!(hub.messages[2].role, "user");
+        // 顺序必须与 tool_calls 的声明顺序一致。
+        assert_eq!(tool_result_ids(&hub.messages[2]), vec!["c1", "c2"]);
+        // 工具结果文本不能在合并中丢失。
+        match &hub.messages[2].content {
+            ContentIn::Blocks(blocks) => match (&blocks[0], &blocks[1]) {
+                (Block::ToolResult { content: a, .. }, Block::ToolResult { content: b, .. }) => {
+                    assert_eq!(a, "sunny");
+                    assert_eq!(b, "rainy");
+                }
+                other => panic!("应为两个 ToolResult,实际: {other:?}"),
+            },
+            other => panic!("应为 Blocks,实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_to_hub_parallel_tool_results_keep_pairing_on_kiro_wire() {
+        // 端到端复核 Kiro 数据面线上形状:history 必须 user/assistant 严格交替且以助手轮收尾,
+        // 声明 2 个 toolUses 的助手轮之后,2 个 toolResults 必须同在紧随的那一轮里。
+        use crate::kiro::convert::anthropic_to_kiro;
+        use crate::kiro::wire::HistoryItem;
+
+        let mut req = req_with(vec![
+            user_msg("weather in Paris and Tokyo?"),
+            assistant_tool_calls_msg(&[
+                ("c1", "get_weather", "{\"city\":\"Paris\"}"),
+                ("c2", "get_weather", "{\"city\":\"Tokyo\"}"),
+            ]),
+            tool_msg("c1", "sunny"),
+            tool_msg("c2", "rainy"),
+        ]);
+        req.model = "claude-sonnet-4.5".to_string();
+        let hub = openai_to_hub(req);
+        let kiro = anthropic_to_kiro(&hub, None).expect("转换应成功");
+
+        let history = &kiro.conversation_state.history;
+        assert_eq!(history.len(), 2, "history 应为 [用户轮, 助手轮]");
+        assert!(
+            matches!(history[0], HistoryItem::UserInputMessage { .. }),
+            "history[0] 应为用户轮,实际: {:?}",
+            history[0]
+        );
+        let HistoryItem::AssistantResponseMessage {
+            assistant_response_message,
+        } = &history[1]
+        else {
+            panic!("history 必须以助手轮收尾,实际: {:?}", history[1]);
+        };
+        let tool_uses = assistant_response_message
+            .tool_uses
+            .as_ref()
+            .expect("助手轮应带 toolUses");
+        assert_eq!(tool_uses.len(), 2);
+
+        let current_results = kiro
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+            .as_ref()
+            .expect("当前轮应带 toolResults");
+        assert_eq!(
+            current_results.len(),
+            2,
+            "两个 toolUses 必须由同一轮里的两个 toolResults 应答"
+        );
+        assert_eq!(current_results[0].tool_use_id, "c1");
+        assert_eq!(current_results[1].tool_use_id, "c2");
+    }
+
+    #[test]
+    fn openai_to_hub_tool_result_then_user_text_merge_into_one_turn() {
+        // 工具结果之后客户端又追一条 user 文本:两者同为用户轮,必须并成一轮,
+        // 否则 history 会以用户轮收尾、currentMessage 又是用户轮,交替被打破。
+        let req = req_with(vec![
+            user_msg("weather?"),
+            assistant_tool_calls_msg(&[("c1", "get_weather", "{}")]),
+            tool_msg("c1", "sunny"),
+            user_msg("and Berlin?"),
+        ]);
+        let hub = openai_to_hub(req);
+
+        assert_eq!(hub.messages.len(), 3);
+        assert_eq!(hub.messages[2].role, "user");
+        assert_eq!(tool_result_ids(&hub.messages[2]), vec!["c1"]);
+        // 工具结果块本身不参与文本拍平,故这一轮的文本就是追加的那句用户输入。
+        assert_eq!(hub.messages[2].text(), "and Berlin?");
+    }
+
+    #[test]
+    fn openai_to_hub_consecutive_user_texts_join_with_blank_line() {
+        // 相邻同角色消息合并时,两段文本之间必须留空行分隔,不能无缝粘成一个词。
+        let req = req_with(vec![user_msg("hi"), user_msg("there")]);
+        let hub = openai_to_hub(req);
+        assert_eq!(hub.messages.len(), 1);
+        assert_eq!(hub.messages[0].role, "user");
+        assert_eq!(hub.messages[0].text(), "hi\n\nthere");
+    }
+
+    #[test]
+    fn openai_to_hub_consecutive_assistant_messages_merge() {
+        // 部分客户端把「助手文本」与「助手 tool_calls」拆成两条 assistant 消息回灌,
+        // 合并后文本与 toolUses 必须同属一轮。
+        let req = req_with(vec![
+            user_msg("weather?"),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(OpenAiContent::Text("let me check".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            assistant_tool_calls_msg(&[("c1", "get_weather", "{}")]),
+        ]);
+        let hub = openai_to_hub(req);
+
+        assert_eq!(hub.messages.len(), 2);
+        assert_eq!(hub.messages[1].role, "assistant");
+        assert_eq!(hub.messages[1].text(), "let me check");
+        match &hub.messages[1].content {
+            ContentIn::Blocks(blocks) => {
+                assert!(
+                    blocks
+                        .iter()
+                        .any(|b| matches!(b, Block::ToolUse { id, .. } if id == "c1")),
+                    "合并后应保留 ToolUse,实际: {blocks:?}"
+                );
+            }
+            other => panic!("应为 Blocks,实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_to_hub_single_user_message_stays_plain_text() {
+        // 无相邻同角色消息时不做任何改写:单条纯文本消息仍是 ContentIn::Text(不被块化)。
+        let req = req_with(vec![system_msg("s"), user_msg("hi")]);
+        let hub = openai_to_hub(req);
+        assert_eq!(hub.messages.len(), 1);
+        assert!(
+            matches!(&hub.messages[0].content, ContentIn::Text(s) if s == "hi"),
+            "happy path 不应被块化,实际: {:?}",
+            hub.messages[0].content
+        );
     }
 
     #[test]

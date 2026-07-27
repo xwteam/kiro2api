@@ -29,6 +29,43 @@ const EST_COST_PER_REQUEST_USD: f64 = 1.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ApiKeyId(pub Option<u32>);
 
+/// 鉴权闸解析出的**账号绑定白名单**:本次请求只允许使用这些上游凭据 id。
+/// 与 [`ApiKeyId`] 同规约,经请求扩展下传给 relay 的选号层。
+///
+/// 契约(选号层必须照此裁决):
+/// - 扩展**缺席** = 不受限(全局 key / 开放模式 / 未绑定的 store key)——热路径原样选号,零开销;
+/// - 扩展**在场** = 只准从 `.0` 列出的凭据 id 里选,成员判定一律走 [`BoundCredentialIds::allows`]。
+///
+/// 为什么要在鉴权闸解析而不是让选号层自己再查一遍 store:绑定值必须与本次鉴权命中的那条 key
+/// **同一份快照**(闸内已持有 `validate` 的结果),否则请求在途时管理员改绑定会出现"按旧 key
+/// 放行、按新绑定选号"的错配;且热路径可省掉一次 store 读锁。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundCredentialIds(pub Vec<u64>);
+
+impl BoundCredentialIds {
+    /// 池里的凭据 id(String)是否落在白名单内。
+    ///
+    /// 池 id 是任意字符串(见 `kiro::credential` 的 flexible 反序列化),而绑定列表是数值 id
+    /// (管理面按账号数值 id 勾选),故解析不出数值的 id 一律**不放行**(fail-closed):
+    /// 绑定的语义是"只准用这几个账号",宁可选不出账号(上游 503)也不能把请求漏给未授权账号。
+    pub fn allows(&self, credential_id: &str) -> bool {
+        match credential_id.parse::<u64>() {
+            Ok(n) => self.0.contains(&n),
+            Err(_) => false,
+        }
+    }
+}
+
+/// 把 store 里的绑定字段收敛成"受限白名单":`None` 与**空列表**都表示不受限,返回 `None`。
+///
+/// 空列表按"不受限"处理是为了与管理面显示保持一致:面板把 `boundCredentialIds` 为空的 key
+/// 归进"全局策略(未绑定)"那一组(admin-ui-v2/js/sec-apikeys.js 的分组判据就是 `length > 0`)。
+/// 若这里把空列表当成"一个账号都不准用",面板上显示为未绑定的 key 会在数据面被判死(选不出
+/// 账号),显示与行为对不上——绑定这类只在管理面配置的策略,最忌看到的和执行的两回事。
+fn restricted_binding(bound: Option<Vec<u64>>) -> Option<BoundCredentialIds> {
+    bound.filter(|ids| !ids.is_empty()).map(BoundCredentialIds)
+}
+
 /// 鉴权中间件所需状态:
 /// - `api_key`:全局 API key(`None`/空串 = 该来源不设全局 key)。
 /// - `api_keys`:store-backed 每用户 key。协议闸据此放行 store key,并据“store 里是否有 key”
@@ -196,7 +233,8 @@ fn attach_reservation_to_response(
 /// 判定顺序:
 /// 1. 配置了非空全局 key 且常量时间匹配 → 放行(全局模式,不归属 store key)。
 /// 2. 否则,协议闸按 store 的 `validate` 裁决:
-///    - Valid 且未超消费上限 → 惰性激活 + 把 `ApiKeyId(Some(id))` 塞进请求扩展后放行;
+///    - Valid 且未超消费上限 → 惰性激活 + 把 `ApiKeyId(Some(id))`(以及该 key 若设了账号绑定,
+///      再加一个 [`BoundCredentialIds`])塞进请求扩展后放行;
 ///    - Valid 但已达/超上限 → 402;
 ///    - Disabled / Expired / NotFound → 401(不泄露具体命中与否细节,统一措辞)。
 ///    admin 闸跳过本步:store key 不得取得管理员权限。
@@ -260,6 +298,7 @@ pub async fn require_api_key(
                 id,
                 spending_limit,
                 limit_unit,
+                bound_credential_ids,
                 ..
             } => {
                 // 消费上限:原子 reserve-then-reconcile(闭合 check-then-act 的并发窗口)。
@@ -293,6 +332,13 @@ pub async fn require_api_key(
                 // 惰性激活(首次使用才据 duration_days 定 expires_at;已激活幂等)。
                 let _ = store.activate_key(id, now);
                 request.extensions_mut().insert(ApiKeyId(Some(id)));
+                // 账号绑定随本次鉴权结果一起下传:管理面把 key 绑到某几个账号后,这份白名单
+                // 必须真正抵达选号层,否则绑定只停留在存储与面板展示上,任何 store key 仍能
+                // 消费池里任意账号(绑定形同虚设)。只有受限时才插扩展:未绑定的 key 与全局
+                // key 走原路径、扩展缺席 = 不限,热路径无任何额外开销与语义变化。
+                if let Some(bound) = restricted_binding(bound_credential_ids) {
+                    request.extensions_mut().insert(bound);
+                }
                 let response = next.run(request).await;
                 // 把预留 guard 绑定到响应 body 的生命周期:body 全部发完(流式亦然)才释放预留。
                 return attach_reservation_to_response(response, reservation);
@@ -1056,6 +1102,188 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_text(resp).await, k.id.to_string());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 回显解析出的账号绑定白名单:扩展缺席 → "unbound",在场 → "3,7" 形式的 id 列表。
+    async fn echo_binding(ext: Option<Extension<BoundCredentialIds>>) -> String {
+        match ext {
+            Some(Extension(BoundCredentialIds(ids))) => ids
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            None => "unbound".to_string(),
+        }
+    }
+
+    fn binding_router(auth: AuthState) -> Router {
+        Router::new()
+            .route("/protected", get(echo_binding))
+            .layer(middleware::from_fn_with_state(auth, require_api_key))
+    }
+
+    fn store_auth(store: Arc<ApiKeyStore>) -> AuthState {
+        AuthState {
+            api_key: None,
+            runtime_cfg: None,
+            role: AuthRole::Protocol,
+            api_keys: Some(store),
+            stats: Some(StatsManager::load_from_dir(&std::env::temp_dir())),
+        }
+    }
+
+    /// 回归(账号绑定被丢弃):管理面给 key 绑定了账号 [3,7],鉴权闸必须把这份白名单
+    /// 经请求扩展下传给选号层。修复前闸内 `..` 直接丢掉 `bound_credential_ids`,
+    /// 扩展永不出现 → 绑定只存在于存储与面板展示里,数据面任意账号照用不误。
+    #[tokio::test]
+    async fn store_key_binding_reaches_request_extensions() {
+        let path = tmp_store_path("bound");
+        let _ = std::fs::remove_file(&path);
+        let store = ApiKeyStore::load(&path);
+        let k = store.create(
+            "u1".into(),
+            None,
+            None,
+            None,
+            None,
+            Some(vec![3, 7]),
+            Utc::now(),
+        );
+        let app = binding_router(store_auth(store));
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header("authorization", format!("Bearer {}", k.key))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            body_text(resp).await,
+            "3,7",
+            "绑定的凭据白名单必须原样抵达选号层"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 未绑定的 store key:扩展缺席 = 不受限(既有 happy path 不得被收紧)。
+    #[tokio::test]
+    async fn store_key_without_binding_is_unrestricted() {
+        let path = tmp_store_path("unbound");
+        let _ = std::fs::remove_file(&path);
+        let store = ApiKeyStore::load(&path);
+        let k = store.create("u1".into(), None, None, None, None, None, Utc::now());
+        let app = binding_router(store_auth(store));
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header("authorization", format!("Bearer {}", k.key))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_text(resp).await, "unbound");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 空绑定列表按"不受限"处理:面板把它显示成"全局策略(未绑定)",数据面不得把这类 key
+    /// 判死(否则显示与行为不一致,且线上会突然一个账号都选不出)。
+    #[tokio::test]
+    async fn empty_binding_list_is_treated_as_unrestricted() {
+        let path = tmp_store_path("emptybound");
+        let _ = std::fs::remove_file(&path);
+        let store = ApiKeyStore::load(&path);
+        let k = store.create(
+            "u1".into(),
+            None,
+            None,
+            None,
+            None,
+            Some(Vec::new()),
+            Utc::now(),
+        );
+        let app = binding_router(store_auth(store));
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header("authorization", format!("Bearer {}", k.key))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_text(resp).await, "unbound");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 走全局 key 放行时不带任何绑定:全局 key 不属于任何 store key,自然不受其绑定约束。
+    #[tokio::test]
+    async fn global_key_path_carries_no_binding() {
+        let path = tmp_store_path("globalnobind");
+        let _ = std::fs::remove_file(&path);
+        let store = ApiKeyStore::load(&path);
+        let _ = store.create(
+            "u1".into(),
+            None,
+            None,
+            None,
+            None,
+            Some(vec![3]),
+            Utc::now(),
+        );
+        let auth = AuthState {
+            api_key: Some("secret".into()),
+            runtime_cfg: None,
+            role: AuthRole::Protocol,
+            api_keys: Some(store),
+            stats: Some(StatsManager::load_from_dir(&std::env::temp_dir())),
+        };
+        let app = binding_router(auth);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_text(resp).await, "unbound");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 白名单成员判定:数值 id 命中才放行;池里非数值 id 一律拒(fail-closed)。
+    #[test]
+    fn binding_allows_only_listed_numeric_ids() {
+        let b = BoundCredentialIds(vec![3, 7]);
+        assert!(b.allows("3"));
+        assert!(b.allows("7"));
+        assert!(!b.allows("4"));
+        // 池 id 可以是任意字符串;解析不出数值 → 绝不可能在白名单里 → 不放行。
+        assert!(!b.allows("a1"));
+        assert!(!b.allows(""));
+        assert!(!b.allows("03x"));
+    }
+
+    /// 收敛规则:None / 空列表 → 不受限;非空 → 受限白名单原样保留。
+    #[test]
+    fn restricted_binding_normalizes_empty_to_unrestricted() {
+        assert_eq!(restricted_binding(None), None);
+        assert_eq!(restricted_binding(Some(Vec::new())), None);
+        assert_eq!(
+            restricted_binding(Some(vec![5, 9])),
+            Some(BoundCredentialIds(vec![5, 9]))
+        );
     }
 
     #[tokio::test]

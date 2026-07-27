@@ -94,11 +94,48 @@ impl ApiKey {
         }
         self.activated_at = Some(now);
         if let Some(days) = self.duration_days {
-            // 以毫秒精度换算,兼容 0.25 天(6 小时)这类小数时长。
-            let ms = (days * 86_400_000.0).round() as i64;
-            self.expires_at = Some(now + Duration::milliseconds(ms));
+            self.expires_at = Some(expiry_from_duration_days(now, days));
         }
         true
+    }
+}
+
+/// `duration_days` 的绝对值上限(约 1 万年)。超过即视为"实际上永不过期",
+/// 用于把管理面传进来的任意 f64 收敛到 chrono 绝不会溢出的范围内。
+/// 取值理由:3.65e6 天换算成毫秒约 3.2e14,远在 i64 与 `DateTime<Utc>` 的可表示范围内
+/// (chrono 上限约公元 262143 年),而任何真实的授权时长都不会接近它,故对正常业务是纯粹的空操作。
+const MAX_DURATION_DAYS: f64 = 3_650_000.0;
+
+/// 把任意 f64 时长收敛到安全范围:NaN → 0(立即过期,失败方向取"更严"而非"无限期可用"),
+/// 其余按 ±[`MAX_DURATION_DAYS`] 截断(±Inf 也在此被截断)。
+///
+/// 为什么必须有:`CreateApiKeyRequest.duration_days` 是裸 `Option<f64>`,从 HTTP body 一路
+/// 原样存进 `ApiKey`,中间没有任何范围校验。管理员误填 `1000000000`(或 JSON 里的 `1e999`
+/// 解析出的 Inf)本身不报错,坏账要到**该 key 第一次被使用**时才爆。
+fn sanitize_duration_days(days: f64) -> f64 {
+    if days.is_nan() {
+        return 0.0;
+    }
+    days.clamp(-MAX_DURATION_DAYS, MAX_DURATION_DAYS)
+}
+
+/// 由惰性时长算绝对过期时刻。**任何取值都不得 panic**。
+///
+/// 为什么用 checked 算术而不是 `now + Duration::milliseconds(ms)`:后者的 `Add` 实现内部是
+/// `.expect("`DateTime + TimeDelta` overflowed")`,溢出直接 panic;而本函数跑在鉴权中间件的
+/// 热路径上(`auth::require_api_key` → `ApiKeyStore::activate_key`,每个 key 首次使用都会走),
+/// 一条 `durationDays: 1e9` 的坏 key 就能让请求线程 panic —— 客户拿到 500/连接断开,而不是
+/// 一个可解释的鉴权错误。先 clamp 再 checked,双保险:clamp 后理论上不可能溢出,真溢出也只是
+/// 饱和到可表示边界(正时长 → 几乎永不过期,负时长 → 立即过期),绝不 panic。
+fn expiry_from_duration_days(now: DateTime<Utc>, days: f64) -> DateTime<Utc> {
+    let days = sanitize_duration_days(days);
+    // 以毫秒精度换算,兼容 0.25 天(6 小时)这类小数时长。
+    // 浮点→整数的 `as` 转换在 Rust 中是饱和的(NaN→0),不会 UB。
+    let ms = (days * 86_400_000.0).round() as i64;
+    match Duration::try_milliseconds(ms).and_then(|d| now.checked_add_signed(d)) {
+        Some(t) => t,
+        None if ms >= 0 => DateTime::<Utc>::MAX_UTC,
+        None => DateTime::<Utc>::MIN_UTC,
     }
 }
 
@@ -127,7 +164,9 @@ struct ApiKeyStoreFile {
     /// 下一个待分配的 id;单调递增,进程重启/删除 key 都不回退。
     #[serde(default)]
     next_id: u32,
-    #[serde(default)]
+    /// key 列表。**故意不加 `#[serde(default)]`**:写侧恒会写出该字段,故一份「是对象但没有
+    /// keys 数组」的文件(被别的内容顶掉/手工编辑写坏字段名)只可能是坏文件。若给它加默认值,
+    /// 这类坏文件会被 serde 悄悄解析成"空 store"而不报错,随后 5s 刷盘就把它原地覆写掉。
     keys: Vec<ApiKey>,
 }
 
@@ -195,11 +234,7 @@ impl ApiKeyStore {
     /// 由现存 id 推出(平滑升级),文件被手工编辑过导致 next_id 落后时也不会退回去撞已用 id。
     pub fn load<P: AsRef<Path>>(path: P) -> Arc<Self> {
         let path = path.as_ref().to_path_buf();
-        let (initial, stored_next_id) = match read_json::<ApiKeyFile>(&path).ok().flatten() {
-            Some(ApiKeyFile::Versioned(f)) => (f.keys, f.next_id),
-            Some(ApiKeyFile::Legacy(keys)) => (keys, 0),
-            None => (Vec::new(), 0),
-        };
+        let (initial, stored_next_id) = load_keys_resilient(&path);
         let next_id = stored_next_id.max(max_id_plus_one(initial.as_slice()));
         let (dirty, handle) = dirty_channel();
         let store = Arc::new(Self {
@@ -308,7 +343,9 @@ impl ApiKeyStore {
                 expires_at,
                 spending_limit,
                 limit_unit: limit_unit.unwrap_or_else(default_limit_unit),
-                duration_days,
+                // 入库即收敛到安全范围:HTTP 层的 `durationDays` 是裸 f64、无任何校验,
+                // 让 1e9 这种值落到盘上,重启后每次读到它都得再防一遍溢出。
+                duration_days: duration_days.map(sanitize_duration_days),
                 activated_at: None,
                 bound_credential_ids,
             };
@@ -354,7 +391,8 @@ impl ApiKeyStore {
                 k.limit_unit = v;
             }
             if let Some(v) = duration_days {
-                k.duration_days = v;
+                // 同 `create`:改时长也要收敛,别让越界值绕过创建口从更新口进来。
+                k.duration_days = v.map(sanitize_duration_days);
             }
             if let Some(v) = bound_credential_ids {
                 k.bound_credential_ids = v;
@@ -491,6 +529,262 @@ pub fn api_keys_path_from(credentials_path: &str) -> PathBuf {
         _ => PathBuf::from("."),
     };
     dir.join("api_keys.json")
+}
+
+/// 逐条抢救坏文件时,最多逐条打印多少条坏 key 的明细(其余只计入总数)。
+/// 上限的理由与凭据池同:线上 api_keys.json 有上千条客户 key,整体格式走样时不能让启动日志
+/// 被刷爆(日志同时进实时日志面板的环形缓冲,刷爆等于把别的线索一起冲掉)。
+const MAX_BAD_APIKEY_LOGS: usize = 20;
+
+/// 载入落盘的 key 列表——**解析失败绝不静默当空 store**。返回 `(可用 key, next_id 下界)`。
+///
+/// 为什么不能再写 `read_json(..).ok().flatten()`:那会把「解析失败」和「文件根本不存在」
+/// 折叠成同一个 `None`。线上这份 api_keys.json 装着全部客户 key,而 serde 是整份文件
+/// all-or-nothing —— 任何**一条** key 写坏(`created_at` 不是 RFC3339、缺 `key` 字段、
+/// 手工编辑多一个逗号、文件被截断)都会让整份文件解析失败。旧写法的后果是:进程带着 0 个 key
+/// 启动、日志里一个字都没有,全部客户当场 401、管理面 API-KEY 页空空如也;运营者只能猜
+/// 「那就重新发一个 key」——这一下 `create` 置脏,5s 去抖刷盘就把内存里仅有的那条新 key
+/// 整份原子覆写上去,原本还能人工修好的上千条客户 key 当场蒸发且不可逆。
+///
+/// 故这里与 `server::load_credentials_resilient` / `stats::usage` 同规格做三件事:
+/// 1. **原样备份**(复制而非改名):存成 `{path}.corrupt.{unix秒}.{序号}`,原文件留在原处供人工
+///    修复,备份档任凭后续任何原子写都覆不掉;
+/// 2. **逐条抢救**:文件本体还是 JSON(新版对象 / 旧版裸数组)时按条反序列化,坏条目跳过、
+///    好 key 照常入库 —— 1 条坏 key 不再拖垮另外 999 条,客户继续能用;
+/// 3. **大声报错**并抬高 `next_id` 下界:坏条目进不了内存,但它占用过的 id 仍要计入下界,
+///    否则新建 key 会复用该 id、直接继承前任的用量明细与累计消费(跨客户串账,见 `create` 注释)。
+fn load_keys_resilient(path: &Path) -> (Vec<ApiKey>, u32) {
+    let err = match read_json::<ApiKeyFile>(path) {
+        Ok(Some(ApiKeyFile::Versioned(f))) => return (f.keys, f.next_id),
+        Ok(Some(ApiKeyFile::Legacy(keys))) => return (keys, 0),
+        // 文件不存在 = 首次运行的正常路径,静默按空 store 起(不备份、不报错)。
+        Ok(None) => return (Vec::new(), 0),
+        Err(e) => e,
+    };
+    // 走到这里说明文件存在但读不动/解析不了。备份与逐条抢救都要用原始字节,只读一次。
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(read_err) => {
+            tracing::error!(
+                path = %path.display(),
+                error = %err,
+                read_error = %read_err,
+                "api_keys.json 读取失败,API-KEY 按空载入;修好之前请勿在管理面增删 key——任何写入都会用空存储整份覆写该文件"
+            );
+            return (Vec::new(), 0);
+        }
+    };
+    let backup = backup_corrupt_api_keys(path, &raw);
+    let salvaged = salvage_api_keys(&raw);
+    tracing::error!(
+        path = %path.display(),
+        error = %err,
+        entries_total = salvaged.total,
+        salvaged = salvaged.keys.len(),
+        skipped = salvaged.skipped,
+        next_id = salvaged.next_id,
+        backup = backup
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<备份失败>".to_string()),
+        "api_keys.json 解析失败:已原样备份并逐条抢救可用 key;请按上面的逐条报错修好坏条目后重启,期间在管理面增删 key 会用当前(可能不完整的)列表覆写该文件"
+    );
+    (salvaged.keys, salvaged.next_id)
+}
+
+/// 逐条抢救的产物。
+struct SalvagedKeys {
+    /// 解析成功、可继续鉴权的 key。
+    keys: Vec<ApiKey>,
+    /// `next_id` 下界:`max(文件里的 next_id, 全部条目(含坏条目)的最大 id + 1)`。
+    next_id: u32,
+    /// 文件里的条目总数(含坏条目)。
+    total: usize,
+    /// 跳过的坏条目数。
+    skipped: usize,
+}
+
+/// 逐条抢救:文件本体仍是 JSON 时按条反序列化,坏条目跳过并报错。
+/// 整份文件连 JSON 都解析不出(语法错/被截断)时全空——此时只剩备份档可人工修复。
+fn salvage_api_keys(raw: &[u8]) -> SalvagedKeys {
+    let empty = SalvagedKeys {
+        keys: Vec::new(),
+        next_id: 0,
+        total: 0,
+        skipped: 0,
+    };
+    let value: serde_json::Value = match serde_json::from_slice(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "api_keys.json 连 JSON 都解析不出(语法错误/文件被截断),无法逐条抢救;原文件已备份,请人工修复"
+            );
+            return empty;
+        }
+    };
+    let (entries, stored_next_id) = match value {
+        // 旧版裸数组形态。
+        serde_json::Value::Array(a) => (a, 0u32),
+        // 新版对象形态:`next_id` 单独抢救——它自己坏掉也不该连累 key 列表,反之亦然。
+        serde_json::Value::Object(mut o) => {
+            let next_id = o
+                .get("next_id")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32;
+            match o.remove("keys") {
+                Some(serde_json::Value::Array(a)) => (a, next_id),
+                _ => {
+                    tracing::error!("api_keys.json 里没有可用的 keys 数组,无法逐条抢救 key");
+                    (Vec::new(), next_id)
+                }
+            }
+        }
+        _ => {
+            tracing::error!("api_keys.json 既不是对象也不是数组,无法逐条抢救");
+            return empty;
+        }
+    };
+    let total = entries.len();
+    let mut keys = Vec::with_capacity(total);
+    let mut skipped = 0usize;
+    let mut max_id = 0u32;
+    for (index, entry) in entries.into_iter().enumerate() {
+        // 先取 id:坏条目也要计入 next_id 下界,否则新 key 复用它的 id 会继承前任的用量与消费。
+        if let Some(id) = entry.get("id").and_then(|v| v.as_u64()) {
+            max_id = max_id.max(id.min(u32::MAX as u64) as u32);
+        }
+        match serde_json::from_value::<ApiKey>(entry) {
+            Ok(k) => {
+                max_id = max_id.max(k.id);
+                keys.push(k);
+            }
+            Err(e) => {
+                skipped += 1;
+                if skipped <= MAX_BAD_APIKEY_LOGS {
+                    // 定位信息只取数组下标,**绝不打印 key 明文或 name**——这些日志会进实时日志
+                    // 面板与日志文件,打出去等于把客户密钥泄给任何能看日志的人。
+                    tracing::error!(
+                        index = index,
+                        error = %e,
+                        "该 API-KEY 条目解析失败,已跳过(其余 key 照常载入)"
+                    );
+                }
+            }
+        }
+    }
+    SalvagedKeys {
+        keys,
+        next_id: stored_next_id.max(max_id.saturating_add(1)),
+        total,
+        skipped,
+    }
+}
+
+/// 把当前(解析不了的)api_keys.json **原样复制**一份到 `{path}.corrupt.{unix秒}.{序号}`。
+///
+/// 为什么是复制而不是像 `stats::usage` 那样改名:这份文件是客户 key 的唯一真源。改名走人,
+/// 运营者连"照着原文件改一个字符"都没得改,且下一次刷盘就会用抢救出来的残缺列表建一份新文件。
+/// 复制则两头都保住:原文件留在原地供人工修复,备份档任凭后续原子写也覆不掉。
+///
+/// 幂等:同一份坏内容已经备份过(存在字节完全相同的 `.corrupt.*`)就不再重复备份,
+/// 否则容器反复重启会在数据盘上堆出一摞副本。
+fn backup_corrupt_api_keys(path: &Path, raw: &[u8]) -> Option<PathBuf> {
+    if let Some(existing) = existing_identical_backup(path, raw) {
+        return Some(existing);
+    }
+    let backup = corrupt_backup_path(path);
+    let res = (|| -> std::io::Result<()> {
+        // 文件里是全部客户 API-KEY 的明文:与 `persist::write_bytes_atomic` 同规按 0600 建,
+        // 不能用默认权限(0644)把密钥副本变成全局可读。`create_new` 保证绝不顶掉已有备份。
+        #[cfg(unix)]
+        let f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&backup)?
+        };
+        #[cfg(not(unix))]
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)?;
+        {
+            use std::io::Write;
+            let mut w = std::io::BufWriter::new(&f);
+            w.write_all(raw)?;
+            w.flush()?;
+        }
+        f.sync_all() // fsync:备份的意义就在于机器随后掉电也还在
+    })();
+    match res {
+        Ok(()) => Some(backup),
+        Err(e) => {
+            tracing::error!(
+                path = %path.display(),
+                backup = %backup.display(),
+                error = %e,
+                "损坏的 api_keys.json 备份失败:原文件仍在原处,但下一次刷盘会覆盖它,请先手工另存一份"
+            );
+            None
+        }
+    }
+}
+
+/// 损坏文件的备份路径:`{path}.corrupt.{unix秒}.{序号}`,取第一个尚不存在的候选
+/// (与 `server` / `stats::usage` 同规格),保证同秒内多次备份互不覆盖。
+fn corrupt_backup_path(path: &Path) -> PathBuf {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let with_suffix = |n: u32| {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(format!(".corrupt.{secs}.{n}"));
+        PathBuf::from(s)
+    };
+    for n in 0..100 {
+        let cand = with_suffix(n);
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    with_suffix(99)
+}
+
+/// 找同目录下内容与 `raw` 逐字节相同的既有 `{basename}.corrupt.*` 备份(有则本次不必再备份)。
+/// 先比长度再比内容,避免为每个候选都整份读一遍。
+fn existing_identical_backup(path: &Path, raw: &[u8]) -> Option<PathBuf> {
+    let (dir, file_name) = (
+        path.parent()?,
+        path.file_name()?.to_string_lossy().into_owned(),
+    );
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let prefix = format!("{file_name}.corrupt.");
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let same_len = entry
+            .metadata()
+            .map(|m| m.len() == raw.len() as u64)
+            .unwrap_or(false);
+        if same_len
+            && std::fs::read(entry.path())
+                .map(|b| b == raw)
+                .unwrap_or(false)
+        {
+            return Some(entry.path());
+        }
+    }
+    None
 }
 
 /// 现存 key 里最大 id + 1(空列表 → 1),即"不撞已用 id"的下界。
@@ -1021,6 +1315,302 @@ mod tests {
         drop(g);
         assert!(store.try_reserve_spend(1, 10.0, 10.0, f64::NAN).is_ok());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 每个测试独享的空目录(备份档要按 `.corrupt.*` 枚举,不能和别的用例共用目录)。
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "kiro2api_apikey_{}_{}_{}",
+            tag,
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 目录下的损坏备份文件列表(`*.corrupt.*`)。
+    fn corrupt_backups(dir: &Path) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains(".corrupt."))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// 回归:一条 key 写坏不得让整份 api_keys.json 被静默当成空 store。
+    ///
+    /// 修复前 `read_json(..).ok().flatten()` 把解析错误和"文件不存在"折叠成同一个 None:
+    /// 全部客户当场 401、日志里一个字都没有,管理员随手新建一个 key 就会让 5s 刷盘把这份
+    /// 仍可人工挽救的文件整份覆写掉。
+    #[test]
+    fn corrupt_entry_is_salvaged_backed_up_and_does_not_recycle_ids() {
+        let dir = unique_temp_dir("salvage");
+        let path = dir.join("api_keys.json");
+        // 三条 key,中间那条的 created_at 写坏(untagged 枚举下会让**整份**文件解析失败)。
+        let broken = r#"{
+          "next_id": 4,
+          "keys": [
+            {"id":1,"key":"sk-aaa","name":"0001","enabled":true,"created_at":"2026-07-20T00:00:00Z"},
+            {"id":2,"key":"sk-bbb","name":"0002","enabled":true,"created_at":"not-a-timestamp"},
+            {"id":3,"key":"sk-ccc","name":"0003","enabled":true,"created_at":"2026-07-20T00:00:00Z"}
+          ]
+        }"#;
+        std::fs::write(&path, broken).unwrap();
+
+        let store = ApiKeyStore::load(&path);
+        // 好的两条照常鉴权,坏的那条跳过 —— 不是全军覆没。
+        assert_eq!(store.len(), 2, "坏条目不得拖垮其余 key");
+        let now = ts("2026-07-21T00:00:00Z");
+        assert!(matches!(
+            store.validate("sk-aaa", now),
+            ApiKeyAuthResult::Valid { id: 1, .. }
+        ));
+        assert!(matches!(
+            store.validate("sk-ccc", now),
+            ApiKeyAuthResult::Valid { id: 3, .. }
+        ));
+
+        // 原文件原地未动(供人工修复),且已原样备份一份覆不掉的副本。
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        let backups = corrupt_backups(&dir);
+        assert_eq!(backups.len(), 1, "坏文件必须被备份:{backups:?}");
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), broken.as_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&backups[0]).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "备份含 key 明文,必须仅属主可读写,实际 {mode:o}"
+            );
+        }
+
+        // next_id 不因坏条目被跳过而回退:新 key 不得复用 id 2/3(会继承前任用量与消费)。
+        let k = store.create("new".into(), None, None, None, None, None, now);
+        assert_eq!(k.id, 4, "id 不得回收复用");
+
+        // 幂等:同一份坏内容再载入一次不再堆备份。
+        let _ = ApiKeyStore::load(&path);
+        assert_eq!(corrupt_backups(&dir).len(), 1, "同一份坏内容不应重复备份");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归:被截断/手工写坏语法的文件同样要备份 + 报错,而不是静默空载入。
+    /// 此时逐条抢救无能为力(连 JSON 都不是),备份档就是唯一的挽救手段。
+    #[test]
+    fn truncated_file_is_backed_up_and_left_in_place() {
+        let dir = unique_temp_dir("truncated");
+        let path = dir.join("api_keys.json");
+        let broken = r#"{"next_id":9,"keys":[{"id":1,"key":"sk-aaa","na"#;
+        std::fs::write(&path, broken).unwrap();
+
+        let store = ApiKeyStore::load(&path);
+        assert!(store.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            broken,
+            "原文件必须留在原处供人工修复"
+        );
+        let backups = corrupt_backups(&dir);
+        assert_eq!(backups.len(), 1, "坏文件必须被备份:{backups:?}");
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), broken.as_bytes());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归:旧版裸数组里有坏条目时,同样逐条抢救,且 next_id 下界要盖住**坏条目**的 id。
+    #[test]
+    fn corrupt_legacy_array_salvages_and_covers_bad_entry_id() {
+        let dir = unique_temp_dir("salvage_legacy");
+        let path = dir.join("api_keys.json");
+        // 裸数组(无 next_id 字段),最大 id 的那条恰好是坏的。
+        let broken = r#"[
+          {"id":1,"key":"sk-aaa","name":"0001","enabled":true,"created_at":"2026-07-20T00:00:00Z"},
+          {"id":9,"key":"sk-bbb","name":"0009","created_at":"2026-07-20T00:00:00Z","limit_unit":123}
+        ]"#;
+        std::fs::write(&path, broken).unwrap();
+
+        let store = ApiKeyStore::load(&path);
+        assert_eq!(store.len(), 1);
+        let now = ts("2026-07-21T00:00:00Z");
+        // 坏条目虽被跳过,它占的 id=9 仍计入下界 → 新 key 从 10 起,绝不复用 9。
+        let k = store.create("new".into(), None, None, None, None, None, now);
+        assert_eq!(k.id, 10, "坏条目的 id 也不得被复用");
+        assert_eq!(corrupt_backups(&dir).len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归:文件是对象但没有 `keys` 数组(被别的内容顶掉/字段名写坏)也算坏文件,
+    /// 必须备份 + 报错,而不是被 serde 的 default 悄悄解析成空 store。
+    #[test]
+    fn object_without_keys_array_is_treated_as_corrupt() {
+        let dir = unique_temp_dir("nokeys");
+        let path = dir.join("api_keys.json");
+        std::fs::write(&path, r#"{"next_id":12}"#).unwrap();
+
+        let store = ApiKeyStore::load(&path);
+        assert!(store.is_empty());
+        assert_eq!(corrupt_backups(&dir).len(), 1, "缺 keys 数组应判为坏文件");
+        // 抢救出的 next_id 仍被采纳,新 key 不撞历史 id。
+        let k = store.create(
+            "new".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            ts("2026-07-21T00:00:00Z"),
+        );
+        assert_eq!(k.id, 12);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 正常路径不得被"抢救"逻辑打扰:健康文件照常载入,且**不留任何备份档**。
+    #[test]
+    fn healthy_file_loads_without_backup() {
+        let dir = unique_temp_dir("healthy");
+        let path = dir.join("api_keys.json");
+        let now = ts("2026-07-20T00:00:00Z");
+        {
+            let store = ApiKeyStore::load(&path);
+            store.create("a".into(), None, None, None, None, None, now);
+            store.create("b".into(), None, None, None, None, None, now);
+            store.save_now().unwrap();
+        }
+        let reloaded = ApiKeyStore::load(&path);
+        assert_eq!(reloaded.len(), 2);
+        assert!(corrupt_backups(&dir).is_empty(), "健康文件不该产生备份");
+        // 文件不存在也是正常路径:不报错、不备份。
+        let missing = dir.join("nope.json");
+        assert!(ApiKeyStore::load(&missing).is_empty());
+        assert!(corrupt_backups(&dir).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 造一条带指定惰性时长的 key(直接构造,绕过 `create` 的收敛),
+    /// 用来模拟"修复前已落盘 / 被手工编辑写进去"的坏数据。
+    fn key_with_duration(days: f64, now: DateTime<Utc>) -> ApiKey {
+        ApiKey {
+            id: 1,
+            key: "sk-poison".into(),
+            name: "p".into(),
+            enabled: true,
+            created_at: now,
+            expires_at: None,
+            spending_limit: None,
+            limit_unit: default_limit_unit(),
+            duration_days: Some(days),
+            activated_at: None,
+            bound_credential_ids: None,
+        }
+    }
+
+    /// 回归:离谱的 `durationDays` 不得让惰性激活 panic。
+    ///
+    /// 修复前 `now + Duration::milliseconds((days*86_400_000.0).round() as i64)` 在
+    /// `|days| > ~9.5e7` 时溢出,chrono 的 Add 实现内部 expect 直接 panic;而该路径是
+    /// `auth::require_api_key` 每个 key 首次使用都会走的鉴权热路径
+    /// (→ `ApiKeyStore::activate_key` → `ApiKey::activate`),panic 即 500/断连。
+    ///
+    /// 这里直接构造 ApiKey(不走 `create`),是因为已经落盘的坏值也必须扛得住 ——
+    /// 入库收敛只管住新写入,`activate` 自身不许有任何会 panic 的取值。
+    #[test]
+    fn absurd_duration_days_never_panic_on_activation() {
+        let now = ts("2026-07-20T00:00:00Z");
+        for days in [
+            1e9_f64,
+            -1e9,
+            1e18,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::MAX,
+            f64::MIN,
+        ] {
+            let mut k = key_with_duration(days, now);
+            assert!(k.activate(now), "首次激活应返回 true:{days}");
+            let exp = k.expires_at.expect("激活后应有绝对过期时刻");
+            // 过期判定同样不得 panic(仅比较,不再做算术)。
+            let _ = k.is_expired(now);
+            let _ = k.is_expired(ts("2099-01-01T00:00:00Z"));
+            // 正时长 → 远期(实际上永不过期);负时长/NaN → 立即过期(失败方向取更严)。
+            if days > 0.0 {
+                assert!(exp > now, "正时长应算出未来时刻:{days}");
+            } else {
+                assert!(exp <= now, "负时长/NaN 应立即过期:{days}");
+            }
+        }
+
+        // 端到端走一遍 store:1e9 天的 key 激活后到 2099 年仍可用,不是 panic 也不是当场失效。
+        let path = tmp_path("absurd_duration");
+        let _ = std::fs::remove_file(&path);
+        let store = ApiKeyStore::load(&path);
+        let long = store.create("long".into(), None, None, None, Some(1e9), None, now);
+        assert_eq!(store.activate_key(long.id, now), Some(true));
+        assert!(matches!(
+            store.validate(&long.key, ts("2099-01-01T00:00:00Z")),
+            ApiKeyAuthResult::Valid { .. }
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 回归:越界 `durationDays` 入库即收敛(创建口与更新口都要),
+    /// 免得坏值落到盘上、重启后每次读回来都得再防一遍。
+    #[test]
+    fn absurd_duration_days_are_clamped_on_write() {
+        let path = tmp_path("clamp_duration");
+        let _ = std::fs::remove_file(&path);
+        let store = ApiKeyStore::load(&path);
+        let now = ts("2026-07-20T00:00:00Z");
+
+        for days in [1e9_f64, -1e9, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let k = store.create("x".into(), None, None, None, Some(days), None, now);
+            let stored = k.duration_days.expect("应保留惰性时长");
+            assert!(stored.is_finite(), "落盘时长必须有限:{days} → {stored}");
+            assert!(
+                stored.abs() <= MAX_DURATION_DAYS,
+                "落盘时长必须在安全范围内:{days} → {stored}"
+            );
+        }
+        // 更新口同样收敛,别让越界值绕过创建口从这里进来。
+        let k = store.create("upd".into(), None, None, None, None, None, now);
+        let upd = store
+            .update(k.id, None, None, None, None, None, Some(Some(1e300)), None)
+            .unwrap();
+        assert_eq!(upd.duration_days, Some(MAX_DURATION_DAYS));
+        // 正常值不受影响。
+        let ok = store.update(k.id, None, None, None, None, None, Some(Some(30.0)), None);
+        assert_eq!(ok.unwrap().duration_days, Some(30.0));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 正常时长的换算不得被 clamp 改动(happy path 回归)。
+    #[test]
+    fn ordinary_duration_days_are_unchanged() {
+        let now = ts("2026-07-20T00:00:00Z");
+        assert_eq!(
+            expiry_from_duration_days(now, 0.25),
+            ts("2026-07-20T06:00:00Z")
+        );
+        assert_eq!(
+            expiry_from_duration_days(now, 30.0),
+            ts("2026-08-19T00:00:00Z")
+        );
+        assert_eq!(expiry_from_duration_days(now, 0.0), now);
+        assert_eq!(sanitize_duration_days(365.0), 365.0);
     }
 
     #[test]

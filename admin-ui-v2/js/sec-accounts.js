@@ -716,7 +716,10 @@
   // automatic on-load query. Fetches each enabled account's balance one request
   // at a time (never bursts the upstream), updating the per-row 剩余 cell and the
   // 全局积分 card as results arrive. `opts`:
-  //   { btn, toast (bool), token (auto-query cancellation token), onDone }
+  //   { btn, toast (bool), token (cancellation token — 手动/自动两条路都要带), onDone }
+  // 两条硬性约束(都出过线上事故,别删):
+  //   ① 串行:一次只发一发,绝不对上游成批爆发;
+  //   ② 撞 401/403 立刻整轮停,详见下面 catch 里的注释。
   function runBalanceFanout(opts) {
     opts = opts || {};
     var enabled = accounts.filter(function (a) { return !a.disabled; });
@@ -731,23 +734,47 @@
     renderStats();
 
     var i = 0, ok = 0, fail = 0;
+
+    // 本轮是否已被作废:令牌被顶掉(列表重载 / 离开本页 / 又点了一次查询)。
+    function cancelled() { return opts.token != null && opts.token !== autoQueryToken; }
+
+    // 收工/中止的统一出口。**一定**要同时放掉 queryingInfo 并解禁按钮:
+    // 老写法的两个取消分支只清了 queryingInfo,手动那一轮被顶掉时「查询信息」
+    // 按钮会永远灰着。
+    function stop() {
+      queryingInfo = false;
+      if (opts.btn) opts.btn.disabled = false;
+    }
+
     function next() {
-      // cancelled (list reloaded) — bail without touching UI state again
-      if (opts.token != null && opts.token !== autoQueryToken) { queryingInfo = false; return; }
+      // cancelled (list reloaded / left the page) — bail without touching UI state again
+      if (cancelled()) { stop(); return; }
       if (i >= enabled.length) {
-        queryingInfo = false;
-        if (opts.btn) opts.btn.disabled = false;
+        stop();
         renderStats();
         if (opts.toast) api.toast(t('imp.result', { added: ok, total: enabled.length, failed: fail }), fail ? 'info' : 'success');
         if (opts.onDone) opts.onDone();
         return;
       }
       var acc = enabled[i++];
+      var authFailed = false;
       api.get('/credentials/' + acc.id + '/balance').then(function (b) {
         if (b && b.remaining != null) { balanceMap[String(acc.id)] = b; ok++; }
         else fail++;
-      }).catch(function () { fail++; }).then(function () {
-        if (opts.token != null && opts.token !== autoQueryToken) { queryingInfo = false; return; }
+      }).catch(function (e) {
+        fail++;
+        // 401/403 = admin key 已经失效(改了 ADMIN key 重启容器、别处轮换了钥匙、
+        // 会话过期……)。api.js 收到它已经清掉本地钥匙并弹出登录浮层了。
+        //
+        // 这时**绝不能**照旧 next() 把剩下的账号发完:池里有上千个,它们会在几秒内
+        // 全部 401,而每一个 401 都会再触发一次 onUnauthorized —— 后者会清空登录
+        // 输入框并重新抢占焦点。结果就是运维眼睁睁看着输入框被反复清空、一个字都
+        // 打不进去,自己把自己锁在后台外面。所以撞到鉴权失败就整轮停。
+        if (e && (e.status === 401 || e.status === 403)) authFailed = true;
+      }).then(function () {
+        // 顺带把令牌自增,让同时可能在飞的另一轮(手动/自动)也一起停下。
+        if (authFailed) { autoQueryToken++; stop(); return; }
+        if (cancelled()) { stop(); return; }
         // update the matching row's remaining cell if it is on-screen
         var node = document.querySelector('.account-row[data-acct-id="' + cssEscape(String(acc.id)) + '"] .stat-n[data-bal-cell]');
         var b = balanceMap[String(acc.id)];
@@ -762,8 +789,10 @@
   // 查询信息 — manual refresh of all enabled-account balances (toasts a summary).
   function queryAllInfo(btn) {
     if (queryingInfo) return;
-    autoQueryToken++; // supersede any in-flight auto-query
-    runBalanceFanout({ btn: btn, toast: true });
+    // 手动这一轮**也要带令牌**:老写法 token 为 null,于是 runBalanceFanout 里两个
+    // 取消点对手动查询完全不生效 —— 离开页面/掉线都停不掉它。
+    var token = ++autoQueryToken; // supersede any in-flight auto-query
+    runBalanceFanout({ btn: btn, toast: true, token: token });
   }
 
   // AUTO-QUERY on section load: silently populate balances so the user never has
@@ -1969,7 +1998,18 @@
       if (!container) buildShell();
       loadAccounts();
     },
-    onHide: function () {}
+    // 离开账号页时作废在飞的余额扇出。两个场景都需要它:
+    //  ① 切到别的分区 —— 池里上千个账号,一轮串行要跑很久,人都走了还继续打上游
+    //     纯属白烧配额;
+    //  ② 401 掉线 —— app.js 的 onUnauthorized 会主动调当前分区的 onHide,这里
+    //     必须真的把扇出停掉,否则剩余请求会一路 401、把登录浮层反复重弹并抢走
+    //     输入框焦点,运维根本打不进钥匙。
+    // 同时放掉 queryingInfo,免得下次进本页的自动查询被 `if (queryingInfo) return`
+    // 挡住(在飞的那一发解析时会看到令牌已变,自己静默停工,不会再往下发)。
+    onHide: function () {
+      autoQueryToken++;
+      queryingInfo = false;
+    }
   };
 
   // Allow dashboard to jump here focused on an account.

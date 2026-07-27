@@ -216,19 +216,10 @@ impl RuntimeConfig {
         );
 
         let output = serde_json::to_string_pretty(&json)?;
-        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-        let tmp = match parent {
-            Some(dir) => dir.join(format!(
-                ".{}.tmp.{}",
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("config.json"),
-                std::process::id()
-            )),
-            None => std::path::PathBuf::from(format!("config.json.tmp.{}", std::process::id())),
-        };
-        std::fs::write(&tmp, output)?;
-        std::fs::rename(&tmp, path)?;
+        // 复用共享原子写:唯一 tmp 名(不再是每进程固定名——两个并发管理请求会互相踩)、
+        // 建 tmp 即 0600(config.json 装着主 apiKey 与 adminApiKey 明文,不能全局可读)、
+        // rename 前 fsync 数据、rename 后 fsync 父目录(崩溃后不会整体回退)、顺手清孤儿 tmp。
+        crate::stats::persist::write_bytes_atomic(path, output.as_bytes())?;
         Ok(())
     }
 }
