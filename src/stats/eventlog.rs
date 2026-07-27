@@ -26,6 +26,8 @@ pub struct EventLog<E: Event> {
     events: RwLock<Vec<E>>,
     dirty: DirtyFlag,
     cap: usize,
+    /// 落盘路径,供 [`flush_now`](Self::flush_now) 在停机/重启流程里显式刷盘。
+    path: PathBuf,
 }
 
 impl<E: Event> EventLog<E> {
@@ -37,6 +39,7 @@ impl<E: Event> EventLog<E> {
             events: RwLock::new(initial),
             dirty,
             cap,
+            path: path.clone(),
         });
         let snap = store.clone();
         spawn_flush_loop(
@@ -49,6 +52,58 @@ impl<E: Event> EventLog<E> {
             },
         );
         store
+    }
+
+    /// 立即把当前事件全量同步落盘(原子写),不等后台约 5s 的去抖定时器。
+    ///
+    /// 停机/管理面重启前必须调用:`push` 只改内存 + 置脏,真正写盘要等下一拍;而进程退出
+    /// (SIGTERM 或重启端点的 `std::process::exit`,后者连析构都不跑)时那一拍根本轮不到,
+    /// 于是最近约 5s 内的 401/403 与 429 事件静默消失——失败/限流弹窗查不到刚出事的那几条,
+    /// usage-summary 的 errorRate 窗口计数也跟着少算。失败只记 error 日志,不阻断停机。
+    pub async fn flush_now(&self) {
+        let snapshot = {
+            let guard = self.events.read().await;
+            match serde_json::to_vec_pretty(&*guard) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    // 序列化失败就整轮跳过:宁可磁盘停在上一版本,也不能拿坏快照覆盖。
+                    tracing::error!(error = %e, path = %self.path.display(), "事件日志序列化失败,跳过停机刷盘");
+                    return;
+                }
+            }
+        };
+        let path = self.path.clone();
+        // 同步写 + fsync 可达数十毫秒,不占 async 工作线程。
+        let res = tokio::task::spawn_blocking(move || {
+            crate::stats::persist::write_bytes_atomic(&path, &snapshot)
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, path = %self.path.display(), "事件日志最终刷盘失败")
+            }
+            Err(e) => {
+                tracing::error!(error = %e, path = %self.path.display(), "事件日志最终刷盘任务 join 失败")
+            }
+        }
+    }
+
+    /// 删除某凭据的全部事件;返回删除条数。有删除则置脏触发落盘。
+    ///
+    /// 凭据被删除时调用:事件按数值 id 键控,而 id 会被后续新增的凭据复用,残留事件会让
+    /// 新账号的失败/限流弹窗里凭空出现上一位主人的报错明细(含上游响应体)。
+    pub async fn remove_credential(&self, credential_id: u32) -> usize {
+        let removed = {
+            let mut guard = self.events.write().await;
+            let before = guard.len();
+            guard.retain(|e| e.credential_id() != credential_id);
+            before - guard.len()
+        };
+        if removed > 0 {
+            self.dirty.mark_dirty();
+        }
+        removed
     }
 
     /// 追加一条事件,裁到每凭据上限,置脏(热路径)。

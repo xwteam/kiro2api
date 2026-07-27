@@ -62,6 +62,8 @@ impl BalanceSnapshot {
 pub struct BalanceCache {
     inner: RwLock<HashMap<String, BalanceSnapshot>>,
     dirty: DirtyFlag,
+    /// 落盘路径,供 [`flush_now`](Self::flush_now) 在停机/重启流程里显式刷盘。
+    path: PathBuf,
 }
 
 impl BalanceCache {
@@ -84,6 +86,7 @@ impl BalanceCache {
         let cache = Arc::new(Self {
             inner: RwLock::new(initial),
             dirty: flag,
+            path: path.clone(),
         });
         // 快照闭包在 spawn_blocking 内被调用:用 blocking_read 拿只读快照序列化。
         let snap_src = cache.clone();
@@ -92,6 +95,42 @@ impl BalanceCache {
             serde_json::to_vec_pretty(&*map).unwrap_or_else(|_| b"{}".to_vec())
         });
         cache
+    }
+
+    /// 立即把当前缓存全量同步落盘(原子写),不等后台约 5s 的去抖定时器。
+    ///
+    /// 停机/管理面重启前必须调用:`put`/`invalidate` 只改内存 + 置脏,真正写盘要等下一拍;
+    /// 而进程退出(SIGTERM 或重启端点的 `std::process::exit`,后者连析构都不跑)时那一拍
+    /// 根本轮不到。丢这一拍里的 `invalidate` 尤其要命:被删凭据的残留条目会随旧文件一起
+    /// 复活,新增凭据复用同一个 id 时在 TTL 内(最长 5 分钟)显示已删账号的余额与订阅档位
+    /// ——正是 [`invalidate`](Self::invalidate) 文档里点名不许发生的那件事。
+    /// 失败只记 error 日志,不阻断停机。
+    pub async fn flush_now(&self) {
+        let snapshot = {
+            let map = self.inner.read().await;
+            match serde_json::to_vec_pretty(&*map) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    // 序列化失败就整轮跳过:宁可磁盘停在上一版本,也不能拿坏快照覆盖。
+                    tracing::error!(error = %e, path = %self.path.display(), "余额缓存序列化失败,跳过停机刷盘");
+                    return;
+                }
+            }
+        };
+        let path = self.path.clone();
+        // 同步写 + fsync 可达数十毫秒,不占 async 工作线程。
+        let res =
+            tokio::task::spawn_blocking(move || persist::write_bytes_atomic(&path, &snapshot))
+                .await;
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, path = %self.path.display(), "余额缓存最终刷盘失败")
+            }
+            Err(e) => {
+                tracing::error!(error = %e, path = %self.path.display(), "余额缓存最终刷盘任务 join 失败")
+            }
+        }
     }
 
     /// 取某凭据仍新鲜的缓存;过期/缺失返回 None。

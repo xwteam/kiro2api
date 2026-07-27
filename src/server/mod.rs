@@ -63,8 +63,12 @@ pub fn build_router_with_handles(
 /// (SIGTERM/Ctrl-C,或管理面重启端点的 `std::process::exit`——它连析构都不跑)时若不显式刷一次,
 /// 落在两拍之间的写就只在内存里,重启即回滚。
 pub struct PersistHandles {
-    /// 用量 / 计费统计:丢一拍 = 少算这段时间的钱。
+    /// 用量 / 计费统计(含失败 401/403 与限流 429 事件日志):丢一拍 = 少算这段时间的钱、
+    /// 且刚出的报错现场在失败/限流弹窗里查无此事。
     pub stats: Arc<crate::stats::StatsManager>,
+    /// 余额缓存:丢一拍最要命的是 `invalidate` —— 删账号时清掉的条目会随旧文件复活,
+    /// 复用同一 id 的新账号在 TTL 内(最长 5 分钟)显示已删账号的余额与订阅档位。
+    pub balance: Arc<crate::balance::BalanceCache>,
     /// API-KEY 存储:丢一拍的后果更重——**刚吊销的 key 会随旧文件复活**(重启后照样鉴权通过),
     /// 刚建出并交给用户的 key 则凭空消失(用户拿着新 key 直接 401)。
     pub api_keys: Arc<crate::apikey::ApiKeyStore>,
@@ -75,10 +79,14 @@ pub struct PersistHandles {
 impl PersistHandles {
     /// 退出前的最终刷盘:把去抖窗口(约 5s)内尚未落盘的写立刻同步落下去。
     ///
-    /// 两项之间无依赖;任一失败只记 error、绝不阻断停机(停机路径宁可少落一项,也不能卡住不退)。
+    /// 各项之间无依赖;任一失败只记 error、绝不阻断停机(停机路径宁可少落一项,也不能卡住不退)。
     pub async fn flush_before_exit(&self) {
-        // 用量/计费:去抖窗口内的记录只在内存里,不刷就少算钱。
+        // 用量/计费 + 失败/限流事件日志:去抖窗口内的记录只在内存里,不刷就少算钱、
+        // 且最近这几秒的 401/403、429 现场直接消失(见 StatsManager::flush_now)。
         self.stats.flush_now().await;
+        // 余额缓存:删账号时的 invalidate 同样只置脏,不刷则残留条目随旧文件复活,
+        // 复用同一 id 的新账号会显示上一位主人的余额/订阅档位(最长 5 分钟)。
+        self.balance.flush_now().await;
         // API-KEY:create/update/delete/disable 都只 `mark_dirty()`,真正写盘要等下一拍定时器。
         if !self.api_keys_overwrite_is_safe() {
             tracing::error!(
@@ -292,6 +300,7 @@ pub fn build_router_with_persist_handles(
         router,
         PersistHandles {
             stats,
+            balance,
             api_keys,
             api_keys_path,
         },
@@ -1474,6 +1483,88 @@ mod tests {
         assert!(
             !after_delete.contains(&key.key),
             "已吊销的 key 不得在重启后复活"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 关键回归:停机刷盘的句柄集合必须**覆盖余额缓存与失败/限流事件日志**。
+    ///
+    /// 这两样和 API-KEY 一样是「改内存 + 置脏 + 等约 5s 的下一拍」,而 SIGTERM 收尾里那一拍
+    /// 根本轮不到(进程退出,运行时随之销毁)。此前 `build_router_with_persist_handles` 连余额
+    /// 句柄都不交出来,`serve()` 结构上就没法刷它:删账号时清掉的条目随旧文件复活,复用同一
+    /// id 的新账号在 TTL 内(最长 5 分钟)显示上一位主人的余额;刚出的 401/403、429 现场则在
+    /// 重启后从失败/限流弹窗里消失。
+    #[tokio::test]
+    async fn shutdown_flush_persists_balance_cache_and_event_logs() {
+        let dir = unique_temp_dir("balevflush");
+        let creds_path = dir.join("credentials.json").to_string_lossy().into_owned();
+        let cfg = Config {
+            credentials_path: creds_path,
+            ..Config::default()
+        };
+        let (_app, persist) = build_router_with_persist_handles(Arc::new(cfg), None);
+        // 先让各后台刷盘循环把 interval 的立即首拍空跑掉(此刻还没有脏数据,它什么都不写)。
+        // 不等的话首拍可能与下面的置脏撞上,把文件写出去,断言就会因为错误的理由变绿。
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        persist
+            .balance
+            .put(
+                "7",
+                crate::balance::BalanceSnapshot {
+                    subscription_title: Some("KIRO PRO+".into()),
+                    current_usage: 1.0,
+                    usage_limit: 100.0,
+                    remaining: 99.0,
+                    usage_percentage: 1.0,
+                    next_reset_at: None,
+                    fetched_at_unix: 1_700_000_000,
+                },
+            )
+            .await;
+        persist
+            .stats
+            .record_failure(7, "api", 403, "forbidden-body", 1_700_000_000)
+            .await;
+        persist
+            .stats
+            .record_throttle(7, "api", "too-many-requests", 1_700_000_001)
+            .await;
+        // 去抖窗口内确实还没落盘(证明这一拍真的丢得掉)。
+        assert!(
+            !dir.join(crate::balance::BALANCE_CACHE_FILE).exists()
+                && !dir.join("failure_log.json").exists()
+                && !dir.join("throttle_log.json").exists(),
+            "前提:这三样都只置脏,尚未落盘"
+        );
+
+        persist.flush_before_exit().await;
+
+        // 重启:新进程从同一数据目录读回来,三样都必须在。
+        let balance = crate::balance::BalanceCache::load_from_dir(&dir);
+        assert!(
+            balance.get_fresh("7", 1_700_000_100).await.is_some(),
+            "停机刷盘必须落下余额缓存,否则重启后这一拍里的写(含删账号时的 invalidate)整段回滚"
+        );
+        let stats = crate::stats::StatsManager::load_from_dir(&dir);
+        assert_eq!(
+            stats
+                .failure_log
+                .records_for_credential(7, 1, 10)
+                .await
+                .total,
+            1,
+            "停机刷盘必须落下失败日志,否则重启后查不到停机前刚出的 401/403"
+        );
+        assert_eq!(
+            stats
+                .throttle_log
+                .records_for_credential(7, 1, 10)
+                .await
+                .total,
+            1,
+            "停机刷盘必须落下限流日志,否则重启后查不到停机前刚出的 429"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

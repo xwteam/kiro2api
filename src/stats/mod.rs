@@ -57,14 +57,32 @@ impl StatsManager {
         })
     }
 
-    /// 停机时的最终刷盘:把用量记录与每日汇总同步落盘(原子写),不等 5s 去抖定时器。
+    /// 停机时的最终刷盘:把**三个存储**(用量记录 + 每日汇总、失败日志、限流日志)同步
+    /// 落盘(原子写),不等 5s 去抖定时器。
     ///
-    /// 优雅停机(SIGTERM/Ctrl-C)流程应在退出前 `await` 本方法(`stats.flush_now().await`),
-    /// 否则最近一拍之后的用量与计费记录只在内存里,重启即丢。失败只记 error 日志,不阻断停机。
+    /// 优雅停机(SIGTERM/Ctrl-C)与管理面重启端点都必须在退出前 `await` 本方法,否则最近
+    /// 一拍之后的写只在内存里,重启即丢。失败只记 error 日志,不阻断停机。
     ///
-    /// 口径:只刷用量记录(计费相关);失败/限流事件日志仍由各自后台任务按拍落盘。
+    /// 口径为什么必须含事件日志:后台刷盘任务指望不上——进程退出时运行时随之销毁,那一拍
+    /// 轮不到;重启端点更是直接 `std::process::exit`,连析构都不跑。丢的这几秒正是运营者
+    /// 最想看的现场:刚出的 401/403 与 429 在失败/限流弹窗里查无此事,usage-summary 的
+    /// errorRate 窗口计数(`EventLog::count_in_window`)也跟着少算。
     pub async fn flush_now(&self) {
         self.usage.flush_now().await;
+        self.failure_log.flush_now().await;
+        self.throttle_log.flush_now().await;
+    }
+
+    /// 清空某凭据的全部用量记录与失败/限流事件;返回删除的用量记录条数。
+    ///
+    /// 凭据被删除时调用:三类记录都按数值 id 键控,而 id 会被后续新增的凭据复用
+    /// (高水位边车文件缺失/写失败时尤其容易),不清就等于让新账号一上线就继承前任的
+    /// 用量、消费与报错明细——统计聚合、每凭据记录上限、失败/限流弹窗全被污染。
+    pub async fn purge_credential(&self, credential_id: u32) -> usize {
+        let removed = self.usage.reset_credential(credential_id).await;
+        self.failure_log.remove_credential(credential_id).await;
+        self.throttle_log.remove_credential(credential_id).await;
+        removed
     }
 
     /// 记录一次失败(401/403)。响应体截断到 2000 字符。热路径 fire-and-forget。
@@ -93,6 +111,12 @@ impl StatsManager {
         api_key_id: u32,
     ) -> crate::stats::usage::ApiKeyUsageSummary {
         self.usage.summary_for_api_key(api_key_id).await
+    }
+
+    /// 各 API-KEY 的实时 RPM(近 60s 窗口内落库的请求数),委托 usage 层。
+    /// 供 `GET /api/admin/rpm` 的 `byApiKey` 维度使用。
+    pub async fn rpm_by_api_key(&self, now_unix: i64) -> std::collections::HashMap<u32, u32> {
+        self.usage.rpm_by_api_key(now_unix).await
     }
 
     /// 所有出现过的 API-KEY 的用量聚合(按 id 升序,不含无归属 id=0)。

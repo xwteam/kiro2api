@@ -32,6 +32,9 @@ use crate::stats::persist::{
 
 /// 每凭据用量记录上限(超出淘汰最旧)。
 pub const USAGE_CAP_PER_CREDENTIAL: usize = 10_000;
+/// 实时 RPM 的滑动窗口(秒)。与 `kiro::pool` 的每账号 RPM 同宽,使管理面上
+/// 「每账号 RPM」与「每 API-KEY RPM」是同一时间尺度上的数,可直接互相对照。
+pub const RPM_WINDOW_SECS: i64 = 60;
 /// 单日记录导出上限(端点 6 契约:max 2000)。
 pub const DAILY_RECORDS_MAX: usize = 2_000;
 /// 每日汇总保留天数上限(超出丢最旧的日)。每天一条定长累计(几十字节),
@@ -856,6 +859,25 @@ impl UsageTracker {
             })
             .collect();
         out.sort_by_key(|s| s.api_key_id);
+        out
+    }
+
+    /// 各 API-KEY 的实时 RPM:近 [`RPM_WINDOW_SECS`] 秒内该 key 落库的用量记录条数,
+    /// `api_key_id → 条数`(不含无归属的 id=0;窗口内无记录的 key 不出现在结果里)。
+    ///
+    /// 口径与池的每账号 RPM(`Pool::rpm_all`)一致:同为"近 60 秒滑动窗口内的次数",
+    /// 窗口取左开右闭 `(now-60, now]`。差别只在计数时点——池在**选中账号时**计数,
+    /// 本方法按**用量记录落库时**计数(即请求跑完时),故长流请求会记在结束那一刻。
+    /// 这是 API-KEY 维度唯一带时刻的数据源:池只认账号,不认 key。
+    pub async fn rpm_by_api_key(&self, now_unix: i64) -> HashMap<u32, u32> {
+        let window_start = now_unix.saturating_sub(RPM_WINDOW_SECS);
+        let guard = self.state.read().await;
+        let mut out: HashMap<u32, u32> = HashMap::new();
+        for r in guard.records.iter() {
+            if r.api_key_id != 0 && r.created_at_unix > window_start {
+                *out.entry(r.api_key_id).or_insert(0) += 1;
+            }
+        }
         out
     }
 

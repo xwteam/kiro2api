@@ -1036,12 +1036,17 @@ pub struct RestartResponse {
 /// 就 `exit(0)`,后台那一拍根本轮不到:进程带着旧 api_keys.json 重新拉起,刚吊销的 key 复活、
 /// 照样鉴权通过(反过来,刚建出交给用户的 key 则凭空消失)。
 ///
+/// 余额缓存与失败/限流事件日志同理,且各有自己的坑:前者丢的 `invalidate` 会让复用 id 的新
+/// 账号顶着已删账号的余额/订阅档位(最长 5 分钟),后者丢的是运营者点「重启」前刚发生的
+/// 401/403、429 现场。故 [`crate::server::PersistHandles`] 的四项一个都不能少。
+///
 /// 落盘复用 [`crate::server::PersistHandles::flush_before_exit`],与 SIGTERM 停机路径共用同一套
 /// 规矩(含"磁盘上的 api_keys.json 解析不动且内存里一把 key 都没有时跳过写入"的自保阀),
 /// 不在此另起一套平行实现。
 async fn flush_persistent_state_before_exit(state: &MessagesState) {
     crate::server::PersistHandles {
         stats: state.stats.clone(),
+        balance: state.balance.clone(),
         api_keys: state.api_keys.clone(),
         // 与 `build_router` 同一推断规则(数据目录 = credentials_path 的父目录),
         // 故这里算出的就是本进程 ApiKeyStore 实际读写的那份 api_keys.json。
@@ -2321,8 +2326,8 @@ pub async fn api_key_usage_records(
 }
 
 /// 实时 RPM 快照,camelCase 对齐前端 `RpmSnapshot`。
-/// `global` = 全池当前最大单账号 RPM;`by_credential` = id(字符串)→ 窗口内 RPM;
-/// `by_api_key` = Phase 2 API-KEY 维度,当前为空占位(池不追踪 key 维度 RPM)。
+/// `global` = 全池当前最大单账号 RPM;`by_credential` = 账号 id(字符串)→ 窗口内 RPM;
+/// `by_api_key` = API-KEY id(字符串)→ 窗口内 RPM。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpmSnapshotView {
@@ -2331,9 +2336,17 @@ pub struct RpmSnapshotView {
     pub by_api_key: std::collections::HashMap<String, u32>,
 }
 
-/// `GET /api/admin/rpm`:每账号实时 RPM(近 60s 选择次数)只读快照。
-/// 从池的 `rpm_all(now)` 读取(与 relay 数据面共享同一 `Arc<Mutex<Pool>>`),
-/// `global` 取各账号 RPM 的最大值。`by_api_key` 留空(Phase 2 维度未接入)。
+/// `GET /api/admin/rpm`:每账号 + 每 API-KEY 的实时 RPM(近 60s)只读快照。
+///
+/// - `by_credential` 取池的 `rpm_all(now)`(与 relay 数据面共享同一 `Arc<Mutex<Pool>>`),
+///   即近 60s 内该账号被 select 选中的次数;`global` 取其最大值。
+/// - `by_api_key` 取统计层的 `rpm_by_api_key(now)`,即近 60s 内归属该 key 的用量记录条数。
+///   池只认账号、不认 key,故 key 维度只能从账本的时刻走——两者同为 60s 滑动窗口,数值可对照,
+///   仅计数时点不同(池在选中账号时计,账本在请求跑完落库时计)。
+///   无归属记录(api_key_id=0,即用全局 key 直连的流量)不计入,窗口内没跑过的 key 不出现。
+///
+/// 这一维度不能再留空:API-KEY 页每张卡片的 "RPM x" 直接读本字段(前端
+/// `sec-apikeys.js` 的 `byApiKey`),留空就等于所有 key 永远显示 RPM 0。
 pub async fn rpm_snapshot(State(state): State<MessagesState>) -> Json<RpmSnapshotView> {
     let now = now_unix();
     let pool = state.pool.lock().await;
@@ -2342,11 +2355,19 @@ pub async fn rpm_snapshot(State(state): State<MessagesState>) -> Json<RpmSnapsho
 
     let global = per.iter().map(|(_, r)| *r).max().unwrap_or(0);
     let by_credential: std::collections::HashMap<String, u32> = per.into_iter().collect();
+    // 前端按 String(key.id) 取值,故这里也以字符串 id 为键(与 by_credential 一致)。
+    let by_api_key: std::collections::HashMap<String, u32> = state
+        .stats
+        .rpm_by_api_key(now as i64)
+        .await
+        .into_iter()
+        .map(|(id, rpm)| (id.to_string(), rpm))
+        .collect();
 
     Json(RpmSnapshotView {
         global,
         by_credential,
-        by_api_key: std::collections::HashMap::new(),
+        by_api_key,
     })
 }
 
@@ -2637,11 +2658,18 @@ pub async fn update_credential(
     .into_response()
 }
 
-/// `DELETE /api/admin/credentials/{id}`:从活池移除 → 落盘 → 失效该 id 的余额/模型缓存。
-/// 未知 id → 404。
+/// `DELETE /api/admin/credentials/{id}`:从活池移除 → 落盘 → 清掉该 id 的全部按 id 键控的
+/// 残留状态(余额缓存、模型缓存、用量记录、失败/限流事件)。未知 id → 404。
 ///
-/// 缓存以凭据 id 为键:id 会被后续新增凭据复用,残留条目会让新凭据显示上一位主人的
-/// 余额与模型清单,故删除后必须同步失效(两个缓存都是纯内存/本地快照,失效不触上游)。
+/// 这些状态一律以凭据 id 为键,而 id 会被后续新增凭据复用:账号编号高水位存在旁挂文件里,
+/// 它写失败(best-effort)、缺失(从旧版本升级、从备份还原 credentials.json、drop-in 一份
+/// 原生 credentials.json、只搬 JSON 不搬旁挂文件)时,重启后编号退回 `max(现有 id)+1`,
+/// 于是刚删掉的最大号会被下一个新账号原样领走。不清就等于新账号一上线就继承前任的余额、
+/// 模型清单、用量与消费历史、失败/限流明细——统计与计费跨账号串味,弹窗里凭空多出别人的
+/// 上游报错。缓存/记录都是本地状态,清理不触上游。
+///
+/// 另有一层与 id 复用无关、无条件成立的理由:不清的话已删账号的用量记录永远留在账本里,
+/// 继续占着每凭据记录上限、继续出现在聚合统计里,而面板上已经没有这个账号了。
 pub async fn delete_credential(
     State(state): State<MessagesState>,
     Path(id): Path<String>,
@@ -2659,6 +2687,19 @@ pub async fn delete_credential(
     }
     state.balance.invalidate(&id).await;
     state.models_cache.invalidate(&id).await;
+    // 统计层按数值 id 键控:`id_as_u32` 对非数值 id 回落 0,而 0 是"无归属"这一整桶
+    // (relay 拿不到数值账号 id 时就落 0),绝不能拿它去清——那会误删别的账号的记录。
+    let numeric_id = id_as_u32(&id);
+    if numeric_id != 0 {
+        let purged = state.stats.purge_credential(numeric_id).await;
+        if purged > 0 {
+            tracing::info!(
+                credential_id = numeric_id,
+                purged_usage_records = purged,
+                "已随账号删除清理其用量记录与失败/限流事件(防编号复用后新账号继承前任历史)"
+            );
+        }
+    }
     Json(SuccessResponse {
         success: true,
         message: "credential deleted".into(),
@@ -4300,8 +4341,58 @@ mod tests {
         assert_eq!(v["byCredential"]["1"], 0);
         assert_eq!(v["byCredential"]["2"], 0);
         assert_eq!(v["global"], 0);
-        // byApiKey 为空占位(Phase 2 维度未接入)
+        // 账本为空 → key 维度自然没有条目(注意:这是"没跑过流量",不是恒空占位,
+        // 有流量时必须出数,见 rpm_snapshot_reports_per_api_key_traffic)
         assert_eq!(v["byApiKey"].as_object().unwrap().len(), 0);
+    }
+
+    /// 关键回归:API-KEY 页每张卡片那行 "RPM x" 直接读 `/api/admin/rpm` 的 `byApiKey`
+    /// (前端 sec-apikeys.js 取 `byApiKey[String(key.id)] || 0`)。后端此前无条件返回空对象,
+    /// 于是不管这把 key 正在跑多少流量,面板永远显示 RPM 0 —— 数据源根本没接。
+    #[tokio::test]
+    async fn rpm_snapshot_reports_per_api_key_traffic() {
+        let stats = empty_stats("rpm_bykey");
+        let now = super::now_unix() as i64;
+        async fn rec(stats: &Arc<StatsManager>, api_key_id: u32, at: i64) {
+            stats
+                .usage
+                .record_usage_with_api_key(
+                    1,
+                    api_key_id,
+                    "claude-sonnet-4".into(),
+                    10,
+                    20,
+                    0.5,
+                    None,
+                    None,
+                    None,
+                    at,
+                )
+                .await;
+        }
+        // key 1 在窗口内跑了 3 次,key 2 跑了 1 次。
+        rec(&stats, 1, now).await;
+        rec(&stats, 1, now - 1).await;
+        rec(&stats, 1, now - 2).await;
+        rec(&stats, 2, now - 3).await;
+        // key 1 还有一次是 90s 前的:已滑出 60s 窗口,不该计入。
+        rec(&stats, 1, now - 90).await;
+        // 无归属流量(用全局 key 直连,api_key_id=0)不属于任何 key,不得出现在 byApiKey 里。
+        rec(&stats, 0, now).await;
+
+        let app = admin_api_router(state_with_stats(
+            vec![cred("1")],
+            Config::default(),
+            stats.clone(),
+        ));
+        let (st, v) = get(&app, "/api/admin/rpm").await;
+        assert_eq!(st, HttpStatusCode::OK);
+        assert_eq!(
+            v["byApiKey"]["1"], 3,
+            "近 60s 内 key 1 跑了 3 次,面板不能再显示 RPM 0:{v}"
+        );
+        assert_eq!(v["byApiKey"]["2"], 1, "{v}");
+        assert!(v["byApiKey"]["0"].is_null(), "无归属流量不属于任何 key:{v}");
     }
 
     #[tokio::test]
@@ -5707,19 +5798,37 @@ mod tests {
         dir
     }
 
-    /// 生产同款接线的 state:统计、API-KEY 存储、credentials.json 全落在同一个数据目录下,
-    /// 使 `api_keys_path_from(cfg.credentials_path)` 指向 store 自己读写的那份文件
+    /// 生产同款接线的 state:统计、API-KEY 存储、余额缓存、credentials.json 全落在同一个
+    /// 数据目录下,使 `api_keys_path_from(cfg.credentials_path)` 指向 store 自己读写的那份文件
     /// (`state_with` 默认把 store 放在无关的临时路径上,验不了退出前刷盘的路径规约)。
     fn state_with_data_dir(dir: &std::path::Path) -> MessagesState {
-        let creds = dir.join("credentials.json").to_string_lossy().into_owned();
+        state_with_data_dir_creds(dir, vec![])
+    }
+
+    /// 同 [`state_with_data_dir`],但可带一池账号(验删账号 → 重启这条链路要真删得动)。
+    fn state_with_data_dir_creds(dir: &std::path::Path, creds: Vec<Credential>) -> MessagesState {
+        let creds_path = dir.join("credentials.json").to_string_lossy().into_owned();
         let cfg = Config {
-            credentials_path: creds.clone(),
+            credentials_path: creds_path.clone(),
             ..Config::default()
         };
-        let mut state = state_with_stats(vec![], cfg, StatsManager::load_from_dir(dir));
+        let mut state = state_with_stats(creds, cfg, StatsManager::load_from_dir(dir));
         state.api_keys =
-            crate::apikey::ApiKeyStore::load(crate::apikey::api_keys_path_from(&creds));
+            crate::apikey::ApiKeyStore::load(crate::apikey::api_keys_path_from(&creds_path));
+        // 余额缓存也必须落在本测试目录:生产由同一数据目录推断,默认助手把它放在共享的
+        // 系统临时目录上(测试之间会串味,也验不了"重启后从盘上读回来的是什么")。
+        state.balance = crate::balance::BalanceCache::load_from_dir(dir);
         state
+    }
+
+    /// 等各存储的后台刷盘循环走完 `tokio::time::interval` 的**立即首拍**。
+    ///
+    /// 为什么非等不可:首拍是零延迟触发的,若测试在它之前就置了脏,首拍会当场把文件写出去,
+    /// 于是"退出前显式刷盘"的回归测试即便在刷盘被摘掉的情况下也照样变绿(靠的是后台那一拍,
+    /// 不是被测代码)。先空跑掉首拍(此刻还没有脏数据,它什么都不写),之后的 5s 内再置脏
+    /// 只会走"收到通知不落盘"的去抖分支,断言因而是确定性的。
+    async fn settle_flush_loops() {
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     }
 
     /// 退出前必须把去抖窗口内的记录落盘:后台刷盘每约 5s 才一拍,restart 直接 exit(0)
@@ -5797,6 +5906,101 @@ mod tests {
             !after.contains(&key.key),
             "重启前刷盘必须落下吊销,否则重启后这把已删除的 key 复活并继续鉴权通过"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 关键回归:管理面「重启」前的刷盘范围必须**包含余额缓存**。
+    ///
+    /// 现场:管理员删掉账号 7(handler 会 `invalidate` 掉它的余额缓存,但那只是置脏)→ 立刻点
+    /// 重启 → `exit(0)` 不跑析构、后台那一拍轮不到 → 进程读回旧 kiro_balance_cache.json,
+    /// 已删账号的条目原样复活;账号编号高水位一旦缺失(旧版本升级/从备份还原 credentials.json/
+    /// drop-in 一份原生文件),新加的账号会重新领到 id 7,于是它在余额 TTL 内(最长 5 分钟)
+    /// 顶着上一位主人的剩余额度与订阅档位——正是 `BalanceCache::invalidate` 文档点名不许发生的事。
+    #[tokio::test]
+    async fn flush_before_exit_persists_balance_cache_invalidation() {
+        let dir = tmp_dir("restart_balflush");
+        let now = super::now_unix();
+        // 先在盘上放一份"账号 7 的余额已缓存"的现场(等价于上次运行留下的文件)。
+        let seeded: std::collections::HashMap<String, crate::balance::BalanceSnapshot> = [(
+            "7".to_string(),
+            crate::balance::BalanceSnapshot {
+                subscription_title: Some("KIRO PRO+".into()),
+                current_usage: 1.0,
+                usage_limit: 100.0,
+                remaining: 99.0,
+                usage_percentage: 1.0,
+                next_reset_at: None,
+                fetched_at_unix: now,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let cache_path = dir.join(crate::balance::BALANCE_CACHE_FILE);
+        std::fs::write(&cache_path, serde_json::to_vec(&seeded).unwrap()).unwrap();
+
+        let state = state_with_data_dir_creds(&dir, vec![cred("7")]);
+        settle_flush_loops().await;
+        assert!(
+            state.balance.get_fresh("7", now).await.is_some(),
+            "前提:进程启动时从盘上读回了账号 7 的余额缓存"
+        );
+
+        let app = admin_api_router(state.clone());
+        let (st, _v) = send(&app, Method::DELETE, "/api/admin/credentials/7", None).await;
+        assert_eq!(st, HttpStatusCode::OK);
+        // 删除只把缓存条目从内存里摘掉并置脏,盘上那份还是旧的(此处到断言之间无 await)。
+        assert!(
+            std::fs::read_to_string(&cache_path)
+                .unwrap()
+                .contains("\"7\""),
+            "前提:invalidate 只置脏,尚未落盘"
+        );
+
+        super::flush_persistent_state_before_exit(&state).await;
+
+        // 重启:新进程从同一目录把缓存读回来。
+        let reloaded = crate::balance::BalanceCache::load_from_dir(&dir);
+        assert!(
+            reloaded.get_fresh("7", now).await.is_none(),
+            "重启前刷盘必须落下 invalidate,否则复用 id 7 的新账号会顶着已删账号的余额/订阅档位(最长 5 分钟)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 关键回归:管理面「重启」前的刷盘范围必须**包含失败/限流事件日志**。
+    ///
+    /// 现场:上游刚回了 401/403 与 429(events 只进内存 + 置脏)→ 运营者看到告警、顺手点重启
+    /// 排障 → `exit(0)` 让那一拍永远轮不到 → 重启后点账号行上的「失败」「限流」计数,弹窗里
+    /// 空空如也,usage-summary 的 errorRate 窗口计数也跟着少算——最想看的现场恰恰被重启抹掉。
+    #[tokio::test]
+    async fn flush_before_exit_persists_failure_and_throttle_events() {
+        let dir = tmp_dir("restart_evflush");
+        let state = state_with_data_dir(&dir);
+        settle_flush_loops().await;
+        state
+            .stats
+            .record_failure(7, "api", 403, "forbidden-body", 1_700_000_000)
+            .await;
+        state
+            .stats
+            .record_throttle(7, "api", "too-many-requests", 1_700_000_001)
+            .await;
+        // 去抖窗口内:后台循环还没到下一拍,盘上什么都没有。
+        assert!(
+            !dir.join("failure_log.json").exists() && !dir.join("throttle_log.json").exists(),
+            "前提:事件只置脏,尚未落盘"
+        );
+
+        super::flush_persistent_state_before_exit(&state).await;
+
+        // 重启:新进程从同一目录把事件读回来,弹窗里必须还查得到刚才那两条。
+        let reloaded = StatsManager::load_from_dir(&dir);
+        let f = reloaded.failure_log.records_for_credential(7, 1, 10).await;
+        assert_eq!(f.total, 1, "重启后失败日志弹窗必须还查得到刚出的 403");
+        assert_eq!(f.items[0].response_body, "forbidden-body");
+        let t = reloaded.throttle_log.records_for_credential(7, 1, 10).await;
+        assert_eq!(t.total, 1, "重启后限流日志弹窗必须还查得到刚出的 429");
+        assert_eq!(t.items[0].response_body, "too-many-requests");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5950,6 +6154,81 @@ mod tests {
             models.get_fresh("77991", now).await.is_none(),
             "删除凭据后模型缓存应已失效"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 关键回归:删账号必须连它在统计层的用量记录与失败/限流事件一并清掉。
+    ///
+    /// 两层危害:
+    /// 1. 无条件成立的账本泄漏——账号已经从面板上消失,它的记录却永远留在账本里,继续占着
+    ///    每凭据记录上限、继续出现在聚合统计里;
+    /// 2. 编号复用后的串味——账号编号高水位是旁挂文件里的 best-effort 值,写失败或文件缺失
+    ///    (旧版本升级、从备份还原 credentials.json、drop-in 一份原生文件、只搬 JSON 不搬旁挂
+    ///    文件)时,重启后编号退回 `max(现有 id)+1`,刚删掉的最大号会被下一个新账号原样领走,
+    ///    于是新账号一上线就顶着前任的用量、消费与报错明细。
+    #[tokio::test]
+    async fn delete_credential_purges_usage_records_and_event_logs() {
+        let cfg = cfg_with_temp_creds();
+        let path = cfg.credentials_path.clone();
+        let stats = empty_stats("del_purge");
+        // 账号 5 跑过 2 次、报过一次 403、限过一次流;账号 6 各一条,用来验"只清被删的那个"。
+        for (cred_id, at) in [
+            (5u32, 1_700_000_000i64),
+            (5, 1_700_000_001),
+            (6, 1_700_000_002),
+        ] {
+            stats
+                .usage
+                .record_usage(
+                    cred_id,
+                    "claude-sonnet-4".into(),
+                    10,
+                    20,
+                    0.5,
+                    None,
+                    None,
+                    None,
+                    at,
+                )
+                .await;
+        }
+        stats
+            .record_failure(5, "api", 403, "forbidden-body", 1_700_000_000)
+            .await;
+        stats
+            .record_throttle(5, "api", "too-many-requests", 1_700_000_000)
+            .await;
+        stats
+            .record_failure(6, "api", 401, "unauthorized", 1_700_000_000)
+            .await;
+
+        let app = admin_api_router(state_with_stats(
+            vec![cred("5"), cred("6")],
+            cfg,
+            stats.clone(),
+        ));
+        // 前提:删之前面板确实查得到账号 5 的这些明细。
+        let (_st, v) = get(&app, "/api/admin/credentials/5/usage/records").await;
+        assert_eq!(v["total"], 2, "前提:账号 5 有 2 条用量记录");
+
+        let (st, _v) = send(&app, Method::DELETE, "/api/admin/credentials/5", None).await;
+        assert_eq!(st, HttpStatusCode::OK);
+
+        let (_st, v) = get(&app, "/api/admin/credentials/5/usage/records").await;
+        assert_eq!(
+            v["total"], 0,
+            "已删账号的用量记录必须清干净,否则复用 id 5 的新账号一上线就继承前任的用量与消费:{v}"
+        );
+        let (_st, v) = get(&app, "/api/admin/credentials/5/failure-logs").await;
+        assert_eq!(v["total"], 0, "已删账号的失败日志必须清干净:{v}");
+        let (_st, v) = get(&app, "/api/admin/credentials/5/throttle-logs").await;
+        assert_eq!(v["total"], 0, "已删账号的限流日志必须清干净:{v}");
+
+        // 只清被删的那个:账号 6 的明细一条不少。
+        let (_st, v) = get(&app, "/api/admin/credentials/6/usage/records").await;
+        assert_eq!(v["total"], 1, "不得误伤其它账号的用量记录:{v}");
+        let (_st, v) = get(&app, "/api/admin/credentials/6/failure-logs").await;
+        assert_eq!(v["total"], 1, "不得误伤其它账号的失败日志:{v}");
         let _ = std::fs::remove_file(&path);
     }
 }
