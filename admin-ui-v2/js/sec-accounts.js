@@ -786,6 +786,8 @@
     // 收工/中止的统一出口。**一定**要同时放掉 queryingInfo 并解禁按钮:
     // 老写法的两个取消分支只清了 queryingInfo,手动那一轮被顶掉时「查询信息」
     // 按钮会永远灰着。
+    // queryingInfo 只在这里放掉 —— 它是"确实有一轮扇出在走"的唯一真相,别处提前
+    // 替它清零就会让 whenFanoutIdle 误判空闲、开出并发的第二轮(见 onHide 注释)。
     function stop() {
       queryingInfo = false;
       if (opts.btn) opts.btn.disabled = false;
@@ -857,10 +859,23 @@
 
   // AUTO-QUERY on section load: silently populate balances so the user never has
   // to click 查询信息. Serial + cancellable (a fresh loadAccounts bumps the token).
+  //
+  // 老写法开头是 `if (queryingInfo) return;`,而且这一句在 ++autoQueryToken **之前**,
+  // 于是上面那句"a fresh loadAccounts bumps the token"其实是假的:列表重载时在飞
+  // 的那一轮既没被作废也没被重启,它会继续照着**重载前**的账号快照一路走完。这个
+  // 窗口不小 —— GET /credentials 不分页,扇出又是严格串行,上千个账号一轮要好几
+  // 分钟,运维几乎每次批量导入/删号都会撞上。后果全是他看得见的:
+  //   · 新导入的账号一个都不会被查,「剩余」永远停在未设置,「全局积分」永远差一截;
+  //   · 刚删掉的账号还在被一个个请求余额,纯属白烧上游配额。
+  // 现在和「查询信息」按钮走同一条路:先自增令牌顶掉在飞那轮,等它收工(它要等手上
+  // 那一发请求落地才看得到令牌变了),再拿**重载后**的账号列表开新一轮。
   function autoQueryBalances() {
-    if (queryingInfo) return; // a manual/auto pass is already running
-    var token = ++autoQueryToken;
-    runBalanceFanout({ token: token, toast: false });
+    var token = ++autoQueryToken; // 作废在飞的自动/手动轮
+    whenFanoutIdle(function () {
+      // 等待期间又被顶掉(离开页面 / 又重载了一次 / 点了查询信息)→ 本轮作废。
+      if (token !== autoQueryToken) return;
+      runBalanceFanout({ token: token, toast: false });
+    });
   }
 
   // 清除已禁用 — delete every disabled account (with confirm)
@@ -2092,11 +2107,14 @@
     //  ② 401 掉线 —— app.js 的 onUnauthorized 会主动调当前分区的 onHide,这里
     //     必须真的把扇出停掉,否则剩余请求会一路 401、把登录浮层反复重弹并抢走
     //     输入框焦点,运维根本打不进钥匙。
-    // 同时放掉 queryingInfo,免得下次进本页的自动查询被 `if (queryingInfo) return`
-    // 挡住(在飞的那一发解析时会看到令牌已变,自己静默停工,不会再往下发)。
+    // 只自增令牌、**不要**顺手把 queryingInfo 清掉:自动查询已经不再被
+    // `if (queryingInfo) return` 挡了(改成了等在飞那轮收工再开新一轮),而这里
+    // 提前清零反而会骗过 whenFanoutIdle —— 手上那一发请求还没落地就放人进来开
+    // 第二轮,两轮并发打上游,正是 runBalanceFanout 注释里那条"绝不成批爆发"的
+    // 硬约束不许发生的事。在飞的那一发落地时会看到令牌已变,自己静默 stop(),
+    // queryingInfo 随之释放,最多晚一发请求的时间。
     onHide: function () {
       autoQueryToken++;
-      queryingInfo = false;
     }
   };
 

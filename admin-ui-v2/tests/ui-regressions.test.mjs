@@ -6,6 +6,9 @@
  *   ① api.js:登录被拒绝(403)被当成"管理员密钥无效",把人踢出后台;
  *   ② 账号页:每行 RPM 恒为 0(列表接口根本不返回这个字段);
  *   ③ 账号页:自动查询期间点「查询信息」静默无响应;
+ *   ③b 账号页:自动查询期间重载列表(导入/删号/刷新),在飞那轮既不作废也不重启,
+ *       继续照旧快照跑完 —— 新导入的账号永远查不到「剩余」;
+ *   ③c 账号页:离开再进来会开出并发的第二轮余额扇出(扇出必须严格串行);
  *   ④ 账号页:失败/限流日志的"详情"列永远是「—」;
  *   ⑤ 账号页:清空昵称提示"已保存",实际后端根本没改;
  *   ⑥ API 管理:编辑保存失败也弹"API 密钥已保存";
@@ -238,17 +241,26 @@ function apiError(status, message) {
   return e;
 }
 
-/* 假 K.api:记录每次调用、可按路径延迟/抛错;toast 全部留痕供断言。 */
+/* 假 K.api:记录每次调用、可按路径延迟/抛错;toast 全部留痕供断言。
+ * 另外单独跟踪**余额请求**的同时在飞条数并留下峰值 maxInFlight —— 余额扇出必须
+ * 严格串行,这个峰值是唯一能证明它没并发的观测点(列表/日用量之类的一次性请求
+ * 不属于扇出,不计入)。 */
 function makeApi(handler, opts) {
   opts = opts || {};
-  const stats = { calls: [], puts: [], posts: [], toasts: [] };
+  const stats = { calls: [], puts: [], posts: [], toasts: [], inFlight: 0, maxInFlight: 0 };
   function run(method, pathname, body) {
     stats.calls.push(pathname);
     if (method === 'PUT') stats.puts.push({ path: pathname, body: body });
     if (method === 'POST') stats.posts.push({ path: pathname, body: body });
+    const counted = pathname.endsWith('/balance');
+    if (counted) {
+      stats.inFlight++;
+      if (stats.inFlight > stats.maxInFlight) stats.maxInFlight = stats.inFlight;
+    }
     const delay = typeof opts.delay === 'function' ? opts.delay(pathname) : (opts.delay || 0);
     return new Promise((resolve, reject) => {
       setTimeout(() => {
+        if (counted) stats.inFlight--;
         let out;
         try { out = handler(pathname, method, body); } catch (e) { reject(e); return; }
         resolve(out);
@@ -422,6 +434,84 @@ test('accounts: 自动查询期间点「查询信息」要真的顶掉它,而不
   assert.ok(await waitFor(() => api._stats.toasts.some((x) => x.msg === 'imp.result'), 5000),
     '手动查询从没真正执行过');
   assert.equal(btn.disabled, false, '手动轮结束后按钮应当解禁');
+});
+
+test('accounts: 列表重载要顶掉在飞的余额扇出(新导入的账号必须查得到「剩余」)', async () => {
+  // 场景 = 生产上最常见的那一步:池子很大、进页面的自动查询要跑好几分钟,运维在这
+  // 期间做了一次批量导入/删号(或者只是点了「刷新」),列表换了一批账号。
+  //
+  // 修复前 autoQueryBalances 开头是 `if (queryingInfo) return;`(而且在 ++token
+  // 之前),重载既不作废也不重启在飞的那一轮 —— 它继续照着**重载前**的快照往下走:
+  // 新导入的账号一个都查不到、「剩余」永远是未设置,刚删掉的账号还在被请求余额。
+  let roster = [1, 2, 3, 4, 5, 6, 7, 8];
+  const { api, dom, sections } = bootAccounts((p) => {
+    if (p === '/credentials') {
+      return { credentials: roster.map((id) => ({ id: id, nickname: 'acct-' + id, disabled: false })) };
+    }
+    if (p === '/usage/daily') return [];
+    if (p === '/rpm') return { global: 0, byCredential: {}, byApiKey: {} };
+    if (p.endsWith('/balance')) return { remaining: 12.5 };
+    return {};
+  }, { delay: (pth) => (pth.endsWith('/balance') ? 25 : 0) });
+
+  const balancePaths = () => api._stats.calls.filter((p) => p.endsWith('/balance'));
+  sections.accounts.onShow();
+  assert.ok(await waitFor(() => balancePaths().length >= 2), '自动查询应当已经开跑');
+
+  // 批量导入 / 删号之后的那次 loadAccounts():4~8 没了,31/32 是新进来的。
+  roster = [1, 2, 3, 31, 32];
+  const cut = api._stats.calls.length;
+  const reloadBtn = dom.document.querySelector('.section-actions button[data-i18n="common.refresh"]');
+  assert.ok(reloadBtn, '工具栏里应当有「刷新」按钮');
+  fire(reloadBtn, 'click');
+
+  // ① 新账号必须真的被查一遍(修复前:这两发请求一辈子不会出现)。
+  assert.ok(
+    await waitFor(() => {
+      const after = balancePaths();
+      return after.indexOf('/credentials/31/balance') >= 0 && after.indexOf('/credentials/32/balance') >= 0;
+    }, 5000),
+    '重载后新导入的账号从没被查过余额'
+  );
+  await settle();
+
+  // ② 已经删掉的账号不该再被请求余额(允许重载那一刻手上正在飞的那一发落地)。
+  const staleAfterReload = api._stats.calls.slice(cut)
+    .filter((p) => /^\/credentials\/([4-8])\/balance$/.test(p));
+  assert.ok(
+    staleAfterReload.length <= 1,
+    `重载后仍在请求已删除账号的余额:${JSON.stringify(staleAfterReload)}`
+  );
+
+  // ③ 运维眼里的最终样子:新列表每一行都有数字「剩余」,不再停在「未设置」。
+  const balCell = (id) => dom.document.querySelector(
+    '.account-row[data-acct-id="' + id + '"] .stat-n[data-bal-cell]'
+  );
+  roster.forEach((id) => {
+    const cell = balCell(id);
+    assert.ok(cell, '账号 #' + id + ' 的行没渲染出来');
+    assert.equal(cell.textContent, '12.5', '账号 #' + id + ' 的「剩余」没被填上');
+  });
+});
+
+test('accounts: 离开再进来不能开出并发的第二轮扇出', async () => {
+  // 上一条修好"重载要顶掉在飞那轮"之后,自动查询改成了"等在飞那轮收工再开新一轮"。
+  // 这就要求 queryingInfo 必须诚实:onHide 若照旧顺手把它清零,手上那一发请求还没
+  // 落地就会被放行,第二轮当场开跑 —— 两轮同时打上游,正是扇出注释里那条"绝不成批
+  // 爆发"的硬约束不许发生的事。
+  const { api, sections } = bootAccounts(accountsHandler(), {
+    delay: (p) => (p.endsWith('/balance') ? 40 : 0)
+  });
+
+  sections.accounts.onShow();
+  assert.ok(await waitFor(() => api._stats.calls.some((p) => p.endsWith('/balance'))), '自动查询应当已经开跑');
+
+  // 切走再切回来:此刻第一轮手上那一发余额请求(40ms)还在飞。
+  sections.accounts.onHide();
+  sections.accounts.onShow();
+  await settle();
+
+  assert.equal(api._stats.maxInFlight, 1, '离开再进来开出了并发的第二轮余额扇出');
 });
 
 test('accounts: 失败日志弹窗要显示上游响应体,而不是一列「—」', async () => {
