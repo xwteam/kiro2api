@@ -39,7 +39,7 @@ use crate::protocol::gemini::types::{
     Candidate, Content, FunctionCall, GeminiModel, GeminiModelList, GenerateContentRequest,
     GenerateContentResponse, Part, UsageMetadata,
 };
-use crate::server::auth::ApiKeyId;
+use crate::server::auth::{ApiKeyId, BoundCredentialIds};
 
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
@@ -355,13 +355,14 @@ pub async fn stream_generate_content(
     hub_req: crate::protocol::anthropic::types::MessagesRequest,
     api_key_id: u32,
     client_ip: Option<String>,
+    bound: Option<BoundCredentialIds>,
     wire: WireFormat,
     now_unix: u64,
 ) -> Result<Response, RelayError> {
     let crate::protocol::anthropic::handler::CallOutcome {
         mut resp,
         credential_id,
-    } = select_and_call_with_retry(&state, &hub_req, now_unix).await?;
+    } = select_and_call_with_retry(&state, &hub_req, now_unix, bound.as_ref()).await?;
     // 统计层用量句柄(Arc,移入哨兵);记账经 Drop 哨兵在流**任意方式结束**时都落一条(#8/#9/#15)。
     let usage_handle = state.stats.usage.clone();
     let record_model = hub_req.model.clone();
@@ -563,6 +564,7 @@ pub async fn generate_content(
     Query(query): Query<AltQuery>,
     connect_info: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     api_key_id: Option<axum::Extension<ApiKeyId>>,
+    bound: Option<axum::Extension<BoundCredentialIds>>,
     headers: axum::http::HeaderMap,
     payload: Result<Json<GenerateContentRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
@@ -574,6 +576,8 @@ pub async fn generate_content(
         Err(rejection) => return bad_request_response(&rejection.body_text()),
     };
     let api_key_id = api_key_id.and_then(|axum::Extension(k)| k.0).unwrap_or(0);
+    // store-key 绑定白名单(鉴权闸解析;扩展缺席 = 不受限)。下传给选号层执行。
+    let bound = bound.map(|axum::Extension(b)| b);
     // 客户端 IP:优先 XFF/Real-IP(反代场景),否则 socket 对端地址(见 extract_client_ip)。
     let client_ip = extract_client_ip(&headers, connect_info.map(|axum::Extension(ci)| ci.0));
 
@@ -584,7 +588,7 @@ pub async fn generate_content(
                 Ok(r) => r,
                 Err(e) => return convert_error_to_gemini(e),
             };
-            match relay_core_outcome(&state, hub_req, api_key_id, client_ip, now).await {
+            match relay_core_outcome(&state, hub_req, api_key_id, client_ip, bound, now).await {
                 Ok(CoreOutcome::Response(resp)) => Json(hub_to_gemini(resp)).into_response(),
                 // 上游把限流/鉴权/参数错误放在 HTTP 200 的事件流里,必须按其映射出的状态码回错,
                 // 否则客户端拿到的是 200 + 空 candidates,既察觉不到失败也不会重试。
@@ -600,7 +604,7 @@ pub async fn generate_content(
                 Err(e) => return convert_error_to_gemini(e),
             };
             let wire = wire_format(query.alt.as_deref());
-            match stream_generate_content(state, hub_req, api_key_id, client_ip, wire, now).await {
+            match stream_generate_content(state, hub_req, api_key_id, client_ip, bound, wire, now).await {
                 Ok(resp) => resp,
                 Err(e) => relay_error_to_gemini(e),
             }

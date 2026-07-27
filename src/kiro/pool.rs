@@ -1,6 +1,7 @@
 //! Kiro 多账号池:健康账号选择 + 失败分级冷却 + 负载均衡。
 //! 冷却时长与错误分类均按可观测错误语义自行设计(非移植);时钟以 now_unix 注入。
 use crate::kiro::credential::{AuthMethod, Credential};
+use crate::server::auth::BoundCredentialIds;
 use serde::Serialize;
 
 /// 凭据可变字段的局部更新集合(Phase 3):字段为 `None` 即"不改动"。
@@ -421,17 +422,25 @@ impl Pool {
         self.select_excluding(now_unix, |_| false)
     }
 
-    /// 选一个健康账号,但跳过 `exclude_ids` 中已试过的凭据 id(跨账号重试用)。
-    /// 除排除集外,选择纪律与 [`select`](Self::select) 完全一致(disabled/冷却/RPM 均跳过、
-    /// 沿用当前 LB 模式与 cursor)。无满足条件的账号时返回 None。
+    /// 选一个健康账号,但跳过 `exclude_ids` 中已试过的凭据 id(跨账号重试用),并在
+    /// `allowed` 在场时只从它放行的凭据里选。除这两层过滤外,选择纪律与
+    /// [`select`](Self::select) 完全一致(disabled/冷却/RPM 均跳过、沿用当前 LB 模式与
+    /// cursor)。无满足条件的账号时返回 None(中转层据此回 503)。
     ///
     /// 供中转层跨账号重试:某账号数据面失败后,以已试过的 id 集合再选下一个不同的健康账号。
+    ///
+    /// `allowed` 为本次请求的 store-key 绑定白名单(鉴权闸从命中的那条 key 上解析,经请求
+    /// 扩展下传;`None` = 不受限)。**这是绑定唯一的执行点**:成员判定一律委托
+    /// [`BoundCredentialIds::allows`],不在此处另写一份 id 解析,以免两处口径漂移。
     pub fn select_with_exclude(
         &mut self,
         now_unix: u64,
         exclude_ids: &std::collections::HashSet<String>,
+        allowed: Option<&BoundCredentialIds>,
     ) -> Option<Credential> {
-        self.select_excluding(now_unix, |c| exclude_ids.contains(&c.id))
+        self.select_excluding(now_unix, |c| {
+            exclude_ids.contains(&c.id) || allowed.is_some_and(|b| !b.allows(&c.id))
+        })
     }
 
     /// [`select`](Self::select) 与 [`select_with_exclude`](Self::select_with_exclude) 的共享内核:
@@ -1057,14 +1066,61 @@ mod tests {
         let mut ex = HashSet::new();
         ex.insert("a".to_string());
         for _ in 0..5 {
-            assert_eq!(p.select_with_exclude(0, &ex).unwrap().id, "b");
+            assert_eq!(p.select_with_exclude(0, &ex, None).unwrap().id, "b");
         }
         // 两个都排除 → None(即便都健康)。
         ex.insert("b".to_string());
-        assert!(p.select_with_exclude(0, &ex).is_none());
+        assert!(p.select_with_exclude(0, &ex, None).is_none());
         // 空排除集 → 行为等同 select(可选到任一健康账号)。
         let none: HashSet<String> = HashSet::new();
-        assert!(p.select_with_exclude(0, &none).is_some());
+        assert!(p.select_with_exclude(0, &none, None).is_some());
+    }
+
+    /// 绑定必须在**选号层**生效,而不是"值传到了就算数":上一轮的修复只把白名单塞进请求
+    /// 扩展、没人读,回归测试却只断言扩展在场,于是绑定形同虚设。这里直接断言选出来的账号。
+    #[test]
+    fn binding_restricts_selection_to_whitelisted_accounts() {
+        use std::collections::HashSet;
+        let none: HashSet<String> = HashSet::new();
+        let mut p = Pool::new(
+            vec![cred("3", 1), cred("7", 1), cred("9", 1)],
+            LbMode::Priority,
+        );
+        // 只绑 7 号:轮询转多少圈都只能选到 7。
+        let only7 = BoundCredentialIds(vec![7]);
+        for _ in 0..10 {
+            assert_eq!(p.select_with_exclude(0, &none, Some(&only7)).unwrap().id, "7");
+        }
+        // 绑定 + 排除集叠加:绑 3/7 而 7 已试过 → 只剩 3。
+        let three_seven = BoundCredentialIds(vec![3, 7]);
+        let mut ex = HashSet::new();
+        ex.insert("7".to_string());
+        for _ in 0..10 {
+            assert_eq!(
+                p.select_with_exclude(0, &ex, Some(&three_seven)).unwrap().id,
+                "3"
+            );
+        }
+        // 白名单指向池里不存在的账号 → 选不出(fail-closed,绝不回落到未授权账号)。
+        let ghost = BoundCredentialIds(vec![4242]);
+        assert!(p.select_with_exclude(0, &none, Some(&ghost)).is_none());
+        // 白名单里唯一的账号进冷却 → 同样选不出,不会漏给别的健康账号。
+        p.report_failure("7", FailureKind::Quota, 100);
+        assert!(p.select_with_exclude(200, &none, Some(&only7)).is_none());
+        assert!(p.select_with_exclude(200, &none, None).is_some()); // 不受限时仍有健康账号
+    }
+
+    /// 非数值 id 在绑定在场时一律不放行(fail-closed);不受限时照选。
+    #[test]
+    fn binding_rejects_non_numeric_credential_ids() {
+        use std::collections::HashSet;
+        let none: HashSet<String> = HashSet::new();
+        let mut p = Pool::new(vec![cred("uuid-abc", 1)], LbMode::Priority);
+        assert!(
+            p.select_with_exclude(0, &none, Some(&BoundCredentialIds(vec![1])))
+                .is_none()
+        );
+        assert!(p.select_with_exclude(0, &none, None).is_some());
     }
 
     #[test]
@@ -1075,12 +1131,12 @@ mod tests {
         p.report_failure("b", FailureKind::Quota, 100);
         let none: HashSet<String> = HashSet::new();
         for _ in 0..5 {
-            assert_eq!(p.select_with_exclude(200, &none).unwrap().id, "a");
+            assert_eq!(p.select_with_exclude(200, &none, None).unwrap().id, "a");
         }
         // 再把 a 也排除 → 无可选(b 冷却中 + a 被排除)。
         let mut ex = HashSet::new();
         ex.insert("a".to_string());
-        assert!(p.select_with_exclude(200, &ex).is_none());
+        assert!(p.select_with_exclude(200, &ex, None).is_none());
     }
 
     #[test]

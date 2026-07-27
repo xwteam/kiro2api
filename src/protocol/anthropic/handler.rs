@@ -36,7 +36,7 @@ use crate::protocol::anthropic::stream;
 use crate::protocol::anthropic::types::{
     AnthropicModel, AnthropicModelList, CountTokensResponse, MessagesRequest, MessagesResponse,
 };
-use crate::server::auth::ApiKeyId;
+use crate::server::auth::{ApiKeyId, BoundCredentialIds};
 use crate::stats::StatsManager;
 
 /// 选账号后,离过期不足此秒数即先内存刷新(仅内存,不写盘)。
@@ -386,6 +386,7 @@ pub(crate) async fn select_and_call_with_retry(
     state: &MessagesState,
     req: &MessagesRequest,
     now_unix: u64,
+    bound: Option<&BoundCredentialIds>,
 ) -> Result<CallOutcome, RelayError> {
     let pool_size = { state.pool.lock().await.len() };
     let max_attempts = cross_account_attempts(pool_size);
@@ -394,7 +395,7 @@ pub(crate) async fn select_and_call_with_retry(
     let mut last_err: Option<RelayError> = None;
 
     for _attempt in 0..max_attempts {
-        match select_and_call_once(state, req, now_unix, &tried_ids).await {
+        match select_and_call_once(state, req, now_unix, &tried_ids, bound).await {
             // 成功:直接返回(响应体尚未开始消费)。
             Ok((outcome, _tried_id)) => return Ok(outcome),
             // 请求级致命错误:任何账号上都会同样失败,不重试。
@@ -446,11 +447,12 @@ pub(crate) async fn select_and_call_once(
     req: &MessagesRequest,
     now_unix: u64,
     exclude_ids: &std::collections::HashSet<String>,
+    bound: Option<&BoundCredentialIds>,
 ) -> Result<(CallOutcome, String), (RelayError, Option<String>)> {
     // 1) 选账号(整条链路串行占锁,见 MessagesState 说明);排除本请求已试过的账号。
     let mut pool = state.pool.lock().await;
     let mut cred = pool
-        .select_with_exclude(now_unix, exclude_ids)
+        .select_with_exclude(now_unix, exclude_ids, bound)
         .ok_or((RelayError::NoAccount, None))?;
 
     // 2) 即将过期 → 集中刷新并写回活池(不各自反复轮换令牌;见 kiro::ensure_fresh)。
@@ -706,7 +708,7 @@ pub async fn relay_core(
     req: MessagesRequest,
     now_unix: u64,
 ) -> Result<MessagesResponse, RelayError> {
-    relay_core_attributed(state, req, 0, None, now_unix).await
+    relay_core_attributed(state, req, 0, None, None, now_unix).await
 }
 
 /// 非流式内核(带 store-key 归属)。`api_key_id` 为鉴权闸解析出的 store-key id
@@ -720,9 +722,10 @@ pub async fn relay_core_attributed(
     req: MessagesRequest,
     api_key_id: u32,
     client_ip: Option<String>,
+    bound: Option<BoundCredentialIds>,
     now_unix: u64,
 ) -> Result<MessagesResponse, RelayError> {
-    match relay_core_outcome(state, req, api_key_id, client_ip, now_unix).await? {
+    match relay_core_outcome(state, req, api_key_id, client_ip, bound, now_unix).await? {
         CoreOutcome::Response(resp) => Ok(resp),
         CoreOutcome::Exception { e, .. } => Err(RelayError::Upstream(exception_detail(&e))),
     }
@@ -751,6 +754,7 @@ pub async fn relay_core_outcome(
     req: MessagesRequest,
     api_key_id: u32,
     client_ip: Option<String>,
+    bound: Option<BoundCredentialIds>,
     now_unix: u64,
 ) -> Result<CoreOutcome, RelayError> {
     let started = std::time::Instant::now();
@@ -759,7 +763,7 @@ pub async fn relay_core_outcome(
     let CallOutcome {
         resp,
         credential_id,
-    } = select_and_call_with_retry(state, &req, now_unix).await?;
+    } = select_and_call_with_retry(state, &req, now_unix, bound.as_ref()).await?;
 
     // 端到端延迟(选账号+跨账号重试+调上游,至上游响应就绪):既用于 INFO 日志,也随用量记录落库
     // 供 usage-summary 计 avgLatencyMs(与日志的 latency_ms 同源、口径一致)。
@@ -962,7 +966,7 @@ pub async fn relay_stream(
     req: MessagesRequest,
     now_unix: u64,
 ) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>> + use<>>, RelayError> {
-    relay_stream_attributed(state, req, 0, None, now_unix).await
+    relay_stream_attributed(state, req, 0, None, None, now_unix).await
 }
 
 /// 流式内核(带 store-key 归属)。`api_key_id` 同 [`relay_core_attributed`];
@@ -972,6 +976,7 @@ pub async fn relay_stream_attributed(
     req: MessagesRequest,
     api_key_id: u32,
     client_ip: Option<String>,
+    bound: Option<BoundCredentialIds>,
     now_unix: u64,
 ) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>> + use<>>, RelayError> {
     let started = std::time::Instant::now();
@@ -979,7 +984,7 @@ pub async fn relay_stream_attributed(
     let CallOutcome {
         mut resp,
         credential_id,
-    } = select_and_call_with_retry(state, &req, now_unix).await?;
+    } = select_and_call_with_retry(state, &req, now_unix, bound.as_ref()).await?;
     let model = req.model.clone();
 
     // 流建立延迟(选账号+跨账号重试+调上游至 SSE 就绪):既用于 INFO 日志,也随用量记录落库供
@@ -1204,6 +1209,7 @@ pub async fn messages(
     connect_info: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: axum::http::HeaderMap,
     api_key_id: Option<axum::Extension<ApiKeyId>>,
+    bound: Option<axum::Extension<BoundCredentialIds>>,
     payload: Result<Json<MessagesRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let req = match payload {
@@ -1216,6 +1222,8 @@ pub async fn messages(
         }
     };
     let api_key_id = api_key_id.and_then(|axum::Extension(k)| k.0).unwrap_or(0);
+    // store-key 绑定白名单(鉴权闸解析;扩展缺席 = 不受限)。下传给选号层执行。
+    let bound = bound.map(|axum::Extension(b)| b);
     // 客户端 IP:优先 X-Forwarded-For/X-Real-IP(反代场景),否则取 socket 对端地址。
     // ConnectInfo 经 make-service 塞进请求扩展,以 `Option<Extension<..>>` 读取:单测用 oneshot
     // 不带连接信息,此时为 None、回落到仅头部提取(ConnectInfo 本身在 axum 0.8 无 Option 提取器)。
@@ -1225,12 +1233,12 @@ pub async fn messages(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     if req.stream == Some(true) {
-        match relay_stream_attributed(&state, req, api_key_id, client_ip, now_unix).await {
+        match relay_stream_attributed(&state, req, api_key_id, client_ip, bound, now_unix).await {
             Ok(sse) => sse.into_response(),
             Err(e) => e.into_response(),
         }
     } else {
-        match relay_core_outcome(&state, req, api_key_id, client_ip, now_unix).await {
+        match relay_core_outcome(&state, req, api_key_id, client_ip, bound, now_unix).await {
             Ok(CoreOutcome::Response(resp)) => (StatusCode::OK, Json(resp)).into_response(),
             // 上游 200 事件流里的 exception:按映射出的状态码回错误,不再是 200 + 空内容。
             Ok(CoreOutcome::Exception { status, e }) => {
@@ -1817,6 +1825,67 @@ mod tests {
         assert_eq!(v["role"], "assistant");
         assert_eq!(v["content"][0]["type"], "text");
         assert_eq!(v["content"][0]["text"], "pong");
+    }
+
+    /// 绑定必须**真的**约束选号,而不是"白名单送到了扩展里"就算修好。
+    ///
+    /// 上一轮的回归测试只断言扩展在场,选号层从没读过它,于是绑定形同虚设却带着"已修复"
+    /// 的标签发了版。这里改为断言可观测行为:绑定指向池里没有的账号时必须回 503,
+    /// 绝不能悄悄回落到一个未授权但健康的账号(那才是这条 finding 的真实危害)。
+    #[tokio::test]
+    async fn binding_to_absent_account_yields_503_instead_of_falling_back() {
+        let server = MockServer::start().await;
+        // 上游一律成功:一旦选号漏给了未授权账号,这里就会回 200 —— 断言 503 才有意义。
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+        let mut healthy = cred();
+        healthy.id = "3".into();
+        let st = state(&server.uri(), vec![healthy]);
+
+        // 未绑定:同一个池、同一发请求 → 200(证明池本身是健康可用的)。
+        let app = messages_router(st.clone());
+        let body = r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#;
+        let ok = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK, "未绑定时应正常中转");
+
+        // 绑定到池里不存在的 4242:必须 503,而不是回落到健康的 3 号。
+        let app = messages_router(st).layer(axum::middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                req.extensions_mut()
+                    .insert(BoundCredentialIds(vec![4242]));
+                next.run(req).await
+            },
+        ));
+        let denied = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            denied.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "绑定未命中任何账号时必须选不出账号(503),绝不能漏给未授权账号"
+        );
     }
 
     /// 空池 → 503。
@@ -2567,7 +2636,7 @@ mod tests {
         )
         .unwrap();
         // 归属到 key id 42。
-        let out = relay_core_attributed(&st, req, 42, None, 1000)
+        let out = relay_core_attributed(&st, req, 42, None, None, 1000)
             .await
             .unwrap();
         assert!(

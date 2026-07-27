@@ -36,7 +36,7 @@ use crate::protocol::responses::convert::{
     ResponsesConvertError, hub_to_responses, responses_to_hub,
 };
 use crate::protocol::responses::types::ResponsesRequest;
-use crate::server::auth::ApiKeyId;
+use crate::server::auth::{ApiKeyId, BoundCredentialIds};
 
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
@@ -222,12 +222,13 @@ pub async fn responses_stream(
     created: u64,
     api_key_id: u32,
     client_ip: Option<String>,
+    bound: Option<BoundCredentialIds>,
     now_unix: u64,
 ) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>> + use<>>, RelayError> {
     let crate::protocol::anthropic::handler::CallOutcome {
         mut resp,
         credential_id,
-    } = select_and_call_with_retry(&state, &hub_req, now_unix).await?;
+    } = select_and_call_with_retry(&state, &hub_req, now_unix, bound.as_ref()).await?;
     // 统计层用量句柄(Arc,移入哨兵);记账经 Drop 哨兵在流**任意方式结束**时都落一条(#8/#9/#15)。
     let usage_handle = state.stats.usage.clone();
     let model = hub_req.model.clone();
@@ -573,6 +574,7 @@ pub async fn responses(
     connect_info: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: axum::http::HeaderMap,
     api_key_id: Option<axum::Extension<ApiKeyId>>,
+    bound: Option<axum::Extension<BoundCredentialIds>>,
     payload: Result<Json<ResponsesRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let req = match payload {
@@ -580,6 +582,8 @@ pub async fn responses(
         Err(rejection) => return json_rejection_to_openai(rejection),
     };
     let api_key_id = api_key_id.and_then(|axum::Extension(k)| k.0).unwrap_or(0);
+    // store-key 绑定白名单(鉴权闸解析;扩展缺席 = 不受限)。下传给选号层执行。
+    let bound = bound.map(|axum::Extension(b)| b);
     let now = now_unix();
     let created = now;
     let is_stream = req.stream == Some(true);
@@ -594,12 +598,12 @@ pub async fn responses(
     };
 
     if is_stream {
-        match responses_stream(state, hub_req, created, api_key_id, client_ip, now).await {
+        match responses_stream(state, hub_req, created, api_key_id, client_ip, bound, now).await {
             Ok(sse) => sse.into_response(),
             Err(e) => relay_error_to_openai(e),
         }
     } else {
-        match relay_core_outcome(&state, hub_req, api_key_id, client_ip, now).await {
+        match relay_core_outcome(&state, hub_req, api_key_id, client_ip, bound, now).await {
             Ok(CoreOutcome::Response(resp)) => {
                 Json(hub_to_responses(resp, created)).into_response()
             }
