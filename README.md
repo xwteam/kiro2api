@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.2.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.2.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-07-27 | v0.2.1 - 🔒 二轮审计修复（对抗式复核确认 39 项，含此前从未审计过的面板与文档）：密钥文件（`api_keys.json`、`config.json`）此前以全局可读权限落盘，手动 `chmod` 后每次写盘又被悄悄改回；客户端 IP 可被直连端口的任何人伪造；API-KEY 的凭据绑定只存不生效；`GET /api/admin/models` 每次打开面板都触发全量账号池上游扫描（改为单飞、限量并加冷却）；凭据文件损坏时被当成空池并覆写、导致账号全灭（改为先备份再逐条抢救）；API-KEY 变更在关停时丢失；OpenAI 并行工具调用产生非法的工具往返；部分 Gemini 请求体（内置工具、snake_case 字段、非图片 inlineData）被拒绝或改坏；2 MB 请求体上限会拒掉约 1.5 MB 的图片；另修复大量管理面板/用户面板问题 |
 | 2026-07-26 | v0.2.0 - 🛡️ 全链路审计修复：API-KEY 消费上限四种协议全部生效（此前只在 Anthropic 端点生效，另外三种可无限消费且用量显示为零）；仅配置用户级 API-KEY 时管理端不再开放；上游报错、流中途传输中断与截断不再被当成正常完成上报；账号池刷新失败回写账号池；用量/账单重启不再丢失、账本文件回滚安全；`--credentials` 与跟随 `PORT` 的健康检查真正生效 |
 | 2026-07-26 | v0.1.4 - 🐛 修复 Anthropic `system` 字段支持内容块数组（不只字符串）——Claude Code / 带 prompt 缓存的 SDK 把 system 发成数组时不再报 422 |
 | 2026-07-26 | v0.1.3 - 📥 批量 JSON 导入改为实时逐条展示进度：进度条、成功/重复/失败实时计数、每行状态列表（验证中 → 已验证并附用量 / 重复 / 失败已回滚）；验证通过的账号即时保存，中途打断也不丢失 |

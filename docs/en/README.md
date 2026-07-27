@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.2.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.2.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | Date | Update |
 |------|--------|
+| 2026-07-27 | v0.2.1 - 🔒 Follow-up audit fixes (39 findings confirmed by adversarial review, this round also covering the panels and the docs, which had never been audited): secret-bearing files (`api_keys.json`, `config.json`) were written world-readable and silently re-widened on every flush even after a manual `chmod`; the client IP could be forged by anyone reaching the port directly; an API-KEY credential binding was stored but never enforced; `GET /api/admin/models` kicked off an unbounded full-pool upstream sweep on every dashboard visit (now single-flight, bounded, with a cooldown); a corrupt credentials file was treated as an empty pool and then overwritten, destroying every account (now backed up and salvaged entry by entry); API-KEY changes were lost on shutdown; OpenAI parallel tool calls produced an invalid tool round-trip; several Gemini payloads (builtin tools, snake_case keys, non-image `inlineData`) were rejected or mangled; the 2 MB body limit rejected ~1.5 MB images; plus many admin/user panel fixes |
 | 2026-07-26 | v0.2.0 - 🛠 Full-chain audit fixes: API-KEY spending limits now apply on all four protocols (they previously only took effect on the Anthropic endpoint, so the other three could spend without limit and showed zero usage); the admin plane is no longer open when only user-level API-KEYs are configured; upstream errors, mid-stream transport interruptions and truncation are no longer reported as a normal completion on any protocol; account-pool refresh failures now feed back into the pool; usage/billing is no longer lost on restart and the ledger file stays rollback-safe; `--credentials` and the PORT-aware health check now actually work |
 | 2026-07-26 | v0.1.4 - 🐛 Fix: the Anthropic `system` field now accepts a content-block array (not only a string) — no more 422 when Claude Code / prompt-caching SDKs send it as an array |
 | 2026-07-26 | v0.1.3 - Bulk JSON import now shows live per-account progress: a progress bar, running success/duplicate/failed stats, and a per-row status list (verifying → verified with usage / duplicate / failed, rolled back); verified accounts are saved immediately, so interrupting mid-import does not lose them |

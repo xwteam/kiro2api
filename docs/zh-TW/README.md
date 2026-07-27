@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.2.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.2.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-07-27 | v0.2.1 - 🛡 補充審計修復（對抗式複查確認 39 項問題，含此前從未受審的面板與文件）：安全面，帶機密的檔案（`api_keys.json`、`config.json`）以任何人可讀的權限落盤，且每次寫回都會靜默放寬回去、手動 `chmod` 也守不住；客戶端 IP 可被任何直連連接埠的人偽造；API-KEY 上綁定的憑證只儲存、從未生效。另修復：`GET /api/admin/models` 每次開儀表板都觸發無上限的整池上游掃描（現改為單次合流、限量並加冷卻）；憑證檔損毀時被當成空池並隨即覆寫、毀掉全部帳號（現改為先備份再逐條搶救）；API-KEY 變更在關閉時遺失；OpenAI 平行工具呼叫產生不合法的工具往返；部分 Gemini 酬載（內建工具、snake_case 鍵、非圖片 inlineData）被拒或被改壞；2 MB 請求體上限擋掉約 1.5 MB 的圖片；以及大量管理面板／使用者面板修復 |
 | 2026-07-26 | v0.2.0 - 🔒 全鏈路審計修復：API-KEY 消費上限現在於 Anthropic / OpenAI / OpenAI-Responses / Gemini 四協議一律生效（此前只在 Anthropic 端點生效，改用其餘三協議即可無限消費，且這些流量的用量顯示為零）；只設定了使用者級 API-KEY 時管理面不再開放；上游錯誤、串流中途傳輸中斷與截斷不再被報成正常完成；帳號池刷新失敗會回饋到池；用量計費不再因重啟遺失、統計檔案保持可回滾；`--credentials` 與跟隨 `PORT` 的健康檢查現在真正生效 |
 | 2026-07-26 | v0.1.4 - 🐛 修復 Anthropic `system` 欄位支援內容區塊陣列（不只字串）——Claude Code / 帶 prompt 快取的 SDK 把 system 發成陣列時不再回 422 |
 | 2026-07-26 | v0.1.3 - 📥 批次 JSON 匯入改為即時逐條進度：進度條、即時累計成功/重複/失敗統計，以及逐條狀態清單（驗證中 → 已驗證並顯示用量 / 重複 / 失敗已回滾）；已驗證帳號即時落盤，匯入途中中斷也不會遺失 |

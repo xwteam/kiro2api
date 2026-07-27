@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.2.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.2.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日付 | 更新内容 |
 |------|----------|
+| 2026-07-27 | v0.2.1 - 🔒 追加監査に基づく修正（敵対的レビューで確認した **39 件**、これまで未監査だったパネルとドキュメントを含む）：秘密情報を含むファイル（`api_keys.json`・`config.json`）が誰でも読める権限で書き出され、手動で `chmod` しても書き込みのたびに黙って権限が戻る問題、ポートへ直接到達できれば誰でもクライアント IP を偽装できる問題、保存されるだけで一度も検証されていなかった API-KEY の認証情報バインドを修正；ダッシュボードを開くたびに `GET /api/admin/models` がプール全体へ無制限のアップストリーム照会を走らせていた問題（単一フライト化・件数制限・クールダウン付きに）；壊れた認証情報ファイルを空のプールとみなして上書きし、全アカウントを失う問題（バックアップのうえ 1 件ずつ救出）；終了時に API-KEY の変更が失われる問題；OpenAI の並列ツール呼び出しが不正なツール往復を生成する問題；一部の Gemini ペイロード（ビルトインツール・snake_case キー・画像以外の `inlineData`）が拒否・破損する問題；2 MB のボディ上限が約 1.5 MB の画像を弾く問題；ほか管理者/ユーザーパネルの多数の修正 |
 | 2026-07-26 | v0.2.0 - 🔒 全チェーン監査に基づく修正：API-KEY の消費上限が **4 プロトコルすべて**で有効に（従来は Anthropic エンドポイントでしか効かず、残り 3 つは無制限に消費でき使用量も 0 表示のままでした）；ユーザー級の API-KEY しか設定していない場合に管理インターフェースが無認証で開放される問題を修正；アップストリームのエラー・ストリーム途中の伝送中断・切り詰めを、どのプロトコルでも正常完了として報告しなくなりました；アカウントプールのリフレッシュ失敗をプールへ反映；再起動で使用量/課金が失われなくなり、統計ファイルはロールバック可能な形式を維持；`--credentials` と `PORT` に追従するヘルスチェックが実際に機能するように |
 | 2026-07-26 | v0.1.4 - 🐛 修正：Anthropic の `system` フィールドがコンテンツブロック配列（文字列だけでなく）に対応——Claude Code / プロンプトキャッシュ対応 SDK が配列で送っても 422 にならない |
 | 2026-07-26 | v0.1.3 - 📥 一括 JSON インポートがアカウントごとの進捗をリアルタイム表示：プログレスバー、成功/重複/失敗の集計、行ごとのステータスリスト（検証中 → 検証済み（使用量付き）/ 重複 / 失敗（ロールバック））；検証済みアカウントは即座に保存されるため、途中で中断しても失われません |

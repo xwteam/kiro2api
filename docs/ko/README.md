@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.2.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.2.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 날짜 | 업데이트 내용 |
 |------|----------|
+| 2026-07-27 | v0.2.1 - 🛠 후속 감사 수정: 적대적 검토로 확인된 39건의 문제(한 번도 감사한 적 없던 패널과 문서 포함). 보안: 비밀 정보가 담긴 파일(`api_keys.json`, `config.json`)이 누구나 읽을 수 있는 권한으로 저장되고, 수동으로 `chmod`해도 flush 때마다 조용히 다시 넓어지던 문제; 포트에 직접 닿을 수 있는 사람이면 누구나 클라이언트 IP를 위조할 수 있던 문제; 저장만 되고 실제로는 적용되지 않던 API-KEY의 자격 증명 바인딩. 수정: 대시보드를 열 때마다 `GET /api/admin/models`가 계정 풀 전체에 무제한 업스트림 조회를 유발하던 문제(이제 단일 실행·상한·쿨다운 적용); 손상된 자격 증명 파일을 빈 풀로 간주한 뒤 덮어써 모든 계정이 사라지던 문제(이제 백업 후 항목 단위로 복구); 종료 시 API-KEY 변경 사항이 유실되던 문제; OpenAI 병렬 도구 호출이 잘못된 도구 왕복을 만들던 문제; 일부 Gemini 페이로드(내장 도구, snake_case 키, 이미지가 아닌 `inlineData`)가 거부되거나 손상되던 문제; 2 MB 본문 제한이 약 1.5 MB 이미지를 거부하던 문제; 그 외 다수의 관리자/사용자 패널 수정 |
 | 2026-07-26 | v0.2.0 - 🛠 전체 체인 감사 수정: API-KEY 지출 한도가 **4개 프로토콜 전부**에 적용(이전에는 Anthropic 엔드포인트에서만 유효하여 나머지 3개는 무제한 소비되고 사용량도 0으로 표시됨); 사용자용 API-KEY만 설정된 경우에도 관리 인터페이스가 더 이상 개방되지 않음; 업스트림 오류·스트림 도중 전송 중단·잘림을 어느 프로토콜에서도 정상 완료로 보고하지 않음; 계정 풀 갱신 실패가 풀에 그대로 반영됨; 재시작해도 사용량/과금이 유실되지 않고 원장 파일이 롤백에 안전하게 유지됨; `--credentials`와 `PORT`를 반영하는 헬스 체크가 실제로 동작 |
 | 2026-07-26 | v0.1.4 - 🐛 수정: Anthropic `system` 필드가 콘텐츠 블록 배열(문자열뿐 아니라)을 지원 — Claude Code / 프롬프트 캐싱 SDK가 배열로 보내도 더 이상 422가 발생하지 않음 |
 | 2026-07-26 | v0.1.3 - 일괄 JSON 가져오기가 이제 계정별 실시간 진행 상황을 표시: 진행률 바, 실시간 성공/중복/실패 통계, 계정별 상태 목록(검증 중 → 사용량과 함께 검증 완료 / 중복 / 실패 후 롤백); 검증된 계정은 즉시 저장되므로 가져오기 도중 중단해도 유실되지 않음 |
