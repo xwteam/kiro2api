@@ -49,11 +49,47 @@ const REFRESH_MARGIN_SECS: u64 = 300;
 /// → socket 对端地址(`peer.ip()`,直连公网时即真实客户端)。
 /// 经 Docker `-p` 端口映射且无反代时,本机回环请求的对端会被改写为 docker 网关(172.x),
 /// 属预期(改用 host 网络或经 CDN/反代注入上述头即可拿到真实客户端 IP)。IP 非机密,可安全落库/展示。
+/// 对端是否可信到能采信其转发头:回环 / 私网(RFC1918、CGNAT、link-local、唯一本地 IPv6)。
+/// 无对端信息(测试或非 TCP 场景)按可信处理,保持既有单测与内部调用的语义不变。
+fn peer_is_trusted(peer: Option<std::net::SocketAddr>) -> bool {
+    use std::net::IpAddr;
+    let Some(p) = peer else { return true };
+    match p.ip() {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                // 100.64.0.0/10:运营商级 NAT,容器/编排网络也常用
+                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                // fc00::/7 唯一本地地址 + fe80::/10 链路本地
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // ::ffff:a.b.c.d 形式的 IPv4 映射地址按其 v4 语义判定
+                || v6.to_ipv4_mapped().is_some_and(|v4| {
+                    v4.is_loopback() || v4.is_private() || v4.is_link_local()
+                })
+        }
+    }
+}
+
 pub(crate) fn extract_client_ip(
     headers: &axum::http::HeaderMap,
     peer: Option<std::net::SocketAddr>,
 ) -> Option<String> {
-    // CDN 边缘设置的权威真实客户端头(由边缘写入,客户端无法伪造),优先级最高。
+    // 转发头一律**只在对端是私网/回环时**才采信:这些头是普通请求头,任何能直连本服务的
+    // 客户端都能自己写一个。之前无条件采信,等于谁都能决定自己被记成哪个 IP(用量记录、
+    // 失败日志、面板展示全被污染)。反代/CDN 回源必然来自私网或回环,故按对端网段判别。
+    //
+    // ⚠️ 局限(照实说明):经 Docker `-p` 端口映射时,**直连公网端口的请求**在容器内看到的
+    // 对端同样是 docker 网关(172.x,私网),与经反代回源无法区分。要真正堵死伪造,需把
+    // 容器端口收到 `127.0.0.1:<port>` 只让反代进,或改用 host 网络。
+    if !peer_is_trusted(peer) {
+        return peer.map(|p| p.ip().to_string());
+    }
+    // CDN 边缘设置的权威真实客户端头(边缘写入),优先级最高。
     // - Cloudflare:`CF-Connecting-IP`;
     // - Akamai / Cloudflare 企业版:`True-Client-IP`。
     // 放在 XFF 之前,避免"客户端伪造 XFF 首跳、CDN 只在其后追加真实 IP"导致取到伪造值。
@@ -1378,6 +1414,34 @@ mod tests {
 
     /// CDN 权威头(CF-Connecting-IP / True-Client-IP)优先级高于 XFF/X-Real-IP,
     /// 使伪造的 XFF 首跳无法覆盖 Cloudflare 边缘写入的真实访客 IP。
+    /// 回归:公网对端伪造的转发头**不得**被采信——否则任何人都能决定自己被记成哪个 IP,
+    /// 污染用量记录、失败日志与面板展示。私网/回环对端(反代回源)才继续采信。
+    #[test]
+    fn extract_client_ip_ignores_forged_headers_from_public_peer() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("cf-connecting-ip", "1.2.3.4".parse().unwrap());
+        h.insert("x-forwarded-for", "5.6.7.8".parse().unwrap());
+        h.insert("x-real-ip", "9.9.9.9".parse().unwrap());
+
+        // 公网对端:全部转发头忽略,只认 socket 对端。
+        let public: std::net::SocketAddr = "203.0.113.7:5555".parse().unwrap();
+        assert_eq!(
+            extract_client_ip(&h, Some(public)).as_deref(),
+            Some("203.0.113.7"),
+            "公网对端的转发头必须忽略,否则可任意伪造日志 IP"
+        );
+
+        // 私网对端(反代/CDN 回源,含 docker 网关):继续采信最高优先级的头。
+        for p in ["127.0.0.1:1", "172.17.0.1:1", "10.0.0.5:1", "192.168.1.9:1"] {
+            let peer: std::net::SocketAddr = p.parse().unwrap();
+            assert_eq!(
+                extract_client_ip(&h, Some(peer)).as_deref(),
+                Some("1.2.3.4"),
+                "私网对端({p})应继续采信 CDN 权威头"
+            );
+        }
+    }
+
     #[test]
     fn extract_client_ip_prefers_cdn_authoritative_headers() {
         let peer: std::net::SocketAddr = "10.0.0.9:5555".parse().unwrap();

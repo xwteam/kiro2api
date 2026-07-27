@@ -553,7 +553,10 @@ data: {"candidates":[{"content":{"parts":[{"text":"夜"}]}}]}
 
 ## 管理 API
 
-`/admin` 管理パネル（静的、rust-embed 埋め込み）は `/api/admin/*` API で駆動されます。以下のエンドポイントはすべて `adminApiKey`（未設定時は `apiKey` にフォールバック。両方とも未設定なら管理 API はオープンになります——この状態で外部に公開しないでください）で認証されます。認証の渡し方はプロトコルゲートと同じです（`Authorization: Bearer` / `x-api-key` / `?token=`。ヘッダーを設定できない SSE ログストリームは `?api_key=`）。レスポンス本体はすべて camelCase で、**access/refresh トークンや鍵を一切含みません**。
+`/admin` 管理パネル（静的、rust-embed 埋め込み）は `/api/admin/*` API で駆動されます。以下のエンドポイントはすべて `adminApiKey`（未設定時は `apiKey` にフォールバック。両方とも未設定なら管理 API はオープンになります——この状態で外部に公開しないでください）で認証されます。認証の渡し方はプロトコルゲートと同じです（`Authorization: Bearer` / `x-api-key` / `?token=`。ヘッダーを設定できない SSE ログストリームは `?api_key=`）。レスポンス本体はすべて camelCase で、**アカウントの access/refresh トークンは一切含みません**（`GET /api/admin/credentials` は状態のみ）。
+
+> [!WARNING]
+> 管理 API のレスポンスは**秘密情報を含まないわけではありません**。`GET`/`POST /api/admin/api-keys` の `key` フィールドは**完全な平文**、`GET /api/admin/server-info` の `masterApiKey` も**完全な平文**です。マスキングされるのは `GET /api/admin/config/auth-keys` と `GET /api/admin/config` だけです。読み取り専用の管理者ロールは存在しないため、管理キーを持つ者はすべての key を閲覧・作成・ローテーションできます。管理 API のレスポンスは秘密情報として扱い、issue やログ、サードパーティのツールに貼り付けないでください。
 
 ### GET /api/admin/credentials
 
@@ -716,12 +719,12 @@ curl -X POST http://localhost:8080/api/admin/login/sso-token \
 
 ### API キー管理
 
-呼び出し側に渡す対外 key を管理します。
+呼び出し側に渡す対外 key を管理します。一覧 / 作成のレスポンスは `key` フィールドを**完全な平文**で返します（パネルは表示時にクライアント側でマスクしますが、コピーボタンには実値が必要なため）。
 
 | メソッド | エンドポイント | 機能 |
 |---------|--------------|------|
-| GET | `/api/admin/api-keys` | 一覧 |
-| POST | `/api/admin/api-keys` | 作成 |
+| GET | `/api/admin/api-keys` | 一覧（`key` は完全な平文） |
+| POST | `/api/admin/api-keys` | 作成（`key` は完全な平文） |
 | PUT | `/api/admin/api-keys/{id}` | 更新 |
 | DELETE | `/api/admin/api-keys/{id}` | 削除 |
 | GET | `/api/admin/api-keys/usage` | 全 key の使用量 |
@@ -797,13 +800,16 @@ curl -X PUT http://localhost:8080/api/admin/config/auth-keys \
 
 ```json
 {
-  "masterApiKey": "sk-****",
-  "version": "0.1.0",
-  "kiroVersion": "0.11.107"
+  "masterApiKey": "sk-マスターキーの平文",
+  "version": "0.2.0",
+  "kiroVersion": "0.11.107",
+  "rustVersion": "1.90.0",
+  "runMode": "Docker",
+  "uptimeSecs": 3600
 }
 ```
 
-`masterApiKey` は**マスキング済み**（未設定なら `null`）、`version` は kiro2api のバージョン、`kiroVersion` は偽装した上流 UA のバージョンです。
+`masterApiKey` は設定済み `apiKey` の**完全な平文**（未設定なら `null`）で、ここでは**マスキングされません**——パネルがブラウザ側でマスクして表示し、コピーボタンは実値を使います。マスキング済みの値が必要なら `GET /api/admin/config/auth-keys` を使ってください。`version` は kiro2api のバージョン、`kiroVersion` は偽装した上流 UA のバージョン、`rustVersion` はビルド時の rustc バージョンです。ほかに実行時メトリクス（`serverTime`、`serverTimeUnix`、`os`、`memoryUsedBytes`、`memoryTotalBytes`、`cpuPercent`、`runMode`、`pid`、`uptimeSecs`）も含まれます。
 
 ### リアルタイムログ
 

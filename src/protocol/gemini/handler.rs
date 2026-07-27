@@ -33,7 +33,7 @@ use crate::protocol::anthropic::handler::{
     select_and_call_with_retry,
 };
 use crate::protocol::gemini::convert::{
-    finish_reason_for_truncation, gemini_to_hub, hub_to_gemini,
+    GeminiConvertError, finish_reason_for_truncation, gemini_to_hub, hub_to_gemini,
 };
 use crate::protocol::gemini::types::{
     Candidate, Content, FunctionCall, GeminiModel, GeminiModelList, GenerateContentRequest,
@@ -221,14 +221,29 @@ fn bad_model_action_response() -> Response {
 
 /// 未知 action(非 `generateContent`/`streamGenerateContent`)时的 400 Gemini 错误体。
 fn unsupported_action_response(action: &str) -> Response {
+    bad_request_response(&format!("unsupported action: {action}"))
+}
+
+/// 通用的 400 + Gemini 错误体(`INVALID_ARGUMENT`)。
+///
+/// 请求体级失败(JSON 解析不了 / 形状不符 / 缺 content-type)与转换级失败都走它:Gemini
+/// 客户端遇错一律 `response.json()` 取 `error.{code,message,status}`,拿到 axum 默认的
+/// `text/plain` 只会抛 JSONDecodeError,真正的失败原因反而被吞掉。
+fn bad_request_response(message: &str) -> Response {
     let body = serde_json::json!({
         "error": {
             "code": 400,
-            "message": format!("unsupported action: {action}"),
+            "message": message,
             "status": "INVALID_ARGUMENT",
         },
     });
     (axum::http::StatusCode::BAD_REQUEST, Json(body)).into_response()
+}
+
+/// 把 [`GeminiConvertError`] 映射成 Gemini 形状的 400(与 `RelayError::Convert` 同一档:
+/// 请求本身不合法,重试无用)。
+fn convert_error_to_gemini(e: GeminiConvertError) -> Response {
+    bad_request_response(&e.to_string())
 }
 
 /// 把上游在 200 事件流里下发的 exception 包成 Gemini 错误体。
@@ -537,6 +552,11 @@ pub async fn stream_generate_content(
 /// 鉴权闸(见 `server::auth`)命中 store key 时会把 [`ApiKeyId`] 塞进请求扩展;
 /// 全局 key/开放模式下扩展缺失,归属 id 记 0。两条路径都要归属,否则 store key 的消费上限
 /// 会被绕过、面板上这些流量的用量显示为零。
+///
+/// 请求体以 `Result<Json<..>, JsonRejection>` 提取(与 `/v1/messages` 同法):解析失败时由本
+/// 函数回 Gemini 形状的 400,而不是 axum 默认的 `text/plain` 400/422/415 —— 后者 SDK 用
+/// `response.json()` 读错误时只会抛 JSONDecodeError,真正的失败原因被吞掉;且 422/415 也不在
+/// Gemini 的错误码契约里。
 pub async fn generate_content(
     State(state): State<MessagesState>,
     Path(model_action): Path<String>,
@@ -544,10 +564,14 @@ pub async fn generate_content(
     connect_info: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     api_key_id: Option<axum::Extension<ApiKeyId>>,
     headers: axum::http::HeaderMap,
-    Json(req): Json<GenerateContentRequest>,
+    payload: Result<Json<GenerateContentRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Some((model, action)) = split_model_action(&model_action) else {
         return bad_model_action_response();
+    };
+    let req = match payload {
+        Ok(Json(req)) => req,
+        Err(rejection) => return bad_request_response(&rejection.body_text()),
     };
     let api_key_id = api_key_id.and_then(|axum::Extension(k)| k.0).unwrap_or(0);
     // 客户端 IP:优先 XFF/Real-IP(反代场景),否则 socket 对端地址(见 extract_client_ip)。
@@ -556,7 +580,10 @@ pub async fn generate_content(
     match action.as_str() {
         "generateContent" => {
             let now = now_unix();
-            let hub_req = gemini_to_hub(req, model);
+            let hub_req = match gemini_to_hub(req, model) {
+                Ok(r) => r,
+                Err(e) => return convert_error_to_gemini(e),
+            };
             match relay_core_outcome(&state, hub_req, api_key_id, client_ip, now).await {
                 Ok(CoreOutcome::Response(resp)) => Json(hub_to_gemini(resp)).into_response(),
                 // 上游把限流/鉴权/参数错误放在 HTTP 200 的事件流里,必须按其映射出的状态码回错,
@@ -567,7 +594,11 @@ pub async fn generate_content(
         }
         "streamGenerateContent" => {
             let now = now_unix();
-            let hub_req = gemini_to_hub(req, model);
+            // 转换失败要在开流**之前**拦下:响应头一发出去就改不了状态码了。
+            let hub_req = match gemini_to_hub(req, model) {
+                Ok(r) => r,
+                Err(e) => return convert_error_to_gemini(e),
+            };
             let wire = wire_format(query.alt.as_deref());
             match stream_generate_content(state, hub_req, api_key_id, client_ip, wire, now).await {
                 Ok(resp) => resp,
@@ -1067,6 +1098,205 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["status"], "INVALID_ARGUMENT");
+    }
+
+    // ==================== 请求体级失败:必须是 Gemini 错误体,不是 axum 纯文本 ====================
+
+    /// 断言:400 + `application/json` + Gemini 形状的 `error{code,message,status}`。
+    async fn assert_gemini_400(resp: Response) -> serde_json::Value {
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap_or_default().to_string())
+            .unwrap_or_default();
+        assert!(
+            ct.contains("application/json"),
+            "错误响应必须是 JSON(SDK 用 response.json() 读错误);实际 content-type = {ct}"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .expect("错误体必须是合法 JSON,否则 SDK 抛 JSONDecodeError");
+        assert_eq!(v["error"]["code"], 400);
+        assert_eq!(v["error"]["status"], "INVALID_ARGUMENT");
+        assert!(v["error"]["message"].is_string());
+        v
+    }
+
+    /// 回归:请求体 JSON 截断 → 此前是 axum 默认的 `text/plain` 400,SDK 的 `response.json()`
+    /// 会抛 JSONDecodeError,真正的失败原因被吞掉。必须回 Gemini 错误体。
+    #[tokio::test]
+    async fn malformed_json_body_yields_gemini_error_body() {
+        let server = MockServer::start().await;
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:generateContent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"contents":[{"role":"user""#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_gemini_400(resp).await;
+    }
+
+    /// 回归:形状不符(`contents` 不是数组)→ 此前是 `422 text/plain`。422 不在 Gemini 的
+    /// 错误码契约里,SDK 也解析不了纯文本。
+    #[tokio::test]
+    async fn shape_mismatch_body_yields_400_gemini_error_not_422() {
+        let server = MockServer::start().await;
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:generateContent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"contents":"not-an-array"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_gemini_400(resp).await;
+    }
+
+    /// 回归:缺 `content-type` → 此前是 `415 text/plain`。同样收编成 Gemini 400 错误体。
+    #[tokio::test]
+    async fn missing_content_type_yields_gemini_error_body() {
+        let server = MockServer::start().await;
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:generateContent")
+                    .body(Body::from(
+                        r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_gemini_400(resp).await;
+    }
+
+    /// 回归:`tools` 里的内建工具条目(google-genai 的 `types.Tool(google_search=...)`、
+    /// gemini-cli 默认就发)没有 `functionDeclarations` 键,此前整个请求被打成 422 —— 这些
+    /// 客户端一句话都发不出去。必须照常放行(内建工具本身无从兑现,安静忽略)。
+    #[tokio::test]
+    async fn builtin_tool_entry_does_not_reject_request() {
+        let server = MockServer::start().await;
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tools":[{"functionDeclarations":[{"name":"f"}]},{"codeExecution":{}},{"googleSearch":{}}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:generateContent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "内建工具条目不应把整个请求打成 422"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["candidates"][0]["content"]["parts"][0]["text"], "pong");
+    }
+
+    /// 回归:snake_case(proto 原名)请求体全链路走通 —— 此前 `system_instruction` /
+    /// `inline_data` 被 serde 当未知字段静默丢弃,请求照样 200 但内容已经缺斤少两。
+    #[tokio::test]
+    async fn snake_case_request_body_is_accepted_end_to_end() {
+        let server = MockServer::start().await;
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"},{"inline_data":{"mime_type":"image/png","data":"AAAA"}}]}],"system_instruction":{"parts":[{"text":"be brief"}]},"generation_config":{"max_output_tokens":64}}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:generateContent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["candidates"][0]["content"]["parts"][0]["text"], "pong");
+    }
+
+    /// 回归:非 `image/*` 的 `inlineData`(PDF 等)此前被当图片发上游、`format` 是伪造值,
+    /// 调用方只能收到一个无从归因的上游错误。现在应在开流前就回 400 并点名 mimeType。
+    #[tokio::test]
+    async fn non_image_inline_data_yields_gemini_400() {
+        let server = MockServer::start().await;
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":"application/pdf","data":"JVBERi0="}}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:generateContent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = assert_gemini_400(resp).await;
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("application/pdf"),
+            "错误文案应点名 mimeType;实际:{}",
+            v["error"]["message"]
+        );
+    }
+
+    /// 流式路径同样必须在**开流之前**拦下:响应头一发出去状态码就改不了了。
+    #[tokio::test]
+    async fn non_image_inline_data_yields_gemini_400_on_stream_path() {
+        let server = MockServer::start().await;
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":"audio/mp3","data":"AAAA"}}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:streamGenerateContent?alt=sse")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_gemini_400(resp).await;
     }
 
     #[tokio::test]

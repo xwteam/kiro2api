@@ -191,8 +191,18 @@ fn sweep_stale_tmp(path: &str) {
 /// #11:每次 save 顺手清理同目录下遗留的**孤儿** `{path}.tmp.*`(此前进程在 tmp 写完与 rename
 /// 之间崩溃留下的),仅清足够旧的,不碰并发写者正在写的新 tmp。
 pub fn save(path: &str, creds: &[Credential]) -> anyhow::Result<()> {
-    let tmp = unique_tmp_path(path);
     let data = serde_json::to_vec_pretty(creds)?;
+    atomic_write(path, &data).map_err(Into::into)
+}
+
+/// 原子写一个文件:唯一 tmp(0600)→ 写 → fsync → rename 顶替,失败清 tmp,顺手清孤儿 tmp。
+///
+/// 抽成独立函数是为了让**所有**落到凭据目录的持久化写共用同一套规矩:除 credentials.json 本体外,
+/// 旁挂的 `{path}.next-id`(账号 id 高水位)也必须走这条路径 —— 裸 `fs::write` 是「先截断到 0
+/// 再写」,崩溃/掉电正好落在这个窗口就留下 0 字节或半截文件,读回来解析不出 → 高水位丢失 →
+/// 已删除账号的编号被复用(见 [`save_next_id`])。
+fn atomic_write(path: &str, data: &[u8]) -> std::io::Result<()> {
+    let tmp = unique_tmp_path(path);
     // 写失败/中途 panic 时清理残留 tmp,避免堆积;成功 rename 后 tmp 已消失。
     let res = (|| -> std::io::Result<()> {
         // 目标文件权限继承自 tmp(rename 顶替)。unix 下按 0600 建 tmp:文件里是全部账号的
@@ -213,7 +223,7 @@ pub fn save(path: &str, creds: &[Credential]) -> anyhow::Result<()> {
         {
             use std::io::Write;
             let mut w = std::io::BufWriter::new(&f);
-            w.write_all(&data)?;
+            w.write_all(data)?;
             w.flush()?;
         }
         f.sync_all()?; // fsync:确保数据真正落盘,再做 rename
@@ -223,9 +233,9 @@ pub fn save(path: &str, creds: &[Credential]) -> anyhow::Result<()> {
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    // best-effort 清理孤儿 tmp(不影响本次 save 结果)。
+    // best-effort 清理孤儿 tmp(不影响本次写结果)。
     sweep_stale_tmp(path);
-    res.map_err(Into::into)
+    res
 }
 
 /// 账号 id 高水位的旁挂文件路径:`{path}.next-id`。
@@ -247,8 +257,16 @@ pub fn load_next_id(path: &str) -> Option<u64> {
 
 /// 落盘账号 id 高水位。best-effort:写失败只记 warn、不使凭据落盘失败——退化后果仅是
 /// 重启后可能复用已删除账号的编号,而凭据本身必须先写成功。
+///
+/// **必须与 credentials.json 本体同规格走 [`atomic_write`]**(tmp + fsync + rename),不能用裸
+/// `std::fs::write`:后者先把目标文件截断到 0 再写,而本函数在每次令牌刷新时都会被调用
+/// (`ensure_fresh` 每刷一次就落一次盘,生产上约千个账号即高频重复),崩溃/掉电落在那个窗口
+/// 就留下 0 字节或半截文件。读回时 [`load_next_id`] 解析不出 → 回落 `None` → 池退化成
+/// `max(现有 id)+1`:若被删掉的恰是编号最大的账号,下一个新账号就拿回它的编号,继承其
+/// 用量记录、并可能被旧令牌写回覆盖。fsync 后 rename 则保证任何时刻读到的要么是旧值、
+/// 要么是新值,绝不会是半截。
 pub fn save_next_id(path: &str, next_id: u64) {
-    if let Err(e) = std::fs::write(next_id_path(path), next_id.to_string()) {
+    if let Err(e) = atomic_write(&next_id_path(path), next_id.to_string().as_bytes()) {
         tracing::warn!("持久化账号 id 高水位失败(重启后可能复用已删除的账号编号): {e}");
     }
 }
@@ -602,6 +620,55 @@ mod tests {
 
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(next_id_path(&p));
+    }
+
+    /// 关键回归:账号 id 高水位必须**原子**落盘(tmp + fsync + rename),不能用裸 `fs::write`。
+    ///
+    /// 判据取 inode:rename 顶替会换一个 inode,就地截断写(`fs::write`/`File::create`)则 inode 不变。
+    /// 就地写意味着"先截断到 0 再写"——本函数每次令牌刷新都跑,崩溃/掉电落在那个窗口就留下 0 字节
+    /// 文件,重启后高水位丢失、已删除账号的编号被复用(新账号继承旧账号的用量,并可能被旧令牌覆盖)。
+    #[cfg(unix)]
+    #[test]
+    fn save_next_id_replaces_atomically_instead_of_truncating_in_place() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "kiro2api_cred_nextid_atomic_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let p = path.to_str().unwrap().to_string();
+        let sidecar = next_id_path(&p);
+        let _ = std::fs::remove_file(&sidecar);
+
+        save_next_id(&p, 41);
+        let ino_first = std::fs::metadata(&sidecar).unwrap().ino();
+        save_next_id(&p, 42);
+        let ino_second = std::fs::metadata(&sidecar).unwrap().ino();
+        assert_ne!(
+            ino_first, ino_second,
+            "覆盖写必须经 tmp+rename 顶替;inode 不变 = 就地截断写,崩溃窗口内会留下 0 字节高水位文件"
+        );
+        assert_eq!(load_next_id(&p), Some(42), "内容仍须是最新高水位");
+
+        // 成功路径不得留下 tmp 残渣(否则数据盘上会随每次令牌刷新堆积)。
+        let prefix = format!(
+            "{}.tmp.",
+            std::path::Path::new(&sidecar)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+        );
+        let residue = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(prefix.as_str()));
+        assert!(!residue, "落盘成功后不应残留 {prefix}*");
+
+        let _ = std::fs::remove_file(&sidecar);
     }
 
     /// 契约 §7:真机 credentials.json 里绝大多数账号没有 `region` 键(只带

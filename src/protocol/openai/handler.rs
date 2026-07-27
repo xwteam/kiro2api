@@ -201,6 +201,32 @@ pub(crate) fn relay_error_to_openai(e: RelayError) -> Response {
     (status, Json(body)).into_response()
 }
 
+/// 请求体解析失败(axum `Json` 提取器拒收)→ OpenAI 形状的 400 错误体。
+///
+/// 为什么不能用 axum 的默认拒收响应:那是 `422` + `content-type: text/plain` 的一行英文
+/// ("Failed to deserialize the JSON body into the target type: ..."),而 OpenAI 生态的客户端
+/// (官方 SDK / LangChain / 各类前端)一律按 `error.message` / `error.type` 解析错误体 ——
+/// 拿到纯文本会在解析处二次抛错,把"少传了 messages 字段"这种一眼可修的参数问题变成
+/// 客户端内部的 JSONDecodeError,调用方完全看不到真正原因。
+///
+/// 口径与 `/v1/messages` 的同类处理保持一致(见 `anthropic::handler::messages`):
+/// 一律回 **400**(参数错误)并把 axum 的诊断文案原样放进 `message` —— 那句文案会点名具体是哪个
+/// 字段/哪种类型不对,是调用方唯一能据以自查的线索,且不含任何令牌或内部实现细节。
+///
+/// `pub(crate)`:Responses 协议(`/v1/responses`)复用同一形状,不另起第二份。
+pub(crate) fn json_rejection_to_openai(
+    rejection: axum::extract::rejection::JsonRejection,
+) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": rejection.body_text(),
+            "type": "invalid_request_error",
+            "code": null,
+        },
+    });
+    (axum::http::StatusCode::BAD_REQUEST, Json(body)).into_response()
+}
+
 /// 由 HTTP 状态码派生 OpenAI 错误体的 `type`(客户端按它区分限流/鉴权/参数类错误)。
 fn openai_error_kind(status: u16) -> &'static str {
     match status {
@@ -477,13 +503,20 @@ pub async fn chat_completions_stream(
 /// 鉴权闸(见 `server::auth`)命中 store key 时会把 [`ApiKeyId`] 塞进请求扩展;全局 key/开放
 /// 模式下扩展缺失,归属 id 记 0。两条路径(流式/非流式)都必须带上它,否则该 key 的用量与
 /// 消费上限形同虚设。
+///
+/// 请求体以 `Result<Json<..>, JsonRejection>` 提取:解析失败时回 OpenAI 形状的 400 错误体
+/// (见 [`json_rejection_to_openai`]),而不是 axum 默认的纯文本 422 —— 后者 SDK 解析不了。
 pub async fn chat_completions(
     State(state): State<MessagesState>,
     connect_info: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: axum::http::HeaderMap,
     api_key_id: Option<axum::Extension<ApiKeyId>>,
-    Json(req): Json<ChatCompletionRequest>,
+    payload: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let req = match payload {
+        Ok(Json(req)) => req,
+        Err(rejection) => return json_rejection_to_openai(rejection),
+    };
     let api_key_id = api_key_id.and_then(|axum::Extension(k)| k.0).unwrap_or(0);
     let now = now_unix();
     let created = now;
@@ -695,6 +728,62 @@ mod tests {
         let mut st = state(server_uri, creds);
         st.stats = crate::stats::StatsManager::load_from_dir(dir);
         st
+    }
+
+    /// 关键回归:请求体解析不了时必须回 **OpenAI 形状的 JSON 错误体**,不能是 axum 默认的
+    /// `422 text/plain`。OpenAI 生态的客户端一律按 `error.message`/`error.type` 解析错误,
+    /// 拿到纯文本会在解析处二次抛错(JSONDecodeError),把"少传 messages"这种一眼可修的
+    /// 参数问题变成客户端内部错误,调用方看不到真正原因。
+    ///
+    /// 覆盖三种真实坏法:缺必填字段、tagged enum 落到未知分支(OpenAI 新内容类型 /
+    /// 误贴 Anthropic 的 block)、以及整体不是合法 JSON。
+    #[tokio::test]
+    async fn chat_completions_malformed_body_returns_openai_json_error() {
+        let server = MockServer::start().await;
+        // 上游不挂任何 Mock:请求本就不该抵达上游。
+        let bad_bodies = [
+            // 缺必填 messages。
+            r#"{"model":"claude-sonnet-4.5"}"#,
+            // content part 是 tagged enum,没有兜底分支:未知 type 直接反序列化失败。
+            r#"{"model":"claude-sonnet-4.5","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AA","format":"wav"}}]}]}"#,
+            // 整体不是合法 JSON。
+            r#"{"model":"claude-sonnet-4.5","messages":["#,
+        ];
+        for body in bad_bodies {
+            let app = openai_router(state(&server.uri(), vec![cred()]));
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body = {body}");
+            let ct = resp
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                ct.starts_with("application/json"),
+                "错误体必须是 JSON,实际 content-type = {ct}(body = {body})"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|e| panic!("错误体应能被 JSON 解析: {e}(body = {body})"));
+            assert_eq!(v["error"]["type"], "invalid_request_error", "body = {body}");
+            assert!(
+                v["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| !m.is_empty()),
+                "错误体须带可自查的文案: {v}(body = {body})"
+            );
+        }
     }
 
     #[tokio::test]

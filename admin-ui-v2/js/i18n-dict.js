@@ -259,6 +259,7 @@ window.I18N = {
   'edit.profileArnConfigured': { 'zh-CN': '已配置，留空不修改', 'zh-TW': '已配置，留空不修改', 'en': 'Configured; leave blank to keep', 'ja': '設定済み。空欄で変更しない', 'ko': '설정됨. 비워두면 유지' },
   'edit.weightInvalid':   { 'zh-CN': '权重必须是非负整数', 'zh-TW': '權重必須是非負整數', 'en': 'Weight must be a non-negative integer', 'ja': '重みは 0 以上の整数である必要があります', 'ko': '가중치는 0 이상의 정수여야 합니다' },
   'edit.noChanges':       { 'zh-CN': '没有需要更新的字段', 'zh-TW': '沒有需要更新的欄位', 'en': 'No fields to update', 'ja': '更新するフィールドがありません', 'ko': '업데이트할 필드가 없습니다' },
+  'edit.cannotClear':     { 'zh-CN': '昵称/邮箱不支持清空:留空表示“不修改”,请填入新的值', 'zh-TW': '暱稱/信箱不支援清空:留空表示「不修改」,請填入新的值', 'en': 'Nickname/email cannot be cleared: a blank field means “keep unchanged” — enter a new value instead', 'ja': 'ニックネーム/メールは空にできません。空欄は「変更しない」を意味します。新しい値を入力してください', 'ko': '닉네임/이메일은 비울 수 없습니다. 빈 칸은 “변경 안 함”을 의미하므로 새 값을 입력하세요' },
 
   // ---- Web Cookie import ----
   'webcookie.title':      { 'zh-CN': 'Web Cookie 导入', 'zh-TW': 'Web Cookie 匯入', 'en': 'Web Cookie Import', 'ja': 'Web Cookie インポート', 'ko': 'Web Cookie 가져오기' },
@@ -490,6 +491,7 @@ window.I18N = {
   'keyForm.acctN':        { 'zh-CN': '账号 #{n}', 'zh-TW': '帳號 #{n}', 'en': 'Account #{n}', 'ja': 'アカウント #{n}', 'ko': '계정 #{n}' },
   'keyForm.create':       { 'zh-CN': '创建', 'zh-TW': '建立', 'en': 'Create', 'ja': '作成', 'ko': '생성' },
   'keyForm.createFailed': { 'zh-CN': '创建失败', 'zh-TW': '建立失敗', 'en': 'Creation failed', 'ja': '作成に失敗しました', 'ko': '생성 실패' },
+  'keyForm.saveFailed':   { 'zh-CN': '保存失败', 'zh-TW': '儲存失敗', 'en': 'Save failed', 'ja': '保存に失敗しました', 'ko': '저장 실패' },
 
   // ---- Usage summary / records ----
   'usg.totalRequests':    { 'zh-CN': '总请求数', 'zh-TW': '總請求數', 'en': 'Total Requests', 'ja': '総リクエスト数', 'ko': '총 요청 수' },

@@ -7,8 +7,10 @@
      - Playground / relay calls: base '/v1', authenticated with the master
        key via `Authorization: Bearer` (localStorage 'kiro2api_master_key').
 
-   On 401/403 from an admin call the session is cleared and the login overlay
-   is shown (app.js registers the handler as K.api.onUnauthorized). */
+   On 401 from an admin call the session is cleared and the login overlay is
+   shown (app.js registers the handler as K.api.onUnauthorized). 403 is NOT a
+   session error here — the admin auth gate only ever answers 401; a 403 comes
+   from business logic (登录被拒绝),so it surfaces as a normal ApiError. */
 (function () {
   'use strict';
 
@@ -84,7 +86,16 @@
       throw new ApiError(0, tr('common.error', 'Network error'));
     }
 
-    if (res.status === 401 || res.status === 403) {
+    // 只有 401 代表「管理员密钥无效」——鉴权闸(src/server/auth.rs 的
+    // require_api_key)拒绝请求时恒回 401,不会回 403。
+    //
+    // 403 在 /api/admin 下是**业务拒绝**,唯一来源是登录流程:用户在 AWS 设备页
+    // 点了「拒绝」(或上游回 access_denied)→ LoginError::Denied →
+    // login_upstream_error 回 403 +「授权被拒绝」(src/admin/handler.rs)。老写法
+    // 把 403 也当成掉线:清掉本地钥匙、弹登录浮层、拆掉当前分区,还把真正的原因
+    // 替换成「管理员密钥无效」——管理员只是拒绝了一次授权,却被踢出后台并被告知
+    // 钥匙坏了。所以 403 一律往下走普通错误分支,把后端的 error 文案原样抛给调用方。
+    if (res.status === 401) {
       setAdminKey('');
       if (typeof Api.onUnauthorized === 'function') Api.onUnauthorized();
       throw new ApiError(res.status, tr('login.error', 'Unauthorized'));

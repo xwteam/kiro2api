@@ -502,7 +502,10 @@ curl -X POST "http://localhost:8080/gemini/v1beta/models/claude-sonnet-4.5:strea
 
 ## 관리 API
 
-`/admin` 관리 패널은 `/api/admin/*` API로 구동됩니다. 아래 엔드포인트는 모두 `adminApiKey`(미설정 시 `apiKey`로 대체. 둘 다 비어 있으면 관리 API가 개방되므로 그 상태로 외부에 노출하지 마십시오)로 인증됩니다. 응답 본문은 모두 camelCase이며 **access/refresh 토큰이나 비밀 키를 절대 포함하지 않습니다**.
+`/admin` 관리 패널은 `/api/admin/*` API로 구동됩니다. 아래 엔드포인트는 모두 `adminApiKey`(미설정 시 `apiKey`로 대체. 둘 다 비어 있으면 관리 API가 개방되므로 그 상태로 외부에 노출하지 마십시오)로 인증됩니다. 응답 본문은 모두 camelCase이며 **계정의 access/refresh 토큰은 절대 포함하지 않습니다**(`GET /api/admin/credentials`는 상태만 반환).
+
+> [!WARNING]
+> 관리 API 응답이 비밀 정보를 담지 않는 것은 **아닙니다**. `GET`/`POST /api/admin/api-keys`의 `key` 필드는 **완전한 평문**이고, `GET /api/admin/server-info`의 `masterApiKey`도 **완전한 평문**입니다. 마스킹되는 것은 `GET /api/admin/config/auth-keys`와 `GET /api/admin/config`뿐입니다. 읽기 전용 관리자 역할이 없으므로 관리 키를 가진 주체는 모든 key를 조회·생성·교체할 수 있습니다. 관리 API 응답은 비밀 정보로 취급하고 이슈·로그·서드파티 도구에 붙여넣지 마십시오.
 
 ### GET /api/admin/credentials
 
@@ -664,7 +667,7 @@ curl -X POST http://localhost:8080/api/admin/login/builderid/poll \
 
 ### GET /api/admin/api-keys
 
-발급된 대외 API Key 목록
+발급된 대외 API Key 목록. 응답의 `key` 필드는 **완전한 평문**입니다(패널이 브라우저에서 마스킹해 표시하지만 "복사" 버튼에는 실제 값이 필요).
 
 **요청**:
 
@@ -675,7 +678,7 @@ curl http://localhost:8080/api/admin/api-keys \
 
 ### POST /api/admin/api-keys
 
-API Key 발급
+API Key 발급. 응답에는 새 key가 **완전한 평문**으로 담깁니다(한 번에 복사해 전달하는 용도).
 
 **요청**:
 
@@ -806,7 +809,9 @@ curl http://localhost:8080/api/admin/config/auth-keys \
 
 ### GET /api/admin/server-info
 
-`{masterApiKey,version,kiroVersion}` 반환. `masterApiKey`는 **마스킹**(미설정 시 `null`), `version`은 kiro2api 버전, `kiroVersion`은 위장 상류 UA 버전.
+`{masterApiKey,version,kiroVersion,rustVersion,…}` 및 런타임 지표(`serverTime`, `serverTimeUnix`, `os`, `memoryUsedBytes`, `memoryTotalBytes`, `cpuPercent`, `runMode`, `pid`, `uptimeSecs`) 반환. `version`은 kiro2api 버전, `kiroVersion`은 위장 상류 UA 버전.
+
+`masterApiKey`는 설정된 `apiKey`의 **완전한 평문**(미설정 시 `null`)이며 여기서는 **마스킹되지 않습니다** — 패널이 브라우저에서 마스킹해 보여주고 "복사" 버튼은 실제 값을 사용합니다. 마스킹된 값이 필요하면 `GET /api/admin/config/auth-keys`를 사용하십시오.
 
 **요청**:
 

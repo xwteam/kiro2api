@@ -268,10 +268,14 @@
     renderChart();
   }
 
+  // 汇总请求失败时的卡片状态:**全部**回落 '—'。
+  // 老写法只有请求数/错误率/延迟回落 '—',费用和积分却印 fmtCost(0)/fmtCredits(0)
+  // ——「$0.0000 / 0.0000」和真实的"这段窗口没有花费"长得一模一样,统计接口挂掉
+  // 会被读成"没花钱"。没数据就要明说没数据,不能替后端编一个 0 出来。
   function renderSummaryError() {
     els.sumRequests.textContent = '—';
-    els.sumCost.textContent = fmtCost(0);
-    els.sumCredits.textContent = fmtCredits(0);
+    els.sumCost.textContent = '—';
+    els.sumCredits.textContent = '—';
     if (els.sumErrorRate) els.sumErrorRate.textContent = '—';
     if (els.sumLatency) els.sumLatency.textContent = '—';
     if (els.sumRotation) els.sumRotation.textContent = '—';

@@ -532,7 +532,10 @@ data: {"candidates":[{"content":{"role":"model","parts":[{"text":"!"}]}}]}
 
 ## Admin API
 
-The admin panel at `/admin` (a static SPA embedded via rust-embed) is backed by the `/api/admin/*` API. Every endpoint below is authenticated with `adminApiKey` (falling back to `apiKey` if unset; if both are empty the admin API is open — do not expose such a deployment). Auth is carried the same way as the protocol gate (`Authorization: Bearer` / `x-api-key` / `?token=`, or `?api_key=` for the SSE log stream that cannot set headers). All response bodies are camelCase and **never contain access/refresh tokens or secrets**.
+The admin panel at `/admin` (a static SPA embedded via rust-embed) is backed by the `/api/admin/*` API. Every endpoint below is authenticated with `adminApiKey` (falling back to `apiKey` if unset; if both are empty the admin API is open — do not expose such a deployment). Auth is carried the same way as the protocol gate (`Authorization: Bearer` / `x-api-key` / `?token=`, or `?api_key=` for the SSE log stream that cannot set headers). All response bodies are camelCase and **never contain account access/refresh tokens** (`GET /api/admin/credentials` exposes status only).
+
+> [!WARNING]
+> Admin responses are **not** secret-free. `GET`/`POST /api/admin/api-keys` return every outbound key as full plaintext in the `key` field, and `GET /api/admin/server-info` returns `masterApiKey` as full plaintext; only `GET /api/admin/config/auth-keys` and `GET /api/admin/config` are masked. There is no read-only admin role — anything holding the admin key can read, create and rotate every key. Treat admin responses as secrets: do not paste them into issues, logs or third-party tooling.
 
 ### GET /api/admin/credentials
 
@@ -709,12 +712,30 @@ curl -X POST http://localhost:8080/api/admin/login/sso-token \
 
 ### GET /api/admin/api-keys · POST /api/admin/api-keys
 
-List / create the outbound API keys you hand to callers.
+List / create the outbound API keys you hand to callers. Both responses carry each key's `key` field as **full plaintext** — the panel needs the real value for its copy button and masks it client-side only.
 
 **Request:**
 ```bash
 curl http://localhost:8080/api/admin/api-keys \
   -H "Authorization: Bearer sk-your-admin-key"
+```
+
+**Response:**
+```json
+[
+  {
+    "id": 1,
+    "key": "sk-c8a63d2e6323ca12efd128144f621e8f",
+    "name": "My Key",
+    "enabled": true,
+    "createdAt": "2026-07-25T12:00:00Z",
+    "expiresAt": null,
+    "spendingLimit": null,
+    "limitUnit": "usd",
+    "durationDays": null,
+    "activatedAt": null
+  }
+]
 ```
 
 ### PUT /api/admin/api-keys/{id} · DELETE /api/admin/api-keys/{id}
@@ -835,12 +856,26 @@ curl -X PUT http://localhost:8080/api/admin/config/auth-keys \
 
 ### GET /api/admin/server-info
 
-`{masterApiKey,version,kiroVersion}`. `masterApiKey` is **masked** (or `null` when unset), `version` is the kiro2api version, `kiroVersion` is the spoofed upstream UA version.
+`{masterApiKey,version,kiroVersion,rustVersion,…}` plus runtime metrics (`serverTime`, `serverTimeUnix`, `os`, `memoryUsedBytes`, `memoryTotalBytes`, `cpuPercent`, `runMode`, `pid`, `uptimeSecs`). `version` is the kiro2api version, `kiroVersion` is the spoofed upstream UA version.
+
+`masterApiKey` is the configured `apiKey` in **full plaintext** (`null` when unset) — it is **not** masked here; the panel masks it in the browser but its copy button needs the real value. Use `GET /api/admin/config/auth-keys` when you want the masked form.
 
 **Request:**
 ```bash
 curl http://localhost:8080/api/admin/server-info \
   -H "Authorization: Bearer sk-your-admin-key"
+```
+
+**Response** (abridged):
+```json
+{
+  "masterApiKey": "sk-your-master-key",
+  "version": "0.2.0",
+  "kiroVersion": "0.11.107",
+  "rustVersion": "1.90.0",
+  "runMode": "Docker",
+  "uptimeSecs": 3600
+}
 ```
 
 ### GET /api/admin/logs/stream · /snapshot · /download

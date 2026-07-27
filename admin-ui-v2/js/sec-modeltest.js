@@ -330,6 +330,10 @@
     els.key.disabled = true;
     paintKeyHint('error');
   }
+  // 有没有可选凭证:主 API Key 或已创建的密钥,任一即可。
+  // fillKeySelect/setSending 必须用同一把尺子,否则会出现"下拉框填好了却被禁用"。
+  function hasAnyKey() { return !!state.masterKey || state.keys.length > 0; }
+
   function fillKeySelect() {
     var prev = els.key.value;
     els.key.innerHTML = '';
@@ -638,7 +642,11 @@
     els.prompt.disabled = on;
     els.imageBtn.disabled = on;
     els.newChatBtn.disabled = on;
-    els.key.disabled = on || !state.keys.length;
+    // 只在"确实没有任何凭证"时才保持禁用。老写法只看 state.keys.length:只配了
+    // 主 API Key、一个密钥都没创建的实例(fillKeySelect 明确支持这种情况),
+    // 发完第一条消息后 setSending(false) 会把下拉框重新锁死,此后整场会话都
+    // 点不开、也看不出当前用的是哪把钥匙,只能去点 ↻ 重新加载才解锁。
+    els.key.disabled = on || !hasAnyKey();
     els.model.disabled = on || !state.models.length;
   }
 

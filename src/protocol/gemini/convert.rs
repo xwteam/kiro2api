@@ -1,5 +1,6 @@
 //! Gemini ↔ 中枢转换自写;形状照 Google 公开规范/中枢既有(`anthropic::types`)。
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use super::types::{
     Candidate, Content, FunctionCall, FunctionResponse, GenerateContentRequest,
@@ -10,6 +11,35 @@ use crate::protocol::anthropic::types::{
     Block, ContentIn, InMsg, MessagesRequest, MessagesResponse, OutBlock, SystemPrompt, ToolDef,
 };
 use serde_json::{Value, json};
+
+/// Gemini → 中枢转换的致命错误:必须让调用方回 400,而不是硬着头皮往上游发一个注定被拒的请求。
+///
+/// 与中枢侧 [`ConvertError`](crate::kiro::convert::ConvertError) 同一套立场:附件送不到模型手上时
+/// **明确报错、不静默丢弃**,否则调用方既看不到失败也不知道模型压根没收到东西。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GeminiConvertError {
+    /// `inlineData` 的 mimeType 不是 `image/*`(PDF / 音频 / 视频 …)。
+    /// Gemini 规范允许这些类型,但 Kiro 数据面只有图片通道,无从承载。
+    UnsupportedInlineData(String),
+}
+
+impl fmt::Display for GeminiConvertError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GeminiConvertError::UnsupportedInlineData(mime) => write!(
+                f,
+                "不支持的内联附件类型({mime});上游只接受 image/* 内联图片,PDF/音频/视频请改为文本或图片后再发送"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GeminiConvertError {}
+
+/// `inlineData.mimeType` 是否为图片。MIME type 按 RFC 大小写不敏感,故先小写化再判。
+fn is_image_mime(mime: &str) -> bool {
+    mime.to_ascii_lowercase().starts_with("image/")
+}
 
 /// 把中枢 `Value` 响应(工具执行结果)转成纯文本:字符串原样,其它类型 JSON 字符串化。
 fn response_value_to_text(v: &Value) -> Value {
@@ -99,47 +129,63 @@ impl ToolIdAlloc {
 }
 
 /// 把单个 Gemini `Part` 转换成 0~1 个中枢 `Block`;`ids` 供工具 part 取 `tool_use_id`。
-fn convert_part(part: &Part, ids: &mut ToolIdAlloc) -> Option<Block> {
+///
+/// `inlineData` **只认 `image/*`**:中枢的 `Block::Image` 会被
+/// [`image_from_source`](crate::kiro::convert) 以「去掉 `image/` 前缀」的方式推出 Kiro 的
+/// `format` 字段。若把 `application/pdf`(Gemini 规范明确支持的 inlineData 类型)也当图片转下去,
+/// 上游收到的就是 `images:[{"format":"application/pdf",…}]` —— Kiro 只认 jpeg/png/gif/webp,
+/// 结果是一个既不可读又无从归因的上游错误。故非图片类型在此就地报错,由 handler 回 400 说明真因。
+fn convert_part(part: &Part, ids: &mut ToolIdAlloc) -> Result<Option<Block>, GeminiConvertError> {
     if let Some(text) = &part.text {
-        return Some(Block::Text { text: text.clone() });
+        return Ok(Some(Block::Text { text: text.clone() }));
     }
     if let Some(inline) = &part.inline_data {
-        return Some(Block::Image {
-            source: json!({"type": "base64", "media_type": inline.mime_type, "data": inline.data}),
-        });
+        if !is_image_mime(&inline.mime_type) {
+            return Err(GeminiConvertError::UnsupportedInlineData(
+                inline.mime_type.clone(),
+            ));
+        }
+        // media_type 统一小写:下游按字面量 `image/` 前缀裁出 format,大写形(`IMAGE/PNG`)
+        // 裁不掉就会变成伪造的 format 值。
+        let media_type = inline.mime_type.to_ascii_lowercase();
+        return Ok(Some(Block::Image {
+            source: json!({"type": "base64", "media_type": media_type, "data": inline.data}),
+        }));
     }
     if let Some(call) = &part.function_call {
-        return Some(Block::ToolUse {
+        return Ok(Some(Block::ToolUse {
             id: ids.call_id(call),
             name: call.name.clone(),
             input: call.args.clone(),
-        });
+        }));
     }
     if let Some(resp) = &part.function_response {
-        return Some(Block::ToolResult {
+        return Ok(Some(Block::ToolResult {
             tool_use_id: ids.response_id(resp),
             content: response_value_to_text(&resp.response),
             is_error: None,
-        });
+        }));
     }
-    None
+    Ok(None)
 }
 
 /// 把单个 Gemini `Content` 转换成中枢 `InMsg`(role 映射:`"model"`→`"assistant"`,其余→`"user"`)。
-fn convert_content(content: &Content, ids: &mut ToolIdAlloc) -> InMsg {
+fn convert_content(content: &Content, ids: &mut ToolIdAlloc) -> Result<InMsg, GeminiConvertError> {
     let role = match content.role.as_deref() {
         Some("model") => "assistant",
         _ => "user",
     };
-    let blocks: Vec<Block> = content
-        .parts
-        .iter()
-        .filter_map(|p| convert_part(p, ids))
-        .collect();
-    InMsg {
+    // 逐个 part 转换:任一 part 致命出错就整条请求失败(不能只丢那一个 part,否则又回到静默丢附件)。
+    let mut blocks: Vec<Block> = Vec::with_capacity(content.parts.len());
+    for p in &content.parts {
+        if let Some(b) = convert_part(p, ids)? {
+            blocks.push(b);
+        }
+    }
+    Ok(InMsg {
         role: role.to_string(),
         content: ContentIn::Blocks(blocks),
-    }
+    })
 }
 
 /// 读出 `toolConfig.functionCallingConfig.mode`(统一成大写);缺失/形状不符 → `None`。
@@ -152,7 +198,12 @@ fn tool_calling_mode(tool_config: Option<&Value>) -> Option<String> {
 }
 
 /// 把 Gemini `GenerateContentRequest` 转换成中枢 `MessagesRequest`。
-pub fn gemini_to_hub(req: GenerateContentRequest, model: String) -> MessagesRequest {
+///
+/// 失败(见 [`GeminiConvertError`])时由调用方回 Gemini 形状的 400,不往上游发。
+pub fn gemini_to_hub(
+    req: GenerateContentRequest,
+    model: String,
+) -> Result<MessagesRequest, GeminiConvertError> {
     let system = req.system_instruction.as_ref().map(|sys| {
         sys.parts
             .iter()
@@ -163,15 +214,11 @@ pub fn gemini_to_hub(req: GenerateContentRequest, model: String) -> MessagesRequ
 
     let mut tool_ids = ToolIdAlloc::default();
     // 逐条推进轮次下标:无 id 的 functionResponse 据此优先配"最近一轮仍未被答"的同名调用。
-    let messages: Vec<InMsg> = req
-        .contents
-        .iter()
-        .enumerate()
-        .map(|(turn, c)| {
-            tool_ids.turn = turn;
-            convert_content(c, &mut tool_ids)
-        })
-        .collect();
+    let mut messages: Vec<InMsg> = Vec::with_capacity(req.contents.len());
+    for (turn, c) in req.contents.iter().enumerate() {
+        tool_ids.turn = turn;
+        messages.push(convert_content(c, &mut tool_ids)?);
+    }
 
     let mode = tool_calling_mode(req.tool_config.as_ref());
 
@@ -187,6 +234,12 @@ pub fn gemini_to_hub(req: GenerateContentRequest, model: String) -> MessagesRequ
             .collect()
     });
 
+    // `tools` 里只有内建工具条目(`googleSearch`/`codeExecution`/`urlContext`,本中转无从兑现)时
+    // 映射结果为空数组 —— 应如实归成"没有函数工具",而不是下发一个空 tools 让下游去猜。
+    if tools.as_ref().is_some_and(|t| t.is_empty()) {
+        tools = None;
+    }
+
     // `mode: "NONE"` = 本轮禁止调用函数。Kiro 数据面 wire 没有 tool_choice 之类的字段
     // (见 `kiro::convert::anthropic_to_kiro`),唯一能忠实兑现这个约束的手段就是不下发
     // 工具规格。`AUTO` 即默认行为;`ANY`(强制至少调一次)在 wire 上无从表达,只能照默认走。
@@ -199,7 +252,7 @@ pub fn gemini_to_hub(req: GenerateContentRequest, model: String) -> MessagesRequ
         .as_ref()
         .and_then(|g| g.max_output_tokens);
 
-    MessagesRequest {
+    Ok(MessagesRequest {
         model,
         system: system.map(SystemPrompt::Text),
         messages,
@@ -210,7 +263,7 @@ pub fn gemini_to_hub(req: GenerateContentRequest, model: String) -> MessagesRequ
         // Gemini 原始形状,直通只会让下游误以为已生效;而 Kiro 数据面 wire 本就没有对应字段,
         // 转发到底也是空转。唯一可兑现的 `NONE` 已在上面以「不下发工具」如实落地。
         tool_choice: None,
-    }
+    })
 }
 
 /// 把中枢 `stop_reason` 映射成 Gemini `finishReason`,流式复用。
@@ -354,7 +407,8 @@ mod tests {
                 generation_config: None,
             },
             "claude-sonnet-4.5".to_string(),
-        );
+        )
+        .expect("转换应成功");
 
         let ContentIn::Blocks(call_blocks) = &hub.messages[0].content else {
             panic!("模型消息应为块数组");
@@ -449,7 +503,8 @@ mod tests {
                 generation_config: None,
             },
             "claude-sonnet-4.5".to_string(),
-        );
+        )
+        .expect("转换应成功");
         let ContentIn::Blocks(blocks) = &hub.messages[3].content else {
             panic!("最后一条应为块数组");
         };
@@ -512,7 +567,8 @@ mod tests {
                 generation_config: None,
             },
             "claude-sonnet-4.5".to_string(),
-        );
+        )
+        .expect("转换应成功");
         let ContentIn::Blocks(blocks) = &hub.messages[1].content else {
             panic!("结果消息应为块数组");
         };
@@ -547,7 +603,7 @@ mod tests {
             tool_config: None,
             generation_config: None,
         };
-        let hub = gemini_to_hub(req, "claude-sonnet-4.5".to_string());
+        let hub = gemini_to_hub(req, "claude-sonnet-4.5".to_string()).expect("转换应成功");
         assert_eq!(hub.system.as_ref().map(|s| s.text()).as_deref(), Some("s"));
         let last = hub.messages.last().expect("应有消息");
         assert_eq!(last.role, "user");
@@ -570,7 +626,7 @@ mod tests {
             tool_config: None,
             generation_config: None,
         };
-        let hub = gemini_to_hub(req, "m".to_string());
+        let hub = gemini_to_hub(req, "m".to_string()).expect("转换应成功");
         let tools = hub.tools.expect("tools 应存在");
         assert_eq!(tools[0].name, "get_weather");
         assert_eq!(tools[0].description.as_deref(), Some("d"));
@@ -597,7 +653,7 @@ mod tests {
             tool_config: None,
             generation_config: None,
         };
-        let hub = gemini_to_hub(req, "m".to_string());
+        let hub = gemini_to_hub(req, "m".to_string()).expect("转换应成功");
         assert_eq!(hub.messages[0].role, "assistant");
         assert_eq!(hub.messages[0].text(), "hey");
     }
@@ -624,7 +680,7 @@ mod tests {
             tool_config: None,
             generation_config: None,
         };
-        let hub = gemini_to_hub(req, "m".to_string());
+        let hub = gemini_to_hub(req, "m".to_string()).expect("转换应成功");
         match &hub.messages[0].content {
             ContentIn::Blocks(blocks) => match &blocks[0] {
                 Block::ToolUse { id, name, input } => {
@@ -662,7 +718,7 @@ mod tests {
             tool_config: None,
             generation_config: None,
         };
-        let hub = gemini_to_hub(req, "m".to_string());
+        let hub = gemini_to_hub(req, "m".to_string()).expect("转换应成功");
         let ContentIn::Blocks(blocks) = &hub.messages[0].content else {
             panic!("应为 Blocks");
         };
@@ -713,7 +769,7 @@ mod tests {
             tool_config: None,
             generation_config: None,
         };
-        let hub = gemini_to_hub(req, "m".to_string());
+        let hub = gemini_to_hub(req, "m".to_string()).expect("转换应成功");
         let ContentIn::Blocks(call_blocks) = &hub.messages[0].content else {
             panic!("应为 Blocks");
         };
@@ -768,7 +824,7 @@ mod tests {
             tool_config: None,
             generation_config: None,
         };
-        let hub = gemini_to_hub(req, "m".to_string());
+        let hub = gemini_to_hub(req, "m".to_string()).expect("转换应成功");
         let ContentIn::Blocks(call_blocks) = &hub.messages[0].content else {
             panic!("应为 Blocks");
         };
@@ -807,7 +863,7 @@ mod tests {
             tool_config: None,
             generation_config: None,
         };
-        let hub = gemini_to_hub(req, "m".to_string());
+        let hub = gemini_to_hub(req, "m".to_string()).expect("转换应成功");
         match &hub.messages[0].content {
             ContentIn::Blocks(blocks) => match &blocks[0] {
                 Block::ToolResult {
@@ -849,7 +905,7 @@ mod tests {
             tool_config: None,
             generation_config: None,
         };
-        let hub = gemini_to_hub(req, "m".to_string());
+        let hub = gemini_to_hub(req, "m".to_string()).expect("转换应成功");
         match &hub.messages[0].content {
             ContentIn::Blocks(blocks) => match &blocks[0] {
                 Block::ToolResult { content, .. } => assert_eq!(content, "ok"),
@@ -879,7 +935,7 @@ mod tests {
             tool_config: None,
             generation_config: None,
         };
-        let hub = gemini_to_hub(req, "m".to_string());
+        let hub = gemini_to_hub(req, "m".to_string()).expect("转换应成功");
         match &hub.messages[0].content {
             ContentIn::Blocks(blocks) => match &blocks[0] {
                 Block::Image { source } => {
@@ -903,7 +959,7 @@ mod tests {
                 max_output_tokens: Some(256),
             }),
         };
-        let hub = gemini_to_hub(req, "m".to_string());
+        let hub = gemini_to_hub(req, "m".to_string()).expect("转换应成功");
         assert_eq!(hub.max_tokens, Some(256));
         assert_eq!(hub.stream, None);
     }
@@ -982,7 +1038,7 @@ mod tests {
             tool_config: Some(json!({"functionCallingConfig": {"mode": "ANY"}})),
             generation_config: None,
         };
-        let hub = gemini_to_hub(req, "m".to_string());
+        let hub = gemini_to_hub(req, "m".to_string()).expect("转换应成功");
         assert_eq!(hub.tool_choice, None);
         // ANY 无从在 wire 上表达,工具照常下发。
         assert_eq!(hub.tools.expect("tools 应存在").len(), 1);
@@ -1004,7 +1060,7 @@ mod tests {
             tool_config: Some(json!({"functionCallingConfig": {"mode": "none"}})),
             generation_config: None,
         };
-        let hub = gemini_to_hub(req, "m".to_string());
+        let hub = gemini_to_hub(req, "m".to_string()).expect("转换应成功");
         assert_eq!(hub.tools, None);
         assert_eq!(hub.tool_choice, None);
     }
@@ -1047,6 +1103,129 @@ mod tests {
             finish_reason_for_truncation(Some(Truncation::ContextWindow)),
             "MAX_TOKENS"
         );
+    }
+
+    /// 回归:非 `image/*` 的 `inlineData`(Gemini 规范明确支持 PDF/音频/视频)不得被当图片转下去。
+    ///
+    /// 中枢的 `Block::Image` 会被下游按「去掉 `image/` 前缀」推出 Kiro 的 `format`,故
+    /// `application/pdf` 会变成 `images:[{"format":"application/pdf",…}]` —— Kiro 只认
+    /// jpeg/png/gif/webp,调用方拿到的是一个无从归因的上游错误。必须就地报错。
+    #[test]
+    fn non_image_inline_data_is_rejected_not_forwarded_as_image() {
+        for mime in ["application/pdf", "audio/mp3", "video/mp4", "text/plain"] {
+            let req = GenerateContentRequest {
+                contents: vec![Content {
+                    role: Some("user".to_string()),
+                    parts: vec![Part {
+                        text: None,
+                        inline_data: Some(InlineData {
+                            mime_type: mime.to_string(),
+                            data: "JVBERi0".to_string(),
+                        }),
+                        function_call: None,
+                        function_response: None,
+                    }],
+                }],
+                system_instruction: None,
+                tools: None,
+                tool_config: None,
+                generation_config: None,
+            };
+            let err = gemini_to_hub(req, "m".to_string())
+                .expect_err("非图片内联附件必须报错,而不是伪装成图片发上游");
+            assert_eq!(
+                err,
+                GeminiConvertError::UnsupportedInlineData(mime.to_string())
+            );
+            // 错误文案要点名真凶(mimeType),否则调用方无从归因。
+            assert!(err.to_string().contains(mime), "错误文案应含 {mime}");
+        }
+    }
+
+    /// 图片 `inlineData` 的 mimeType 大小写不敏感:`IMAGE/PNG` 既不能被误判成"非图片"而报错,
+    /// 也不能原样带着大写前缀下发(下游按字面量 `image/` 裁 format,裁不掉就成了伪造值)。
+    #[test]
+    fn image_inline_data_mime_is_case_insensitive_and_normalized() {
+        let req = GenerateContentRequest {
+            contents: vec![Content {
+                role: Some("user".to_string()),
+                parts: vec![Part {
+                    text: None,
+                    inline_data: Some(InlineData {
+                        mime_type: "IMAGE/PNG".to_string(),
+                        data: "AAAA".to_string(),
+                    }),
+                    function_call: None,
+                    function_response: None,
+                }],
+            }],
+            system_instruction: None,
+            tools: None,
+            tool_config: None,
+            generation_config: None,
+        };
+        let hub = gemini_to_hub(req, "m".to_string()).expect("图片附件应转换成功");
+        let ContentIn::Blocks(blocks) = &hub.messages[0].content else {
+            panic!("应为 Blocks");
+        };
+        match &blocks[0] {
+            Block::Image { source } => assert_eq!(source["media_type"], "image/png"),
+            other => panic!("应为 Image,实际: {other:?}"),
+        }
+    }
+
+    /// 回归:`tools` 里只有内建工具条目(`googleSearch` 等)时,函数工具应归成 `None`,
+    /// 而不是一个空数组。空数组会让下游得靠"长度是否为 0"去猜意图。
+    #[test]
+    fn builtin_only_tools_map_to_no_tools() {
+        let raw = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tools":[{"googleSearch":{}}]}"#;
+        let req: GenerateContentRequest = serde_json::from_str(raw).expect("内建工具条目应能解析");
+        let hub = gemini_to_hub(req, "m".to_string()).expect("转换应成功");
+        assert_eq!(hub.tools, None);
+    }
+
+    /// 回归:内建工具与函数声明混发时,函数声明必须完整保留。
+    #[test]
+    fn builtin_mixed_with_function_declarations_keeps_functions() {
+        let raw = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tools":[{"functionDeclarations":[{"name":"f"}]},{"codeExecution":{}}]}"#;
+        let req: GenerateContentRequest = serde_json::from_str(raw).expect("混发应能解析");
+        let hub = gemini_to_hub(req, "m".to_string()).expect("转换应成功");
+        let tools = hub.tools.expect("函数工具应保留");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "f");
+    }
+
+    /// 回归:snake_case(proto 原名)请求全链路走通 —— 系统提示、图片、maxOutputTokens
+    /// 都必须真正落到中枢请求上,而不是被 serde 当未知字段静默丢掉。
+    #[test]
+    fn snake_case_request_survives_conversion() {
+        let raw = r#"{
+            "contents":[{"role":"user","parts":[
+                {"text":"hi"},
+                {"inline_data":{"mime_type":"image/png","data":"AAAA"}}
+            ]}],
+            "system_instruction":{"parts":[{"text":"be brief"}]},
+            "generation_config":{"max_output_tokens":128}
+        }"#;
+        let req: GenerateContentRequest = serde_json::from_str(raw).expect("解析失败");
+        let hub = gemini_to_hub(req, "m".to_string()).expect("转换应成功");
+        assert_eq!(
+            hub.system.as_ref().map(|s| s.text()).as_deref(),
+            Some("be brief"),
+            "snake_case system_instruction 必须落到中枢 system,否则系统提示整段丢失"
+        );
+        assert_eq!(hub.max_tokens, Some(128));
+        let ContentIn::Blocks(blocks) = &hub.messages[0].content else {
+            panic!("应为 Blocks");
+        };
+        assert_eq!(blocks.len(), 2, "文本 + 图片两块都要在;实际:{blocks:?}");
+        match &blocks[1] {
+            Block::Image { source } => {
+                assert_eq!(source["media_type"], "image/png");
+                assert_eq!(source["data"], "AAAA");
+            }
+            other => panic!("应为 Image,实际: {other:?}"),
+        }
     }
 
     #[test]

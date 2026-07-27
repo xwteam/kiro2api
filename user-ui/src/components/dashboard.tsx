@@ -18,7 +18,7 @@ interface DashboardProps {
 
 export function Dashboard({ onLogout }: DashboardProps) {
   const [showLog, setShowLog] = useState(false)
-  const { data, isLoading, refetch, isRefetching } = useQuery({
+  const { data, isLoading, isError, refetch, isRefetching } = useQuery({
     queryKey: ['usage'],
     queryFn: getUsage,
     refetchInterval: 30000,
@@ -45,23 +45,48 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const isCredits = data?.limitUnit === 'credits'
   const usedAmount = isCredits ? data?.totalCredits ?? 0 : data?.totalCost ?? 0
 
+  // 「有没有设上限」必须用 != null 判断，不能用真值判断。
+  // 后端把「不限额」表示为 null，而 spendingLimit = 0 是一种真实配置（冻结这把 key）：
+  // 鉴权闸对 Some(0.0) 会把每一发请求都以 402 拒掉。旧写法 `data.spendingLimit &&`
+  // 让 0 和 null 无法区分 —— 额度条整块不渲染、状态还是绿色「正常」，用户看到一把
+  // 健康的 key，实际 100% 的调用都被拒绝。
+  const hasSpendingLimit = data?.spendingLimit != null
+  const spendingLimit = data?.spendingLimit ?? 0
+
   const getStatusBadge = () => {
+    // 轮询失败时 react-query 会保留上一次成功的 data，此时继续显示绿色「正常」等于
+    // 给用户一块过期的牌子。401（key 失效）由 api 层统一踢回登录页，这里兜住其余错误
+    // （断网、后端 5xx 等），至少让用户知道这些数字已经不是实时的。
+    if (isError) return <Badge variant="warning">连接异常</Badge>
     if (!data) return null
     if (data.expiresAt) {
       const expired = new Date(data.expiresAt) < new Date()
       if (expired) return <Badge variant="destructive">已过期</Badge>
     }
-    if (data.spendingLimit && usedAmount >= data.spendingLimit) {
+    if (hasSpendingLimit && usedAmount >= spendingLimit) {
       return <Badge variant="destructive">额度已用完</Badge>
     }
     return <Badge variant="success">正常</Badge>
   }
 
-  const spendingPercent = data?.spendingLimit
-    ? Math.min((usedAmount / data.spendingLimit) * 100, 100)
+  const spendingPercent = hasSpendingLimit
+    // 上限为 0 时 used/limit 会算出 NaN(0/0) 或 Infinity，Progress 会画歪，直接按 100% 处理。
+    ? spendingLimit > 0
+      ? Math.min((usedAmount / spendingLimit) * 100, 100)
+      : 100
     : null
 
   const formatLimitAmount = (n: number) => (isCredits ? n.toFixed(2) : formatCost(n))
+
+  // durationDays 是小数天（后端允许 0.25 = 6 小时这类「时卡」），按量级换单位，
+  // 免得界面上出现「0.25 天」。
+  const formatDuration = (days: number) => {
+    if (days <= 0) return '立即到期'
+    if (days >= 1) return `${Number(days.toFixed(2))} 天`
+    const hours = days * 24
+    if (hours >= 1) return `${Number(hours.toFixed(1))} 小时`
+    return `${Math.round(hours * 60)} 分钟`
+  }
 
   if (isLoading) {
     return (
@@ -111,6 +136,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
       </header>
 
       <main className="max-w-4xl mx-auto px-4 py-6 space-y-6">
+        {/* 首次加载就失败时 data 是 undefined，下面所有卡片都不渲染 —— 不给提示的话
+            用户看到的是一片空白，还以为面板坏了。 */}
+        {isError && !data && (
+          <Card>
+            <CardContent className="py-12 text-center text-muted-foreground space-y-3">
+              <div>无法获取用量数据，请检查网络后重试</div>
+              <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isRefetching}>
+                重试
+              </Button>
+            </CardContent>
+          </Card>
+        )}
+
         {/* Key 信息 */}
         {data && (
           <Card>
@@ -134,15 +172,25 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     到期时间: {formatDate(data.expiresAt)}
                   </div>
                 )}
+                {/* 惰性「N 天卡」在第一次调用之前 activatedAt / expiresAt 都是 null，
+                    只有 durationDays 有值。旧版这两行都不渲染、durationDays 又从没被用过，
+                    于是买家打开面板只看得到一个名字，完全不知道自己买的卡有多久、
+                    什么时候开始计时。 */}
+                {data.durationDays != null && !data.activatedAt && (
+                  <div className="col-span-2 flex items-center gap-2 text-muted-foreground">
+                    <Clock className="h-3.5 w-3.5 shrink-0" />
+                    有效期: {formatDuration(data.durationDays)}（首次调用后开始计时）
+                  </div>
+                )}
               </div>
-              {/* 额度进度条 */}
-              {data.spendingLimit && spendingPercent !== null && (
+              {/* 额度进度条：用 hasSpendingLimit 判断，spendingLimit=0（冻结）也要画出来 */}
+              {hasSpendingLimit && spendingPercent !== null && (
                 <div className="space-y-1.5">
                   <div className="flex justify-between text-sm">
                     <span className="text-muted-foreground">
                       额度使用{isCredits ? '（credits）' : ''}
                     </span>
-                    <span>{formatLimitAmount(usedAmount)} / {formatLimitAmount(data.spendingLimit)}</span>
+                    <span>{formatLimitAmount(usedAmount)} / {formatLimitAmount(spendingLimit)}</span>
                   </div>
                   <Progress value={spendingPercent} />
                 </div>

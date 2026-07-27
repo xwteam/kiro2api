@@ -177,6 +177,11 @@
   var langBound = false;
   var selectedIds = Object.create(null); // id -> true (selection set for batch actions)
   var balanceMap = Object.create(null);  // id -> balance response (for global-credits sum + per-row remaining)
+  // id -> 实时 RPM。GET /credentials 的 CredentialStatusItem **没有** rpm 字段
+  // (src/admin/handler.rs account_to_item),每账号 RPM 只在 GET /rpm 的
+  // byCredential 里。老写法直接读 acc.rpm,于是满载时每行也恒显示 0,
+  // 运维排查流量倾斜会误判成"所有账号都闲着"。
+  var rpmByCred = Object.create(null);
   var dailyToday = null;                  // today's usage/daily row (credits + cost)
   var queryingInfo = false;               // guards the "query info" fan-out
   var autoQueryToken = 0;                  // bumps to cancel an in-flight auto-query when the list reloads
@@ -314,6 +319,8 @@
       renderList();
       renderStats();
       updateBatchBar();
+      // 每账号 RPM — best-effort,单独一发 /rpm(列表接口不带这个字段)
+      loadRpm();
       // today's usage/daily row — best-effort, refreshes the 今日用量 card
       api.get('/usage/daily').then(function (d) {
         var rows = (d && (d.daily || d.days || d.data)) || (Array.isArray(d) ? d : []);
@@ -328,6 +335,32 @@
     }).catch(function (e) {
       api.toast(e.message || t('common.error'), 'error');
       if (list) { list.innerHTML = ''; list.appendChild(elI18n('div', 'empty-state', 'common.error')); if (K.i18n) K.i18n.apply(list); }
+    });
+  }
+
+  // 每账号实时 RPM(近 60s):GET /rpm → { global, byCredential, byApiKey }。
+  // best-effort:失败就保留上一份快照(首次失败时各行回落 0),不打扰用户 —— 列表
+  // 本身已经渲染完了,RPM 只是其中一格。只改在屏行的数字、不整表重绘,免得打断
+  // 正在勾选/正在内联改优先级的操作。
+  function loadRpm() {
+    return api.get('/rpm').then(function (rd) {
+      rd = rd || {};
+      var by = rd.byCredential || rd.by_credential || {};
+      var next = Object.create(null);
+      Object.keys(by).forEach(function (k) { next[k] = by[k]; });
+      rpmByCred = next;
+      paintRpmCells();
+    }).catch(function () { /* silent: 各行回落 0 */ });
+  }
+
+  // 把最新 RPM 刷进已渲染的行(每行的 RPM 数字格带 data-rpm-cell)。
+  function paintRpmCells() {
+    var rows = document.querySelectorAll('.account-row[data-acct-id]');
+    if (!rows || !rows.length) return;
+    Array.prototype.forEach.call(rows, function (row) {
+      var id = row.getAttribute('data-acct-id');
+      var cell = row.querySelector('.stat-n[data-rpm-cell]');
+      if (id != null && cell) cell.textContent = fmtInt(rpmOf(id));
     });
   }
 
@@ -500,7 +533,10 @@
     thrStat.classList.add('is-link');
     thrStat.addEventListener('click', function () { showLogs(acc, 'throttle'); });
     statLine.appendChild(thrStat);
-    statLine.appendChild(stat('accounts.col.rpm', fmtInt(acc.rpm || acc.requestsPerMinute || 0), 'info'));
+    // RPM 只能来自 /rpm 的 byCredential 快照(见 rpmByCred 的注释);拿不到时才回落 0。
+    var rpmStat = stat('accounts.col.rpm', fmtInt(rpmOf(acc.id)), 'info');
+    rpmStat.querySelector('.stat-n').dataset.rpmCell = '1';
+    statLine.appendChild(rpmStat);
     var cachedBal = balanceMap[String(acc.id)];
     var balStat = stat('acc.colRemaining',
       (cachedBal && cachedBal.remaining != null) ? fmtCredits(cachedBal.remaining) : t('common.unset'),
@@ -545,6 +581,12 @@
   }
 
   function padId(id) { var s = String(id); return s.length >= 3 ? s : ('000' + s).slice(-3); }
+
+  // 单账号 RPM:只认 /rpm 快照里的值(id 在 byCredential 里是字符串键)。
+  function rpmOf(id) {
+    var v = rpmByCred[String(id)];
+    return v != null ? v : 0;
+  }
 
   function stat(labelKey, valueText, kind) {
     var s = el('div', 'account-stat ' + (kind || 'neutral'));
@@ -724,6 +766,9 @@
     opts = opts || {};
     var enabled = accounts.filter(function (a) { return !a.disabled; });
     if (!enabled.length) {
+      // 一个可查的账号都没有也要解禁按钮:调用方(queryAllInfo)点下去的那一刻就
+      // 先把按钮禁掉了,这里不放开就永远灰着。
+      if (opts.btn) opts.btn.disabled = false;
       if (opts.toast) api.toast(t('common.empty'), 'info');
       if (opts.onDone) opts.onDone();
       return;
@@ -787,12 +832,27 @@
   }
 
   // 查询信息 — manual refresh of all enabled-account balances (toasts a summary).
+  //
+  // 老写法开头是 `if (queryingInfo) return;`:进页面就会自动跑一轮扇出,上千个账号
+  // 串行要好几分钟,这几分钟里点「查询信息」直接静默返回 —— 不弹提示、按钮也不禁用
+  // (自动那轮没带 btn),看上去就是按钮坏了,运维只会一直点。现在改成**真的顶掉**
+  // 在飞的那一轮:先自增令牌作废它,再等它自己收工(它要等手上那一发请求落地才会
+  // 看到令牌变了),然后开新一轮。按钮从点击那一刻就禁用,用户立刻看得到反馈。
   function queryAllInfo(btn) {
-    if (queryingInfo) return;
-    // 手动这一轮**也要带令牌**:老写法 token 为 null,于是 runBalanceFanout 里两个
-    // 取消点对手动查询完全不生效 —— 离开页面/掉线都停不掉它。
-    var token = ++autoQueryToken; // supersede any in-flight auto-query
-    runBalanceFanout({ btn: btn, toast: true, token: token });
+    var token = ++autoQueryToken; // 作废在飞的自动/手动轮
+    if (btn) btn.disabled = true;
+    whenFanoutIdle(function () {
+      // 等待期间又被顶掉(离开页面 / 列表重载 / 再点一次)→ 本轮作废,按钮交还。
+      if (token !== autoQueryToken) { if (btn) btn.disabled = false; return; }
+      runBalanceFanout({ btn: btn, toast: true, token: token });
+    });
+  }
+
+  // 等到没有扇出在跑再执行 fn。被作废的那一轮最多再跑完手上这一发请求就会 stop(),
+  // 所以这里只是短暂等待,不会真的卡到整轮结束。
+  function whenFanoutIdle(fn) {
+    if (!queryingInfo) { fn(); return; }
+    setTimeout(function () { whenFanoutIdle(fn); }, 120);
   }
 
   // AUTO-QUERY on section load: silently populate balances so the user never has
@@ -1212,7 +1272,13 @@
         var tr = el('tr');
         tr.appendChild(el('td', null, fmtDate(lg.timestamp || lg.createdAt || lg.time)));
         tr.appendChild(el('td', null, String(lg.statusCode || lg.status || lg.reason || '—')));
-        var msg = el('td'); msg.appendChild(el('span', 'kv-mono', lg.message || lg.detail || lg.error || '—'));
+        // 详情 = 上游响应体。端点回的是 EventLogRecordView
+        // {credentialId, requestType, statusCode, responseBody, createdAt}
+        // (src/admin/handler.rs),压根没有 message/detail/error 这几个键 ——
+        // 老写法逐个取空,于是每一行都显示「—」,这个弹窗唯一的用处(看清账号
+        // 为什么在失败/被限流)彻底失效。responseBody 才是真因,放在最前面。
+        var detail = lg.responseBody || lg.message || lg.detail || lg.error || '';
+        var msg = el('td'); msg.appendChild(el('span', 'kv-mono', detail || '—'));
         tr.appendChild(msg);
         tb.appendChild(tr);
       });
@@ -1313,8 +1379,20 @@
     save.addEventListener('click', function () {
       // build a payload containing ONLY changed / newly-entered fields
       var payload = {};
-      var nick = fval('accNick'); if (nick !== (acc.nickname || '')) payload.nickname = nick;
-      var email = fval('accEmail'); if (email !== (acc.email || '')) payload.email = email;
+      // 后端把空串当"不修改"(update_credential:`req.nickname.filter(|s| !s.is_empty())`,
+      // 邮箱同理),清空昵称/邮箱在服务端根本不会发生。老写法照旧把 {"nickname":""}
+      // 发出去,后端回 200,前端弹「账号已保存」,而身后那一行的旧昵称纹丝不动 ——
+      // 成功提示当场被打脸。现在与本对话框自己的说明(「留空的字段不会被更改」)对齐:
+      // 空值不进 payload,并明确告诉用户"清空"这件事做不到,别让他以为已经生效。
+      var wantsClear = false;
+      var nick = fval('accNick');
+      if (nick !== (acc.nickname || '')) {
+        if (nick) payload.nickname = nick; else if (acc.nickname) wantsClear = true;
+      }
+      var email = fval('accEmail');
+      if (email !== (acc.email || '')) {
+        if (email) payload.email = email; else if (acc.email) wantsClear = true;
+      }
       var authRegion = fval('accAuthRegion'); if (authRegion) payload.authRegion = authRegion;
       var apiRegion = fval('accApiRegion'); if (apiRegion) payload.apiRegion = apiRegion;
       if (isIdc) {
@@ -1332,11 +1410,21 @@
         if (isNaN(nw) || nw < 0) { api.toast(t('edit.weightInvalid'), 'error'); return; }
         payload.weight = nw;
       }
-      if (Object.keys(payload).length === 0) { api.toast(t('edit.noChanges'), 'info'); return; }
+      if (Object.keys(payload).length === 0) {
+        // 只想清空、别的什么都没改 → 说清楚为什么不保存,而不是含糊的"没有需要更新的字段"。
+        api.toast(wantsClear ? t('edit.cannotClear') : t('edit.noChanges'), wantsClear ? 'error' : 'info');
+        return;
+      }
 
       save.disabled = true;
       api.put('/credentials/' + acc.id, payload)
-        .then(function () { api.toast(t('acc.saved'), 'success'); m.close(); loadAccounts(); })
+        .then(function () {
+          api.toast(t('acc.saved'), 'success');
+          // 别的字段确实存下了,但被清空的那个没有 —— 单独再提示一次,免得用户
+          // 看见"已保存"就以为昵称/邮箱也一并清掉了。
+          if (wantsClear) api.toast(t('edit.cannotClear'), 'info');
+          m.close(); loadAccounts();
+        })
         .catch(function (e) { api.toast(e.message || t('common.error'), 'error'); save.disabled = false; });
     });
   }

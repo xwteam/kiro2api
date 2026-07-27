@@ -462,7 +462,10 @@ curl http://localhost:8080/v1beta/models \
 
 ## 管理 API（`/admin` · `/api/admin/*`）
 
-`/admin` 管理面板（靜態，rust-embed 嵌入）由 `/api/admin/*` 介面驅動。下列端點均需 `adminApiKey`（未設則回退 `apiKey`；兩者皆空時管理 API 開放——切勿如此對外暴露）。驗證攜帶方式同協議閘（`Authorization: Bearer` / `x-api-key` / `?token=`；無法設標頭的 SSE 日誌流用 `?api_key=`）。回應體一律 camelCase，**絕不含 access/refresh token 或任何金鑰**。
+`/admin` 管理面板（靜態，rust-embed 嵌入）由 `/api/admin/*` 介面驅動。下列端點均需 `adminApiKey`（未設則回退 `apiKey`；兩者皆空時管理 API 開放——切勿如此對外暴露）。驗證攜帶方式同協議閘（`Authorization: Bearer` / `x-api-key` / `?token=`；無法設標頭的 SSE 日誌流用 `?api_key=`）。回應體一律 camelCase，**絕不含帳號的 access/refresh token**（`GET /api/admin/credentials` 只出狀態）。
+
+> [!WARNING]
+> 管理介面的回應**並非無密**：`GET`/`POST /api/admin/api-keys` 的 `key` 欄位是**完整明文**，`GET /api/admin/server-info` 的 `masterApiKey` 也是**完整明文**；只有 `GET /api/admin/config/auth-keys` 與 `GET /api/admin/config` 有去敏。本服務沒有「唯讀管理員」角色——拿到管理金鑰即可讀取、建立、輪換全部 key。請把管理介面的回應當金鑰對待：別貼進 issue、日誌或第三方工具。
 
 ### GET /api/admin/credentials
 
@@ -556,7 +559,7 @@ curl -X DELETE http://localhost:8080/api/admin/credentials/12345 \
 
 你發給呼叫方的對外 key。
 
-- `GET /api/admin/api-keys` · `POST /api/admin/api-keys` —— 列出 / 建立。
+- `GET /api/admin/api-keys` · `POST /api/admin/api-keys` —— 列出 / 建立；回應的 `key` 欄位為**完整明文**（前端自行去敏顯示，「複製」按鈕需要完整值）。
 - `PUT /api/admin/api-keys/{id}` · `DELETE /api/admin/api-keys/{id}` —— 更新 / 刪除。
 - `GET /api/admin/api-keys/usage` —— 全部 key 的用量。
 - `GET /api/admin/api-keys/{id}/usage` · `DELETE …/usage` —— 單 key 用量 / 清零。
@@ -578,7 +581,7 @@ curl -X DELETE http://localhost:8080/api/admin/credentials/12345 \
 - `GET /api/admin/models` —— 帶 `display_name` / `type` / `max_tokens` 的模型列表（與 `/v1/models` 同源模型集）。
 - `GET /api/admin/config/load-balancing` · `PUT …` —— 執行期讀取 / 切換負載平衡模式（`priority` / `balanced`），落盤 `config.json`。
 - `GET /api/admin/config/auth-keys` · `PUT …` —— 執行期讀取（去敏）/ 輪換 `apiKey` 與 `adminApiKey`；即時生效（無需重啟）。
-- `GET /api/admin/server-info` —— `{masterApiKey,version,kiroVersion}`；`masterApiKey` 已**去敏**（未設定則 `null`），`version` 為 kiro2api 版本，`kiroVersion` 為偽裝上游 UA 版本。
+- `GET /api/admin/server-info` —— `{masterApiKey,version,kiroVersion,rustVersion,…}` 外加執行期指標（`serverTime`、`serverTimeUnix`、`os`、`memoryUsedBytes`、`memoryTotalBytes`、`cpuPercent`、`runMode`、`pid`、`uptimeSecs`）；`masterApiKey` 為所設定 `apiKey` 的**完整明文**（未設定則 `null`），此處**不去敏**——前端在瀏覽器自行去敏顯示、「複製」按鈕取完整值；要去敏形式請用 `GET /api/admin/config/auth-keys`。`version` 為 kiro2api 版本，`kiroVersion` 為偽裝上游 UA 版本。
 
 ### 即時日誌
 

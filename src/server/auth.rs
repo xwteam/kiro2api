@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -98,6 +99,10 @@ pub struct AuthState {
     pub role: AuthRole,
     pub api_keys: Option<Arc<ApiKeyStore>>,
     pub stats: Option<Arc<StatsManager>>,
+    /// 消费上限准入用的"已花额"快照缓存(见 [`SpendCache`])。
+    /// `AuthState` 每请求被 axum 克隆一次,故这里必须是 `Arc`——缓存要在整个路由生命周期里共享,
+    /// 克隆一份新的等于每请求都从空缓存开始,又退回到每请求全量扫描账本。
+    pub spend_cache: Arc<SpendCache>,
 }
 
 impl AuthState {
@@ -110,6 +115,7 @@ impl AuthState {
             role: AuthRole::Protocol,
             api_keys: None,
             stats: None,
+            spend_cache: Arc::new(SpendCache::default()),
         }
     }
 
@@ -125,6 +131,7 @@ impl AuthState {
             role: AuthRole::Protocol,
             api_keys: Some(api_keys),
             stats: Some(stats),
+            spend_cache: Arc::new(SpendCache::default()),
         }
     }
 
@@ -144,6 +151,7 @@ impl AuthState {
             role: AuthRole::Admin,
             api_keys: Some(api_keys),
             stats: None,
+            spend_cache: Arc::new(SpendCache::default()),
         }
     }
 
@@ -318,8 +326,13 @@ pub async fn require_api_key(
                 let reservation = if let Some(limit) = spending_limit
                     && let Some(stats) = &auth.stats
                 {
-                    let spent = current_spent(stats, id, &limit_unit).await;
                     let est = est_cost_in_unit(&limit_unit);
+                    // `spent` 走快照缓存:直接调 current_spent 等于**每个请求**都持读锁线性扫描
+                    // 整个用量账本(生产上千万级条目),记账写入还得排在它后面。快照只在
+                    // "连本次在内都够不到上限"时复用,故不会漏放,见 SpendCache。
+                    let spent =
+                        spent_for_admission(&auth.spend_cache, stats, id, &limit_unit, limit, est)
+                            .await;
                     match store.try_reserve_spend(id, spent, limit, est) {
                         Ok(guard) => Some(guard),
                         Err(()) => {
@@ -359,6 +372,11 @@ pub async fn require_api_key(
 
 /// 该 store key 当前已花用量,按 limit_unit 归一(与消费上限同单位以便直接算术比较)。
 /// "credits" 单位下 credits = cost / 0.72;其余(含 "usd")直接取 cost。
+///
+/// **代价**:委托到 `usage` 层的 `summary_for_api_key`,那是持读锁**线性扫描整个用量账本**
+/// (记录上限是 每凭据 10_000 × 账号数,生产上约千个账号 = 千万级条目),并为每条命中记录克隆一次
+/// model 串。故不能每个请求都调 —— 调用方一律走 [`SpendCache`] 的快照路径,只在快照不再安全时
+/// 才落到这里重算。
 async fn current_spent(stats: &StatsManager, api_key_id: u32, limit_unit: &str) -> f64 {
     let summary = stats.get_summary_by_api_key(api_key_id).await;
     if limit_unit.eq_ignore_ascii_case("credits") {
@@ -366,6 +384,127 @@ async fn current_spent(stats: &StatsManager, api_key_id: u32, limit_unit: &str) 
     } else {
         summary.total_cost
     }
+}
+
+/// 已花额快照的最长有效期。
+///
+/// 快照本身的"不漏放"由下面的名义上界判据保证,与时间无关;TTL 只负责**向下修正**:
+/// 管理员清空某 key 的用量、或账本按每凭据上限淘汰旧记录时,真实已花额会变小,快照偏高会误报 402。
+/// 取 3s:足够短到运营者点完"重置用量"几乎立刻见效,又足够长到把热路径的全量扫描收敛成每秒至多一次。
+const SPEND_CACHE_TTL: Duration = Duration::from_secs(3);
+
+/// 快照表的容量上限(按 store key 计)。超出即先清过期项、仍超则整表清空(下一请求自然重建)。
+/// 纯防御:正常情况下条目数 = 设了消费上限的 key 数(数千量级),这里只保证它不会无界增长。
+const SPEND_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// 某 store key 的"已花额"快照,以及快照之后本闸放行过多少次请求。
+struct SpendSnapshot {
+    /// 取快照时全量聚合出的已花额(按 `unit` 归一)。
+    spent: f64,
+    /// 快照所用的计量单位(key 的 limit_unit 被改过就必须重算:credits 与 usd 差 0.72 倍)。
+    unit: String,
+    /// 取快照的时刻(单调钟,不受系统时钟回拨影响)。
+    taken: Instant,
+    /// 快照之后经本闸放行的请求数。这些请求的真实花费可能尚未进账本,故按名义预估上界计入。
+    admitted_since: u32,
+}
+
+/// 消费上限准入用的"已花额"快照缓存。
+///
+/// 为什么需要它:准入判据要拿"该 key 已花多少",而这个数只能靠扫描整个用量账本聚合出来
+/// (见 [`current_spent`])。账本可以长到千万条,而这段扫描落在**每一个**带消费上限的请求的
+/// 关键路径上,并且持的是账本读锁 —— 记账写入(`record_usage`)得排在它后面。上量之后这会
+/// 从"慢"直接变成"互相拖死"。
+///
+/// 为什么复用快照仍然不会漏放(关键不变量):设快照时刻已花 `S`,此后经本闸放行 `n` 次请求。
+/// 一条用量记录只可能由**经本闸放行的请求**产生,而单次请求的花费按既有预留口径不超过名义预估
+/// `est`([`EST_COST_PER_REQUEST_USD`]),故此刻真实已花 `S_true <= S + n * est`。
+/// 复用的判据取 `S + (n+1) * est <= limit`(把本次也算上),它蕴含 `S_true + est <= limit` ——
+/// 而后者正是精确路径的准入口径本身。也就是说:复用快照放行的请求,拿精确值算同样会放行,
+/// 二者一致而非放宽。一旦这个上界够到上限就落回全量重算 —— 于是"逼近上限"的那一小撮 key 仍
+/// 逐请求按精确值裁决(与修复前完全一致),而绝大多数远离上限的请求不再扫账本。
+///
+/// 反过来的方向(快照偏高导致误报 402)由 [`SPEND_CACHE_TTL`] 兜住。
+#[derive(Default)]
+pub struct SpendCache {
+    entries: parking_lot::Mutex<std::collections::HashMap<u32, SpendSnapshot>>,
+    /// 累计的全量账本扫描次数。用于回归测试钉住"多次请求只扫一次账本";正常运行也可作观测量。
+    full_scans: std::sync::atomic::AtomicU64,
+}
+
+impl SpendCache {
+    /// 迄今为止的全量账本扫描次数。
+    pub fn full_scans(&self) -> u64 {
+        self.full_scans.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 快照可安全复用则返回其已花额,并把"快照后放行数" +1;否则 `None`(调用方全量重算)。
+    ///
+    /// 判据见 [`SpendCache`] 的不变量说明。`upper_bound` 里 `+1` 是把**本次**请求也算进去,
+    /// 保证复用发生在"连本次都还够不到上限"时。
+    fn try_reuse(&self, id: u32, unit: &str, limit: f64, est: f64, now: Instant) -> Option<f64> {
+        // 非有限的上限/预估一律走慢路径,由 `try_reserve_spend` 按同一口径保守拒绝:
+        // NaN 参与的比较恒为 false,`upper_bound > limit` 会被误判成"没超",从而漏放(与 apikey
+        // 层 `try_reserve_spend` 里"非有限即保守处理"同规约)。
+        if !limit.is_finite() || !est.is_finite() {
+            return None;
+        }
+        let mut map = self.entries.lock();
+        let snap = map.get_mut(&id)?;
+        if snap.unit != unit || now.duration_since(snap.taken) >= SPEND_CACHE_TTL {
+            return None;
+        }
+        if !snap.spent.is_finite() {
+            return None;
+        }
+        let upper_bound = snap.spent + f64::from(snap.admitted_since.saturating_add(1)) * est;
+        if upper_bound > limit {
+            return None;
+        }
+        snap.admitted_since = snap.admitted_since.saturating_add(1);
+        Some(snap.spent)
+    }
+
+    /// 记下一次全量重算的结果。`admitted_since` 从 1 起(本次请求即算一次放行)。
+    fn store(&self, id: u32, unit: &str, spent: f64, now: Instant) {
+        let mut map = self.entries.lock();
+        if map.len() >= SPEND_CACHE_MAX_ENTRIES && !map.contains_key(&id) {
+            map.retain(|_, s| now.duration_since(s.taken) < SPEND_CACHE_TTL);
+            if map.len() >= SPEND_CACHE_MAX_ENTRIES {
+                map.clear();
+            }
+        }
+        map.insert(
+            id,
+            SpendSnapshot {
+                spent,
+                unit: unit.to_string(),
+                taken: now,
+                admitted_since: 1,
+            },
+        );
+    }
+}
+
+/// 准入判据用的"已花额":能安全复用快照就复用,否则全量重算并刷新快照。
+/// 语义与直接调 [`current_spent`] 一致(见 [`SpendCache`] 的不变量),只是省掉绝大多数账本扫描。
+async fn spent_for_admission(
+    cache: &SpendCache,
+    stats: &StatsManager,
+    id: u32,
+    limit_unit: &str,
+    limit: f64,
+    est: f64,
+) -> f64 {
+    if let Some(spent) = cache.try_reuse(id, limit_unit, limit, est, Instant::now()) {
+        return spent;
+    }
+    cache
+        .full_scans
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let spent = current_spent(stats, id, limit_unit).await;
+    cache.store(id, limit_unit, spent, Instant::now());
+    spent
 }
 
 /// 单次在途请求的预留额,按 limit_unit 归一(与 `current_spent`/上限同单位)。
@@ -475,6 +614,7 @@ mod tests {
             role: AuthRole::Protocol,
             api_keys: None,
             stats: None,
+            spend_cache: Arc::new(SpendCache::default()),
         };
         let app = Router::new()
             .route("/protected", get(ok_handler))
@@ -1055,6 +1195,22 @@ mod tests {
         ))
     }
 
+    /// 每个用例独占的统计目录:`temp_dir()` 是全局共享的,用量断言不能被别的用例
+    /// 落在同一份 usage_records.json 里的记录串扰。
+    fn tmp_stats_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro2api_authstats_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
     /// 回显解析出的 ApiKeyId 扩展(None → "none",Some(id) → id 字符串)。
     async fn echo_key_id(ext: Option<Extension<ApiKeyId>>) -> String {
         match ext {
@@ -1087,6 +1243,7 @@ mod tests {
             role: AuthRole::Protocol,
             api_keys: Some(store),
             stats: Some(stats),
+            spend_cache: Arc::new(SpendCache::default()),
         };
         let app = store_router(auth);
         let resp = app
@@ -1129,6 +1286,7 @@ mod tests {
             role: AuthRole::Protocol,
             api_keys: Some(store),
             stats: Some(StatsManager::load_from_dir(&std::env::temp_dir())),
+            spend_cache: Arc::new(SpendCache::default()),
         }
     }
 
@@ -1245,6 +1403,7 @@ mod tests {
             role: AuthRole::Protocol,
             api_keys: Some(store),
             stats: Some(StatsManager::load_from_dir(&std::env::temp_dir())),
+            spend_cache: Arc::new(SpendCache::default()),
         };
         let app = binding_router(auth);
         let resp = app
@@ -1298,6 +1457,7 @@ mod tests {
             role: AuthRole::Protocol,
             api_keys: Some(store),
             stats: Some(StatsManager::load_from_dir(&std::env::temp_dir())),
+            spend_cache: Arc::new(SpendCache::default()),
         };
         let app = store_router(auth);
         let resp = app
@@ -1329,6 +1489,7 @@ mod tests {
             role: AuthRole::Protocol,
             api_keys: Some(store),
             stats: Some(StatsManager::load_from_dir(&std::env::temp_dir())),
+            spend_cache: Arc::new(SpendCache::default()),
         };
         let app = store_router(auth);
         let resp = app
@@ -1366,6 +1527,7 @@ mod tests {
             role: AuthRole::Protocol,
             api_keys: Some(store),
             stats: Some(StatsManager::load_from_dir(&std::env::temp_dir())),
+            spend_cache: Arc::new(SpendCache::default()),
         };
         let app = store_router(auth);
         let resp = app
@@ -1394,6 +1556,7 @@ mod tests {
             role: AuthRole::Protocol,
             api_keys: Some(store),
             stats: Some(StatsManager::load_from_dir(&std::env::temp_dir())),
+            spend_cache: Arc::new(SpendCache::default()),
         };
         let app = store_router(auth);
         let resp = app
@@ -1421,6 +1584,7 @@ mod tests {
             role: AuthRole::Protocol,
             api_keys: Some(store),
             stats: Some(StatsManager::load_from_dir(&std::env::temp_dir())),
+            spend_cache: Arc::new(SpendCache::default()),
         };
         let app = store_router(auth);
         let resp = app
@@ -1464,6 +1628,7 @@ mod tests {
             role: AuthRole::Protocol,
             api_keys: Some(store),
             stats: Some(stats),
+            spend_cache: Arc::new(SpendCache::default()),
         };
         let app = store_router(auth);
         let resp = app
@@ -1478,6 +1643,160 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 关键回归(热路径):带消费上限的 key 连续请求时,用量账本只应被**全量扫描一次**。
+    ///
+    /// 修复前每个请求都调 `current_spent` → `summary_for_api_key`,那是持读锁线性扫描整个
+    /// `records`(每凭据上限 10_000 × 约千个账号 = 千万级条目)并为每条命中记录克隆 model 串;
+    /// 而记账写入还得排在这把读锁后面。上量之后这不是"慢一点",是把数据面和记账互相拖死。
+    #[tokio::test]
+    async fn spending_limited_key_scans_usage_ledger_once_for_many_requests() {
+        let path = tmp_store_path("cache_hit");
+        let _ = std::fs::remove_file(&path);
+        let store = ApiKeyStore::load(&path);
+        // 上限 100 USD,远离上限 → 每次都该走快照。
+        let k = store.create(
+            "u1".into(),
+            None,
+            Some(100.0),
+            Some("usd".into()),
+            None,
+            None,
+            Utc::now(),
+        );
+        let cache = Arc::new(SpendCache::default());
+        let auth = AuthState {
+            api_key: None,
+            runtime_cfg: None,
+            role: AuthRole::Protocol,
+            api_keys: Some(store),
+            stats: Some(StatsManager::load_from_dir(&tmp_stats_dir("cache_hit"))),
+            spend_cache: cache.clone(),
+        };
+        let app = store_router(auth);
+
+        for i in 0..5 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/protected")
+                        .header("authorization", format!("Bearer {}", k.key))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "第 {i} 次请求应放行");
+            // 读完 body 释放在途预留(预留 guard 绑在 body 生命周期上)。
+            let _ = body_text(resp).await;
+        }
+        assert_eq!(
+            cache.full_scans(),
+            1,
+            "5 次请求只该扫一次账本,实际扫了 {} 次",
+            cache.full_scans()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 缓存不得削弱消费上限:快照的名义上界一够到上限就必须落回精确重算,
+    /// 并按重算出的真实已花额把超限请求拒成 402。
+    #[tokio::test]
+    async fn spend_cache_rescans_and_still_enforces_limit_near_the_cap() {
+        let path = tmp_store_path("cache_cap");
+        let _ = std::fs::remove_file(&path);
+        let store = ApiKeyStore::load(&path);
+        // 上限 3.0 USD,单次名义预估 est = 1.0 USD:第 4 次请求时上界 0+4*1 > 3 → 必须重算。
+        let k = store.create(
+            "u1".into(),
+            None,
+            Some(3.0),
+            Some("usd".into()),
+            None,
+            None,
+            Utc::now(),
+        );
+        let stats = StatsManager::load_from_dir(&tmp_stats_dir("cache_cap"));
+        let cache = Arc::new(SpendCache::default());
+        let auth = AuthState {
+            api_key: None,
+            runtime_cfg: None,
+            role: AuthRole::Protocol,
+            api_keys: Some(store),
+            stats: Some(stats.clone()),
+            spend_cache: cache.clone(),
+        };
+        let app = store_router(auth);
+        let send = |app: Router, key: String| async move {
+            app.oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header("authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        // 前三次:真实花费每次 0.9 USD(不超过单次名义预估 est=1.0,满足快照复用的前提)。
+        for i in 0..3 {
+            let resp = send(app.clone(), k.key.clone()).await;
+            assert_eq!(resp.status(), StatusCode::OK, "第 {i} 次请求应放行");
+            let _ = body_text(resp).await;
+            stats
+                .usage
+                .record_usage_with_api_key(1, k.id, "m".into(), 10, 20, 0.9, None, None, None, 1000)
+                .await;
+        }
+        // 此刻真实已花 2.7 USD:第 4 次的上界够到上限 → 重算 → 2.7 + 1.0 > 3.0 → 402。
+        let resp = send(app.clone(), k.key.clone()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "逼近上限时必须按精确值裁决,缓存不得放过超限请求"
+        );
+        assert_eq!(cache.full_scans(), 2, "只该在快照上界够到上限时才重扫账本");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 快照复用的三条边界(不经 HTTP,直接钉住判据):过期、单位改动、上界够到上限。
+    #[test]
+    fn spend_cache_reuse_boundaries() {
+        let cache = SpendCache::default();
+        let t0 = Instant::now();
+        cache.store(1, "usd", 0.0, t0);
+
+        // 未过期 + 单位一致 + 上界远低于上限 → 复用。
+        assert_eq!(cache.try_reuse(1, "usd", 100.0, 1.0, t0), Some(0.0));
+        // TTL 到点 → 不复用(用量被重置/淘汰时靠它向下修正)。
+        assert!(
+            cache
+                .try_reuse(1, "usd", 100.0, 1.0, t0 + SPEND_CACHE_TTL)
+                .is_none(),
+            "过期快照必须重算"
+        );
+        // 计量单位被改过(credits 与 usd 差 0.72 倍)→ 不复用。
+        assert!(
+            cache.try_reuse(1, "credits", 100.0, 1.4, t0).is_none(),
+            "换了计量单位的快照不可比,必须重算"
+        );
+        // 未知 key → 不复用。
+        assert!(cache.try_reuse(2, "usd", 100.0, 1.0, t0).is_none());
+
+        // 上界够到上限 → 不复用(逼近上限的 key 逐请求按精确值裁决)。
+        let near = SpendCache::default();
+        near.store(3, "usd", 2.4, t0);
+        assert!(
+            near.try_reuse(3, "usd", 3.0, 1.0, t0).is_none(),
+            "2.4 + 2*1.0 > 3.0,必须落回精确重算"
+        );
+        // 上限被写成 NaN 之类的非法值 → 一律走慢路径,不因比较恒假而误放。
+        let nan = SpendCache::default();
+        nan.store(4, "usd", 0.0, t0);
+        assert!(nan.try_reuse(4, "usd", f64::NAN, 1.0, t0).is_none());
     }
 
     /// finding #3:预留必须活到**流式响应 body 发完**为止,而非只活到中间件返回。
@@ -1511,6 +1830,7 @@ mod tests {
             role: AuthRole::Protocol,
             api_keys: Some(store),
             stats: Some(stats),
+            spend_cache: Arc::new(SpendCache::default()),
         };
 
         // handler 返回一个 3 帧的流式 body(每帧一小段 bytes)。

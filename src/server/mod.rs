@@ -123,6 +123,14 @@ impl PersistHandles {
     }
 }
 
+/// 四条协议端点(Anthropic/OpenAI/Responses/Gemini)的请求体上限。
+///
+/// 取 32MB 与 admin 组同档:多模态请求把图片 base64 内联进 JSON,4/3 的膨胀让 axum 默认的
+/// 2MB 只够约 1.5MB 的原图;而上游本身允许的单请求远大于此(Gemini 内联约 20MB、
+/// Anthropic PDF 32MB)。上限仍要有:body 由 `Json<T>` 全量缓冲进内存,无上限等于把内存
+/// 交给调用方决定。
+const PROTOCOL_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
 /// 与 [`build_router_with_handles`] 相同的路由,但交出全部需要在退出前落盘的句柄。
 pub fn build_router_with_persist_handles(
     cfg: Arc<Config>,
@@ -230,6 +238,15 @@ pub fn build_router_with_persist_handles(
             // 期望全局 key 从 runtime_cfg 实时读取,使 PUT /config/auth-keys 轮换即时生效。
             auth::AuthState::protocol(runtime_cfg.clone(), api_keys.clone(), stats.clone()),
             auth::require_api_key,
+        ))
+        // 多模态请求体上限:必须显式抬高,否则走 axum 的默认 2MB(`DEFAULT_LIMIT`)。
+        // 四条协议端点都用 `Json<T>` 提取器,而多模态请求把图片以 base64 内联在 body 里
+        // (Gemini `inlineData.data` / OpenAI `image_url` 的 data: URI / Anthropic image block),
+        // base64 把原图放大 4/3 —— 2MB 的上限意味着约 1.5MB 的 JPEG/PNG 就在 handler 之前
+        // 被拦下,客户端只看到一句"发图必失败",而三家上游本身允许的单请求都远大于此
+        // (Gemini 内联约 20MB、Anthropic PDF 32MB)。故与 admin 组取同一档 32MB。
+        .layer(axum::extract::DefaultBodyLimit::max(
+            PROTOCOL_BODY_LIMIT_BYTES,
         ));
 
     // 用户面 REST API 单独一组:**不叠加任何鉴权 .layer()**——这些端点由调用方随
@@ -780,6 +797,71 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// 关键回归:多模态请求(base64 内联图片)的 body 轻易超过 axum 默认的 2MB 上限。
+    /// 协议组不显式抬高上限时,body 在 handler 之前就被 `Json` 提取器拒掉——`/v1/messages`
+    /// 会把这次拒绝映射成 400,表现为"发个稍大的图就报参数错误",而账号池为空时本该是 503。
+    /// 故断言 503:没有 DefaultBodyLimit 这一层,它会退化成 400。
+    #[tokio::test]
+    async fn protocol_routes_accept_bodies_larger_than_axum_default_limit() {
+        // 3MB 文本 > axum 默认 2MB,< 本仓 32MB 上限。
+        let big = "a".repeat(3 * 1024 * 1024);
+        let body = serde_json::json!({
+            "model": "sonnet",
+            "messages": [{ "role": "user", "content": big }],
+        })
+        .to_string();
+        assert!(
+            body.len() > 2 * 1024 * 1024,
+            "前提:body 须超过 axum 默认上限"
+        );
+
+        let app = build_router(Arc::new(Config::default()));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "超过 2MB 的多模态请求必须能进到 handler(空池 503),而不是被默认体积上限拒在门外"
+        );
+    }
+
+    /// 上限不能取消:body 由 `Json<T>` 全量缓冲进内存,32MB 之外必须挡下。
+    #[tokio::test]
+    async fn protocol_routes_still_reject_absurdly_large_bodies() {
+        let big = "a".repeat(PROTOCOL_BODY_LIMIT_BYTES + 1024);
+        let body = serde_json::json!({
+            "model": "sonnet",
+            "messages": [{ "role": "user", "content": big }],
+        })
+        .to_string();
+        let app = build_router(Arc::new(Config::default()));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "超过上限的 body 必须被拒,不能一路缓冲进内存"
+        );
     }
 
     const MESSAGES_BODY: &str = r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#;

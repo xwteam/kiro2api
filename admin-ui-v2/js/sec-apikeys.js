@@ -1207,7 +1207,11 @@
         }
         loadKeys();
       }).catch(function (e) {
-        api.toast((editing ? t('key.saved') : t('keyForm.createFailed')) + ': ' + (e.message || t('common.error')), 'error');
+        // 失败提示必须用「保存失败」——老写法在编辑分支里复用了成功文案 t('key.saved'),
+        // PUT 失败也会弹「API 密钥已保存: <错误>」,而失败路径又不会 loadKeys(),
+        // 卡片还显示旧值,看起来跟"保存成功但没改动"一模一样。改额度上限时这等于
+        // 让运维以为新的花费上限已经生效,实际还是老的 → 真金白银超支。
+        api.toast((editing ? t('keyForm.saveFailed') : t('keyForm.createFailed')) + ': ' + (e.message || t('common.error')), 'error');
         save.disabled = false;
       });
     });

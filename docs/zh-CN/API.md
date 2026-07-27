@@ -548,7 +548,10 @@ data: {"candidates":[{"content":{"parts":[{"text":" there"}]}}]}
 
 ## 管理 API
 
-`/admin` 管理面板（静态，`rust-embed` 编译期嵌入）由 `/api/admin/*` 接口驱动。下列端点均需 `adminApiKey`（未设则回退 `apiKey`；两者皆空时管理 API 开放——切勿如此对外暴露）。鉴权携带方式同协议闸（`Authorization: Bearer` / `x-api-key` / `?token=`；无法设头的 SSE 日志流用 `?api_key=`）。响应体一律 **camelCase**，**绝不含 access/refresh token 或任何密钥**。
+`/admin` 管理面板（静态，`rust-embed` 编译期嵌入）由 `/api/admin/*` 接口驱动。下列端点均需 `adminApiKey`（未设则回退 `apiKey`；两者皆空时管理 API 开放——切勿如此对外暴露）。鉴权携带方式同协议闸（`Authorization: Bearer` / `x-api-key` / `?token=`；无法设头的 SSE 日志流用 `?api_key=`）。响应体一律 **camelCase**，**绝不含账号的 access/refresh token**（`GET /api/admin/credentials` 只出状态）。
+
+> [!WARNING]
+> 管理接口的响应**并非无密**：`GET`/`POST /api/admin/api-keys` 的 `key` 字段是**完整明文**，`GET /api/admin/server-info` 的 `masterApiKey` 也是**完整明文**；只有 `GET /api/admin/config/auth-keys` 与 `GET /api/admin/config` 做了脱敏。本服务没有"只读管理员"角色——拿到管理密钥即可读取、创建、轮换全部 key。请把管理接口的响应当密钥对待：不要贴进 issue、日志或第三方工具。
 
 ### GET /api/admin/credentials
 
@@ -720,12 +723,30 @@ curl -X POST http://localhost:8080/api/admin/login/sso-token \
 
 ### GET /api/admin/api-keys · POST /api/admin/api-keys
 
-列出 / 创建对外调用 API-KEY（你发给调用方的 key）。
+列出 / 创建对外调用 API-KEY（你发给调用方的 key）。两者的响应里 `key` 字段均为**完整明文**——前端列表卡片自行脱敏显示，但"复制"按钮需要完整值。
 
 **请求**：
 ```bash
 curl http://localhost:8080/api/admin/api-keys \
   -H "Authorization: Bearer sk-你的管理密钥"
+```
+
+**响应**：
+```json
+[
+  {
+    "id": 1,
+    "key": "sk-c8a63d2e6323ca12efd128144f621e8f",
+    "name": "我的 Key",
+    "enabled": true,
+    "createdAt": "2026-07-25T12:00:00Z",
+    "expiresAt": null,
+    "spendingLimit": null,
+    "limitUnit": "usd",
+    "durationDays": null,
+    "activatedAt": null
+  }
+]
 ```
 
 ### PUT /api/admin/api-keys/{id} · DELETE /api/admin/api-keys/{id}
@@ -814,12 +835,15 @@ curl http://localhost:8080/api/admin/server-info \
   -H "Authorization: Bearer sk-你的管理密钥"
 ```
 
-**响应**：`masterApiKey` 已脱敏（未配置则 `null`），`version` 为 kiro2api 版本，`kiroVersion` 为伪装上游 UA 版本。
+**响应**：`masterApiKey` 为所配置 `apiKey` 的**完整明文**（未配置则 `null`），此处**不脱敏**——前端在浏览器里自行脱敏显示、"复制"按钮取完整值；要脱敏形式请用 `GET /api/admin/config/auth-keys`。`version` 为 kiro2api 版本，`kiroVersion` 为伪装上游 UA 版本，`rustVersion` 为构建时 rustc 版本；其余为运行期指标（`serverTime`、`serverTimeUnix`、`os`、`memoryUsedBytes`、`memoryTotalBytes`、`cpuPercent`、`runMode`、`pid`、`uptimeSecs`）。
 ```json
 {
-  "masterApiKey": "sk-****",
-  "version": "0.1.0",
-  "kiroVersion": "0.11.107"
+  "masterApiKey": "sk-你的主密钥明文",
+  "version": "0.2.0",
+  "kiroVersion": "0.11.107",
+  "rustVersion": "1.90.0",
+  "runMode": "Docker",
+  "uptimeSecs": 3600
 }
 ```
 

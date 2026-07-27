@@ -644,9 +644,15 @@
     }
 
     // ---- today's usage (match CST daykey row) ----
+    // "/usage/daily 这一发失败了" 和 "今天确实还没有用量" 是两回事。老写法两种情况
+    // 都印 0.0000 / $0.0000,而 render() 用的是 allSettled、失败连个提示都没有 ——
+    // 统计后端挂掉时,运维看到的是一个和真实零流量一模一样的面板,会当成"今天没花钱"。
+    // 拿不到数据一律回落 '—'(与本页账号数/模型数等其它指标的失败表现一致),
+    // 只有确实收到了(数组形态的)日汇总才允许把没有今日行解释成 0。
+    var dailyOk = Array.isArray(daily);
     var today = todayRow(daily);
-    els.todayCredits.textContent = today ? fmtCreditsFull(today.totalCredits) : fmtCreditsFull(0);
-    els.todayCost.textContent = today ? fmtCostFull(today.totalCost) : fmtCostFull(0);
+    els.todayCredits.textContent = dailyOk ? fmtCreditsFull(today ? today.totalCredits : 0) : '—';
+    els.todayCost.textContent = dailyOk ? fmtCostFull(today ? today.totalCost : 0) : '—';
 
     // ---- models ----
     if (models && Array.isArray(models.data)) {

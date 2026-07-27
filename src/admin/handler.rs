@@ -852,8 +852,11 @@ pub async fn set_auth_keys(
 
 /// GET `/api/admin/server-info`:服务器版本 + 主 API key 状态。
 /// 前端(api-keys 面板)据 `masterApiKey` 是否为 null 判断是否配置了主 key。
-/// `masterApiKey` 已**脱敏**(与 `/config/auth-keys` 同一 [`mask_key`] 规则:前半可见 + `***`);
-/// 未配置则 `null`,绝不出完整明文。`version` = 本服务(crate)版本;
+/// ⚠️ `masterApiKey` 是**完整明文**,不脱敏(前端 api-keys 面板自己 `maskKey()` 显示、复制时
+/// 需要拿全值,故此处刻意不截断;`server_info_reports_full_master_key_when_set` 钉住该行为)。
+/// 要脱敏形态请用 `/config/auth-keys`(那条走 [`mask_key`])。未配置则 `null`。
+/// 本条注释此前写反了("已脱敏、绝不出完整明文"),与实现和其自身单测都矛盾,已更正。
+/// `version` = 本服务(crate)版本;
 /// `kiroVersion` = 伪装 UA 中的上游 Kiro 版本号(前端如需展示伪装版本用它)。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1023,20 +1026,37 @@ pub struct RestartResponse {
     pub message: String,
 }
 
-/// 进程退出前的收尾:把统计的去抖缓冲立刻落盘。
+/// 进程退出前的收尾:把**全部**去抖存储立刻落盘。
 ///
 /// `std::process::exit` 不跑析构、也不给后台刷盘循环最后一拍的机会,不在此显式刷盘就会丢掉
-/// 最近一个去抖周期(约 5s)内的用量/计费记录。刷盘失败由统计层自行记 error 日志,
-/// 这里不阻断退出。
-async fn flush_stats_before_exit(stats: &crate::stats::StatsManager) {
-    stats.usage.flush_now().await;
+/// 最近一个去抖周期(约 5s)内的写。刷盘失败由各存储自行记 error 日志,这里不阻断退出。
+///
+/// 范围不能只有统计:API-KEY 的增删同样是「改内存 + 置脏 + 等下一拍」,而它丢一拍是**安全
+/// 问题**——管理员发现某把 key 泄露、在面板上删掉,再顺手点「重启」,本 handler 只 sleep 500ms
+/// 就 `exit(0)`,后台那一拍根本轮不到:进程带着旧 api_keys.json 重新拉起,刚吊销的 key 复活、
+/// 照样鉴权通过(反过来,刚建出交给用户的 key 则凭空消失)。
+///
+/// 落盘复用 [`crate::server::PersistHandles::flush_before_exit`],与 SIGTERM 停机路径共用同一套
+/// 规矩(含"磁盘上的 api_keys.json 解析不动且内存里一把 key 都没有时跳过写入"的自保阀),
+/// 不在此另起一套平行实现。
+async fn flush_persistent_state_before_exit(state: &MessagesState) {
+    crate::server::PersistHandles {
+        stats: state.stats.clone(),
+        api_keys: state.api_keys.clone(),
+        // 与 `build_router` 同一推断规则(数据目录 = credentials_path 的父目录),
+        // 故这里算出的就是本进程 ApiKeyStore 实际读写的那份 api_keys.json。
+        api_keys_path: crate::apikey::api_keys_path_from(&state.cfg.credentials_path),
+    }
+    .flush_before_exit()
+    .await;
 }
 
 /// POST `/api/admin/restart?confirm=true`:二次确认后退出进程,由容器 `restart` 策略拉起。
 ///
 /// 需 `confirm=true` 防误触(与 gemini2api 同,避免单击即中断可用性)。确认后先返回响应,再由
-/// 后台任务延时 0.5s、把统计刷盘后 `exit(0)`——容器以 `restart: unless-stopped` 运行,退出即被
-/// 重新拉起。裸机运行(无守护)则等价于停止:此时应由 systemd/supervisor 保活。
+/// 后台任务延时 0.5s、把去抖存储(统计 + API-KEY,见 [`flush_persistent_state_before_exit`])
+/// 全部刷盘后 `exit(0)`——容器以 `restart: unless-stopped` 运行,退出即被重新拉起。
+/// 裸机运行(无守护)则等价于停止:此时应由 systemd/supervisor 保活。
 pub async fn restart_server(
     State(state): State<MessagesState>,
     Query(q): Query<RestartQuery>,
@@ -1052,12 +1072,13 @@ pub async fn restart_server(
     }
     tracing::warn!(
         event = "admin_restart",
-        "管理员触发重启:0.5s 后刷盘统计并退出进程,交由容器/守护拉起"
+        "管理员触发重启:0.5s 后刷盘(统计 + API-KEY)并退出进程,交由容器/守护拉起"
     );
-    let stats = state.stats.clone();
+    // 整个 state 随任务搬走:退出前要刷的不只是统计,还有 API-KEY 存储(见
+    // flush_persistent_state_before_exit)。MessagesState 全是 Arc/克隆廉价的句柄。
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        flush_stats_before_exit(&stats).await;
+        flush_persistent_state_before_exit(&state).await;
         std::process::exit(0);
     });
     (
@@ -5686,13 +5707,29 @@ mod tests {
         dir
     }
 
+    /// 生产同款接线的 state:统计、API-KEY 存储、credentials.json 全落在同一个数据目录下,
+    /// 使 `api_keys_path_from(cfg.credentials_path)` 指向 store 自己读写的那份文件
+    /// (`state_with` 默认把 store 放在无关的临时路径上,验不了退出前刷盘的路径规约)。
+    fn state_with_data_dir(dir: &std::path::Path) -> MessagesState {
+        let creds = dir.join("credentials.json").to_string_lossy().into_owned();
+        let cfg = Config {
+            credentials_path: creds.clone(),
+            ..Config::default()
+        };
+        let mut state = state_with_stats(vec![], cfg, StatsManager::load_from_dir(dir));
+        state.api_keys =
+            crate::apikey::ApiKeyStore::load(crate::apikey::api_keys_path_from(&creds));
+        state
+    }
+
     /// 退出前必须把去抖窗口内的记录落盘:后台刷盘每约 5s 才一拍,restart 直接 exit(0)
     /// 不会给它最后一拍的机会,不显式刷盘就静默丢掉最近这批用量/计费。
     #[tokio::test]
-    async fn flush_stats_before_exit_persists_debounced_records() {
+    async fn flush_before_exit_persists_debounced_usage_records() {
         let dir = tmp_dir("flush_exit");
-        let stats = StatsManager::load_from_dir(&dir);
-        stats
+        let state = state_with_data_dir(&dir);
+        state
+            .stats
             .usage
             .record_usage(
                 7,
@@ -5709,9 +5746,57 @@ mod tests {
         let path = dir.join("usage_records.json");
         // 去抖窗口内:后台循环还没到下一拍,盘上什么都没有。
         assert!(!path.exists(), "去抖窗口内不该已落盘");
-        super::flush_stats_before_exit(&stats).await;
+        super::flush_persistent_state_before_exit(&state).await;
         let disk = std::fs::read_to_string(&path).expect("退出前刷盘应已写出 usage_records.json");
         assert!(disk.contains("claude-sonnet-4"), "落盘内容缺记录: {disk}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 关键回归(安全):管理面「重启」前的刷盘范围必须**包含 API-KEY 存储**。
+    ///
+    /// 现场:管理员发现某把 key 泄露 → 点删除(只置脏,要等约 5s 的下一拍才落盘)→ 立刻点重启
+    /// → handler 只 sleep 500ms 就 `exit(0)`,后台那一拍永远轮不到 → 进程读回旧 api_keys.json,
+    /// 被吊销的 key 复活、继续鉴权通过。只刷统计的旧实现在这里会失败。
+    #[tokio::test]
+    async fn flush_before_exit_persists_api_key_revocation() {
+        let dir = tmp_dir("restart_keyflush");
+        let state = state_with_data_dir(&dir);
+        let keys_path = dir.join("api_keys.json");
+
+        let key = state.api_keys.create(
+            "leaked".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            chrono::Utc::now(),
+        );
+        // 先落一份"吊销前"的盘,模拟这把 key 已经在磁盘上活着。
+        state.api_keys.save_now().unwrap();
+        assert!(
+            std::fs::read_to_string(&keys_path)
+                .unwrap()
+                .contains(&key.key),
+            "前提:磁盘上确实有这把 key"
+        );
+
+        assert!(state.api_keys.delete(key.id), "删除应命中");
+        // 去抖窗口内盘上仍是旧内容 —— 这一拍真的丢得掉(此处到断言之间无 await)。
+        assert!(
+            std::fs::read_to_string(&keys_path)
+                .unwrap()
+                .contains(&key.key),
+            "前提:删除只置脏,尚未落盘"
+        );
+
+        super::flush_persistent_state_before_exit(&state).await;
+
+        let after = std::fs::read_to_string(&keys_path).unwrap();
+        assert!(
+            !after.contains(&key.key),
+            "重启前刷盘必须落下吊销,否则重启后这把已删除的 key 复活并继续鉴权通过"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
