@@ -6,6 +6,7 @@ import {
 } from 'lucide-react'
 import { getUsage } from '@/api/user'
 import { storage } from '@/lib/storage'
+import { spendingView } from '@/lib/spending'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -42,16 +43,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
   }
 
-  const isCredits = data?.limitUnit === 'credits'
-  const usedAmount = isCredits ? data?.totalCredits ?? 0 : data?.totalCost ?? 0
-
-  // 「有没有设上限」必须用 != null 判断，不能用真值判断。
-  // 后端把「不限额」表示为 null，而 spendingLimit = 0 是一种真实配置（冻结这把 key）：
-  // 鉴权闸对 Some(0.0) 会把每一发请求都以 402 拒掉。旧写法 `data.spendingLimit &&`
-  // 让 0 和 null 无法区分 —— 额度条整块不渲染、状态还是绿色「正常」，用户看到一把
-  // 健康的 key，实际 100% 的调用都被拒绝。
-  const hasSpendingLimit = data?.spendingLimit != null
-  const spendingLimit = data?.spendingLimit ?? 0
+  // 额度状态统一由 spendingView 算（含「用完没用完」以后端的准入口径为准），
+  // 面板不再自己另推一套 —— 见 @/lib/spending 的注释。
+  const {
+    isCredits,
+    hasLimit: hasSpendingLimit,
+    limit: spendingLimit,
+    used: usedAmount,
+    exhausted,
+    percent: spendingPercent,
+  } = spendingView(data)
 
   const getStatusBadge = () => {
     // 轮询失败时 react-query 会保留上一次成功的 data，此时继续显示绿色「正常」等于
@@ -63,18 +64,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
       const expired = new Date(data.expiresAt) < new Date()
       if (expired) return <Badge variant="destructive">已过期</Badge>
     }
-    if (hasSpendingLimit && usedAmount >= spendingLimit) {
+    if (exhausted) {
       return <Badge variant="destructive">额度已用完</Badge>
     }
     return <Badge variant="success">正常</Badge>
   }
-
-  const spendingPercent = hasSpendingLimit
-    // 上限为 0 时 used/limit 会算出 NaN(0/0) 或 Infinity，Progress 会画歪，直接按 100% 处理。
-    ? spendingLimit > 0
-      ? Math.min((usedAmount / spendingLimit) * 100, 100)
-      : 100
-    : null
 
   const formatLimitAmount = (n: number) => (isCredits ? n.toFixed(2) : formatCost(n))
 

@@ -330,13 +330,21 @@ pub async fn require_api_key(
                     // `spent` 走快照缓存:直接调 current_spent 等于**每个请求**都持读锁线性扫描
                     // 整个用量账本(生产上千万级条目),记账写入还得排在它后面。快照只在
                     // "连本次在内都够不到上限"时复用,故不会漏放,见 SpendCache。
-                    let spent =
-                        spent_for_admission(&auth.spend_cache, stats, id, &limit_unit, limit, est)
-                            .await;
-                    match store.try_reserve_spend(id, spent, limit, est) {
-                        Ok(guard) => Some(guard),
-                        Err(()) => {
+                    match spent_for_admission(&auth.spend_cache, stats, id, &limit_unit, limit, est)
+                        .await
+                    {
+                        // 快照已证明"再放一次的预留都放不下":直接 402。不必再扫账本
+                        // (扫完必然还是这个结论),也不必进预留锁。
+                        Admission::Exhausted => {
                             return payment_required("api key spending limit exceeded");
+                        }
+                        Admission::Spent(spent) => {
+                            match store.try_reserve_spend(id, spent, limit, est) {
+                                Ok(guard) => Some(guard),
+                                Err(()) => {
+                                    return payment_required("api key spending limit exceeded");
+                                }
+                            }
                         }
                     }
                 } else {
@@ -424,7 +432,16 @@ struct SpendSnapshot {
 /// 二者一致而非放宽。一旦这个上界够到上限就落回全量重算 —— 于是"逼近上限"的那一小撮 key 仍
 /// 逐请求按精确值裁决(与修复前完全一致),而绝大多数远离上限的请求不再扫账本。
 ///
-/// 反过来的方向(快照偏高导致误报 402)由 [`SPEND_CACHE_TTL`] 兜住。
+/// **拒的方向同样走快照**,否则"额度已用完"的 key 就是一台免费的扫描发生器:消费上限是
+/// 终身总额,用完即**永久**状态,而这些请求横竖都要被 402 拒掉 —— 每拒一次却要先全量扫一遍
+/// 账本(快照的名义上界必然够到上限,只能落回精确重算),纯属浪费,且客户端一个重试循环就能
+/// 让服务端持着账本读锁反复扫、把记账写入全堵在后面。判据取 `S + est > limit`:账本只增不减
+/// (记录只追加),故真实已花 `S_true >= S`,精确路径同样会拒(`try_reserve_spend` 还要再加上
+/// 在途预留,只会更严),二者一致而非放宽。
+///
+/// 反过来的方向(快照偏高导致误报 402)由 [`SPEND_CACHE_TTL`] 兜住:能让 `S_true < S` 的只有
+/// "管理员清用量"与"账本按每凭据上限淘汰旧记录"两种情形,至多 3s 后必然重算。上限本身**每请求**
+/// 从 store 现读,不进快照,故管理员调高上限对已判定用完的 key 也是立即生效。
 #[derive(Default)]
 pub struct SpendCache {
     entries: parking_lot::Mutex<std::collections::HashMap<u32, SpendSnapshot>>,
@@ -438,31 +455,38 @@ impl SpendCache {
         self.full_scans.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// 快照可安全复用则返回其已花额,并把"快照后放行数" +1;否则 `None`(调用方全量重算)。
+    /// 据快照裁决本次请求:放行(带已花额)/ 直接拒 / 无法裁决(调用方全量重算)。
     ///
-    /// 判据见 [`SpendCache`] 的不变量说明。`upper_bound` 里 `+1` 是把**本次**请求也算进去,
-    /// 保证复用发生在"连本次都还够不到上限"时。
-    fn try_reuse(&self, id: u32, unit: &str, limit: f64, est: f64, now: Instant) -> Option<f64> {
+    /// 判据见 [`SpendCache`] 的不变量说明。放行判据里 `upper_bound` 的 `+1` 是把**本次**请求
+    /// 也算进去,保证复用发生在"连本次都还够不到上限"时;拒的判据是精确路径的准入口径本身
+    /// (`已花 + 单次预留 > 上限`),两者不重叠且拒优先。
+    fn decide(&self, id: u32, unit: &str, limit: f64, est: f64, now: Instant) -> SpendVerdict {
         // 非有限的上限/预估一律走慢路径,由 `try_reserve_spend` 按同一口径保守拒绝:
         // NaN 参与的比较恒为 false,`upper_bound > limit` 会被误判成"没超",从而漏放(与 apikey
         // 层 `try_reserve_spend` 里"非有限即保守处理"同规约)。
         if !limit.is_finite() || !est.is_finite() {
-            return None;
+            return SpendVerdict::Recompute;
         }
         let mut map = self.entries.lock();
-        let snap = map.get_mut(&id)?;
+        let Some(snap) = map.get_mut(&id) else {
+            return SpendVerdict::Recompute;
+        };
         if snap.unit != unit || now.duration_since(snap.taken) >= SPEND_CACHE_TTL {
-            return None;
+            return SpendVerdict::Recompute;
         }
         if !snap.spent.is_finite() {
-            return None;
+            return SpendVerdict::Recompute;
+        }
+        // 拒的方向:快照已花额连一次预留都放不下 → 精确值只会更大,重算改变不了结论。
+        if snap.spent + est > limit {
+            return SpendVerdict::Exhausted;
         }
         let upper_bound = snap.spent + f64::from(snap.admitted_since.saturating_add(1)) * est;
         if upper_bound > limit {
-            return None;
+            return SpendVerdict::Recompute;
         }
         snap.admitted_since = snap.admitted_since.saturating_add(1);
-        Some(snap.spent)
+        SpendVerdict::Admit(snap.spent)
     }
 
     /// 记下一次全量重算的结果。`admitted_since` 从 1 起(本次请求即算一次放行)。
@@ -486,7 +510,27 @@ impl SpendCache {
     }
 }
 
-/// 准入判据用的"已花额":能安全复用快照就复用,否则全量重算并刷新快照。
+/// [`SpendCache::decide`] 的裁决结果。
+#[derive(Debug, PartialEq)]
+enum SpendVerdict {
+    /// 快照证明"连本次在内都够不到上限"→ 按快照的已花额放行,不扫账本。
+    Admit(f64),
+    /// 快照证明"连一次预留都放不下"→ 直接 402,不扫账本(见 [`SpendCache`] 的"拒的方向")。
+    Exhausted,
+    /// 快照不足以裁决(缺失/过期/换了计量单位/名义上界够到上限)→ 全量重算。
+    Recompute,
+}
+
+/// 准入闸对本次请求的判断。
+enum Admission {
+    /// 可以继续走预留:附带本次判据所用的已花额(快照或全量重算所得)。
+    Spent(f64),
+    /// 已花额加上一次预留就越界 → 本次必被 402,无需再走预留锁。
+    Exhausted,
+}
+
+/// 准入判据用的"已花额":能安全复用快照就复用;快照已证明必被拒则直接返回
+/// [`Admission::Exhausted`](省掉一次结论注定不变的全量扫描);否则全量重算并刷新快照。
 /// 语义与直接调 [`current_spent`] 一致(见 [`SpendCache`] 的不变量),只是省掉绝大多数账本扫描。
 async fn spent_for_admission(
     cache: &SpendCache,
@@ -495,21 +539,29 @@ async fn spent_for_admission(
     limit_unit: &str,
     limit: f64,
     est: f64,
-) -> f64 {
-    if let Some(spent) = cache.try_reuse(id, limit_unit, limit, est, Instant::now()) {
-        return spent;
+) -> Admission {
+    match cache.decide(id, limit_unit, limit, est, Instant::now()) {
+        SpendVerdict::Admit(spent) => return Admission::Spent(spent),
+        SpendVerdict::Exhausted => return Admission::Exhausted,
+        SpendVerdict::Recompute => {}
     }
     cache
         .full_scans
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let spent = current_spent(stats, id, limit_unit).await;
     cache.store(id, limit_unit, spent, Instant::now());
-    spent
+    // 重算后仍由 `try_reserve_spend` 统一裁决(它还要叠加在途预留),保持单一判定点。
+    Admission::Spent(spent)
 }
 
 /// 单次在途请求的预留额,按 limit_unit 归一(与 `current_spent`/上限同单位)。
 /// credits 单位下把 USD 名义预估同步换算成 credits;其余按 USD。
-fn est_cost_in_unit(limit_unit: &str) -> f64 {
+///
+/// 对外 `pub`:用户面板要按**与本闸完全相同**的算式判断"这把 key 还发不发得出请求"
+/// (见 `crate::user::handler::spending_exhausted`)。面板若自己另算一套(例如只比
+/// `已花 >= 上限`),就会在"还差不到一次预留"的那段区间里显示绿色的正常,而中继对同一把
+/// key 每一发请求都回 402 —— 展示与执行两回事,用户无从判断自己到底还能不能用。
+pub fn est_cost_in_unit(limit_unit: &str) -> f64 {
     if limit_unit.eq_ignore_ascii_case("credits") {
         EST_COST_PER_REQUEST_USD / CREDITS_PER_USD_DIVISOR
     } else {
@@ -1762,7 +1814,140 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// 快照复用的三条边界(不经 HTTP,直接钉住判据):过期、单位改动、上界够到上限。
+    /// 关键回归:**已用完额度**的 key 被反复重试时,不得每次都全量扫描一遍账本。
+    ///
+    /// 消费上限是终身总额,用完即永久状态;这些请求横竖都会被 402 拒掉,却在修复前每拒一次
+    /// 就先持账本读锁线性扫一遍全部记录(快照的名义上界必然够到上限 → 只能落回精确重算)。
+    /// 客户端一个重试循环就能把服务端按在这条路径上反复扫,记账写入(需写锁)全被堵在后面 ——
+    /// 纯浪费且可被无限撞。此处钉住:连撞 5 次只该扫一次账本,且 5 次都必须仍是 402。
+    #[tokio::test]
+    async fn exhausted_key_keeps_402_without_rescanning_ledger_every_request() {
+        let path = tmp_store_path("exhausted_rescan");
+        let _ = std::fs::remove_file(&path);
+        let store = ApiKeyStore::load(&path);
+        // usd 上限 1.0。
+        let k = store.create(
+            "u1".into(),
+            None,
+            Some(1.0),
+            Some("usd".into()),
+            None,
+            None,
+            Utc::now(),
+        );
+        let stats = StatsManager::load_from_dir(&tmp_stats_dir("exhausted_rescan"));
+        // 已消费 1.5 USD:超过上限,之后每一发请求都注定 402。
+        stats
+            .usage
+            .record_usage_with_api_key(1, k.id, "m".into(), 10, 20, 1.5, None, None, None, 1000)
+            .await;
+        let cache = Arc::new(SpendCache::default());
+        let auth = AuthState {
+            api_key: None,
+            runtime_cfg: None,
+            role: AuthRole::Protocol,
+            api_keys: Some(store),
+            stats: Some(stats),
+            spend_cache: cache.clone(),
+        };
+        let app = store_router(auth);
+
+        for i in 0..5 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/protected")
+                        .header("authorization", format!("Bearer {}", k.key))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::PAYMENT_REQUIRED,
+                "第 {i} 次重试仍须 402(上限是终身总额)"
+            );
+            let _ = body_text(resp).await;
+        }
+        assert_eq!(
+            cache.full_scans(),
+            1,
+            "已用完的 key 连撞 5 次只该扫一次账本,实际扫了 {} 次",
+            cache.full_scans()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 上面那条快路径不得变成"粘住的判决":管理员把消费上限调高后,下一发请求必须立刻放行。
+    /// (上限每请求从 store 现读,快照只提供已花额;若把"已用完"这个结论本身缓存起来,
+    /// 运营者充值/提额后还要干等 TTL,面板上看着额度充足却继续 402。)
+    #[tokio::test]
+    async fn raising_the_limit_immediately_unblocks_an_exhausted_key() {
+        let path = tmp_store_path("limit_raised");
+        let _ = std::fs::remove_file(&path);
+        let store = ApiKeyStore::load(&path);
+        let k = store.create(
+            "u1".into(),
+            None,
+            Some(1.0),
+            Some("usd".into()),
+            None,
+            None,
+            Utc::now(),
+        );
+        let stats = StatsManager::load_from_dir(&tmp_stats_dir("limit_raised"));
+        stats
+            .usage
+            .record_usage_with_api_key(1, k.id, "m".into(), 10, 20, 1.5, None, None, None, 1000)
+            .await;
+        let store_for_update = store.clone();
+        let auth = AuthState {
+            api_key: None,
+            runtime_cfg: None,
+            role: AuthRole::Protocol,
+            api_keys: Some(store),
+            stats: Some(stats),
+            spend_cache: Arc::new(SpendCache::default()),
+        };
+        let app = store_router(auth);
+        let send = |app: Router, key: String| async move {
+            app.oneshot(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header("authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        // 两发:第一发全量重算后判拒,第二发走"已用完"快路径判拒。
+        for i in 0..2 {
+            let resp = send(app.clone(), k.key.clone()).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::PAYMENT_REQUIRED,
+                "提额前第 {i} 发应 402"
+            );
+            let _ = body_text(resp).await;
+        }
+        // 管理员提额到 100 USD。
+        store_for_update.update(k.id, None, None, None, Some(Some(100.0)), None, None, None);
+        let resp = send(app.clone(), k.key.clone()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "提额后必须立刻放行,不能等快照过期"
+        );
+        let _ = body_text(resp).await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 快照裁决的各条边界(不经 HTTP,直接钉住判据):过期、单位改动、上界够到上限、
+    /// 以及"已用完直接拒"这条快路径本身的边界。
     #[test]
     fn spend_cache_reuse_boundaries() {
         let cache = SpendCache::default();
@@ -1770,33 +1955,66 @@ mod tests {
         cache.store(1, "usd", 0.0, t0);
 
         // 未过期 + 单位一致 + 上界远低于上限 → 复用。
-        assert_eq!(cache.try_reuse(1, "usd", 100.0, 1.0, t0), Some(0.0));
+        assert_eq!(
+            cache.decide(1, "usd", 100.0, 1.0, t0),
+            SpendVerdict::Admit(0.0)
+        );
         // TTL 到点 → 不复用(用量被重置/淘汰时靠它向下修正)。
-        assert!(
-            cache
-                .try_reuse(1, "usd", 100.0, 1.0, t0 + SPEND_CACHE_TTL)
-                .is_none(),
+        assert_eq!(
+            cache.decide(1, "usd", 100.0, 1.0, t0 + SPEND_CACHE_TTL),
+            SpendVerdict::Recompute,
             "过期快照必须重算"
         );
         // 计量单位被改过(credits 与 usd 差 0.72 倍)→ 不复用。
-        assert!(
-            cache.try_reuse(1, "credits", 100.0, 1.4, t0).is_none(),
+        assert_eq!(
+            cache.decide(1, "credits", 100.0, 1.4, t0),
+            SpendVerdict::Recompute,
             "换了计量单位的快照不可比,必须重算"
         );
         // 未知 key → 不复用。
-        assert!(cache.try_reuse(2, "usd", 100.0, 1.0, t0).is_none());
+        assert_eq!(
+            cache.decide(2, "usd", 100.0, 1.0, t0),
+            SpendVerdict::Recompute
+        );
 
-        // 上界够到上限 → 不复用(逼近上限的 key 逐请求按精确值裁决)。
+        // 上界够到上限、但已花额本身还放得下一次预留 → 落回精确重算(不能直接拒:
+        // 这段区间里真实已花可能远低于名义上界,拒了就是误杀)。
         let near = SpendCache::default();
         near.store(3, "usd", 2.4, t0);
-        assert!(
-            near.try_reuse(3, "usd", 3.0, 1.0, t0).is_none(),
-            "2.4 + 2*1.0 > 3.0,必须落回精确重算"
+        assert_eq!(
+            near.decide(3, "usd", 4.0, 1.0, t0),
+            SpendVerdict::Recompute,
+            "2.4 + 2*1.0 > 4.0 但 2.4 + 1.0 <= 4.0,必须落回精确重算"
         );
+
+        // 已花额连一次预留都放不下 → 直接拒,不再扫账本(精确重算只会得出同样结论)。
+        let done = SpendCache::default();
+        done.store(5, "usd", 2.4, t0);
+        assert_eq!(
+            done.decide(5, "usd", 3.0, 1.0, t0),
+            SpendVerdict::Exhausted,
+            "2.4 + 1.0 > 3.0,精确路径必拒,快照可直接给结论"
+        );
+        // 拒的快照同样受 TTL 约束:清用量/记录淘汰后至多 3s 就必须重算,不会永久误拒。
+        assert_eq!(
+            done.decide(5, "usd", 3.0, 1.0, t0 + SPEND_CACHE_TTL),
+            SpendVerdict::Recompute,
+            "过期的拒决必须重算,否则清空用量后 key 会被永久判死"
+        );
+        // 上限被现场调高 → 立即改判(上限每请求现读,不进快照)。
+        assert_eq!(
+            done.decide(5, "usd", 100.0, 1.0, t0),
+            SpendVerdict::Admit(2.4),
+            "上限调高后快照必须立刻改判放行"
+        );
+
         // 上限被写成 NaN 之类的非法值 → 一律走慢路径,不因比较恒假而误放。
         let nan = SpendCache::default();
         nan.store(4, "usd", 0.0, t0);
-        assert!(nan.try_reuse(4, "usd", f64::NAN, 1.0, t0).is_none());
+        assert_eq!(
+            nan.decide(4, "usd", f64::NAN, 1.0, t0),
+            SpendVerdict::Recompute
+        );
     }
 
     /// finding #3:预留必须活到**流式响应 body 发完**为止,而非只活到中间件返回。

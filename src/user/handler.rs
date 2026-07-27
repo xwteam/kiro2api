@@ -23,6 +23,39 @@ use crate::stats::usage::{ApiKeyUsageSummary, ModelUsageAgg, Page};
 /// credits 换算系数：cost($) / 0.72 = credits（与前端、admin、auth 闸同规约）。
 const CREDITS_PER_USD: f64 = 0.72;
 
+/// 把累计花费按 key 的计量单位归一（与 auth 闸的 `current_spent` 同一套换算）。
+fn spent_in_unit(total_cost: f64, limit_unit: &str) -> f64 {
+    if limit_unit.eq_ignore_ascii_case("credits") {
+        total_cost / CREDITS_PER_USD
+    } else {
+        total_cost
+    }
+}
+
+/// 这把 key 的**下一发请求**会不会被鉴权闸以 402 拒掉。
+///
+/// 判据必须与 `server::auth` 的准入闸逐字相同：闸上放行的条件是
+/// `已花 + 在途预留 + 单次预留估算 <= 上限`（见 `apikey::ApiKeyStore::try_reserve_spend`），
+/// 而面板过去只比 `已花 >= 上限`。两者整整差一个单次预留额：在 `上限 - 预留 < 已花 < 上限`
+/// 这一段里，中继对每一发请求都回 402，面板却还画着绿色的「正常」和一条没走完的额度条——
+/// 用户看着有额度、却一个字都发不出去，且面板上找不到任何线索。极端情形是上限本身小于一次
+/// 预留（如 1.38 credits）：这把 key 从签发起就发不出任何请求，面板却始终显示 0 / 1.38 正常。
+/// 故这里直接引用闸上的 `est_cost_in_unit`，单位归一也照同一套，让展示与执行必然同口径。
+///
+/// 在途预留（并发请求临时占额）不计入：它随请求结束即释放，不是用户能看懂的稳定状态；
+/// 少算它只会让面板比闸更宽松一格，不会出现「面板说用完、实际还能发」这种反向错报。
+fn spending_exhausted(spending_limit: Option<f64>, limit_unit: &str, total_cost: f64) -> bool {
+    let Some(limit) = spending_limit else {
+        return false;
+    };
+    let spent = spent_in_unit(total_cost, limit_unit);
+    // 取「闸上的放行条件」再取反，而不是直接写 `已花 + 预留 > 上限`：NaN 参与的比较恒为假，
+    // 而闸上对非有限的上限/已花额一律保守拒绝（`try_reserve_spend` 直接 Err）。按放行条件
+    // 取反，NaN 会落到「已用完」这一侧、与闸一致；直接写 `>` 则会得出「正常」，正好相反。
+    let gate_admits = spent + crate::server::auth::est_cost_in_unit(limit_unit) <= limit;
+    !gate_admits
+}
+
 /// 当前 UTC 时刻（校验过期用；注入点集中于此，与 store/auth 的注入时钟规约对齐）。
 fn now_utc() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now()
@@ -88,6 +121,9 @@ pub struct LoginResponse {
     pub expires_at: Option<String>,
     pub duration_days: Option<f64>,
     pub activated_at: Option<String>,
+    /// 额度是否已用完（口径 = 鉴权闸的准入算式，见 [`spending_exhausted`]）。
+    /// 前端据此显示「额度已用完」，不再自己按 `已花 >= 上限` 推断。
+    pub exhausted: bool,
 }
 
 /// `POST /api/user/login`：校验 key（body `apiKey` 优先，回退 header），返回该 key
@@ -108,6 +144,7 @@ pub async fn login(
     };
 
     let summary = state.stats.get_summary_by_api_key(key.id).await;
+    let exhausted = spending_exhausted(key.spending_limit, &key.limit_unit, summary.total_cost);
     Json(LoginResponse {
         id: key.id,
         name: key.name,
@@ -118,6 +155,7 @@ pub async fn login(
         expires_at: key.expires_at.map(dt_to_rfc3339),
         duration_days: key.duration_days,
         activated_at: key.activated_at.map(dt_to_rfc3339),
+        exhausted,
     })
     .into_response()
 }
@@ -164,9 +202,12 @@ pub struct UsageResponse {
     pub total_cost: f64,
     pub total_credits: f64,
     pub by_model: Vec<ModelUsageView>,
+    /// 额度是否已用完（口径 = 鉴权闸的准入算式，见 [`spending_exhausted`]）。
+    pub exhausted: bool,
 }
 
 fn build_usage_response(key: ApiKey, summary: ApiKeyUsageSummary) -> UsageResponse {
+    let exhausted = spending_exhausted(key.spending_limit, &key.limit_unit, summary.total_cost);
     UsageResponse {
         id: key.id,
         name: key.name,
@@ -185,6 +226,7 @@ fn build_usage_response(key: ApiKey, summary: ApiKeyUsageSummary) -> UsageRespon
             .into_iter()
             .map(ModelUsageView::from)
             .collect(),
+        exhausted,
     }
 }
 
@@ -734,6 +776,186 @@ mod tests {
         assert_eq!(v["pageSize"], 50);
         assert_eq!(v["total"], 1);
         assert_eq!(v["totalPages"], 1);
+    }
+
+    /// 把鉴权闸原样搭成一条最小路由，用来问「这把 key 现在还发不发得出请求」。
+    /// 面板的额度状态只有和它逐发对齐才算数，故回归测试必须同时问两边。
+    fn gate_router(
+        api_keys: Arc<crate::apikey::ApiKeyStore>,
+        stats: Arc<StatsManager>,
+    ) -> axum::Router {
+        use crate::server::auth::{AuthRole, AuthState, SpendCache, require_api_key};
+        let auth = AuthState {
+            api_key: None,
+            runtime_cfg: None,
+            role: AuthRole::Protocol,
+            api_keys: Some(api_keys),
+            stats: Some(stats),
+            spend_cache: Arc::new(SpendCache::default()),
+        };
+        axum::Router::new()
+            .route("/v1/messages", axum::routing::post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(auth, require_api_key))
+    }
+
+    async fn gate_status(
+        api_keys: Arc<crate::apikey::ApiKeyStore>,
+        stats: Arc<StatsManager>,
+        key: &str,
+    ) -> HttpStatusCode {
+        let resp = gate_router(api_keys, stats)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/messages")
+                    .header("x-api-key", key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        // 放行的话预留 guard 绑在 body 上，读完才释放（对 402 无影响）。
+        let _ = axum::body::to_bytes(resp.into_body(), 65536).await;
+        status
+    }
+
+    /// 关键回归：面板的「额度状态」必须与鉴权闸同口径。
+    ///
+    /// 闸上放行的条件是 `已花 + 单次预留 <= 上限`，面板过去只比 `已花 >= 上限`，两者差着
+    /// 一整个单次预留额。取一把 1.0 credits 的 key（单次预留 = 1/0.72 ≈ 1.39 credits，比上限
+    /// 还大）：中继对它每一发请求都 402，而按旧判据 `0 >= 1.0` 为假，面板会显示绿色「正常」
+    /// 和一条空着的额度条——用户看着有额度，却一个字也发不出去，面板上还找不到任何线索。
+    /// 这里同时问闸和面板：闸拒 402，面板就必须回 exhausted=true。
+    #[tokio::test]
+    async fn usage_reports_exhausted_exactly_when_the_gate_rejects() {
+        let stats = empty_stats("exhausted_band");
+        let (state, api_keys) = make_state("exhausted_band", stats.clone());
+        let k = api_keys.create(
+            "band".into(),
+            None,
+            Some(1.0),
+            Some("credits".into()),
+            None,
+            None,
+            chrono::Utc::now(),
+        );
+
+        // 闸:一发都发不出去。
+        assert_eq!(
+            gate_status(api_keys.clone(), stats.clone(), &k.key).await,
+            HttpStatusCode::PAYMENT_REQUIRED,
+            "上限比一次预留还小，中继必然 402"
+        );
+
+        let app = user_api_router(state);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/user/usage")
+                    .header("x-api-key", &k.key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatusCode::OK);
+        let v = body_json(resp).await;
+        // 旧判据(已花 >= 上限)在这里为假 —— 正是它让面板显示「正常」。
+        assert!(
+            v["totalCredits"].as_f64().unwrap() < v["spendingLimit"].as_f64().unwrap(),
+            "本用例必须落在「已花 < 上限」区间，否则钉不住这个缺陷"
+        );
+        assert_eq!(
+            v["exhausted"], true,
+            "闸已 402，面板必须报「额度已用完」而不是绿色正常"
+        );
+
+        // 登录响应同样要带这个判断:只登录不刷新用量的客户端也不能被误导。
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/user/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"apiKey":"{}"}}"#, k.key)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatusCode::OK);
+        assert_eq!(body_json(resp).await["exhausted"], true);
+    }
+
+    /// 反向:额度真的还够用时不得误报「已用完」——否则用户会以为卡废了。
+    #[tokio::test]
+    async fn usage_not_exhausted_while_the_gate_still_admits() {
+        let stats = empty_stats("healthy_limit");
+        let (state, api_keys) = make_state("healthy_limit", stats.clone());
+        let k = api_keys.create(
+            "healthy".into(),
+            None,
+            Some(100.0),
+            Some("credits".into()),
+            None,
+            None,
+            chrono::Utc::now(),
+        );
+        stats
+            .usage
+            .record_usage_with_api_key(1, k.id, "m".into(), 10, 20, 0.72, None, None, None, 1000)
+            .await;
+
+        assert_eq!(
+            gate_status(api_keys.clone(), stats.clone(), &k.key).await,
+            HttpStatusCode::OK,
+            "额度充足时闸必须放行"
+        );
+
+        let resp = user_api_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/user/usage")
+                    .header("x-api-key", &k.key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        assert_eq!(v["exhausted"], false, "闸还在放行，面板不得报已用完");
+    }
+
+    /// 无消费上限的 key 永远不算「已用完」（面板据此完全不画额度条）。
+    #[tokio::test]
+    async fn usage_without_spending_limit_is_never_exhausted() {
+        let stats = empty_stats("nolimit");
+        let (state, api_keys) = make_state("nolimit", stats.clone());
+        let k = api_keys.create(
+            "free".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            chrono::Utc::now(),
+        );
+        stats
+            .usage
+            .record_usage_with_api_key(1, k.id, "m".into(), 10, 20, 99.0, None, None, None, 1000)
+            .await;
+        let resp = user_api_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/user/usage")
+                    .header("x-api-key", &k.key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["exhausted"], false);
     }
 
     #[tokio::test]

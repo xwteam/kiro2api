@@ -12,6 +12,9 @@ export interface LoginResponse {
   expiresAt: string | null
   durationDays: number | null
   activatedAt: string | null
+  // 后端按鉴权闸的准入算式给出的「下一发请求会不会被 402 拒掉」。
+  // 可选是为了兼容还没带这个字段的老后端（前端会退回旧判据，见 @/lib/spending）。
+  exhausted?: boolean
 }
 
 export interface ModelUsage {
@@ -36,6 +39,8 @@ export interface UsageResponse {
   totalCost: number
   totalCredits: number
   byModel: ModelUsage[]
+  // 同 LoginResponse.exhausted：额度状态以后端的准入口径为准。
+  exhausted?: boolean
 }
 
 export interface UsageRecordItem {
