@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-28
+
+### Fixed
+
+- **Responses 接口不再因内置工具整轮被拒**。`/v1/responses` 的工具定义此前把 `name` 设成必填,而照 OpenAI 规范,工具数组里除了 `type:"function"` 还混着内置工具(`web_search` / `local_shell` / `file_search` …),这类工具**天生没有 `name`**。真实客户端(codex)一次送十几个工具,其中一个内置工具就足以让整轮请求死在反序列化:`Failed to deserialize the JSON body: tools[13]: missing field \`name\``——错误只报下标,看不出是哪类工具,接入方无从下手。现在 `name` 可缺省;能映射到中枢的(带 `name` 的 `function` / `custom`)照常转换,内置工具由 OpenAI 服务端自行执行、Kiro 数据面无等价物,故丢弃并落一条 WARN(`responses_builtin_tool_dropped`,带 `tool_type`)——不记的话,「模型怎么不会搜网页」在日志里毫无线索。
+- **Responses 多轮不再因无法映射的输入条目整轮被拒**。`input` 里遇到不认识的条目类型此前直接判错。但客户端做多轮时会把上一轮的**整个** output 原样回灌,里面必然带 `reasoning`、`local_shell_call` 这类 Responses 侧产物,中枢没有对应槽位——判成错误的后果是**第一轮能通、第二轮必炸**,且错误只说「不支持的条目类型」。现在这类条目整条跳过(记 DEBUG `responses_input_item_skipped`),可映射的条目不受影响。
+- **Responses 函数工具允许省略 `parameters`**。中枢要求 `input_schema` 是 JSON Schema 对象,此前直接透传 `null`,会被上游判成畸形工具、整轮失败;现在补成空对象 schema。
+
 ## [0.7.0] - 2026-07-28
 
 ### Added

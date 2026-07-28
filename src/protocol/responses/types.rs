@@ -53,6 +53,15 @@ pub enum InputItem {
         call_id: String,
         output: serde_json::Value,
     },
+    /// 认得出、但映射不到中枢协议的条目(`reasoning`、`local_shell_call`、`web_search_call` …)。
+    ///
+    /// 这些是 Responses 侧的产物,Anthropic 中枢没有对应槽位。客户端做多轮时会把上一轮的
+    /// **整个** output 原样回灌,里面必然带这类条目;若判成错误,第一轮能通、第二轮必炸,
+    /// 且错误信息只说"不支持的条目类型",排查要从头翻报文。故整条跳过而非拒绝整轮请求。
+    /// 保留 `kind` 是为了转换阶段能记出到底跳过了什么。
+    Unsupported {
+        kind: String,
+    },
 }
 
 /// 从 JSON 对象里取一个必填字符串字段;缺失/非字符串 → `missing_field` 错误。
@@ -94,7 +103,9 @@ impl<'de> Deserialize<'de> for InputItem {
                 };
                 Ok(InputItem::Message { role, content })
             }
-            Some(other) => Err(de::Error::custom(format!("不支持的输入条目类型: {other}"))),
+            Some(other) => Ok(InputItem::Unsupported {
+                kind: other.to_string(),
+            }),
         }
     }
 }
@@ -126,11 +137,17 @@ pub enum InputContentPart {
 }
 
 /// 工具定义(Responses 是扁平 function 形)。
+///
+/// `name` **可缺省**:Responses 的工具数组里除了 `type:"function"`,还混着内置工具
+/// (`web_search` / `local_shell` / `file_search` …),它们照规范就没有 `name`。把 `name`
+/// 设成必填会让整个请求在反序列化阶段被拒——真实客户端(codex)一次就送十几个工具,其中一个
+/// 内置工具就足以让整轮对话打不通,且错误只报到 `tools[13]: missing field name`,看不出是哪类。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResponsesTool {
     #[serde(rename = "type")]
     pub kind: String,
-    pub name: String,
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -395,7 +412,7 @@ mod tests {
         let tools = req.tools.expect("tools 应存在");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].kind, "function");
-        assert_eq!(tools[0].name, "f");
+        assert_eq!(tools[0].name.as_deref(), Some("f"));
         assert_eq!(tools[0].description.as_deref(), Some("d"));
         assert_eq!(tools[0].parameters["a"], 1);
     }

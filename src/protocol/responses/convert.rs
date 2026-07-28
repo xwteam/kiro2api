@@ -103,6 +103,15 @@ fn convert_input_item(item: &InputItem) -> Option<InMsg> {
                 is_error: None,
             }]),
         }),
+        // 中枢没有对应槽位,整条丢。记一条:多轮里客户端回灌了什么,只有这里看得见。
+        InputItem::Unsupported { kind } => {
+            tracing::debug!(
+                event = "responses_input_item_skipped",
+                item_type = %kind,
+                "输入条目无中枢对应,已跳过"
+            );
+            None
+        }
     }
 }
 
@@ -125,13 +134,33 @@ pub fn responses_to_hub(req: ResponsesRequest) -> Result<MessagesRequest, Respon
         ResponsesInput::Items(items) => items.iter().filter_map(convert_input_item).collect(),
     };
 
+    // 只有带 `name` 的工具(`function` / `custom`)能映射成中枢 ToolDef。内置工具
+    // (`web_search` / `local_shell` / `file_search` …)由 OpenAI 服务端自己执行,Kiro 数据面
+    // 没有等价物,转不过去也无法代为执行——丢掉是唯一诚实的处理,但必须记出来:否则模型
+    // "怎么不会搜网页/不会跑命令"在日志里毫无线索,只能靠猜。
     let tools = req.tools.map(|tools| {
         tools
             .into_iter()
-            .map(|t: ResponsesTool| ToolDef {
-                name: t.name,
-                description: t.description,
-                input_schema: t.parameters,
+            .filter_map(|t: ResponsesTool| match t.name {
+                Some(name) => Some(ToolDef {
+                    name,
+                    description: t.description,
+                    // 无 `parameters` 的函数工具照中枢规范补空对象:中枢要求 input_schema 是
+                    // JSON Schema 对象,直接透传 null 会被上游判成畸形工具、整轮请求失败。
+                    input_schema: if t.parameters.is_null() {
+                        json!({"type": "object", "properties": {}})
+                    } else {
+                        t.parameters
+                    },
+                }),
+                None => {
+                    tracing::warn!(
+                        event = "responses_builtin_tool_dropped",
+                        tool_type = %t.kind,
+                        "内置工具无中枢等价物,已丢弃(模型将不具备该能力)"
+                    );
+                    None
+                }
             })
             .collect()
     });
@@ -440,7 +469,7 @@ mod tests {
             instructions: None,
             tools: Some(vec![ResponsesTool {
                 kind: "function".to_string(),
-                name: "get_weather".to_string(),
+                name: Some("get_weather".to_string()),
                 description: Some("d".to_string()),
                 parameters: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
             }]),
@@ -647,5 +676,63 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item, OutputItem::Message { .. }))
         );
+    }
+
+    /// codex 的工具数组里混着内置工具(照规范无 `name`)。曾把 `name` 设成必填,导致
+    /// 整轮请求在反序列化阶段就被拒:`tools[13]: missing field name`——一个内置工具
+    /// 就废掉整个会话,且错误看不出是哪类工具。内置工具须能解析、被丢弃,函数工具照常留下。
+    #[test]
+    fn builtin_tools_without_name_are_dropped_not_rejected() {
+        let raw = serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+                {"type": "web_search"},
+                {"type": "local_shell"},
+                {"type": "file_search", "vector_store_ids": ["vs_1"]}
+            ]
+        });
+        let req: ResponsesRequest = serde_json::from_value(raw).expect("内置工具不得导致整轮请求被拒");
+        let hub = responses_to_hub(req).expect("应转换成功");
+        let tools = hub.tools.expect("tools 应存在");
+        assert_eq!(tools.len(), 1, "只有带 name 的函数工具能映射到中枢");
+        assert_eq!(tools[0].name, "shell");
+    }
+
+    /// 函数工具可以不带 `parameters`。中枢要求 input_schema 是 JSON Schema 对象,
+    /// 透传 null 会被上游判成畸形工具、整轮失败,故补空对象。
+    #[test]
+    fn function_tool_without_parameters_gets_empty_object_schema() {
+        let raw = serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "now"}]
+        });
+        let req: ResponsesRequest = serde_json::from_value(raw).expect("应解析成功");
+        let hub = responses_to_hub(req).expect("应转换成功");
+        let tools = hub.tools.expect("tools 应存在");
+        assert_eq!(tools[0].input_schema, json!({"type": "object", "properties": {}}));
+    }
+
+    /// 多轮时客户端把上一轮 output 整个回灌,里面带 `reasoning` 等中枢没有的条目。
+    /// 曾判成错误,结果第一轮能通、第二轮必炸。这类条目须整条跳过,可映射的条目不受影响。
+    #[test]
+    fn unmappable_input_items_are_skipped_not_rejected() {
+        let raw = serde_json::json!({
+            "model": "gpt-4o",
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "reasoning", "id": "rs_1", "summary": []},
+                {"type": "local_shell_call", "id": "ls_1", "call_id": "c1",
+                 "action": {"type": "exec", "command": ["ls"]}},
+                {"type": "message", "role": "assistant", "content": "there"}
+            ]
+        });
+        let req: ResponsesRequest = serde_json::from_value(raw).expect("未知条目不得导致整轮请求被拒");
+        let hub = responses_to_hub(req).expect("应转换成功");
+        assert_eq!(hub.messages.len(), 2, "两条 message 保留,其余跳过");
+        assert_eq!(hub.messages[0].role, "user");
+        assert_eq!(hub.messages[1].role, "assistant");
     }
 }
