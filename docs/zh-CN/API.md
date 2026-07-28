@@ -4,7 +4,7 @@
 
 ## 认证
 
-所有协议端点走**统一鉴权**。支持三种携带方式（任选其一）：
+所有协议端点走**统一鉴权**。密钥可走下列**六条通道**中的任意一条，服务端按固定优先级取第一条命中的：`Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > `?api_key=` > `?token=` > `?key=`。
 
 ### 方式 1：Authorization Header（推荐）
 
@@ -20,12 +20,23 @@ curl -H "x-api-key: sk-你的API密钥" \
   http://localhost:8080/v1/models
 ```
 
-### 方式 3：查询参数
+### 方式 3：x-goog-api-key Header
 
-无法设置请求头的场景（如浏览器 `EventSource`）可用 `?token=`：
+Gemini 生态的标准头（官方 `google-genai` SDK 默认只发这一条），本服务同样接受：
 
 ```bash
+curl -H "x-goog-api-key: sk-你的API密钥" \
+  http://localhost:8080/v1beta/models
+```
+
+### 方式 4：查询参数
+
+无法设置请求头的场景（如浏览器 `EventSource`）可把密钥放进 URL query。三个参数名都认，优先级 `api_key` > `token` > `key`（`?key=` 是 Gemini 官方 SDK 的默认写法）：
+
+```bash
+curl "http://localhost:8080/v1/models?api_key=sk-你的API密钥"
 curl "http://localhost:8080/v1/models?token=sk-你的API密钥"
+curl "http://localhost:8080/v1beta/models?key=sk-你的API密钥"
 ```
 
 ### 获取 API Key
@@ -81,19 +92,25 @@ cat data/config.json | grep apiKey
 - **OpenAI / Responses 形状**：`{"error":{"message":"...","type":"...","code":"..."}}`
 - **Gemini 形状**：`{"error":{"code":...,"message":"...","status":"..."}}`
 
+> [!IMPORTANT]
+> **例外：鉴权闸返回的 `401` / `402` 恒为 Anthropic 形状。** 这两种响应由鉴权中间件在请求进入协议 handler **之前**产生，四条协议路由共用同一个闸，所以 OpenAI / Responses / Gemini 客户端在 key 无效或超额时收到的同样是 `{"type":"error","error":{"type":"authentication_error"|"billing_error","message":"..."}}`，而不是本协议的原生形状——按状态码判断，别按错误体形状判断。（`/api/user/*` 的 `401` 由 handler 自己产生，形状是 `{"error":"…"}`，见「用户 API」。）
+
 ### 常见错误码
 
 | 状态码 | 说明 |
 |--------|------|
-| 400 | 请求非法 / 未映射到模型（`INVALID_MODEL_ID`）—— 不瞎重试、不误伤账号 |
-| 401 | 认证失败，API Key 无效或缺失（已配置 `apiKey` 时） |
-| 429 | 请求过于频繁（超过 `MAX_RPM_PER_CREDENTIAL` 或上游限流） |
-| 502 | 上游 Kiro 失败 |
-| 503 | 无可用账号（全部冷却 / 禁用 / 超 RPM），或日志端点未启用（`logCapacity=0`） |
+| 400 | 两类不同成因、都不重试也不误伤账号：①**模型名在本网关本地映射不上**——体为 `无法识别的模型名: <你传的名字>`，类型 `invalid_request_error`，**不含** `INVALID_MODEL_ID` 字样；②**上游确定性拒绝该模型**（账号档位无权），上游 reason 码即 `INVALID_MODEL_ID`，原样转出。另外，四种协议的对话端点在请求体解析失败时也回 `400`（已改写成各自 SDK 认得的错误形状） |
+| 401 | 认证失败，API Key 无效或缺失（已配置 `apiKey` 时）；管理端创建的 API-KEY 被停用 / 过期同样是 `401`。协议路由与 `/api/admin/*` 的 `401` 体恒为 Anthropic 形状的 `authentication_error`（见上方例外说明）；`/api/user/*` 的 `401` 则是 `{"error":"…"}` |
+| 402 | 该 API-KEY 的**消费额度已达或超上限**（体恒为 Anthropic 形状的 `billing_error`，见上方例外说明）。仅对管理端创建、且设了 `spendingLimit` 的 key 生效；用全局 `apiKey` 调用不会命中 |
+| 404 | 管理端点的 `{id}` 不存在：账号回 `{"error":"account not found","id":…}`，API-KEY 回 `{"error":"api key not found","id":…}`，登录会话回 `{"success":false,"error":"login session not found or expired"}` |
+| 422 | 请求体反序列化失败（缺必填字段 / 类型不符），axum 默认拒收，`text/plain` 纯文本。出现在带 body 提取器的端点上：`/api/admin/*`、`POST /api/user/login` 与 `/v1/messages/count_tokens`（`/api/user/*` 的其余端点只收 query，参数类型不符是 `400` 而非 `422`） |
+| 429 | **只来自上游限流**，且只在上游于 HTTP 200 事件流中途下发 `Throttling*` 异常帧时原样映射。本地的 `MAX_RPM_PER_CREDENTIAL` **不会**产生 `429`：超过该上限只是让这个账号本轮选不中，全部账号都选不中才落到 `503`（见下行）。上游在 HTTP 层直接回的 `429` 也**不**原样透出——那会被归为配额失败、冷却该账号并换号重试，用尽后以 `502` 收尾。据自己设的 RPM 上限去监控 `429` 是等不到的 |
+| 502 | 上游 Kiro 失败（含跨账号重试用尽后的最后一个账号级错误） |
+| 503 | 无可用账号（全部冷却 / 禁用 / **超本地 RPM 上限**），或日志端点未启用（`logCapacity=0`） |
 
 ## 模型名映射
 
-客户端传入的模型名按**小写子串**匹配到 Kiro 内部模型，未匹配到则返回 `400`（`INVALID_MODEL_ID`）：
+客户端传入的模型名按**小写子串**匹配到 Kiro 内部模型，一个都匹配不到则本网关直接返回 `400`，体为 `无法识别的模型名: <你传的名字>`（这一步是本地映射失败，**不会**带 `INVALID_MODEL_ID`——那个码只在名字映射成功、但上游按账号档位拒绝时才由上游给出）：
 
 | 传入含 | 解析为 |
 |--------|--------|
@@ -106,13 +123,13 @@ cat data/config.json | grep apiKey
 | `auto` | `auto` |
 
 > [!TIP]
-> **可用模型取决于账号订阅档位**：免费档（KIRO FREE）通常只授权 `claude-sonnet-4.5`，opus/GPT 等需更高档位。各协议 `/models` 端点返回本服务**实际可服务**的模型 id，建议客户端 list-then-use。
+> **可用模型取决于账号订阅档位**：免费档（KIRO FREE）通常只授权 `claude-sonnet-4.5`，opus/GPT 等需更高档位。注意各协议的 `/models` 端点返回的是一份**编译期写死的常用模型短清单**，**不读账号池、也不按订阅档位过滤**（三个协议的固定清单彼此还略有出入）；完整模型目录请用 `GET /api/admin/models`。因此不能拿协议 `/models` 的返回当"可用性"依据——列表里的模型若不在你账号的授权范围内，请求照样返回 `400`（`INVALID_MODEL_ID`）。
 
 ## OpenAI 兼容 API
 
 ### GET /v1/models
 
-获取可用模型列表。也可使用带前缀路径 `/openai/v1/models`。
+获取模型列表（固定短清单，非账号池实际可服务集，详见上文提示）。也可使用带前缀路径 `/openai/v1/models`。
 
 **请求**：
 ```bash
@@ -125,12 +142,9 @@ curl http://localhost:8080/v1/models \
 {
   "object": "list",
   "data": [
-    {
-      "id": "claude-sonnet-4.5",
-      "object": "model",
-      "created": 1715970000,
-      "owned_by": "kiro"
-    }
+    {"id": "claude-sonnet-4.5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-opus-4.6", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "gpt-5.6-sol", "object": "model", "created": 1700000000, "owned_by": "kiro2api"}
   ]
 }
 ```
@@ -146,9 +160,15 @@ curl http://localhost:8080/v1/models \
 | `model` | string | 是 | 模型名称，如 `claude-sonnet-4.5` |
 | `messages` | array | 是 | 消息列表，每条消息含 `role` 和 `content`。`content` 可以是字符串或对象数组（支持多模态） |
 | `stream` | boolean | 否 | 是否流式返回，默认 false |
-| `max_tokens` | number | 否 | 最大输出 token 数 |
+| `max_tokens` | number | 否 | **接受但不生效**（见下方说明），不会截断回复长度 |
 | `tools` | array | 否 | 函数调用工具列表 |
-| `tool_choice` | string | 否 | 工具选择策略，`auto`/`required`/`none` |
+| `tool_choice` | string 或 object | 否 | **接受但不生效**（见下方说明），无法强制/禁止调用某个工具 |
+
+> [!IMPORTANT]
+> **生成参数不生效，请勿依赖。** Kiro 数据面的线格式里没有对应字段，本服务**故意不转发、也不改写成提示词伪装成已生效**：
+> - `max_tokens`（Anthropic 同名字段、Responses 的 `max_output_tokens`、Gemini 的 `generationConfig.maxOutputTokens` 都折进同一个字段）会被解析、然后丢弃，**不会**限制回复长度。你看到的 `finish_reason:"length"` / `stop_reason:"max_tokens"` 是**上游自己**命中输出预算后回的截断信号，与你传的值无关。
+> - `tool_choice` 同理，仅带进内部请求便不再被读取，`auto`/`required`/`none`/指定函数名一律无效果。四种协议里**只有** Gemini 的 `toolConfig.functionCallingConfig.mode:"NONE"` 能被兑现——办法是这一轮干脆不下发工具规格；`AUTO` 等同默认行为，`ANY` 在线格式上无从表达，按默认走。
+> - `temperature` / `top_p` 等采样参数**连字段都不存在**，serde 当作未知键静默丢弃：既不生效，也**不会**报错。设 `temperature=0` 求确定性输出是拿不到的。
 
 **多模态 content 格式**：
 
@@ -302,9 +322,11 @@ curl -X POST http://localhost:8080/v1/responses \
 | `instructions` | string | 否 | 系统/开发者前置说明，转换为 system，加在对话最前面 |
 | `stream` | boolean | 否 | 是否流式返回，默认 false |
 | `tools` | array | 否 | 函数调用工具定义 |
+| `max_output_tokens` | number | 否 | **接受但不生效**，同 `max_tokens`（见「OpenAI 兼容 API」下的生成参数说明） |
+| `tool_choice` | string 或 object | 否 | **接受但不生效**，同上 |
 
-**`input` 数组条目类型**：
-- `{"type":"message","role":"user"|"assistant"|"system","content":[...]}` —— 内容块：`{"type":"input_text","text":...}`、`{"type":"input_image","image_url":"..."}`、`{"type":"output_text","text":...}`
+**`input` 数组条目类型**——**只认下面三种**（`type` 缺省时按带 `role` 视为 `message`）。写任何其它 `type` 值（例如 `tool_result`，本服务**没有**这个条目类型）会让**整个请求**反序列化失败，返回 `400`：
+- `{"type":"message","role":"user"|"assistant"|"system","content":[...]}` —— 内容块：`{"type":"input_text","text":...}`、`{"type":"input_image","image_url":"..."}`、`{"type":"output_text","text":...}`。`input_image` 的 `image_url` **只支持 `data:` Base64 URI**；远程 http(s) URL 会被**静默跳过**（该图片不进上游，不报错），别指望服务端替你抓图
 - `{"type":"function_call","call_id","name","arguments"}` —— 历史里助手调用工具的那一轮
 - `{"type":"function_call_output","call_id","output"}` —— 客户端回传的工具执行结果
 
@@ -325,7 +347,7 @@ curl -X POST http://localhost:8080/v1/responses \
       "role": "assistant",
       "status": "completed",
       "content": [
-        {"type": "output_text", "text": "1+1等于2", "annotations": []}
+        {"type": "output_text", "text": "1+1等于2"}
       ]
     }
   ],
@@ -333,14 +355,19 @@ curl -X POST http://localhost:8080/v1/responses \
     "input_tokens": 10,
     "output_tokens": 5,
     "total_tokens": 15
-  },
-  "previous_response_id": null,
-  "instructions": null,
-  "error": null
+  }
 }
 ```
 
-**响应（流式）**：严格按官方协议顺序发送带命名的 SSE 事件，每个事件都带**单调递增**的 `sequence_number`。**没有** `data: [DONE]` 结尾标记（那是 Chat Completions 的老约定）——完成信号是 `response.completed`：
+> [!NOTE]
+> 上面就是**全部**字段。本服务**不发** `previous_response_id`、`instructions`、`error`，`output_text` 块上也**没有** `annotations`，`usage` 只有这三个计数器（无 `input_tokens_details` / `output_tokens_details`）——按官方 SDK 的完整形状去索引这些键会取到空。唯一的额外字段是 `incomplete_details`：仅当上游截断、`status` 为 `"incomplete"` 时出现，形如 `{"reason":"max_output_tokens"}`；`status:"completed"` 时整个字段省略。
+
+**响应（流式）**：严格按官方协议顺序发送带命名的 SSE 事件，每个事件都带**单调递增**的 `sequence_number`。**没有** `data: [DONE]` 结尾标记（那是 Chat Completions 的老约定）。
+
+> [!IMPORTANT]
+> **终结事件有三种，只等 `response.completed` 会把客户端挂死**：正常结束发 `response.completed`；上游截断（输出预算 / 上下文窗口耗尽）发 `response.incomplete`（`status:"incomplete"` + `incomplete_details`）；上游下发非截断异常（限流 / 鉴权 / 参数）或传输中断发 `response.failed`（`status:"failed"` + `error`）。后两种**绝不会**再补一个 `response.completed`——这是刻意的，免得 agent 框架把半截回答当完整结果继续用。收到任一终结事件即可停止读取。
+
+纯文本、正常完成时的事件序列：
 
 ```
 event: response.created
@@ -409,11 +436,12 @@ curl http://localhost:8080/claude/v1/models \
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `model` | string | 是 | 模型名称 |
-| `messages` | array | 是 | 消息列表，`content` 支持字符串或块数组（`text`/`image`/`tool_use`/`tool_result`） |
-| `max_tokens` | number | 否 | 最大输出 token 数 |
-| `system` | string | 否 | 系统提示 |
+| `messages` | array | 是 | 消息列表，`content` 支持字符串或块数组（`text`/`image`/`tool_use`/`tool_result`）。`image` 的 `source` **只收 `type:"base64"`**，远程图片 URL 一律 `400` |
+| `max_tokens` | number | 否 | **接受但不生效**（见「OpenAI 兼容 API」下的生成参数说明），不会截断回复长度。注意 Anthropic 官方规范里该字段是必填，本服务放宽为可选 |
+| `system` | string | 否 | 系统提示，字符串或内容块数组均可 |
 | `stream` | boolean | 否 | 是否流式返回 |
 | `tools` | array | 否 | 工具列表 |
+| `tool_choice` | object | 否 | **接受但不生效**（见上），无法强制/禁止调用某个工具 |
 
 **请求示例**：
 
@@ -445,13 +473,15 @@ curl -X POST http://localhost:8080/v1/messages \
   ],
   "model": "claude-sonnet-4.5",
   "stop_reason": "end_turn",
-  "stop_sequence": null,
   "usage": {
     "input_tokens": 10,
     "output_tokens": 20
   }
 }
 ```
+
+> [!NOTE]
+> 非流式响应体**没有** `stop_sequence` 字段（该字段只出现在流式的 `message_start` / `message_delta` 事件里）。`stop_reason` 取值：正常结束 `end_turn`、命中工具 `tool_use`、上游输出预算耗尽 `max_tokens`、上下文窗口耗尽 `model_context_window_exceeded`。
 
 > 流式为 Anthropic 标准 SSE：`message_start` → `content_block_start` → `content_block_delta` → … → `message_stop`。工具走 `tool_use` 块与 `input_json_delta`。
 
@@ -497,7 +527,11 @@ curl http://localhost:8080/v1beta/models \
 
 生成内容（非流式）。也可使用带前缀路径 `/gemini/v1beta/models/{model}:generateContent`。
 
-**请求体**：`contents[]`（`parts[]` 支持 `text`/`inline_data`）、`system_instruction?`、`tools[].function_declarations`。
+**请求体**：`contents[]`（`parts[]` 支持 `text`/`inline_data`）、`system_instruction?`、`tools[].function_declarations`、`toolConfig?`、`generationConfig?`。camelCase 与 proto 的 snake_case 拼写（`system_instruction`、`generation_config`、`inline_data`、`mime_type`…）**两种都认**。
+
+> [!IMPORTANT]
+> `generationConfig` 里**只有** `maxOutputTokens` 会被解析，而且解析完也**不生效**（详见「OpenAI 兼容 API」下的生成参数说明）；`temperature`、`topP`、`topK`、`stopSequences`、`responseMimeType` 等键属于未知字段，照 Gemini 官方 SDK 的惯例被**静默丢弃**——既不生效、也不报错。
+> `toolConfig` 只有 `functionCallingConfig.mode:"NONE"` 会被兑现（做法是本轮不下发工具规格）；`AUTO` 就是默认行为，`ANY`（强制至少调一次）在上游线格式里无从表达，按默认走。
 
 **请求**：
 ```bash
@@ -544,11 +578,11 @@ data: {"candidates":[{"content":{"parts":[{"text":" there"}]}}]}
 ```
 
 > [!NOTE]
-> Gemini/OpenAI 客户端一律用本服务的**统一鉴权**（Bearer / `x-api-key` / `?token=`），不是厂商原生的 `?key=`/`x-goog-api-key`。
+> 密钥可走鉴权闸接受的任意通道，优先级为：`Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > query（`?api_key=` > `?token=` > `?key=`）。Gemini 原生的 `x-goog-api-key` 头与 `?key=` 参数**同样被接受**，官方 `google-genai` SDK 只换 `base_url` 即可直接用。要换的是**值**：一律传**本服务**的 API-KEY，绝不是真的 Google / OpenAI 厂商密钥。
 
 ## 管理 API
 
-`/admin` 管理面板（静态，`rust-embed` 编译期嵌入）由 `/api/admin/*` 接口驱动。下列端点均需 `adminApiKey`（未设则回退 `apiKey`；两者皆空时管理 API 开放——切勿如此对外暴露）。鉴权携带方式同协议闸（`Authorization: Bearer` / `x-api-key` / `?token=`；无法设头的 SSE 日志流用 `?api_key=`）。响应体一律 **camelCase**，**绝不含账号的 access/refresh token**（`GET /api/admin/credentials` 只出状态）。
+`/admin` 管理面板（静态，`rust-embed` 编译期嵌入）由 `/api/admin/*` 接口驱动。下列端点均需 `adminApiKey`（未设则回退 `apiKey`；两者皆空时管理 API 开放——切勿如此对外暴露）。鉴权携带方式与优先级同协议闸的六条通道（`Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > `?api_key=` > `?token=` > `?key=`；无法设头的 SSE 日志流用 `?api_key=`）。响应体**默认 camelCase**，但下列端点为对齐面板的数据模型返回 **snake_case**：`GET /api/admin/config`、`GET /api/admin/models`，以及两个旧端点 `GET /admin/api/config`（与 `/api/admin/config` 同一 handler）和 `GET /admin/api/stats`（**整个响应**，`summary` 与 `accounts[]` 的每一项都是——`last_used_unix`、`auth_method`、`expires_at_unix`、`has_profile_arn`、`cooldown_until`、`in_cooldown` 等）。所有响应**绝不含账号的 access/refresh token**（`GET /api/admin/credentials` 只出状态）。
 
 > [!WARNING]
 > 管理接口的响应**并非无密**：`GET`/`POST /api/admin/api-keys` 的 `key` 字段是**完整明文**，`GET /api/admin/server-info` 的 `masterApiKey` 也是**完整明文**；只有 `GET /api/admin/config/auth-keys` 与 `GET /api/admin/config` 做了脱敏。本服务没有"只读管理员"角色——拿到管理密钥即可读取、创建、轮换全部 key。请把管理接口的响应当密钥对待：不要贴进 issue、日志或第三方工具。
@@ -568,7 +602,7 @@ curl http://localhost:8080/api/admin/credentials \
 {
   "total": 2,
   "available": 2,
-  "currentId": 12345,
+  "currentId": -1,
   "credentials": [
     {
       "id": 12345,
@@ -576,7 +610,7 @@ curl http://localhost:8080/api/admin/credentials \
       "weight": 1,
       "disabled": false,
       "failureCount": 0,
-      "isCurrent": true,
+      "isCurrent": false,
       "expiresAt": "2026-07-25T12:00:00Z",
       "authMethod": "social",
       "hasProfileArn": true,
@@ -587,9 +621,14 @@ curl http://localhost:8080/api/admin/credentials \
 }
 ```
 
+> [!NOTE]
+> 账号池是**每次请求**现选账号，并不存在一个持久的"当前账号"：`currentId` 恒为 `-1`、每行的 `isCurrent` 恒为 `false`，两个字段是给未来的粘性选择模式预留的。请勿依赖它们做判断。
+
 ### POST /api/admin/credentials
 
 新增一条凭据入池并落盘。
+
+**必填的只有 `refreshToken`**（`authMethod` 为 `idc` 时还需 `clientId` + `clientSecret`）。本端点**不接受** access token 与到期时间——它们由首次自动刷新时补齐；多余的键会被**静默忽略**（不报错）。可选键：`authMethod`、`email`、`nickname`、`clientId`、`clientSecret`、`profileArn`、`priority`、`weight`、`authRegion`、`apiRegion`、`machineId`、`proxyUrl`、`proxyUsername`、`proxyPassword`。
 
 **请求**：
 ```bash
@@ -597,9 +636,7 @@ curl -X POST http://localhost:8080/api/admin/credentials \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-你的管理密钥" \
   -d '{
-    "accessToken": "...",
     "refreshToken": "...",
-    "expiresAt": "2026-07-25T12:00:00Z",
     "authMethod": "social",
     "profileArn": "arn:aws:codewhisperer:us-east-1:...:profile/..."
   }'
@@ -649,14 +686,14 @@ curl -X POST http://localhost:8080/api/admin/credentials/12345/disabled \
 
 ### POST /api/admin/credentials/{id}/priority
 
-设置账号优先级 / 权重。
+设置账号优先级——它**就是**池内权重（`balanced` 策略下越大分到的流量越多），小于 1 会被钳到 1。请求体只有 `{"priority": <整数>}`，`priority` **必填**（缺失返回 `422`）；本端点**没有**独立的 `weight` 字段，多传会被静默忽略。要显式设权重请改用 `PUT /api/admin/credentials/{id}` 传 `{"weight": N}`。
 
 **请求**：
 ```bash
 curl -X POST http://localhost:8080/api/admin/credentials/12345/priority \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-你的管理密钥" \
-  -d '{"priority": 1, "weight": 2}'
+  -d '{"priority": 2}'
 ```
 
 ### POST /api/admin/credentials/{id}/reset
@@ -671,46 +708,82 @@ curl -X POST http://localhost:8080/api/admin/credentials/12345/reset \
 
 ### POST /api/admin/credentials/batch-import
 
-批量导入凭据；接受数组、KAM `{accounts}` 对象或单对象；逐条规整 / 校验 / 落盘，返回逐项结果与计数。
+批量导入凭据；逐条规整 / 校验 / 落盘，返回逐项结果与计数。
+
+顶层请求体**必须**是 `{"data": …}` 对象（缺 `data` 键直接 `422`）；`data` 本身可以是数组、KAM 的 `{accounts:[…]}` 对象或单个对象。逐项只认 `refreshToken`（必填）、`clientId`、`clientSecret`、`region` / `authRegion` / `apiRegion`、`email`、`nickname`、`machineId`、`priority`（也支持 KAM 的 `credentials: {…}` 嵌套）；`authMethod` 由 `clientId`+`clientSecret` 是否成对出现**自动推断**（成对 → `idc`，否则 `social`；只给其一即判失败），`accessToken`、`expiresAt`、`profileArn` 等键会被忽略。
 
 **请求**：
 ```bash
 curl -X POST http://localhost:8080/api/admin/credentials/batch-import \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-你的管理密钥" \
-  -d '[{"accessToken":"...","refreshToken":"...","expiresAt":"...","authMethod":"social"}]'
+  -d '{"data":[{"refreshToken":"...","email":"a@x.io"}]}'
 ```
+
+**响应**：
+```json
+{
+  "success": true,
+  "message": "imported 1 of 1 credential(s), 0 duplicate, 0 failed",
+  "total": 1,
+  "added": 1,
+  "duplicate": 0,
+  "failed": 0,
+  "results": [{"index": 1, "status": "added", "credentialId": 2, "email": "a@x.io"}]
+}
+```
+
+逐项 `index` 从 **1** 起；`status` 为 `added` | `duplicate` | `failed`；`credentialId`/`email`/`error` 缺省时不出现；逐项**没有** `success` 字段。
 
 ### POST /api/admin/login/builderid/start · /poll
 
-AWS Builder ID 设备码流。`start` 返回设备码信息，`poll` 返回 `{success,completed,status,interval?,credentialId?,email?}`，成功即落库（无需手改 `credentials.json`）。
+AWS Builder ID 设备码流。`start` 返回 `{sessionId,userCode,verificationUri,interval}`，`poll` 返回 `{success,completed,status,interval?,credentialId?,email?}`，成功即落库（无需手改 `credentials.json`）。
+
+> [!IMPORTANT]
+> 两个端点都用 JSON body 提取器，**必须带 `Content-Type: application/json` 和请求体**——不带体的裸 `POST` 会被在进 handler 之前拒掉。`start` 的字段全可选（不指定 region 就发 `{}`）；`poll` 的 `sessionId` **必填**，缺失返回 `422`。
 
 **请求**：
 ```bash
+# 发起：region 可省，但 body 不能省
 curl -X POST http://localhost:8080/api/admin/login/builderid/start \
-  -H "Authorization: Bearer sk-你的管理密钥"
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-你的管理密钥" \
+  -d '{}'
+
+# 轮询：用 start 回的 sessionId
+curl -X POST http://localhost:8080/api/admin/login/builderid/poll \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-你的管理密钥" \
+  -d '{"sessionId": "start 返回的 sessionId"}'
 ```
 
 ### POST /api/admin/login/iam-sso/start · /complete
 
 IAM Identity Center（SSO）流。`start` 返回 `{sessionId,authorizeUrl}`；`complete` 消费回调 URL（校验 `state`）后落库。
 
+> [!IMPORTANT]
+> `start` 的 `startUrl` **必填**：整个键缺失是 `422`，给了空串 / 全空白是 `400`（`startUrl is required`）。`region` 可省（默认 `us-east-1`）。`complete` 需要 `{"sessionId":…,"callbackUrl":…}` 两个字段，同样都必填。两者都必须带 `Content-Type: application/json`。
+
 **请求**：
 ```bash
 curl -X POST http://localhost:8080/api/admin/login/iam-sso/start \
-  -H "Authorization: Bearer sk-你的管理密钥"
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-你的管理密钥" \
+  -d '{"startUrl": "https://your-domain.awsapps.com/start", "region": "us-east-1"}'
 ```
 
 ### POST /api/admin/login/sso-token
 
 批量导入原始 bearer/SSO token（每行一个）。
 
+请求体的字段名是 **`bearerToken`**（必填，缺失返回 `422`），值为**整段换行分隔文本**，服务端按行拆分逐行兑换，最多 200 行（超出的行记为 failed）。可选 `region`（缺省 `us-east-1`）。其它键会被静默忽略。
+
 **请求**：
 ```bash
 curl -X POST http://localhost:8080/api/admin/login/sso-token \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-你的管理密钥" \
-  -d '{"tokens": "..."}'
+  -d '{"bearerToken": "token1\ntoken2", "region": "us-east-1"}'
 ```
 
 **响应**：
@@ -767,7 +840,7 @@ curl http://localhost:8080/api/admin/api-keys \
 
 **请求**：
 ```bash
-curl "http://localhost:8080/api/admin/api-keys/key-1/usage/records?page=1&page_size=20" \
+curl "http://localhost:8080/api/admin/api-keys/7/usage/records?page=1&page_size=20" \
   -H "Authorization: Bearer sk-你的管理密钥"
 ```
 
@@ -799,7 +872,7 @@ curl http://localhost:8080/api/admin/credentials/12345/balance \
 
 ### GET /api/admin/config
 
-获取脱敏配置视图（仅布尔 / 非密字段）。
+获取脱敏配置视图（仅布尔 / 非密字段）。**本端点的字段名是 snake_case**（对齐面板数据模型），不是 camelCase。
 
 **请求**：
 ```bash
@@ -807,9 +880,26 @@ curl http://localhost:8080/api/admin/config \
   -H "Authorization: Bearer sk-你的管理密钥"
 ```
 
+**响应**：
+```json
+{
+  "host": "127.0.0.1",
+  "port": 8080,
+  "region": "us-east-1",
+  "load_balancing_mode": "priority",
+  "max_rpm_per_credential": 0,
+  "kiro_version": "0.11.107",
+  "system_version": "win32#10.0.22631",
+  "node_version": "22.22.0",
+  "credentials_path": "/app/data/credentials.json",
+  "api_key_set": false,
+  "admin_api_key_set": false
+}
+```
+
 ### GET /api/admin/models
 
-带 `display_name`/`type`/`max_tokens` 的模型列表（与 `/v1/models` 同源模型集）。
+带 `display_name`/`type`/`max_tokens` 的模型列表（**snake_case 字段名**，同上）。这里返回的是各账号上游 `ListAvailableModels` 的**并集**（缓存命中即用；并集为空时后台惰性回填，本次先回落到内置的 17 条静态目录）——与协议侧 `/v1/models` 的固定短清单**不是同一个集合**，本端点才是完整目录。
 
 ### GET /api/admin/config/load-balancing · PUT
 
@@ -839,7 +929,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -868,7 +958,7 @@ curl "http://localhost:8080/api/admin/logs/stream?api_key=sk-你的管理密钥"
 
 ## 用户 API
 
-`/user` 用户面板（静态，`rust-embed` 嵌入）由 `/api/user/*` 驱动。这些端点**不走** admin 闸——每次请求用调用方**自己的 API-KEY** 鉴权（`x-api-key` 头，或登录 body 里的 `{apiKey}`）；handler 校验后把数据面限定到该 key。key 非法 → `401`，体 `{"error":"…"}`。响应 camelCase；`credits = cost / 0.72`。
+`/user` 用户面板（静态，`rust-embed` 嵌入）由 `/api/user/*` 驱动。这些端点**不走** admin 闸——每次请求用调用方**自己的 API-KEY** 鉴权：key 从请求头按 `Authorization: Bearer` > `x-api-key` > `x-goog-api-key` 的优先级提取（**没有 query 通道**，`?api_key=` / `?token=` 在这里不认）；`POST /api/user/login` 额外接受 body 里的 `{apiKey}`，且 body 的 `apiKey` **优先于**请求头。handler 校验后把数据面限定到该 key。key 非法 → `401`，体 `{"error":"…"}`。响应 camelCase；`credits = cost / 0.72`。
 
 ### POST /api/user/login
 
@@ -884,7 +974,7 @@ curl -X POST http://localhost:8080/api/user/login \
 **响应**：
 ```json
 {
-  "id": "key-1",
+  "id": 7,
   "name": "我的 Key",
   "spendingLimit": 100,
   "limitUnit": "credits",
@@ -932,7 +1022,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.1.0"
+  "version": "0.2.1"
 }
 ```
 

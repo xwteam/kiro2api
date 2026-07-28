@@ -27,7 +27,7 @@ http://サーバーIP:8080/admin
 1. `.env` または `config.json` から `adminApiKey`（未設定の場合は `apiKey`）を確認
 2. パネルに入力してサインイン
 
-> **ヒント**: kiro2api の統一認証は `Authorization: Bearer` / `x-api-key` / `?token=` の 3 通りに対応しています。管理 API（`/api/admin/*`）は `adminApiKey`（未設定時は `apiKey`）を設定して初めて保護されます——どちらも未設定なら無認証で誰でもアクセスできるため、公開環境では必ず `ADMIN_API_KEY` を設定してください。なおパネル本体（`/admin`・`/user`）に認証はなく、ログイン画面は入力したキーをブラウザに保存して API 呼び出しに使うだけです。
+> **ヒント**: kiro2api の統一認証は 6 チャネルに対応し、最初に見つかった 1 つを採用します（優先順位は `Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > `?api_key=` > `?token=` > `?key=`）。管理 API（`/api/admin/*`）は `adminApiKey`（未設定時は `apiKey`）を設定して初めて保護されます——どちらも未設定なら無認証で誰でもアクセスできるため、公開環境では必ず `ADMIN_API_KEY` を設定してください。なおパネル本体（`/admin`・`/user`）に認証はなく、ログイン画面は入力したキーをブラウザに保存して API 呼び出しに使うだけです。
 
 ## パネル機能
 
@@ -86,7 +86,11 @@ Kiro（CodeWhisperer）の認証情報プールを管理します。
 - key ごとの使用量の確認とリセット
 - ページ分割されたリクエスト記録の閲覧
 
-> **消費上限の適用範囲**: key に設定した上限額は 4 つのプロトコルフロントエンド（Anthropic / OpenAI / OpenAI-Responses / Gemini）**すべて**で有効です。どのエンドポイントを使っても課金はその key に紐づけて計上され、上限に達した時点で `402` を返します。使用量統計にも 4 プロトコル分がまとめて反映されます。
+> **消費上限の適用範囲**: key に設定した上限額は 4 つのプロトコルフロントエンド（Anthropic / OpenAI / OpenAI-Responses / Gemini）**すべて**で有効です。どのエンドポイントを使っても課金はその key に紐づけて計上され、上限を超える見込みになった時点で `402` を返します。使用量統計にも 4 プロトコル分がまとめて反映されます。
+>
+> **上限ぴったりまでは使い切れません**: 実際のコストはレスポンスが返るまで確定しないため、認証ゲートはリクエストごとに **1 回分の名目見積（1 USD、`credits` 単位なら 1 USD ÷ 0.72 ≒ 1.39 クレジット）を在途分として先に予約**します。判定式は `実績 + 予約中 + 見積 > 上限` で `402`。つまり残りが 1 リクエスト分の見積を下回った時点で、実績が上限に達していなくても以後のリクエストは全部 `402` になります（ゲートは handler の手前にあるため、`GET /v1/models` のような無課金の呼び出しも同様に弾かれます）。予約はリクエスト完了時に解放され、確定コストで記帳し直されます。
+>
+> この仕様上、**見積より小さい上限（例：`credits` で 1.0、USD で 0.5）を設定した key は最初から 1 回も通りません**。上限は 1 リクエスト分の見積より十分大きい値にしてください。なおユーザーパネルの残量バッジは実績（`実績 >= 上限`）だけを見ているため、この帯域では「正常」と緑表示のまま全リクエストが `402` になります。
 
 ### リアルタイムログ
 
@@ -148,7 +152,9 @@ API 使用状況の統計情報を表示します。
 | 認証キー | `apiKey` / `adminApiKey` のローテーション（即時反映） |
 | 集成示例 | プロトコル × 言語のコピー可能なコード片 |
 | サービス | ワンクリック再起動、更新チェック |
-| サーバー情報 | マスキングされたマスターキーと kiro2api バージョンを表示 |
+
+> [!WARNING]
+> **マスター API キーはマスキングされません**: マスター API キー（`apiKey`）は「API キー」ページの「サービス接続情報」カードに表示されますが、マスクしているのは**ブラウザ側の表示だけ**です。値の取得元である `GET /api/admin/server-info` の `masterApiKey` は**完全な平文**を返し（コピーボタンがその実値を使うため）、サーバー側でマスキングは一切行われません。マスキング済みの値を返すのは `GET /api/admin/config/auth-keys` だけです。したがって `server-info` のレスポンスを issue やログ、サードパーティのツールに貼り付けないでください。
 
 > **再起動 / 停止時の挙動**: 優雅な停止では在途リクエストの排出を待ちますが、その待機時間には**上限（8 秒）**があります。実時ログの SSE のような無期限の長時間接続が残っていても停止処理が止まることはなく、最後の統計フラッシュが必ず実行されるため、使用量と課金の記録が再起動で失われることはありません。
 
@@ -179,7 +185,7 @@ kiro2api はマルチモーダルコンテンツをサポートしており、�
 
 ### OpenAI 形式
 
-`messages` 配列で `image_url` タイプを使用します。Base64 Data URI とリモート HTTP URL の両方をサポートしています。
+`messages` 配列で `image_url` タイプを使用します。対応するのは **Base64 Data URI（`data:image/...;base64,...`）のみ**です。`http(s)://` のリモート URL は上流 Kiro がインライン base64 しか受け取らないため、**黙って無視されるのではなく `400`（`invalid_request_error`）で拒否されます**——画像は自分でダウンロードして Data URI に変換してから送ってください（Anthropic 形式の `{"type":"image","source":{"type":"url",…}}` も同じく `400` です）。
 
 **Base64 画像の例**：
 
@@ -198,31 +204,6 @@ curl -X POST http://localhost:8080/v1/chat/completions \
             "type": "image_url",
             "image_url": {
               "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-            }
-          }
-        ]
-      }
-    ]
-  }'
-```
-
-**リモート URL 画像の例**：
-
-```bash
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-あなたのキー" \
-  -d '{
-    "model": "claude-sonnet-4.5",
-    "messages": [
-      {
-        "role": "user",
-        "content": [
-          {"type": "text", "text": "この画像を分析してください"},
-          {
-            "type": "image_url",
-            "image_url": {
-              "url": "https://example.com/image.jpg"
             }
           }
         ]
@@ -293,16 +274,23 @@ kiro2api は後端の Kiro（CodeWhisperer）が提供する Claude 系モデル
 
 | モデル名 | 説明 |
 |---------|------|
-| `claude-sonnet-4.5` | 免費档（KIRO FREE）でも通常利用可能な標準モデル |
-| （その他） | opus / GPT 系など、より高い订阅档位で授権されるモデル |
+| `claude-sonnet-4.5` | 無料階層（KIRO FREE）でも通常利用可能な標準モデル |
+| （その他） | opus / GPT 系など、より上位のサブスクリプション階層で認可されるモデル |
 
-> **重要**: **利用可能なモデルはアカウントの订阅档位に依存します**。免費档（KIRO FREE）は通常 `claude-sonnet-4.5` のみを授権します。サポートされていないモデルを要求すると、明確に `400`（`INVALID_MODEL_ID`）が返されます（静かに失敗したり、無駄な再試行でアカウントを傷つけたりはしません）。
+> **重要**: **利用可能なモデルはアカウントのサブスクリプション階層に依存します**。無料階層（KIRO FREE）は通常 `claude-sonnet-4.5` のみを認可します。サポートされていないモデルを要求すると、明確に `400`（`INVALID_MODEL_ID`）が返されます（静かに失敗したり、無駄な再試行でアカウントを傷つけたりはしません）。
 
-**モデルの確認**：まず `GET /v1/models`（または `/claude/v1/models`、`/v1beta/models`）で本サービスが実際に提供できるモデル id を確認し、list-then-use することを推奨します。
+**モデルの確認**：`GET /v1/models`（または `/claude/v1/models`、`/v1beta/models`）は**固定 3 件**の短いリストを返すだけで、アカウントプールもサブスクリプション階層も参照しません。したがって「一覧に載っている＝使える」とは限らず、階層が足りなければ `400`（`INVALID_MODEL_ID`）になります。
 
 ```bash
 curl http://localhost:8080/v1/models \
   -H "Authorization: Bearer sk-あなたのキー"
+```
+
+より広いカタログは管理 API で確認できます（各アカウントの上流モデル一覧の**和集合**、なければ静的な 17 件にフォールバック）。
+
+```bash
+curl http://localhost:8080/api/admin/models \
+  -H "Authorization: Bearer sk-管理端のキー"
 ```
 
 ## サードパーティクライアント接続
@@ -539,7 +527,7 @@ docker compose ps
 
 ```bash
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.1.0"}
+# {"service":"kiro2api","status":"ok","version":"0.2.1"}
 ```
 
 ### 認証エラー
@@ -565,14 +553,14 @@ curl -H "Authorization: sk-xxx"
 
 **解決方法**:
 
-1. 利用可能なモデルを確認：
+1. より広いモデルカタログを確認（管理 API。上流の和集合、なければ静的な 17 件。`/v1/models` は固定 3 件を返すだけで階層フィルタは掛かりません）：
 
 ```bash
-curl http://localhost:8080/v1/models \
-  -H "Authorization: Bearer sk-あなたのキー"
+curl http://localhost:8080/api/admin/models \
+  -H "Authorization: Bearer sk-管理端のキー"
 ```
 
-2. アカウントの订阅档位を確認（免費档は通常 `claude-sonnet-4.5` のみ授権。opus/GPT 等はより高い档位が必要）
+2. アカウントのサブスクリプション階層を確認（無料階層は通常 `claude-sonnet-4.5` のみ認可。opus/GPT 等はより上位の階層が必要）
 
 ### アカウントが冷却中
 

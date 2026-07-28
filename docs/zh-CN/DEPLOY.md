@@ -112,9 +112,11 @@ LOAD_BALANCING_MODE=priority
 # 可选：每账号每分钟请求上限（0 = 无限，默认 0）
 MAX_RPM_PER_CREDENTIAL=0
 
-# 可选：凭据文件路径（镜像已内置该默认值）。
-# 它同时决定用量统计、api_keys.json 与余额缓存的目录（取其父目录），务必指向挂载卷内
-CREDENTIALS_PATH=/app/data/credentials.json
+# 可选：凭据文件路径。镜像不设这个变量：内置默认值 credentials.json 会就近解析到 -c 所指
+# 配置文件的目录，容器以 -c /app/data/config.json 启动，因此默认落点就是 /app/data/credentials.json
+# （在挂载卷内）。正因为没烘焙成 ENV，config.json 里的 credentialsPath 才仍然生效。
+# 它同时决定用量统计、api_keys.json 与余额缓存的目录（取其父目录），自定义时务必指向挂载卷内
+# CREDENTIALS_PATH=/app/data/credentials.json
 ```
 
 ### 配置注意事项
@@ -253,7 +255,7 @@ LOAD_BALANCING_MODE=priority
 curl http://localhost:8080/health
 
 # 输出示例：
-# {"service":"kiro2api","status":"ok","version":"0.1.0"}
+# {"service":"kiro2api","status":"ok","version":"0.2.1"}
 ```
 
 ### 准备 API Key
@@ -271,7 +273,7 @@ cat data/config.json | grep -i apiKey
 ### 测试 API
 
 ```bash
-# 获取可用模型列表
+# 获取协议侧模型清单（固定短清单，不代表账号档位真的授权）
 curl http://localhost:8080/v1/models \
   -H "Authorization: Bearer sk-你的API密钥"
 
@@ -333,7 +335,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 **解决方案**：
 1. **可用模型取决于账号订阅档位**：免费档（KIRO FREE）通常只授权 `claude-sonnet-4.5`，opus/GPT 等需更高档位
-2. 先调用 `/v1/models` 查看本服务实际可服务的模型 id，再 list-then-use
+2. 用管理接口 `GET /api/admin/models` 查询模型目录（各账号上游能力的并集；并集为空时先回落到内置的 17 条静态目录，此时不反映档位授权）。协议侧 `GET /v1/models` 只是编译期写死的固定短清单，不读账号池、也不按档位过滤，**不能**拿它当可用性依据
 3. 这是**确定性请求错误**，服务不会瞎重试、不会误伤账号，会把上游原因直接回给客户端
 
 ### 认证失败
@@ -342,12 +344,14 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 **解决方案**：
 1. 检查 API Key 是否正确
-2. 确保请求头中携带以下三种之一：
+2. 确保密钥走了鉴权闸接受的六条通道之一（优先级 `Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > `?api_key=` > `?token=` > `?key=`）：
    ```bash
    -H "Authorization: Bearer sk-你的API密钥"
    # 或
    -H "x-api-key: sk-你的API密钥"
-   # 或在 URL 上带 ?token=sk-你的API密钥
+   # 或（Gemini 官方 SDK 默认走它）
+   -H "x-goog-api-key: sk-你的API密钥"
+   # 或在 URL 上带 ?api_key= / ?token= / ?key=
    ```
 3. 检查 API Key 是否在 `.env` 或 `config.json` 中正确配置
 
@@ -490,7 +494,7 @@ API_KEY=sk-xxx ./target/release/kiro2api \
   --credentials data/credentials.json
 ```
 
-> 配置优先级：**命令行参数 > 环境变量 > `config.json` > 内置默认**。`--credentials` 不给时由 `CREDENTIALS_PATH` / `config.json` 的 `credentialsPath` / 默认的 `credentials.json`（相对当前工作目录）决定；用量统计、`api_keys.json` 与余额缓存都落在该文件的父目录里。
+> 配置优先级：**命令行参数 > 环境变量 > `config.json` > 内置默认**。`--credentials` 不给时由 `CREDENTIALS_PATH` / `config.json` 的 `credentialsPath` / 内置默认的 `credentials.json`（就近解析到 `-c` 所指配置文件的目录；`-c` 只给了无目录的文件名时才相对当前工作目录）决定；用量统计、`api_keys.json` 与余额缓存都落在该文件的父目录里。
 
 > [!TIP]
 > 裸机部署请勿轻易把 `HOST` 改成 `0.0.0.0`。`/admin`、`/user` 面板本体始终不鉴权，`/api/admin/*` 只有在配置了 `adminApiKey`（缺省回退 `apiKey`）之后才受保护——一个都不配时管理接口对所有人开放；`/api/user/*` 不走该闸，始终要求调用方自带有效 API-KEY（无效/停用/过期即 401）。

@@ -48,7 +48,7 @@
 > 本專案與 Amazon / AWS / Kiro 無關聯。透過封裝 Kiro（CodeWhisperer）後端提供多協議相容 API，可能不符合相關服務條款。使用風險自負，作者不對任何帳號處罰或資料遺失承擔責任。
 
 > [!IMPORTANT]
-> `apiKey`/`API_KEY` 為空時，協議端點會**開放存取**（啟動會告警）。對外部署務必設定。管理介面 `/api/admin/*` 只有在設定了 `adminApiKey`（缺省回退 `apiKey`）之後才受保護——**兩個 key 都不設時，管理介面跟面板一樣是開放的**，任何人都能增刪憑證、改驗證金鑰；`/admin`、`/user` 面板本體則始終不驗證。部署到公網必須設定 `ADMIN_API_KEY`。容器映像已內建 `HOST=0.0.0.0`；裸機部署請勿輕易把 `HOST` 改成 `0.0.0.0`。
+> `apiKey`/`API_KEY` 為空**且尚未建立任何 API-KEY** 時，協議端點會**開放存取**（啟動會告警）；在管理面發出第一條 API-KEY 之後協議閘即收口，不帶有效金鑰的請求一律 `401`。對外部署務必設定。管理介面 `/api/admin/*` 只有在設定了 `adminApiKey`（缺省回退 `apiKey`）之後才受保護——**兩個 key 都不設時，管理介面跟面板一樣是開放的**，任何人都能增刪憑證、改驗證金鑰；`/admin`、`/user` 面板本體則始終不驗證。部署到公網必須設定 `ADMIN_API_KEY`。容器映像已內建 `HOST=0.0.0.0`；裸機部署請勿輕易把 `HOST` 改成 `0.0.0.0`。
 
 > [!TIP]
 > 後端為 Kiro（CodeWhisperer）帳號池。**可用模型取決於帳號訂閱檔位**：免費檔（KIRO FREE）通常只授權 `claude-sonnet-4.5`，opus/GPT 等需更高檔位——請求不支援的模型會明確傳回 `400`（`INVALID_MODEL_ID`），而非靜默失敗。
@@ -84,7 +84,7 @@
 
 ### 🔐 統一驗證閘
 
-- 三選一：`Authorization: Bearer` / `x-api-key` / `?token=`，常數時間比較，失敗即 `401`
+- 六條攜帶通道，依優先順序：`Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > 查詢參數（`?api_key=` > `?token=` > `?key=`），常數時間比較，失敗即 `401`
 - `adminApiKey`（缺省回退 `apiKey`）保護 `/api/admin/*`，兩者都未設定時該閘為開放模式；持有者用自己的 **API-KEY** 存取 `/api/user/*`
 - `/health`、`/v1/ping` 等探活端點不驗證
 
@@ -121,7 +121,7 @@
 ### 🧭 模型名映射
 
 - 客戶端傳入的模型名按**小寫子字串**匹配到 Kiro 內部模型（未匹配到 → `400`）
-- `/models` 端點傳回本服務實際可服務的模型 id，建議客戶端 list-then-use
+- 協議端點的 `/models` 傳回一份**寫死的**常用 id 短清單，**不依帳號訂閱檔位過濾**（列出的模型仍可能回 `400`）；要看帳號實際授權的動態並集請用 `GET /api/admin/models`
 
 ### ⚡ 高效能架構
 
@@ -178,7 +178,7 @@ cp .env.example .env
 ```env
 API_KEY=sk-你的對外呼叫金鑰
 # 管理端獨立金鑰；公網部署必填（不設則 /api/admin/* 回退用 API_KEY 驗證，兩者都不設即開放）。
-# 不需要就把整行註解掉——寫成空值會覆蓋 config.json 裡已設定的金鑰。
+# 不需要就把整行註解掉或留空——空值（含純空白）一律視為未設定，不會覆蓋 config.json 裡已設定的金鑰。
 ADMIN_API_KEY=sk-你的管理端金鑰
 ```
 
@@ -217,9 +217,9 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.1.0"}
+# {"service":"kiro2api","status":"ok","version":"0.2.1"}
 
-# 查看可用模型
+# 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \
   -H "Authorization: Bearer sk-你的API金鑰"
 
@@ -237,9 +237,11 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 ## 🧪 接入範例
 
 > [!NOTE]
-> 所有 API 請求都需要攜帶 API Key。支援兩種方式：
+> 所有 API 請求都需要攜帶 API Key。最常用的兩種攜帶方式是：
 > - `Authorization: Bearer sk-xxx`（推薦，相容 OpenAI/Anthropic SDK）
 > - `x-api-key: sk-xxx`
+>
+> 驗證閘另受理 `x-goog-api-key` 標頭與 `?api_key=` / `?token=` / `?key=` 查詢參數，共六條通道，優先順序為：`Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > `?api_key=` > `?token=` > `?key=`。
 >
 > base URL 用**標準裸前綴**：OpenAI = `{host}/v1`，Anthropic = `{host}`（SDK 自動補 `/v1/messages`），Gemini = `{host}/v1beta`。也可用顯式廠商前綴 `/openai/v1`、`/claude/v1`、`/gemini/v1beta`。
 
@@ -361,7 +363,7 @@ resp = client.chat.completions.create(
 
 | 方法 | 端點 | 功能 |
 |------|------|------|
-| GET | `/models` | 可用模型列表 |
+| GET | `/models` | 模型清單（寫死的短清單，不依帳號檔位過濾） |
 | POST | `/chat/completions` | 對話補全（串流傳回 `chat.completion.chunk` + `[DONE]`，含工具/圖片） |
 
 ### OpenAI Responses（`/v1/responses` 或 `/openai/v1/responses`）
@@ -376,14 +378,14 @@ resp = client.chat.completions.create(
 |------|------|------|
 | POST | `/v1/messages` | Messages（串流/工具/圖片） |
 | POST | `/v1/messages/count_tokens` | token 估算 |
-| GET | `/claude/v1/models` | 模型列表（Anthropic 形狀，避開與 OpenAI `/v1/models` 衝突） |
+| GET | `/claude/v1/models` | 模型清單（Anthropic 形狀，避開與 OpenAI `/v1/models` 衝突；同為寫死的短清單，且與 OpenAI／Gemini 那兩份內容不一致） |
 | POST | `/claude/v1/messages` · `.../count_tokens` | 顯式前綴變體 |
 
 ### Gemini 原生（`/v1beta` 或 `/gemini/v1beta`）
 
 | 方法 | 端點 | 功能 |
 |------|------|------|
-| GET | `/models` | 模型列表 |
+| GET | `/models` | 模型清單（寫死的短清單，不依帳號檔位過濾） |
 | POST | `/models/{m}:generateContent` | 內容生成（非串流） |
 | POST | `/models/{m}:streamGenerateContent` | 串流生成（`?alt=sse`，camelCase） |
 
@@ -397,7 +399,7 @@ resp = client.chat.completions.create(
 
 > URL 裡的 `localhost:8080` 只是範例；連接埠由 `PORT`/`config.json` 配置，按你的部署替換。
 >
-> Gemini/OpenAI 客戶端一律用本服務的**統一驗證**（Bearer/`x-api-key`/`?token=`），不是廠商原生的 `?key=`/`x-goog-api-key`。
+> 憑證可走驗證閘接受的任一通道，優先順序：`Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > 查詢參數（`?api_key=` > `?token=` > `?key=`）。Gemini 原生的 `x-goog-api-key` 與 `?key=` **同樣受理**，官方 `google-genai` SDK 換掉 `base_url` 即可直用；要換的是**值**——一律填**本服務**的 API Key，不是廠商真金鑰。
 
 ---
 
@@ -411,11 +413,11 @@ resp = client.chat.completions.create(
 
 | 變數 | 必填 | 預設值 | 說明 |
 |------|------|--------|------|
-| `API_KEY` | ✅ | — | 對外呼叫金鑰（留空則協議端點開放存取，啟動告警） |
+| `API_KEY` | ✅ | — | 對外呼叫金鑰（留空**且未建立任何 API-KEY** 時協議端點開放存取，啟動告警） |
 | `ADMIN_API_KEY` | ❌ | 回退 `API_KEY` | 管理端獨立驗證 key；與 `API_KEY` 都不設時 `/api/admin/*` 開放，公網部署必填 |
 | `HOST` | ❌ | `127.0.0.1`（映像內建 `0.0.0.0`） | 監聽位址 |
 | `PORT` | ❌ | `8080` | 服務連接埠（compose 的連接埠映射與健康檢查都跟隨該值） |
-| `REGION` | ❌ | `us-east-1` | 預設 AWS region（帳號 `profileArn` 內的 region 優先） |
+| `REGION` | ❌ | `us-east-1` | 僅供 `GET /api/admin/config` 的配置展示；**不影響實際呼叫**——資料面與令牌刷新的 region 取自帳號 `profileArn`，其次該帳號自身的 `region` 欄位，最後回落寫死的 `us-east-1` |
 | `LOAD_BALANCING_MODE` | ❌ | `priority` | 負載平衡：`priority`（等權輪詢）/ `balanced`（按 weight 加權） |
 | `MAX_RPM_PER_CREDENTIAL` | ❌ | `0` | 每帳號每分鐘請求上限，`0` = 無限 |
 | `CREDENTIALS_PATH` | ❌ | `credentials.json`（相對 `-c` 設定檔所在目錄解析，容器內即 `/app/data/credentials.json`） | 憑證檔案路徑；被命令列 `--credentials` 覆蓋 |
@@ -446,13 +448,13 @@ resp = client.chat.completions.create(
 
 ## ⚠ 注意事項
 
-1. **對外部署務必設定 `API_KEY` 與 `ADMIN_API_KEY`**：`API_KEY` 留空時協議端點開放存取（啟動會告警）；`adminApiKey`/`apiKey` 都不設時 `/api/admin/*` 同樣開放，憑證、API-KEY、驗證設定都能被任意改寫。`/admin`、`/user` 面板本體始終不驗證（真正的閘在其 `/api/**` 介面上）；裸機部署慎改 `HOST=0.0.0.0`。
+1. **對外部署務必設定 `API_KEY` 與 `ADMIN_API_KEY`**：`API_KEY` 留空且未建立任何 API-KEY 時協議端點開放存取（啟動會告警，發出第一條 API-KEY 後即收口）；`adminApiKey`/`apiKey` 都不設時 `/api/admin/*` 同樣開放，憑證、API-KEY、驗證設定都能被任意改寫。`/admin`、`/user` 面板本體始終不驗證（真正的閘在其 `/api/**` 介面上）；裸機部署慎改 `HOST=0.0.0.0`。
 
 2. **可用模型取決於帳號訂閱檔位**：免費檔（KIRO FREE）通常只授權 `claude-sonnet-4.5`；請求不支援的模型傳回 `400`（`INVALID_MODEL_ID`），不瞎重試、不誤傷帳號。
 
 3. **令牌自癒**：token 到期自動記憶體刷新並原子落盤 `credentials.json`；真正的憑證失效才永久停用，配額/風控/限流一律冷卻自癒。
 
-4. **串流輸出**：四種協議均支援串流；`stream:false` 時服務內部仍解碼事件流，收集完畢後一次性傳回完整 JSON。上游報錯或串流中途傳輸中斷（連線重置 / 讀取逾時 / 分塊未收尾）時，一律以該協議自身的錯誤事件收束（Anthropic `error` 事件、OpenAI 錯誤 chunk 且不補 `[DONE]`、Responses `response.failed`、Gemini 錯誤區塊），**絕不會被當成正常完成**；命中 `max_tokens` 或上下文耗盡時，如實回報截斷原因（`max_tokens` / `length` / `MAX_TOKENS` / `incomplete`）。
+4. **串流輸出**：四種協議均支援串流；`stream:false` 時服務內部仍解碼事件流，收集完畢後一次性傳回完整 JSON。上游報錯或串流中途傳輸中斷（連線重置 / 讀取逾時 / 分塊未收尾）時，一律以該協議自身的錯誤事件收束（Anthropic `error` 事件、OpenAI 錯誤 chunk 且不補 `[DONE]`、Responses `response.failed`、Gemini 錯誤區塊），**絕不會被當成正常完成**；**上游自己**判定截斷（它自己的長度預算或上下文耗盡）時如實回報截斷原因（`max_tokens` / `length` / `MAX_TOKENS` / `incomplete`）——這與客戶端傳的 `max_tokens` / `maxOutputTokens` 無關，那些參數**相容接受但不轉發給上游、不會限制回應長度**（詳見 [API.md](API.md)）。
 
 5. **網路環境**：部署伺服器需能存取 AWS CodeWhisperer/Kiro 端點（`*.amazonaws.com`）。
 
@@ -467,7 +469,7 @@ resp = client.chat.completions.create(
 - [x] 令牌單飛自動刷新 + 原子落盤
 - [x] 端點回退（Kiro/CodeWhisperer/AmazonQ）+ 跨帳號重試
 - [x] body-aware 失敗分類（永久失效才停用，其餘冷卻自癒）
-- [x] 統一驗證閘（Bearer / x-api-key / ?token=）
+- [x] 統一驗證閘（Bearer / x-api-key / x-goog-api-key / `?api_key=` / `?token=` / `?key=`）
 - [x] Web 管理面板（憑證/登入/API-KEY/用量/日誌/餘額/設定）
 - [x] 使用者面板（持有者用自身 API-KEY 登入）
 - [x] 三種互動式登入流（Builder ID / IAM SSO / 社交令牌）

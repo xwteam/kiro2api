@@ -11,3 +11,4 @@ node_modules/
 /.superpowers/
 /docs/superpowers/
 *.tsbuildinfo
+.claude/

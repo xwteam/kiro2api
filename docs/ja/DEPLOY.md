@@ -66,8 +66,10 @@ cp .env.example .env
 
 ```env
 API_KEY=sk-あなたの対外呼び出しキー
-# 管理端の独立認証キー。公開デプロイでは必須（未設定だと /api/admin/* が無認証になります）。
-# 不要なら行ごとコメントアウトしてください——空値で書くと config.json 側の管理キーを消してしまいます。
+# 管理端の独立認証キー。公開デプロイでは必須（未設定だと /api/admin/* は API_KEY で照合され、
+# API_KEY も未設定なら無認証になります）。
+# 不要なら行ごとコメントアウトしてください（空値で書いた場合も未設定と同じ扱いで、
+# config.json 側の管理キーはそのまま残ります）。
 ADMIN_API_KEY=sk-管理端専用の独立キー
 HOST=0.0.0.0
 # サービスポート。compose のポートマッピングとヘルスチェックもこの値に追従します
@@ -75,27 +77,30 @@ PORT=8080
 REGION=us-east-1
 LOAD_BALANCING_MODE=priority
 MAX_RPM_PER_CREDENTIAL=0
-CREDENTIALS_PATH=/app/data/credentials.json
+# 任意：認証情報ファイルのパス。イメージはこの変数を設定しません。組み込み既定は
+# `-c` で指定した設定ファイルと同じディレクトリに解決されるため、コンテナでは
+# そのまま /app/data/credentials.json になります（通常は指定不要）。
+# CREDENTIALS_PATH=/app/data/credentials.json
 ```
 
 **重要な設定項目：**
 
 | 変数 | 説明 | デフォルト |
 |------|------|-----------|
-| `API_KEY` | 対外呼び出しキー（空白ならプロトコルエンドポイントが開放され、起動時に警告） | 必須 |
-| `ADMIN_API_KEY` | 管理端の独立認証キー（この行ごと省略した場合のみ `API_KEY` にフォールバック。`API_KEY` ともども未設定だと `/api/admin/*` は無認証） | — |
+| `API_KEY` | 対外呼び出しキー（空白かつ管理パネルで API-KEY を 1 件も作成していない間だけプロトコルエンドポイントが開放され、起動時に警告） | 必須 |
+| `ADMIN_API_KEY` | 管理端の独立認証キー（行ごと省略・空値のどちらも未設定扱いで `API_KEY` にフォールバック。`API_KEY` ともども未設定だと `/api/admin/*` は無認証） | — |
 | `HOST` | リッスンアドレス（コンテナイメージには `0.0.0.0` を内蔵） | `127.0.0.1` |
 | `PORT` | サービスポート（compose のポートマッピングとヘルスチェックもこの値に追従） | 8080 |
 | `REGION` | 既定の AWS リージョン（アカウントの `profileArn` 内リージョンが優先） | us-east-1 |
 | `LOAD_BALANCING_MODE` | 負荷分散：`priority`（均等ローテーション）/ `balanced`（`weight` による重み付け） | priority |
 | `MAX_RPM_PER_CREDENTIAL` | アカウント当たりの毎分リクエスト上限、`0` = 無制限 | 0 |
-| `CREDENTIALS_PATH` | 認証情報ファイルのパス。使用量統計・`api_keys.json`・残高キャッシュの保存先（このファイルの親ディレクトリ）も決めるため、必ずマウントボリューム内を指すこと | `credentials.json`（イメージは `/app/data/credentials.json` を内蔵） |
+| `CREDENTIALS_PATH` | 認証情報ファイルのパス。使用量統計・`api_keys.json`・残高キャッシュの保存先（このファイルの親ディレクトリ）も決めるため、必ずマウントボリューム内を指すこと | `credentials.json`（`-c` の設定ファイルと同じディレクトリを基準に解決。コンテナでは `/app/data/credentials.json`。イメージは `CREDENTIALS_PATH` を設定しないため、`config.json` の `credentialsPath` も有効なままです） |
 
 > **注意**: 値に引用符は不要です。余分なスペースや改行がないことを確認してください。`logCapacity` は `config.json` でのみ設定します。
 >
-> **キーは必ず設定**: `API_KEY` が空だとプロトコルエンドポイントが開放されます。さらに `ADMIN_API_KEY`・`API_KEY` の両方が未設定だと `/api/admin/*` も無認証で開放され、認証情報・API-KEY・認証設定を誰でも書き換えられます。公開デプロイでは `ADMIN_API_KEY` の設定が必須です。
+> **キーは必ず設定**: `API_KEY` が空で、かつ管理パネルで API-KEY を 1 件も作成していない間はプロトコルエンドポイントが開放されます（API-KEY を 1 件でも作れば、以降は有効な API-KEY が必要になります）。さらに `ADMIN_API_KEY`・`API_KEY` の両方が未設定だと `/api/admin/*` も無認証で開放され、認証情報・API-KEY・認証設定を誰でも書き換えられます。管理ゲートは API-KEY を作っても閉じません（管理者級のキーを設定して初めて閉じます）。公開デプロイでは `ADMIN_API_KEY` の設定が必須です。
 >
-> **空値を書かない**: `API_KEY=`・`ADMIN_API_KEY=` のような空値は `config.json` に設定済みのキーを上書きします。使わないなら行ごとコメントアウトしてください。
+> **空値は無視される**: `API_KEY=`・`ADMIN_API_KEY=` のような空値（空白のみも同様）は読み込み時に捨てられ、`config.json` やパネルで設定済みのキーは**上書きされません**。環境変数で値を変えたいときは必ず非空の値を書いてください。
 
 ### ステップ 4: 認証情報を配置
 
@@ -133,16 +138,17 @@ docker compose up -d
 docker compose logs -f
 ```
 
-起動成功の確認（アカウントプールがリードになり、ポートをリッスンしていれば成功）：
+起動成功の確認（認証情報の読み込みとリッスン開始の 2 行が出れば成功）。サーバーのログメッセージ本体は中国語で出力されます（先頭のタイムスタンプは省略）：
 
 ```
-Account pool ready
+INFO kiro2api::server: 已载入账号凭据 path=/app/data/credentials.json accounts=3
+INFO kiro2api::server: kiro2api listening on 0.0.0.0:8080
 ```
 
-`API_KEY` が空の場合、起動時に次のような警告が出て、プロトコルエンドポイントが開放されます。
+`API_KEY` が空の場合、起動時に次の警告が出ます（API-KEY を 1 件も作成していない間、プロトコルエンドポイントは開放されます）。
 
 ```
-WARN: apiKey is empty, protocol endpoints are publicly accessible
+WARN kiro2api::server: 未设置 api_key:在未创建任何 API-KEY 前,四条协议端点(Anthropic/OpenAI/Responses/Gemini)开放访问
 ```
 
 この場合は `.env` に `API_KEY` を設定し、`docker compose restart` を実行してください。
@@ -216,7 +222,7 @@ curl http://localhost:8080/health
 期待される応答：
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.1.0"}
+{"service":"kiro2api","status":"ok","version":"0.2.1"}
 ```
 
 ### モデル一覧の確認
@@ -250,7 +256,7 @@ AI からの応答が返ってくれば、デプロイは成功です。
 
 **解決方法**:
 
-1. 正しいヘッダーを使用（3 択のいずれか 1 つ）：
+1. 受理される 6 チャネルのいずれか 1 つで渡す（ゲートは最初に見つかった 1 つを採用。優先順位は下記の並び順）：
 
 ```bash
 # 方法 1
@@ -259,30 +265,42 @@ curl -H "Authorization: Bearer sk-xxx"
 # 方法 2
 curl -H "x-api-key: sk-xxx"
 
-# 方法 3（クエリパラメータ）
+# 方法 3（Gemini ネイティブヘッダー）
+curl -H "x-goog-api-key: sk-xxx"
+
+# 方法 4〜6（クエリパラメータ。ヘッダーを設定できないクライアント向け）
+curl "http://localhost:8080/v1/models?api_key=sk-xxx"
 curl "http://localhost:8080/v1/models?token=sk-xxx"
+curl "http://localhost:8080/v1/models?key=sk-xxx"
 ```
 
-2. `.env` の `API_KEY` が設定されているか確認。空白の場合はプロトコルエンドポイントが開放されます。
+2. `.env` の `API_KEY` が設定されているか確認。空白でも管理パネルで API-KEY を作成済みなら、その API-KEY による認証が必要です（API-KEY が 1 件も無いときだけプロトコルエンドポイントが開放されます）。
 
 ### サポートされないモデルエラー（400 / INVALID_MODEL_ID）
 
 **症状**: `400`（`INVALID_MODEL_ID`）が返る
 
-**原因**: リクエストしたモデルがアカウントの订阅档位で授权されていない。**利用可能なモデルはアカウントのサブスクリプション階層に依存します**。無料档（KIRO FREE）は通常 `claude-sonnet-4.5` のみ授权されます。
+**原因**: リクエストしたモデルがアカウントのサブスクリプション階層で認可されていない。**利用可能なモデルはアカウントのサブスクリプション階層に依存します**。無料階層（KIRO FREE）は通常 `claude-sonnet-4.5` のみ認可されます。
 
 **解決方法**:
 
-1. `/models` エンドポイントで実際にサービス可能なモデル id を確認：
+1. より広いモデルカタログを確認（管理 API。上流の和集合、なければ静的な 17 件）：
+
+```bash
+curl http://localhost:8080/api/admin/models \
+  -H "Authorization: Bearer sk-管理端のキー"
+```
+
+プロトコル側の `/v1/models` も使えますが、こちらは**固定 3 件**を返すだけで階層によるフィルタは掛かりません：
 
 ```bash
 curl http://localhost:8080/v1/models \
   -H "Authorization: Bearer sk-あなたのキー"
 ```
 
-2. 返ってきたモデル id を使用（クライアントは list-then-use 推奨）。opus/GPT 等はより高い階層が必要です。
+2. 一覧に載っていても階層が足りなければ `400` になります。opus/GPT 等はより高い階層が必要なので、実際に通るモデルは 1 回試して確かめてください。
 
-> **注意**: この 400 は明示的なエラーであり、静默失敗ではありません。無闇にリトライせず、アカウントも誤って傷つけません。
+> **注意**: この 400 は明示的なエラーであり、暗黙のうちに失敗するわけではありません。無闇にリトライせず、アカウントも誤って傷つけません。
 
 ### ポート競合エラー
 
@@ -391,7 +409,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 20s
     restart: unless-stopped
 ```
 

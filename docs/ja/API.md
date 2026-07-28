@@ -6,7 +6,7 @@ kiro2api は Kiro（CodeWhisperer）をバックエンドとする多プロト�
 
 ## 認証
 
-すべてのプロトコルエンドポイントには認証が必要です。以下の 3 つの方法をサポートしています（いずれも定数時間比較で照合されます）。
+すべてのプロトコルエンドポイントには認証が必要です。ゲートは **6 つ**のチャネルを受け付け、**最初に見つかった 1 つ**を採用します。優先順位は `Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > `?api_key=` > `?token=` > `?key=` です（いずれも定数時間比較で照合されます）。
 
 ### 方法 1: Authorization ヘッダー（推奨）
 
@@ -22,13 +22,26 @@ curl -H "x-api-key: sk-あなたのキー" \
   http://localhost:8080/v1/models
 ```
 
-### 方法 3: token クエリパラメータ
+### 方法 3: x-goog-api-key ヘッダー（Gemini ネイティブ）
 
 ```bash
-curl "http://localhost:8080/v1/models?token=sk-あなたのキー"
+curl -H "x-goog-api-key: sk-あなたのキー" \
+  http://localhost:8080/v1beta/models
 ```
 
-> **ヒント**: API Key は `.env` の `API_KEY`、`config.json` の `apiKey`、または管理パネルから確認できます。`apiKey`/`API_KEY` が空の場合、プロトコルエンドポイントは**開放アクセス**になります（起動時に警告が出ます）。外部公開時は必ず設定してください。
+### 方法 4〜6: クエリパラメータ
+
+ヘッダーを設定できないクライアント向けです（ブラウザの `EventSource` など）。公式 Gemini SDK は `?key=` を使います。
+
+```bash
+curl "http://localhost:8080/v1/models?api_key=sk-あなたのキー"
+curl "http://localhost:8080/v1/models?token=sk-あなたのキー"
+curl "http://localhost:8080/v1/models?key=sk-あなたのキー"
+```
+
+ヘッダーはクエリパラメータより常に優先され、同じグループ内では上記の並び順で決まります。`/health` と `/v1/ping` は死活監視用で認証不要です。
+
+> **ヒント**: API Key は `.env` の `API_KEY`、`config.json` の `apiKey`、または管理パネルから確認できます。`apiKey`/`API_KEY` が空で、**かつ管理パネルで API-KEY を 1 件も作成していない**場合に限り、プロトコルエンドポイントは**開放アクセス**になります（起動時に警告が出ます）。API-KEY を 1 件でも作成すると、以降プロトコルエンドポイントは有効な API-KEY を要求します。外部公開時は必ず設定してください。
 
 ## 標準ベアパス
 
@@ -73,12 +86,9 @@ curl http://localhost:8080/openai/v1/models \
 {
   "object": "list",
   "data": [
-    {
-      "id": "claude-sonnet-4.5",
-      "object": "model",
-      "created": 1715970000,
-      "owned_by": "kiro"
-    }
+    {"id": "claude-sonnet-4.5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-opus-4.6", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "gpt-5.6-sol", "object": "model", "created": 1700000000, "owned_by": "kiro2api"}
   ]
 }
 ```
@@ -88,7 +98,7 @@ curl http://localhost:8080/openai/v1/models \
 > - `opus` / `GPT` などのモデルはより上位の階層が必要です。
 > - サポートされていないモデルをリクエストすると、静かに失敗するのではなく明確に `400`（`INVALID_MODEL_ID`）を返します。
 >
-> 実際に提供可能なモデル id を確認するには、各プロトコルの `/models` エンドポイントを list してから使用する（list-then-use）ことを推奨します。
+> ⚠️ ただし各プロトコルの `/models` が返すのは**固定の短いリスト**です（OpenAI/Gemini は `claude-sonnet-4.5` / `claude-opus-4.6` / `gpt-5.6-sol`、Anthropic は `claude-sonnet-4.5` / `claude-opus-4.6` / `claude-haiku-4.5`）。アカウントプールもサブスクリプション階層も参照しない静的な値なので、**list-then-use は利用可否の保証にはなりません**——ここに載っているモデルでも階層が足りなければ `400`（`INVALID_MODEL_ID`）になります。より広いカタログは `GET /api/admin/models` を参照してください（各アカウントの上流モデル一覧の**和集合**、なければ静的な 17 件にフォールバック）。なお中継が受け付けるモデル名はこれらのリストの完全一致に限りません——モデル名は小文字化して部分一致で内部 id に写像されるため、どのリストにも載らない綴りが通ることもあります。
 
 ### POST /openai/v1/chat/completions
 
@@ -118,11 +128,13 @@ curl -X POST http://localhost:8080/openai/v1/chat/completions \
 | `model` | string | ✅ | モデル名（例: `claude-sonnet-4.5`） |
 | `messages` | array | ✅ | メッセージ配列。`content` は文字列またはオブジェクト配列（マルチモーダル対応） |
 | `stream` | boolean | ❌ | ストリーミング有効（デフォルト: false） |
-| `temperature` | number | ❌ | 創造性（0.0-2.0） |
-| `max_tokens` | integer | ❌ | 最大トークン数 |
-| `top_p` | number | ❌ | Nucleus sampling（0.0-1.0） |
+| `temperature` | number | ❌ | 受け付けますが**効果はありません**（下記参照） |
+| `max_tokens` | integer | ❌ | 受け付けますが**効果はありません**（下記参照） |
+| `top_p` | number | ❌ | 受け付けますが**効果はありません**（下記参照） |
 | `tools` | array | ❌ | 関数定義配列（真透過） |
-| `tool_choice` | string | ❌ | 関数選択戦略 |
+| `tool_choice` | string | ❌ | 受け付けますが**効果はありません**（下記参照） |
+
+> **サンプリング系パラメータは上流へ渡りません**: バックエンドの Kiro データプレーンには `temperature` / `top_p` / `max_tokens` / `tool_choice` に相当するフィールドが存在しないため、これらは受理されても中継されません（SDK 互換のためエラーにはせず、黙って捨てます）。`temperature` / `top_p` はリクエスト構造体のフィールドですらなく、未知キーとして無視されます。出力長の上限は上流側の予算で決まり、そこに達した場合は `finish_reason: "length"`（Anthropic 形式なら `stop_reason: "max_tokens"`）で報告されます。
 
 **マルチモーダル content 形式:**
 
@@ -220,13 +232,13 @@ curl -X POST http://localhost:8080/openai/v1/responses \
 | `instructions` | string | ❌ | 会話の先頭に付加されるシステム/開発者プリアンブル（→ system に変換） |
 | `stream` | boolean | ❌ | ストリーミングを有効化（デフォルト: false） |
 | `tools` | array | ❌ | ツール呼び出し用の関数定義、**フラット形式**: `{"type":"function","name","description","parameters"}`（注: Chat Completions のネストされた `{"type":"function","function":{...}}` 形式とは異なります） |
-| `tool_choice` | string または object | ❌ | `auto`、`none`、`required`、または特定のツールを強制する `{"type":"function","name":"..."}` |
+| `tool_choice` | string または object | ❌ | 受理されますが**上流へは渡らず効果はありません**（`auto` / `none` / `required` / `{"type":"function","name":"..."}` のいずれを送ってもモデルの挙動は変わりません） |
 
 **`input` 配列アイテムの種類:**
 
 - `{"type":"message","role":"user"|"assistant"|"system","content":[...]}` — content のパーツ: `{"type":"input_text","text":...}`、`{"type":"input_image","image_url":"..."}`、`{"type":"output_text","text":...}`
 - `{"type":"function_call","call_id","name","arguments"}` — 直前のアシスタントによるツール呼び出しターン（複数ターンの履歴として自身で再送する場合に使用）
-- `{"type":"function_call_output","call_id","output"}`（または `"tool_result"`）— 送り返すツールの実行結果
+- `{"type":"function_call_output","call_id","output"}` — 送り返すツールの実行結果（`type` はこの綴りのみ。`"tool_result"` など他の値を送ると `400` になります）
 
 **サポートされていません（暗黙の無視ではなく明示的エラー）:** `previous_response_id` — 本サーバーはサーバー側で会話状態を保持しません。指定した場合、黙って無視するのではなく 400 の `invalid_request_error` を返します。毎回のリクエストで会話全体を `input` に含めて送信してください（Codex CLI は既にこの方式で動作しています）。
 
@@ -241,27 +253,24 @@ curl -X POST http://localhost:8080/openai/v1/responses \
   "model": "claude-sonnet-4.5",
   "output": [
     {
-      "id": "msg_xxx",
       "type": "message",
-      "role": "assistant",
+      "id": "msg_xxx",
       "status": "completed",
+      "role": "assistant",
       "content": [
-        {"type": "output_text", "text": "2 + 2 = 4", "annotations": []}
+        {"type": "output_text", "text": "2 + 2 = 4"}
       ]
     }
   ],
   "usage": {
     "input_tokens": 10,
-    "input_tokens_details": {"cached_tokens": 0},
     "output_tokens": 5,
-    "output_tokens_details": {"reasoning_tokens": 0},
     "total_tokens": 15
-  },
-  "previous_response_id": null,
-  "instructions": null,
-  "error": null
+  }
 }
 ```
+
+返るフィールドは上記がすべてです。`usage` は 3 つのカウンタのみで、`input_tokens_details` / `output_tokens_details` は**ありません**。`output_text` パーツに `annotations` は付かず、レスポンス直下の `previous_response_id` / `instructions` / `error` も**返しません**（これらで分岐しないでください）。`max_tokens` 到達などで切り詰められた場合のみ `status` が `"incomplete"` になり、`"incomplete_details": {"reason": "max_output_tokens"}` が追加されます。
 
 **レスポンス（ストリーミング）:** 仕様に準拠した名前付き SSE イベントの並びで、各イベントは単調増加する `sequence_number` を持ちます。`data: [DONE]` のような終端マーカーは**ありません**（これは Chat Completions の慣習です）— 完了は `response.completed`（または `response.failed`）によって通知されます。
 
@@ -332,7 +341,7 @@ Anthropic Claude SDK と互換性のあるエンドポイントです（内部�
 
 ### GET /claude/v1/models
 
-Anthropic 形式のモデル一覧を取得します（OpenAI の `/v1/models` との衝突を避けます）。
+Anthropic 形式のモデル一覧を取得します（OpenAI の `/v1/models` との衝突を避けます）。他のプロトコルの `/models` と同じく**バイナリに焼き込まれた固定リスト**です（[GET /openai/v1/models](#get-openaiv1models) の注記を参照）。OpenAI/Gemini 側が `gpt-5.6-sol` で終わるのに対し、Claude 形式のリストは `claude-haiku-4.5` で終わる点に注意してください。
 
 **リクエスト:**
 
@@ -346,12 +355,13 @@ curl http://localhost:8080/claude/v1/models \
 ```json
 {
   "data": [
-    {
-      "id": "claude-sonnet-4.5",
-      "type": "model",
-      "display_name": "Claude Sonnet 4.5"
-    }
-  ]
+    {"type": "model", "id": "claude-sonnet-4.5", "display_name": "Claude Sonnet 4.5", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "claude-opus-4.6", "display_name": "Claude Opus 4.6", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "claude-haiku-4.5", "display_name": "Claude Haiku 4.5", "created_at": "2026-01-01T00:00:00Z"}
+  ],
+  "has_more": false,
+  "first_id": "claude-sonnet-4.5",
+  "last_id": "claude-haiku-4.5"
 }
 ```
 
@@ -379,11 +389,12 @@ curl -X POST http://localhost:8080/v1/messages \
 | パラメータ | 型 | 必須 | 説明 |
 |-----------|-----|------|------|
 | `model` | string | ✅ | モデル名 |
-| `max_tokens` | integer | ✅ | 最大トークン数 |
+| `max_tokens` | integer | ❌ | Anthropic 規範では必須ですが、本サービスは省略しても受理します。**上流へは渡らず効果もありません**（[OpenAI 側の注記](#post-openaiv1chatcompletions)と同じ） |
 | `messages` | array | ✅ | メッセージ配列。`content` は文字列またはブロック配列（`text`/`image`/`tool_use`/`tool_result`） |
-| `system` | string | ❌ | システムプロンプト |
+| `system` | string または配列 | ❌ | システムプロンプト（文字列、または `{"type":"text","text":…}` ブロック配列） |
 | `tools` | array | ❌ | ツール定義配列（真透過） |
-| `temperature` | number | ❌ | 創造性 |
+| `tool_choice` | object/string | ❌ | 受け付けますが**効果はありません**（上流に対応フィールドなし） |
+| `temperature` | number | ❌ | 受け付けますが**効果はありません**（フィールドとして解析されず無視） |
 | `stream` | boolean | ❌ | ストリーミング有効 |
 
 **レスポンス:**
@@ -401,7 +412,6 @@ curl -X POST http://localhost:8080/v1/messages \
   ],
   "model": "claude-sonnet-4.5",
   "stop_reason": "end_turn",
-  "stop_sequence": null,
   "usage": {
     "input_tokens": 10,
     "output_tokens": 20
@@ -443,7 +453,7 @@ Google Gemini API と互換性のあるエンドポイントです。**すべて
 
 ### GET /gemini/v1beta/models
 
-モデル一覧を取得します。
+モデル一覧を取得します。他のプロトコルの `/models` と同じく**バイナリに焼き込まれた固定リスト**です（[GET /openai/v1/models](#get-openaiv1models) の注記を参照）。各エントリが持つのは `name` と `supportedGenerationMethods` だけで、`displayName` は出力されず、`description` / `inputTokenLimit` / `outputTokenLimit` といったフィールドはありません。
 
 **リクエスト:**
 
@@ -457,12 +467,9 @@ curl http://localhost:8080/gemini/v1beta/models \
 ```json
 {
   "models": [
-    {
-      "name": "models/claude-sonnet-4.5",
-      "displayName": "Claude Sonnet 4.5",
-      "inputTokenLimit": 200000,
-      "outputTokenLimit": 8192
-    }
+    {"name": "models/claude-sonnet-4.5", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/claude-opus-4.6", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/gpt-5.6-sol", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
   ]
 }
 ```
@@ -493,7 +500,7 @@ curl -X POST http://localhost:8080/gemini/v1beta/models/claude-sonnet-4.5:genera
   }'
 ```
 
-`contents[]`（`parts[]` は text / `inline_data`）、`system_instruction?`、`tools[].function_declarations` に対応します。
+`contents[]`（`parts[]` は text / `inline_data`）、`system_instruction?`、`tools[].function_declarations` に対応します（いずれも camelCase / snake_case の両方の綴りを受け付けます）。`generationConfig` で解析されるのは `maxOutputTokens` だけで、しかもそれを含め**サンプリング系は上流へ渡りません**（`temperature` などは未知キーとして無視されます。[OpenAI 側の注記](#post-openaiv1chatcompletions)と同じ）。
 
 **レスポンス:**
 
@@ -549,11 +556,11 @@ data: {"candidates":[{"content":{"parts":[{"text":"春の"}]}}]}
 data: {"candidates":[{"content":{"parts":[{"text":"夜"}]}}]}
 ```
 
-> Gemini/OpenAI クライアントは本サービスの**統一認証**（Bearer / `x-api-key` / `?token=`）を使用します。ベンダーネイティブの `?key=` / `x-goog-api-key` ではありません。
+> 認証情報はゲートが受け付けるいずれのチャネルで渡しても構いません。優先順位は `Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > クエリ（`?api_key=` > `?token=` > `?key=`）です。Gemini ネイティブの `x-goog-api-key` ヘッダーと `?key=` パラメータも**サポートされている**ため、公式の `google-genai` SDK は `base_url` を差し替えるだけで動作します。変更が必要なのは**値**のほうです——常に**本サービスの** API Key を渡してください（Google / OpenAI 本家のベンダーキーではありません）。
 
 ## 管理 API
 
-`/admin` 管理パネル（静的、rust-embed 埋め込み）は `/api/admin/*` API で駆動されます。以下のエンドポイントはすべて `adminApiKey`（未設定時は `apiKey` にフォールバック。両方とも未設定なら管理 API はオープンになります——この状態で外部に公開しないでください）で認証されます。認証の渡し方はプロトコルゲートと同じです（`Authorization: Bearer` / `x-api-key` / `?token=`。ヘッダーを設定できない SSE ログストリームは `?api_key=`）。レスポンス本体はすべて camelCase で、**アカウントの access/refresh トークンは一切含みません**（`GET /api/admin/credentials` は状態のみ）。
+`/admin` 管理パネル（静的、rust-embed 埋め込み）は `/api/admin/*` API で駆動されます。以下のエンドポイントはすべて `adminApiKey`（未設定時は `apiKey` にフォールバック。両方とも未設定なら管理 API はオープンになります——この状態で外部に公開しないでください）で認証されます。認証の渡し方はプロトコルゲートと同じ 6 チャネル・同じ優先順位です（`Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > `?api_key=` > `?token=` > `?key=`。ヘッダーを設定できない SSE ログストリームはクエリ、通例 `?api_key=` を使います）。レスポンス本体は原則 camelCase ですが、**`GET /api/admin/config` と `GET /api/admin/models` はパネルのデータモデルに合わせて snake_case** です（旧 `/admin/api/stats` のサマリーも同様）。いずれのレスポンスも**アカウントの access/refresh トークンは一切含みません**（`GET /api/admin/credentials` は状態のみ）。
 
 > [!WARNING]
 > 管理 API のレスポンスは**秘密情報を含まないわけではありません**。`GET`/`POST /api/admin/api-keys` の `key` フィールドは**完全な平文**、`GET /api/admin/server-info` の `masterApiKey` も**完全な平文**です。マスキングされるのは `GET /api/admin/config/auth-keys` と `GET /api/admin/config` だけです。読み取り専用の管理者ロールは存在しないため、管理キーを持つ者はすべての key を閲覧・作成・ローテーションできます。管理 API のレスポンスは秘密情報として扱い、issue やログ、サードパーティのツールに貼り付けないでください。
@@ -575,7 +582,7 @@ curl http://localhost:8080/api/admin/credentials \
 {
   "total": 2,
   "available": 2,
-  "currentId": 12345,
+  "currentId": -1,
   "credentials": [
     {
       "id": 12345,
@@ -583,7 +590,7 @@ curl http://localhost:8080/api/admin/credentials \
       "weight": 1,
       "disabled": false,
       "failureCount": 0,
-      "isCurrent": true,
+      "isCurrent": false,
       "expiresAt": "2026-07-25T12:00:00Z",
       "authMethod": "social",
       "hasProfileArn": true,
@@ -596,9 +603,13 @@ curl http://localhost:8080/api/admin/credentials \
 }
 ```
 
+> **注意**: プールはリクエストごとにアカウントを選ぶため、「現在のアカウント」という永続的な状態は存在しません。`currentId` は常に `-1`、各行の `isCurrent` は常に `false` を返します（どちらも将来のスティッキー選択モード用の予約フィールドです）。この 2 つで分岐しないでください。
+
 ### POST /api/admin/credentials
 
 新しいアカウント認証情報をプールに追加して永続化します。
+
+必須は `refreshToken` だけです（`authMethod` が `idc` の場合は `clientId` + `clientSecret` も必要）。access token と有効期限は**このエンドポイントでは受け付けません**——初回の自動リフレッシュ時に補完されます。未知のキーは拒否されず、黙って無視されます。
 
 **リクエスト:**
 
@@ -607,9 +618,7 @@ curl -X POST http://localhost:8080/api/admin/credentials \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-あなたのキー" \
   -d '{
-    "accessToken": "...",
     "refreshToken": "...",
-    "expiresAt": "2026-07-25T12:00:00Z",
     "authMethod": "social",
     "profileArn": "arn:aws:codewhisperer:us-east-1:...:profile/..."
   }'
@@ -620,9 +629,14 @@ curl -X POST http://localhost:8080/api/admin/credentials \
 ```json
 {
   "success": true,
-  "message": "Credential added"
+  "message": "credential added",
+  "credentialId": 12345,
+  "email": "a@example.com",
+  "duplicate": false
 }
 ```
+
+`refreshToken` がすでにプールにある場合は新規追加されず、`message` が `"credential already exists"`、`duplicate` が `true`、`credentialId` は**既存アカウントの id** になります（`email` は不明なら省略されます）。
 
 ### PUT /api/admin/credentials/{id}
 
@@ -657,13 +671,24 @@ curl -X POST http://localhost:8080/api/admin/credentials/12345/disabled \
 ```json
 {
   "success": true,
-  "message": "Credential disabled"
+  "message": "credential disabled"
 }
 ```
 
 ### POST /api/admin/credentials/{id}/priority
 
-アカウントの優先度/重みを設定します（`priority` / `balanced` 負荷分散で使用）。
+アカウントの優先度を設定します（`balanced` 負荷分散で使用）。優先度は**プール内の重みそのもの**で、大きいほど多くのトラフィックが割り当てられます。1 未満の値は 1 に丸められます。
+
+ボディは `{"priority": <整数>}` のみで、`priority` は必須です（省略すると `422`）。このエンドポイントに独立した `weight` フィールドは**なく**、余分なキーは黙って無視されます。重みを明示的に設定したい場合は `PUT /api/admin/credentials/{id}` に `{"weight": N}` を渡してください。
+
+**リクエスト:**
+
+```bash
+curl -X POST http://localhost:8080/api/admin/credentials/12345/priority \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-あなたのキー" \
+  -d '{"priority": 2}'
+```
 
 ### POST /api/admin/credentials/{id}/reset
 
@@ -671,7 +696,20 @@ curl -X POST http://localhost:8080/api/admin/credentials/12345/disabled \
 
 ### POST /api/admin/credentials/batch-import
 
-認証情報を一括インポートします。配列、`{accounts}` オブジェクト、単一オブジェクトを受け付け、各行を個別に正規化/検証/永続化し、行ごとの結果と件数を返します。
+認証情報を一括インポートします。ボディは必ず `data` キーで包む必要があり、裸の配列を POST すると `422` になります。`data` の中身は配列、KAM 形式の `{accounts: [...]}` オブジェクト、単一オブジェクトのいずれでも構いません。各行を個別に正規化/検証/永続化し、行ごとの結果と件数を返します。各行で有効なのは `refreshToken`（必須。空なら当該行は失敗）、`clientId`/`clientSecret`（`idc` 用。片方だけだとその行は失敗）、`email`（無ければ `nickname` で代替）、`nickname`、`machineId`、`priority`（アカウントの `weight` として保存、1 未満は 1 に丸め）、`region`/`authRegion`/`apiRegion`（`apiRegion` > `authRegion`/`region` の順に採用、いずれも無ければ `us-east-1`）です。KAM 形式の `credentials: {…}` 入れ子があれば、その中の `refreshToken`/`clientId`/`clientSecret`/`region` が最優先されます。`accessToken` / `expiresAt` / `profileArn` は正規化時に無視されます。`authMethod` も読まれません——auth は `clientId` と `clientSecret` が揃っていれば `idc`、そうでなければ `social` と自動判定されます。
+
+**リクエスト:**
+
+```bash
+curl -X POST http://localhost:8080/api/admin/credentials/batch-import \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-管理端のキー" \
+  -d '{
+    "data": [
+      {"refreshToken": "...", "email": "a@example.com", "priority": 2}
+    ]
+  }'
+```
 
 ### 対話型ログイン / インポート
 
@@ -680,23 +718,29 @@ curl -X POST http://localhost:8080/api/admin/credentials/12345/disabled \
 **AWS Builder ID（デバイスコードフロー）:**
 
 ```bash
-# 1. 開始してデバイスコードを取得
+# 1. 開始してデバイスコードを取得（body は JSON 必須。region は任意、既定 us-east-1）
 curl -X POST http://localhost:8080/api/admin/login/builderid/start \
-  -H "Authorization: Bearer sk-あなたのキー"
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-あなたのキー" \
+  -d '{}'
 
-# 2. ユーザーが認可を完了するまでポーリング
+# 2. ユーザーが認可を完了するまでポーリング（start が返した sessionId が必須）
 curl -X POST http://localhost:8080/api/admin/login/builderid/poll \
-  -H "Authorization: Bearer sk-あなたのキー"
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-あなたのキー" \
+  -d '{"sessionId": "..."}'
 ```
 
-poll は `{success,completed,status,interval?,credentialId?,email?}` を返し、成功時に自動保存します。
+start は `{sessionId,userCode,verificationUri,interval}` を返します。poll は `{success,completed,status,interval?,credentialId?,email?}` を返し、成功時に自動保存します。どちらも `Json` 抽出器を使うため、`Content-Type: application/json` と JSON body なしで送ると本文を読む前に弾かれます（poll は `sessionId` 必須、欠けると `422`）。
 
 **IAM Identity Center（SSO フロー）:**
 
 ```bash
-# 1. 開始して認可 URL を取得
+# 1. 開始して認可 URL を取得（startUrl は必須。空文字なら 400、キーごと欠けると 422）
 curl -X POST http://localhost:8080/api/admin/login/iam-sso/start \
-  -H "Authorization: Bearer sk-あなたのキー"
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-あなたのキー" \
+  -d '{"startUrl": "https://あなたのポータル.awsapps.com/start", "region": "us-east-1"}'
 # → {"sessionId":"...","authorizeUrl":"..."}
 
 # 2. コールバック URL を渡して完了（state を検証して保存）
@@ -712,8 +756,10 @@ curl -X POST http://localhost:8080/api/admin/login/iam-sso/complete \
 curl -X POST http://localhost:8080/api/admin/login/sso-token \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-あなたのキー" \
-  -d '{"tokens": "..."}'
+  -d '{"bearerToken": "token1\ntoken2", "region": "us-east-1"}'
 ```
+
+`bearerToken` は改行区切りのテキスト**全体**を 1 つの文字列として渡すフィールドで、サーバー側が 1 行ずつ分割して処理します（上限 200 行）。必須のため、省略すると `422` になります。`region` は任意（既定は `us-east-1`）で、この 2 つ以外のキーは無視されます。
 
 `{added,failed:[{lineIndex,error}]}` を返します。
 
@@ -756,9 +802,27 @@ curl http://localhost:8080/api/admin/config \
   -H "Authorization: Bearer sk-あなたのキー"
 ```
 
+**レスポンス**（このエンドポイントのフィールド名は snake_case です）:
+
+```json
+{
+  "host": "127.0.0.1",
+  "port": 8080,
+  "region": "us-east-1",
+  "load_balancing_mode": "priority",
+  "max_rpm_per_credential": 0,
+  "kiro_version": "0.11.107",
+  "system_version": "win32#10.0.22631",
+  "node_version": "22.22.0",
+  "credentials_path": "/app/data/credentials.json",
+  "api_key_set": true,
+  "admin_api_key_set": true
+}
+```
+
 ### GET /api/admin/models
 
-`display_name` / `type` / `max_tokens` を含むモデル一覧（`/v1/models` と同じモデル集合）を取得します。
+`display_name` / `type` / `max_tokens` を含むモデル一覧を取得します（フィールド名はパネルに合わせて snake_case）。各アカウントの上流モデル一覧の**和集合**（キャッシュ）を返し、キャッシュが空なら静的な 17 モデルのカタログにフォールバックします。プロトコル側の `/v1/models` などが返す固定 3 件とは**別物で、こちらのほうが広い集合**です。
 
 ### 負荷分散モードの読み取り / 切り替え
 
@@ -801,7 +865,7 @@ curl -X PUT http://localhost:8080/api/admin/config/auth-keys \
 ```json
 {
   "masterApiKey": "sk-マスターキーの平文",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -838,7 +902,7 @@ curl "http://localhost:8080/api/admin/logs/stream?api_key=sk-あなたのキー"
 
 ## ユーザー API
 
-`/user` ユーザーパネル（静的、rust-embed 埋め込み）は `/api/user/*` で駆動されます。これらのエンドポイントは admin ゲートを**通りません**——各リクエストは呼び出し側**自身の API-KEY**（`x-api-key` ヘッダー、またはログイン body の `{apiKey}`）で認証され、handler が検証後にデータをその key に限定します。key が無効なら `401`、本体は `{"error":"…"}`。レスポンスは camelCase、`credits = cost / 0.72`。
+`/user` ユーザーパネル（静的、rust-embed 埋め込み）は `/api/user/*` で駆動されます。これらのエンドポイントは admin ゲートを**通りません**——各リクエストは呼び出し側**自身の API-KEY** で認証され、handler が検証後にデータをその key に限定します。key の取り出しはプロトコル側と同じヘッダー優先順（`Authorization: Bearer` > `x-api-key` > `x-goog-api-key`）で、`/api/user/*` ではクエリパラメータは受け付けません。`POST /api/user/login` だけは body の `{apiKey}` が最優先で、空/未指定なら上記ヘッダーに回ります。key が無効なら `401`、本体は `{"error":"…"}`。レスポンスは camelCase、`credits = cost / 0.72`。
 
 ### POST /api/user/login
 
@@ -856,7 +920,7 @@ curl -X POST http://localhost:8080/api/user/login \
 
 ```json
 {
-  "id": "key-xxx",
+  "id": 7,
   "name": "マイキー",
   "spendingLimit": 100.0,
   "limitUnit": "usd",
@@ -908,7 +972,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.1.0"
+  "version": "0.2.1"
 }
 ```
 
@@ -937,22 +1001,26 @@ API エラーは以下のコードで返されます。
 | コード | 説明 | 対応 |
 |--------|------|------|
 | 400 | パラメータエラー / マッピングされていないモデル（`INVALID_MODEL_ID`） | リクエストパラメータとモデル名を確認 |
-| 401 | 未認証（key がない、または誤った key） | API Key を確認 |
+| 401 | 未認証（key がない、誤った key、無効化/期限切れのストア key） | API Key を確認 |
+| 402 | ストア管理の API-KEY が消費上限に到達（本体は `{"type":"error","error":{"type":"billing_error","message":"…"}}`）。判定には在途分の予約（USD 単位で `1.0`、`credits` 単位で約 `1.39`）が含まれるため、**残りが 1 回分の見積を下回った時点で**上限を使い切る前に拒否が始まります | key の上限を引き上げるか、使用量をリセット |
 | 403 | 禁止 | 権限がない |
-| 429 | レート制限（RPM 超過） | しばらく待機 |
+| 404 | 見つからない（パスが存在しない。または管理エンドポイントにプールへ存在しないアカウント / API-KEY / ログインセッションの id を渡した） | id とパスを確認 |
+| 422 | リクエストボディのデシリアライズ失敗（必須フィールドの欠落や型不一致）。4 プロトコルの対話エンドポイントは自前で拒否を受け取り、それぞれの形状の `400` に変換するため、`422` は主に `/api/admin/*`、`/api/user/login`、`/v1/messages/count_tokens` のように `Json` 抽出器を直接使うエンドポイントで発生します | ボディの形状を確認 |
+| 429 | 上流 Kiro のスロットリング（`ThrottlingException` 系の例外を変換）。`MAX_RPM_PER_CREDENTIAL` の超過はこのコードにはならず、他アカウントへローテーションされ、全滅した場合のみ `503` になります | しばらく待機 |
 | 502 | 上流エラー | 上流の Kiro が失敗 |
 | 503 | 利用不可 | 利用可能なアカウントがない（全てクールダウン中/無効化/RPM 超過）、またはログ機能無効 |
 
 **エラーレスポンス例:**
 
-エラーボディはプロトコルによって異なります。
+エラーボディはプロトコルによって異なります。ただし認証ゲートが返す `401` / `402` は、どのプロトコルのパスでも Anthropic 形式（`{"type":"error","error":{"type":"authentication_error"|"billing_error","message":"…"}}`）で返ります。
 
 ```json
 // Anthropic 形式
 {"type": "error", "error": {"type": "invalid_request_error", "message": "..."}}
 
 // OpenAI / Responses 形式
-{"error": {"message": "Invalid API key", "type": "authentication_error", "code": 401}}
+{"error": {"message": "upstream request failed", "type": "api_error", "code": null}}
+// ↑ 中枢エラーの `code` は常に null。上流の例外を変換した場合だけ `code` に数値の状態コードが入ります。
 
 // Gemini 形式
 {"error": {"code": 400, "message": "...", "status": "INVALID_ARGUMENT"}}

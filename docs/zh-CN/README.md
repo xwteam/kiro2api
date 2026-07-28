@@ -84,7 +84,7 @@
 
 ### 🔐 安全与认证
 
-- 三选一：`Authorization: Bearer` / `x-api-key` / `?token=`，常量时间比较，失败即 `401`
+- 六条通道任选其一，按 `Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > `?api_key=` > `?token=` > `?key=` 的优先级取第一条命中的；常量时间比较，失败即 `401`
 - `adminApiKey`（缺省回退 `apiKey`）保护 `/api/admin/*`，两者都未配置时该闸为开放模式；持有者用自己的 **API-KEY** 访问 `/api/user/*`
 - `/health`、`/v1/ping` 等探活端点不鉴权
 
@@ -121,7 +121,7 @@
 ### 🧭 模型名映射
 
 - 客户端传入的模型名按**小写子串**匹配到 Kiro 内部模型（未匹配到 → `400`）
-- `/models` 端点返回本服务实际可服务的模型 id，建议客户端 list-then-use
+- 协议侧 `/models` 端点返回的是**固定短清单**，不读账号池、也不按订阅档位过滤；完整目录见管理接口 `GET /api/admin/models`。档位未授权的模型即使出现在清单里，请求仍会 `400`（`INVALID_MODEL_ID`）
 
 ### ⚡ 高性能架构
 
@@ -242,9 +242,9 @@ kiro2api 内置令牌自愈机制：token 到期**自动内存刷新**（单飞�
 ```bash
 # 健康检查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.1.0"}
+# {"service":"kiro2api","status":"ok","version":"0.2.1"}
 
-# 查看可用模型
+# 查看协议侧模型清单（固定短清单，不代表账号档位真的授权）
 curl http://localhost:8080/v1/models \
   -H "Authorization: Bearer sk-你的API密钥"
 
@@ -262,9 +262,11 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 ## 🧪 接入示例
 
 > [!NOTE]
-> 所有 API 请求都需要携带 API Key。支持两种方式：
+> 所有 API 请求都需要携带 API Key。鉴权闸接受六条通道，按 `Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > `?api_key=` > `?token=` > `?key=` 的优先级取第一条命中的：
 > - `Authorization: Bearer sk-xxx`（推荐，兼容 OpenAI/Anthropic SDK）
 > - `x-api-key: sk-xxx`
+> - `x-goog-api-key: sk-xxx`（Gemini 官方 SDK 默认走它）
+> - URL query：`?api_key=sk-xxx`、`?token=sk-xxx` 或 `?key=sk-xxx`（无法设请求头的场景，如浏览器 `EventSource`）
 >
 > base URL 用**标准裸前缀**：OpenAI = `{host}/v1`，Anthropic = `{host}`（SDK 自动补 `/v1/messages`），Gemini = `{host}/v1beta`。也可用显式厂商前缀 `/openai/v1`、`/claude/v1`、`/gemini/v1beta`。
 
@@ -386,7 +388,7 @@ resp = client.chat.completions.create(
 
 | 方法 | 端点 | 功能 |
 |------|------|------|
-| GET | `/models` | 可用模型列表 |
+| GET | `/models` | 模型列表（固定短清单，非账号池实际可服务集） |
 | POST | `/chat/completions` | 对话补全（流式返回 `chat.completion.chunk` + `[DONE]`，含工具/图片） |
 
 ### OpenAI Responses（`/v1/responses` 或 `/openai/v1/responses`）
@@ -422,7 +424,7 @@ resp = client.chat.completions.create(
 
 > URL 里的 `localhost:8080` 只是示例；端口由 `PORT`/`config.json` 配置，按你的部署替换。
 >
-> Gemini/OpenAI 客户端一律用本服务的**统一鉴权**（Bearer/`x-api-key`/`?token=`），不是厂商原生的 `?key=`/`x-goog-api-key`。
+> 密钥可走鉴权闸接受的任意通道，优先级为 `Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > query（`?api_key=` > `?token=` > `?key=`）。Gemini 原生的 `x-goog-api-key` 与 `?key=` 同样被接受，官方 `google-genai` SDK 只换 `base_url` 就能用；要换的是**值**——一律传本服务的 API-KEY，不是真的 Google/OpenAI 厂商密钥。
 
 ---
 
@@ -477,7 +479,7 @@ resp = client.chat.completions.create(
 
 3. **令牌自愈**：token 到期自动内存刷新并原子落盘 `credentials.json`；真正的凭据失效才永久禁用，配额/风控/限流一律冷却自愈。
 
-4. **流式输出**：四种协议均支持流式；`stream:false` 时服务内部仍解码事件流，收集完毕后一次性返回完整 JSON。上游报错或流传输中途中断时，流会以该协议自身的错误事件收尾，绝不会伪装成一次正常完成；触及 `max_tokens` 或上下文耗尽时，如实回报截断原因。
+4. **流式输出**：四种协议均支持流式；`stream:false` 时服务内部仍解码事件流，收集完毕后一次性返回完整 JSON。上游报错或流传输中途中断时，流会以该协议自身的错误事件收尾，绝不会伪装成一次正常完成；**上游**命中自身输出预算或上下文耗尽时，如实回报截断原因。注意 `max_tokens` / `tool_choice` / `temperature` 等生成参数**接受但不生效**（上游线格式无对应字段，故意不转发），详见 [API.md](API.md)。
 
 5. **网络环境**：部署服务器需能访问 AWS CodeWhisperer/Kiro 端点（`*.amazonaws.com`）。
 
@@ -492,7 +494,7 @@ resp = client.chat.completions.create(
 - [x] 令牌单飞自动刷新 + 原子落盘
 - [x] 端点回退（Kiro/CodeWhisperer/AmazonQ）+ 跨账号重试
 - [x] body-aware 失败分类（永久失效才禁用，其余冷却自愈）
-- [x] 统一鉴权闸（Bearer / x-api-key / ?token=）
+- [x] 统一鉴权闸（Bearer / x-api-key / x-goog-api-key / `?api_key=` / `?token=` / `?key=`）
 - [x] Web 管理面板（凭据/登录/API-KEY/用量/日志/余额/设置）
 - [x] 用户面板（持有者用自身 API-KEY 登录）
 - [x] 三种交互式登录流（Builder ID / IAM SSO / 社交令牌）

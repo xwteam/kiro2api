@@ -64,7 +64,7 @@ cp .env.example .env
 ```env
 API_KEY=sk-你的對外呼叫金鑰
 # 管理端獨立金鑰；公網部署必填（不設則 /api/admin/* 回退用 API_KEY 驗證，兩者都不設即開放）。
-# 不需要就把整行註解掉——寫成空值會覆蓋 config.json 裡已設定的金鑰。
+# 不需要就把整行註解掉或留空——空值（含純空白）一律視為未設定，不會覆蓋 config.json 裡已設定的金鑰。
 ADMIN_API_KEY=sk-你的管理端金鑰
 ```
 
@@ -85,11 +85,11 @@ ADMIN_API_KEY=sk-你的管理端金鑰
 ```
 
 **重要事項：**
-- `API_KEY` 為空時協議端點**開放存取**（啟動時會告警），對外部署務必設定
+- `API_KEY` 為空**且尚未建立任何 API-KEY** 時，協議端點才**開放存取**（啟動時會告警）；在管理面發出第一條 API-KEY 之後協議閘即收口（不帶有效金鑰一律 `401`）。對外部署務必設定 `API_KEY`
 - 容器映像檔已內建 `HOST=0.0.0.0`；裸機部署請勿輕易把 `HOST` 改成 `0.0.0.0`
 - `/api/admin/*` 只有在設定了 `adminApiKey`（未設則回退 `apiKey`）之後才受保護；**兩個 key 都不設時管理介面完全開放**，任何人都能增刪憑證、改驗證金鑰、重啟服務，公網部署務必設定 `ADMIN_API_KEY`
 - `/admin`、`/user` 面板本體始終不驗證，真正的閘在其 `/api/**` 介面上
-- **不要寫空值**：`API_KEY=`、`ADMIN_API_KEY=` 這種空賦值會覆蓋 `config.json` 裡已設定的金鑰，不想用就把整行註解掉
+- **空值等同未設定**：`API_KEY=`、`ADMIN_API_KEY=` 這種空賦值（含只有空白的值）在載入時一律被忽略，`config.json` 裡已設定的金鑰**繼續生效**、不會被覆蓋；環境變數的值也會先去除前後空白
 
 啟動服務：
 
@@ -192,15 +192,17 @@ curl http://localhost:8080/health
 
 預期回應：
 ```json
-{"service":"kiro2api","status":"ok","version":"0.1.0"}
+{"service":"kiro2api","status":"ok","version":"0.2.1"}
 ```
 
-### 列出可用模型
+### 列出模型清單
 
 ```bash
 curl http://localhost:8080/v1/models \
   -H "Authorization: Bearer sk-你的API金鑰"
 ```
+
+> 這支回傳的是**寫死的**三條短清單，不依帳號訂閱檔位過濾——只能用來確認服務通了，不能拿來判斷「哪些模型我能用」。要看帳號實際授權的模型並集，請用管理端的 `GET /api/admin/models`。
 
 ### 測試 API 請求
 
@@ -216,7 +218,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 你應該收到 AI 的回應。如果收到 `401` 錯誤，請驗證 API Key 是否正確。
 
-> 對外協議呼叫需帶金鑰（三選一）：`Authorization: Bearer <key>`、`x-api-key: <key>` 或 `?token=<key>`，皆為常量時間比較。`/health`、`/v1/ping` 探活端點不驗證。
+> 對外協議呼叫需帶金鑰，可走驗證閘接受的任一通道，優先順序：`Authorization: Bearer <key>` > `x-api-key: <key>` > `x-goog-api-key: <key>`（Gemini 原生）> 查詢參數（`?api_key=` > `?token=` > `?key=`），皆為常量時間比較。`/health`、`/v1/ping` 探活端點不驗證。
 
 ## 常見問題排除
 
@@ -226,7 +228,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 **解決方案：**
 1. **可用模型取決於帳號訂閱檔位**：免費檔（KIRO FREE）通常只授權 `claude-sonnet-4.5`
-2. 先呼叫 `/v1/models` 查看本服務實際可服務的模型 id，再 list-then-use
+2. **別靠 `/v1/models` 排查**：協議端點的模型清單是寫死的短清單，不依帳號檔位過濾，出現在清單裡的模型照樣可能回 `400`；要看帳號實際授權了哪些模型，請用管理端的 `GET /api/admin/models`
 3. 若需 opus/GPT 等模型，需升級 Kiro 帳號訂閱檔位
 4. 這不是 bug：服務刻意不對確定性錯誤瞎重試，也不會誤傷帳號
 
@@ -285,16 +287,16 @@ docker compose down && docker compose up -d
 
 | 變數 | 預設值 | 說明 |
 |------|--------|------|
-| `API_KEY` | — | 對外呼叫金鑰（留空則協議端點開放存取，啟動告警） |
+| `API_KEY` | — | 對外呼叫金鑰（留空**且未建立任何 API-KEY** 時協議端點開放存取，啟動告警） |
 | `ADMIN_API_KEY` | 回退 `API_KEY` | 管理端獨立鑑權 key，保護 `/api/admin/*`；與 `API_KEY` 都不設時該介面開放，公網部署必填 |
 | `HOST` | `127.0.0.1`（映像檔內建 `0.0.0.0`） | 監聽位址 |
 | `PORT` | `8080` | 服務連接埠（compose 的連接埠映射與健康檢查都跟隨該值） |
-| `REGION` | `us-east-1` | 預設 AWS region（帳號 `profileArn` 內的 region 優先） |
+| `REGION` | `us-east-1` | 僅供 `GET /api/admin/config` 的配置展示；**不影響實際呼叫**——資料面與令牌刷新的 region 取自帳號 `profileArn`，其次該帳號自身的 `region` 欄位，最後回落寫死的 `us-east-1` |
 | `LOAD_BALANCING_MODE` | `priority` | 負載均衡：`priority`（等權輪詢）/ `balanced`（按 `weight` 加權） |
 | `MAX_RPM_PER_CREDENTIAL` | `0` | 每帳號每分鐘請求上限，`0` = 無限制 |
-| `CREDENTIALS_PATH` | `credentials.json`（映像檔內建 `/app/data/credentials.json`） | 憑證檔案路徑；被命令列 `--credentials` 覆蓋 |
+| `CREDENTIALS_PATH` | `credentials.json`（相對 `-c` 設定檔所在目錄解析，容器內即 `/app/data/credentials.json`） | 憑證檔案路徑；被命令列 `--credentials` 覆蓋 |
 
-> 憑證路徑同時決定用量統計（`stats/`）、API-KEY 儲存（`api_keys.json`）與餘額快取的落盤目錄——它們都取 `credentials.json` 的上層目錄。容器映像檔已內建 `CREDENTIALS_PATH=/app/data/credentials.json`，這些資料預設就落在掛載卷裡；自訂路徑時請一併指向掛載卷，否則容器重建即遺失。
+> 憑證路徑同時決定用量統計（`stats/`）、API-KEY 儲存（`api_keys.json`）與餘額快取的落盤目錄——它們都取 `credentials.json` 的上層目錄。**映像檔並不設定 `CREDENTIALS_PATH`**（唯一內建的 ENV 是 `HOST=0.0.0.0`）：內建預設值會就近解析到 `-c` 所指設定檔的所在目錄，而容器以 `-c /app/data/config.json` 啟動，故這些資料預設就落在掛載卷 `/app/data` 裡；也正因為映像檔不烘焙這個變數，`config.json` 裡的 `credentialsPath` 仍然生效（環境變數層優先級高於 `config.json`，若烘焙進映像檔反而會把使用者自訂的路徑靜默改道）。自訂路徑時請一併指向掛載卷，否則容器重建即遺失。
 
 **`data/config.json`（camelCase，均可選；`logCapacity` 僅在此配置）：**
 
@@ -348,7 +350,7 @@ API_KEY=sk-xxx ./target/release/kiro2api \
   --credentials data/credentials.json
 ```
 
-> 設定優先順序：**命令列參數 > 環境變數 > `config.json` > 內建預設值**。`--credentials` 不給時，由 `CREDENTIALS_PATH` / `config.json` 的 `credentialsPath` / 預設的 `credentials.json`（相對目前工作目錄）決定；用量統計、`api_keys.json` 與餘額快取都落在該檔案的上層目錄裡。
+> 設定優先順序：**命令列參數 > 環境變數 > `config.json` > 內建預設值**。`--credentials` 不給時，由 `CREDENTIALS_PATH` / `config.json` 的 `credentialsPath` / 內建預設的 `credentials.json`（就近解析到 `-c` 所指設定檔的所在目錄；裸機用預設的 `-c config.json` 時該路徑無目錄，等同相對目前工作目錄）決定；用量統計、`api_keys.json` 與餘額快取都落在該檔案的上層目錄裡。
 
 > 裸機部署請勿輕易把 `HOST` 改成 `0.0.0.0`。`/admin`、`/user` 面板本體始終不驗證，`/api/admin/*` 只有在設定了 `adminApiKey`（未設則回退 `apiKey`）之後才受保護——一個都不設時管理介面對所有人開放；`/api/user/*` 不走該閘，始終要求呼叫方自帶有效 API-KEY（無效/停用/過期即 401）。
 

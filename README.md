@@ -45,7 +45,7 @@
 > 本项目仅供研究和学习用途，请合理使用，不要用于任何商业目的。
 
 > [!IMPORTANT]
-> `apiKey`/`API_KEY` 为空时，协议端点**开放访问**（启动会告警）。对外部署务必设置。管理接口 `/api/admin/*` 只有在配置了 `adminApiKey`（缺省回退 `apiKey`）之后才受保护——**两个 key 都不配时管理接口和面板一样是开放的**，任何人都能增删凭据、改鉴权密钥；`/admin`、`/user` 面板本体则始终不鉴权。部署到公网必须设置 `ADMIN_API_KEY`。容器镜像已内置 `HOST=0.0.0.0`；裸机部署请勿轻易把 `HOST` 改成 `0.0.0.0`。
+> `apiKey`/`API_KEY` 为空**且尚未创建任何 API-KEY** 时，协议端点**开放访问**（启动会告警）；一旦在管理面板发出第一条 API-KEY，协议闸即收口。对外部署务必设置。管理接口 `/api/admin/*` 只有在配置了 `adminApiKey`（缺省回退 `apiKey`）之后才受保护——**两个 key 都不配时管理接口和面板一样是开放的**，任何人都能增删凭据、改鉴权密钥；`/admin`、`/user` 面板本体则始终不鉴权。部署到公网必须设置 `ADMIN_API_KEY`。容器镜像已内置 `HOST=0.0.0.0`；裸机部署请勿轻易把 `HOST` 改成 `0.0.0.0`。
 
 > [!TIP]
 > 后端为 Kiro（CodeWhisperer）账号池。**可用模型取决于账号订阅档位**：免费档（KIRO FREE）通常只授权 `claude-sonnet-4.5`，opus/GPT 等需更高档位——请求不支持的模型会明确返回 400（`INVALID_MODEL_ID`），而非静默失败。
@@ -76,12 +76,12 @@
 
 - 一个服务同时提供 **OpenAI Chat**、**Anthropic Messages**、**OpenAI Responses**、**Gemini 原生** 四种 SDK 格式
 - 内部以 **Anthropic Messages 为中枢母格式**，其余协议双向转换后复用同一条中转内核
-- 每个协议都支持**流式（SSE）**、**函数调用（工具）真透传**、**图片输入（多模态）**
+- 每个协议都支持**流式（SSE）**、**函数调用（工具）真透传**、**图片输入（多模态）**——图片一律**只接受内联 Base64 `data:` URI**；远程 http(s) 图片 URL 在 Anthropic（`source.type:"url"`）与 OpenAI Chat（`image_url`）端点会被拦成 `400`，而在 **Responses（`input_image`）与 Gemini** 端点会被**静默跳过**：请求照常返回 `200`，但模型根本收不到那张图（Gemini 只认 `inlineData`，没有 `fileData` 字段）。发图前请自行转成 `data:` URI
 - **双前缀挂载**：每协议同时挂标准裸前缀与显式厂商前缀（`/openai/v1`、`/claude/v1`、`/gemini/v1beta`），主流 SDK 填 `base_url` 即插即用
 
 ### 🔐 统一鉴权闸
 
-- 三选一：`Authorization: Bearer` / `x-api-key` / `?token=`，常量时间比较，失败即 `401`
+- 凭据通道按优先级取用：`Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > query（`?api_key=` > `?token=` > `?key=`），常量时间比较，失败即 `401`
 - `adminApiKey`（缺省回退 `apiKey`）保护 `/api/admin/*`，两者都未配置时该闸为开放模式；持有者用自己的 **API-KEY** 访问 `/api/user/*`
 - `/health`、`/v1/ping` 等探活端点不鉴权
 
@@ -118,7 +118,7 @@
 ### 🧭 模型名映射
 
 - 客户端传入的模型名按**小写子串**匹配到 Kiro 内部模型（未匹配到 → `400`）
-- `/models` 端点返回本服务实际可服务的模型 id，建议客户端 list-then-use
+- 协议侧 `/models` 返回**固定短清单**（OpenAI/Gemini：`claude-sonnet-4.5`、`claude-opus-4.6`、`gpt-5.6-sol`；Anthropic 形状：`claude-sonnet-4.5`、`claude-opus-4.6`、`claude-haiku-4.5`），**不读账号池、不按订阅档位过滤**——列出的模型你的档位未必授权（返回 `400 INVALID_MODEL_ID`），未列出的模型只要能映射到内部模型且档位授权也照样可用。完整目录见管理接口 `GET /api/admin/models`（账号池实拉的并集，为空时回落静态 17 模型目录）
 
 ### ⚡ 高性能架构
 
@@ -220,7 +220,7 @@ cp .env.example .env
 ```env
 API_KEY=sk-你的对外调用密钥
 # 管理端独立密钥；公网部署必填（不设则 /api/admin/* 回退用 API_KEY 鉴权，两者都不设即开放）。
-# 不需要就把整行注释掉——写成空值会覆盖 config.json 里已配的密钥。
+# 不需要就把整行注释掉或留空——空值（含仅空白）一律按「未设置」处理，不会覆盖 config.json 里已配的密钥。
 ADMIN_API_KEY=sk-你的管理端密钥
 ```
 
@@ -259,7 +259,7 @@ docker compose logs -f
 ```bash
 # 健康检查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.1.0"}
+# {"service":"kiro2api","status":"ok","version":"0.2.1"}
 
 # 查看可用模型
 curl http://localhost:8080/v1/models \
@@ -279,11 +279,19 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 ## 🧪 接入示例
 
 > [!NOTE]
-> 所有 API 请求都需要携带 API Key。支持两种方式：
+> 所有 API 请求都需要携带 API Key。鉴权闸按以下优先级取用凭据：
 > - `Authorization: Bearer sk-xxx`（推荐，兼容 OpenAI/Anthropic SDK）
 > - `x-api-key: sk-xxx`
+> - `x-goog-api-key: sk-xxx`（Gemini 原生头，官方 `google-genai` SDK 默认走这条）
+> - query 参数 `?api_key=` > `?token=` > `?key=`（浏览器原生 EventSource 只能用这条）
 >
 > base URL 用**标准裸前缀**：OpenAI = `{host}/v1`，Anthropic = `{host}`（SDK 自动补 `/v1/messages`），Gemini = `{host}/v1beta`。也可用显式厂商前缀 `/openai/v1`、`/claude/v1`、`/gemini/v1beta`。
+
+> [!IMPORTANT]
+> **这些生成参数会被接受但不生效**：Kiro 数据面 wire 没有对应字段，服务既不转发也不报错，请求照常成功——
+> - `temperature` / `top_p`：请求结构体里根本没有这两个字段，serde 当未知键直接丢弃。设 `temperature: 0` 不会让输出变确定，也不会有任何提示。
+> - `max_tokens` / Gemini `maxOutputTokens`：会被解析进内部结构，但从不下发给上游，**限制不了回复长度**。响应里的 `stop_reason:"max_tokens"` / `finish_reason:"length"` 来自上游自己的预算，与你传的值无关。下面 Anthropic 示例里的 `max_tokens=1024` 只是官方 SDK 的必填参数，保留是为了让 SDK 能把请求发出去。
+> - `tool_choice`（OpenAI / Anthropic / Responses）与 Gemini `toolConfig`：**无法强制模型调用指定工具**。唯一被兑现的是 Gemini `toolConfig.functionCallingConfig.mode = "NONE"`——它靠**不下发任何工具规格**来禁用本轮函数调用；`AUTO` 就是默认行为，`ANY`（强制至少调一次）在 wire 上无从表达，按默认处理。
 
 <details>
 <summary><b>OpenAI SDK（Python）</b></summary>
@@ -406,7 +414,7 @@ resp = client.chat.completions.create(
 
 | 方法 | 端点 | 功能 |
 |------|------|------|
-| GET | `/models` | 可用模型列表 |
+| GET | `/models` | 模型列表（固定短清单，不按账号订阅档位过滤） |
 | POST | `/chat/completions` | 对话补全（流式返回 `chat.completion.chunk` + `[DONE]`，含工具/图片） |
 
 ### OpenAI Responses（`/v1/responses` 或 `/openai/v1/responses`）
@@ -421,14 +429,14 @@ resp = client.chat.completions.create(
 |------|------|------|
 | POST | `/v1/messages` | Messages（流式/工具/图片） |
 | POST | `/v1/messages/count_tokens` | token 估算 |
-| GET | `/claude/v1/models` | 模型列表（Anthropic 形状，避开与 OpenAI `/v1/models` 冲突） |
+| GET | `/claude/v1/models` | 模型列表（Anthropic 形状，固定短清单，不按账号订阅档位过滤；避开与 OpenAI `/v1/models` 冲突） |
 | POST | `/claude/v1/messages` · `.../count_tokens` | 显式前缀变体 |
 
 ### Gemini 原生（`/v1beta` 或 `/gemini/v1beta`）
 
 | 方法 | 端点 | 功能 |
 |------|------|------|
-| GET | `/models` | 模型列表 |
+| GET | `/models` | 模型列表（固定短清单，不按账号订阅档位过滤） |
 | POST | `/models/{m}:generateContent` | 内容生成（非流式） |
 | POST | `/models/{m}:streamGenerateContent` | 流式生成（`?alt=sse`，camelCase） |
 
@@ -444,7 +452,7 @@ resp = client.chat.completions.create(
 
 > URL 里的 `localhost:8080` 只是示例；端口由 `PORT`/`config.json` 配置，按你的部署替换。
 >
-> Gemini/OpenAI 客户端一律用本服务的**统一鉴权**（Bearer/`x-api-key`/`?token=`），不是厂商原生的 `?key=`/`x-goog-api-key`。
+> 鉴权闸接受的通道按优先级为：`Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > query（`?api_key=` > `?token=` > `?key=`）。厂商原生的 `x-goog-api-key` 头与 `?key=` 参数**同样被接受**，官方 `google-genai` SDK 只换 `base_url` 即可直连。要换掉的是**值**：任何通道里传的都必须是**本服务**的 API Key，而不是真正的 Google/OpenAI 厂商密钥。
 
 ---
 
@@ -458,13 +466,13 @@ resp = client.chat.completions.create(
 
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
-| `API_KEY` | ✅ | — | 对外调用密钥（留空则协议端点开放访问，启动告警） |
+| `API_KEY` | ✅ | — | 对外调用密钥（留空且未创建任何 API-KEY 时协议端点开放访问，启动告警） |
 | `ADMIN_API_KEY` | ❌ | 回退 `API_KEY` | 管理端独立鉴权 key；与 `API_KEY` 都不设时 `/api/admin/*` 开放，公网部署必填 |
 | `HOST` | ❌ | `127.0.0.1`（镜像内置 `0.0.0.0`） | 监听地址 |
 | `PORT` | ❌ | `8080` | 服务端口（compose 的端口映射与健康检查都跟随该值） |
-| `REGION` | ❌ | `us-east-1` | 默认 AWS region（账号 `profileArn` 内的 region 优先） |
+| `REGION` | ❌ | `us-east-1` | 仅存进配置本身、供 `GET /api/admin/config` 展示（`config.json` 的 `region` 同理），**不参与上游调用**：数据面与令牌刷新的 region 依次取账号 `profileArn` 内的 region → 账号自身 `region` 字段 → 硬编码 `us-east-1` |
 | `LOAD_BALANCING_MODE` | ❌ | `priority` | 负载均衡：`priority`（等权轮询）/ `balanced`（按 weight 加权） |
-| `MAX_RPM_PER_CREDENTIAL` | ❌ | `0` | 每账号每分钟请求上限，`0` = 无限 |
+| `MAX_RPM_PER_CREDENTIAL` | ❌ | `0` | 每账号每分钟请求上限，`0` = 无限。触顶只会让该账号在窗口内**不被选中**，不会给客户端回 `429`；所有账号都不可选时请求以 `503` 结束（`429` 只来自上游限流） |
 | `CREDENTIALS_PATH` | ❌ | `credentials.json`，解析在 `-c` 配置文件所在目录（容器内即 `/app/data/credentials.json`） | 凭据文件路径；被命令行 `--credentials` 覆盖 |
 
 **`data/config.json`**（camelCase，均可选；`logCapacity` 仅在此配置）：
@@ -493,13 +501,13 @@ resp = client.chat.completions.create(
 
 ## ⚠ 注意事项
 
-1. **对外部署务必设置 `API_KEY` 与 `ADMIN_API_KEY`**：`API_KEY` 留空时协议端点开放访问（启动会告警）；`adminApiKey`/`apiKey` 都不配时 `/api/admin/*` 同样开放，凭据、API-KEY、鉴权设置都能被任意改写。`/admin`、`/user` 面板本体始终不鉴权（真正的闸在其 `/api/**` 接口上）；裸机部署慎改 `HOST=0.0.0.0`。
+1. **对外部署务必设置 `API_KEY` 与 `ADMIN_API_KEY`**：`API_KEY` 留空且尚未创建任何 API-KEY 时，协议端点开放访问（启动会告警），发出第一条 API-KEY 后协议闸即收口；`adminApiKey`/`apiKey` 都不配时 `/api/admin/*` 同样开放（发多少条 API-KEY 都不会收口），凭据、API-KEY、鉴权设置都能被任意改写。`/admin`、`/user` 面板本体始终不鉴权（真正的闸在其 `/api/**` 接口上）；裸机部署慎改 `HOST=0.0.0.0`。
 
 2. **可用模型取决于账号订阅档位**：免费档（KIRO FREE）通常只授权 `claude-sonnet-4.5`；请求不支持的模型返回 `400`（`INVALID_MODEL_ID`），不瞎重试、不误伤账号。
 
 3. **令牌自愈**：token 到期自动内存刷新并原子落盘 `credentials.json`；真正的凭据失效才永久禁用，配额/风控/限流一律冷却自愈。
 
-4. **流式输出**：四种协议均支持流式；`stream:false` 时服务内部仍解码事件流，收集完毕后一次性返回完整 JSON。上游报错或流传输中途中断时，流会以该协议自身的错误事件收尾，绝不会伪装成一次正常完成；触及 `max_tokens` 或上下文耗尽时，如实回报截断原因。
+4. **流式输出**：四种协议均支持流式；`stream:false` 时服务内部仍解码事件流，收集完毕后一次性返回完整 JSON。上游报错或流传输中途中断时，流会以该协议自身的错误事件收尾，绝不会伪装成一次正常完成；上游命中**它自己的**输出预算（`ContentLengthExceededException`）或上下文窗口耗尽时，如实回报截断原因（`stop_reason:"max_tokens"` / `finish_reason:"length"`、`model_context_window_exceeded`）。注意请求里的 `max_tokens` 并不参与其中——它不会下发到上游，见[接入示例](#-接入示例)里的参数说明。
 
 5. **网络环境**：部署服务器需能访问 AWS CodeWhisperer/Kiro 端点（`*.amazonaws.com`）。
 
@@ -557,7 +565,7 @@ kiro2api/
 - [x] 令牌单飞自动刷新 + 原子落盘
 - [x] 端点回退（Kiro/CodeWhisperer/AmazonQ）+ 跨账号重试
 - [x] body-aware 失败分类（永久失效才禁用，其余冷却自愈）
-- [x] 统一鉴权闸（Bearer / x-api-key / ?token=）
+- [x] 统一鉴权闸（Bearer / x-api-key / x-goog-api-key / query 参数）
 - [x] Web 管理面板（凭据/登录/API-KEY/用量/日志/余额/设置）
 - [x] 用户面板（持有者用自身 API-KEY 登录）
 - [x] 三种交互式登录流（Builder ID / IAM SSO / 社交令牌）

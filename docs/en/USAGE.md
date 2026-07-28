@@ -100,8 +100,11 @@ Configure runtime behavior:
    - **Load Balancing**: Switch between `priority` (equal-weight round-robin) and `balanced` (weighted by `weight`)
    - **Auth Keys**: Rotate `apiKey` / `adminApiKey` at runtime (no restart)
    - **Integration Snippets**: Copy ready-made examples per protocol × language
-   - **Server Info**: Shows the (masked) master key and the kiro2api version
+   - **Server Info**: Shows the master key and the kiro2api version
 3. Changes apply live without restarting the service
+
+> [!WARNING]
+> The masking on that Server Info card is applied **in the browser only**. The endpoint behind it, `GET /api/admin/server-info`, returns `masterApiKey` in **full plaintext** — the panel needs the real value for its copy button. Never paste a raw `server-info` response into an issue, a log, a screenshot of a network tab, or third-party tooling. `GET /api/admin/config/auth-keys` is the endpoint that actually returns the masked form. The same applies to the API-KEY list: the panel masks the values it displays, but `GET /api/admin/api-keys` returns every key in plaintext.
 
 ### Service Control
 
@@ -116,9 +119,12 @@ Manage the service from the top control bar:
 
 kiro2api supports multimodal content, including image input. Three API formats are supported for image transmission.
 
+> [!IMPORTANT]
+> **Images must be inlined as base64 — remote URLs are rejected.** The Kiro data plane only accepts inline bytes, so a `http(s)://` image URL is not fetched for you and is not silently dropped either: the request fails with `400` `invalid_request_error` asking you to inline the image as a `data:` URL. This covers OpenAI `image_url` with a remote URL and Anthropic `{"type":"image","source":{"type":"url",…}}` alike. Download the image and base64-encode it yourself first.
+
 ### OpenAI Format
 
-Use `image_url` type in the `messages` array. Supports Base64 Data URI:
+Use `image_url` type in the `messages` array, with a Base64 Data URI:
 
 ```bash
 curl -X POST http://localhost:8080/v1/chat/completions \
@@ -202,13 +208,18 @@ curl -X POST http://localhost:8080/v1beta/models/claude-sonnet-4.5:generateConte
 
 The models you can call depend on your **Kiro account subscription tier**. The free tier (KIRO FREE) typically authorizes only `claude-sonnet-4.5`; opus / GPT tiers require a higher subscription.
 
-Incoming model names are matched to Kiro's internal models by **lowercase substring**. A name that matches nothing returns `400` (`INVALID_MODEL_ID`) — the service does not blindly retry or harm the account, it returns the upstream reason directly.
+Incoming model names are matched to Kiro's internal models by **lowercase substring**. Two different `400`s follow from this, and they need different fixes:
+
+- A name that matches **nothing** is rejected by the gateway's own conversion step (message `无法识别的模型名: <name>`). No request ever reaches Kiro, so `INVALID_MODEL_ID` is *not* involved — fix the name, not the account.
+- A name that **does** map but is not authorized for the account's subscription tier is refused by the upstream with reason `INVALID_MODEL_ID`, which the service reports as `400` with `Invalid model '<name>': not available for the current account. …`.
+
+Both are deterministic: the service does not blindly retry them and neither harms the account.
 
 | Model ID | Description |
 |----------|-------------|
 | `claude-sonnet-4.5` | Claude Sonnet, available on the free tier; the recommended default |
 
-**List then use**: Query the `/models` endpoint (or `/claude/v1/models`, `/v1beta/models`) to see the ids this service can actually serve, then call one of those. This keeps clients correct across subscription changes.
+**Don't trust `/models` as a capability list**: the protocol endpoints (`/v1/models`, `/claude/v1/models`, `/v1beta/models`) each return a **fixed, hard-coded three-entry list** that is compiled into the binary — it is not filtered by your accounts' subscription tier, it is not the full set of names the service accepts, and the three lists do not even agree with each other. Use them at most as a smoke test. The real catalog is `GET /api/admin/models` (the live per-pool capability union, falling back to the full 17-model catalog); whatever id you pick, be ready to handle `400` (`INVALID_MODEL_ID`).
 
 ## Third-Party Client Integration
 
@@ -330,7 +341,10 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 ```
 
 > [!NOTE]
-> Streaming is honest about failures on every protocol: if the upstream returns an error, or the connection is interrupted mid-stream, the stream ends with that protocol's own error event (OpenAI/Responses `error`, Anthropic `error`, Gemini error payload) — never with a normal finish. When the answer is cut short by `max_tokens` or an exhausted context, the stream reports the matching truncation reason (`length` / `max_tokens` / `MAX_TOKENS`) instead of a clean stop, so clients can tell "finished" from "cut off".
+> Streaming is honest about failures on every protocol: if the upstream returns an error, or the connection is interrupted mid-stream, the stream ends with that protocol's own error event (OpenAI/Responses `error`, Anthropic `error`, Gemini error payload) — never with a normal finish. When the answer is cut short — by the upstream's own output budget or by an exhausted context window — the stream reports the matching truncation reason (`length` / `max_tokens` / `MAX_TOKENS`) instead of a clean stop, so clients can tell "finished" from "cut off".
+
+> [!NOTE]
+> **Generation parameters are accepted but have no effect.** `temperature` (and any other sampling knob), `max_tokens` / `max_output_tokens` / `maxOutputTokens`, and `tool_choice` are all discarded — the upstream data plane has no wire fields for them. Requests carrying them still succeed with a normal answer, so a truncation reason you see is always the upstream's own limit, never one you set, and a "forced" tool choice is only ever a suggestion the model may ignore. The single exception is Gemini `toolConfig` with `functionCallingConfig.mode: "NONE"`, which is honored by withholding the tool definitions entirely. See [API.md](API.md#post-openaiv1chatcompletions) for the per-protocol detail.
 
 ## Conversation Context
 
@@ -390,7 +404,7 @@ The upstream data plane falls back in order **Kiro IDE → CodeWhisperer → Ama
 ### "Unauthorized" Error (401)
 
 - Verify the API Key is correct
-- Check the Authorization header format: `Authorization: Bearer sk-xxx` (or `x-api-key: sk-xxx`, or `?token=sk-xxx`)
+- Check the format of whichever channel you use — the gate accepts six, in this order: `Authorization: Bearer sk-xxx`, `x-api-key: sk-xxx`, `x-goog-api-key: sk-xxx`, `?api_key=sk-xxx`, `?token=sk-xxx`, `?key=sk-xxx`
 - If the token was refreshing during the request, retry once — self-healing may have re-issued it
 - Rotate the key in **Settings** if needed
 
@@ -411,5 +425,5 @@ The upstream data plane falls back in order **Kiro IDE → CodeWhisperer → Ama
 ### Model Not Found (400 `INVALID_MODEL_ID`)
 
 - Verify the model name — matching is by lowercase substring
-- Query `GET /v1/models` to see the ids this service can actually serve
+- Don't rely on `GET /v1/models`: it is a fixed, hard-coded list and does not reflect your pool. Query `GET /api/admin/models` for the ids this service can actually serve
 - Model availability depends on your Kiro account subscription tier

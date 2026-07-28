@@ -164,7 +164,10 @@ kiro2api 支持三种交互式登录流，无需手动拼接凭据：
 #### 密钥轮换
 
 - 运行期轮换 `apiKey` / `adminApiKey`，即时生效、无需重启
-- `server-info` 显示脱敏后的主 key 与 kiro2api 版本
+- 面板上这一栏的脱敏值来自 `GET /api/admin/config/auth-keys`（服务端就已经打码）
+
+> [!WARNING]
+> `GET /api/admin/server-info` 的 `masterApiKey` 是**完整明文、不打码**（面板拿全值是为了「复制」按钮，打码只发生在浏览器里）。**不要**把这个接口的响应贴进 issue、日志、截图或第三方工具——那等于直接泄露主 API Key。需要可安全外传的脱敏形态请改用 `GET /api/admin/config/auth-keys`。
 
 ### 主题切换
 
@@ -210,7 +213,12 @@ kiro2api 支持多模态内容，包括图片输入。支持三种 API 格式的
 
 ### OpenAI 格式
 
-在 `messages` 数组中使用 `image_url` 类型，支持 Base64 Data URI 和远程 HTTP URL：
+在 `messages` 数组中使用 `image_url` 类型。**只支持 Base64 Data URI**（`data:image/...;base64,...`）：
+
+> [!IMPORTANT]
+> **远程 http(s) 图片 URL 会被拒绝，不会被抓取。** 上游 Kiro 数据面只接受内联 base64，本服务遇到远程 URL 一律返回 `400`（`invalid_request_error`，体为「不支持远程图片 URL(…)；请把图片内联为 data: URL(base64)后再发送」），而不是静默丢图让模型答非所问。请在客户端先把图片下载并转成 base64 再发。
+>
+> 例外只在 OpenAI Responses 协议：`input_image` 里的非 `data:` URL 是**静默跳过**（不报错，但那张图不会进上游），同样不能指望服务端替你抓图。
 
 **Base64 图片示例**：
 
@@ -229,31 +237,6 @@ curl -X POST http://localhost:8080/v1/chat/completions \
             "type": "image_url",
             "image_url": {
               "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-            }
-          }
-        ]
-      }
-    ]
-  }'
-```
-
-**远程 URL 图片示例**：
-
-```bash
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-你的API密钥" \
-  -d '{
-    "model": "claude-sonnet-4.5",
-    "messages": [
-      {
-        "role": "user",
-        "content": [
-          {"type": "text", "text": "分析这张图片"},
-          {
-            "type": "image_url",
-            "image_url": {
-              "url": "https://example.com/image.jpg"
             }
           }
         ]
@@ -323,7 +306,7 @@ curl -X POST http://localhost:8080/v1beta/models/claude-sonnet-4.5:generateConte
 
 ### 模型可用性取决于订阅档位
 
-kiro2api 的后端是 Kiro（CodeWhisperer）账号池，**可用模型取决于账号订阅档位**。请求前建议先 list-then-use，用 `/v1/models`（或 `/claude/v1/models`、`/v1beta/models`）查询本服务实际可服务的模型 id。
+kiro2api 的后端是 Kiro（CodeWhisperer）账号池，**可用模型取决于账号订阅档位**。注意协议侧的 `/v1/models`（以及 `/claude/v1/models`、`/v1beta/models`）返回的是**编译期写死的固定短清单**，既不读账号池、也不按订阅档位过滤，因此**不能**用它来判定"实际可服务"；完整模型目录请用管理接口 `GET /api/admin/models`（各账号上游能力的并集；并集为空时——没有账号刷新过或缓存全过期——本次先回落到内置的 17 条静态目录，那份**同样不反映档位授权**，后台会惰性回填，稍后再查即为动态并集）。
 
 | 档位 | 通常可用模型 |
 |---------|------|
@@ -336,7 +319,7 @@ kiro2api 的后端是 Kiro（CodeWhisperer）账号池，**可用模型取决于
 ### 模型名映射
 
 - 客户端传入的模型名按**小写子串**匹配到 Kiro 内部模型，未匹配到返回 `400`
-- `/models` 端点返回本服务实际可服务的模型 id，建议客户端 list-then-use
+- 协议侧 `/models` 端点返回的是固定短清单，不代表账号档位真的授权；完整目录见 `GET /api/admin/models`
 
 ## 第三方客户端接入
 
@@ -469,7 +452,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 OpenAI Chat 流式返回 `chat.completion.chunk` 行并以 `data: [DONE]` 收尾；Anthropic / Gemini / Responses 各按自身协议输出（Responses 为命名事件 + 单调 `sequence_number`，无 `[DONE]`）。
 
 > [!NOTE]
-> 上游报错，或流传输中途被中断（连接断开、上游提前收尾）时，流会以该协议自身的错误事件收尾，**绝不会伪装成一次正常完成**，客户端可以据此判断本次输出不完整；触及 `max_tokens` 或上下文耗尽时，则如实回报对应的截断原因，而不是标成正常结束。
+> 上游报错，或流传输中途被中断（连接断开、上游提前收尾）时，流会以该协议自身的错误事件收尾，**绝不会伪装成一次正常完成**，客户端可以据此判断本次输出不完整；**上游**命中自身输出预算或上下文耗尽时，则如实回报对应的截断原因（`stop_reason:"max_tokens"` / `finish_reason:"length"`、`model_context_window_exceeded`），而不是标成正常结束。注意这类截断由上游决定，**不受**你在请求里传的 `max_tokens` 控制——那个参数不下发（见 [API.md](API.md) 的生成参数说明）。
 
 ### 非流式请求
 
@@ -614,7 +597,7 @@ print(resp.text)
 
 **解决**：
 1. 检查 API Key 是否正确
-2. 确保请求头中包含 `Authorization: Bearer sk-xxx`（或 `x-api-key: sk-xxx`、`?token=sk-xxx`）
+2. 确保密钥走了鉴权闸接受的六条通道之一：请求头 `Authorization: Bearer sk-xxx`、`x-api-key: sk-xxx`、`x-goog-api-key: sk-xxx`，或 URL query `?api_key=sk-xxx`、`?token=sk-xxx`、`?key=sk-xxx`（优先级即此顺序，取第一条命中的）
 3. 检查 API Key 是否在 `.env` 或 `config.json` 中正确配置
 
 ### 请求返回 400（INVALID_MODEL_ID）
@@ -622,7 +605,7 @@ print(resp.text)
 **原因**：请求的模型不在当前账号订阅档位授权范围内
 
 **解决**：
-1. 先 `GET /v1/models` 查询实际可用的模型 id
+1. 用管理接口 `GET /api/admin/models` 查询模型目录（协议侧 `GET /v1/models` 只是固定短清单，不反映档位）。注意它返回的是各账号上游能力的并集，**并集为空时会回落到内置的 17 条静态目录**，那份也不反映档位授权——以实际请求的返回为准
 2. 免费档（KIRO FREE）通常只授权 `claude-sonnet-4.5`
 3. 需要 opus / GPT 等更高档模型时，升级账号订阅
 

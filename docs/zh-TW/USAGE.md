@@ -87,6 +87,7 @@ kiro2api 內建靜態管理面板（`/admin`）與使用者面板（`/user`）�
 **消費上限在四協議一律生效：**
 - Anthropic / OpenAI / OpenAI-Responses / **Gemini** 四個協議前端都按鑑權閘解析出的 key 歸屬記帳，額度用盡即返回 `402`
 - 因此無論呼叫方走哪條協議，用量與花費都會如實計入該 key，不存在「換個端點就能繞開上限」的口子
+- **注意會提前擋下**：真實花費要等回應算完 token 才知道，所以鑑權閘在放行前會先為這筆在途請求預留一份保守的名義額度（USD 單位 `1.0`，credits 單位 `1.0 / 0.72 ≈ 1.39`），請求結束即釋放。判斷式是 `已用 + 在途預留 + 本次預留 > 上限` 就回 `402`，也就是**剩餘額度不足一次預留時就開始拒**，而不是真的花到滿。因此面板上的「已用 / 上限」還沒跑滿時就可能全數 `402`；上限本身若小於一次預留（例如只給 `0.5` USD 的 key），該 key 會從一開始就無法呼叫——設上限時請留出餘裕
 
 **用量與記錄：**
 - 檢視或清零單 key 的累計用量
@@ -102,7 +103,7 @@ kiro2api 內建靜態管理面板（`/admin`）與使用者面板（`/user`）�
 - **負載均衡**：執行期切換 `priority`（等權輪詢）/ `balanced`（按 weight 加權）
 - **鑑權密鑰**：輪換 `apiKey` / `adminApiKey`
 - **整合示例**：協議 × 語言可複製片段（OpenAI / Anthropic / Responses / Gemini）
-- **伺服器資訊**：顯示去敏後的主 key 與 kiro2api 版本
+- **伺服器 / 系統資訊**：版本、Rust、OS、記憶體、CPU、PID、執行模式在**儀表板**上顯示。面板上看到的去敏金鑰來自 `GET /api/admin/config/auth-keys`（唯一會去敏的那支）；**驅動系統資訊的 `GET /api/admin/server-info` 本身回傳的 `masterApiKey` 是完整明文、不去敏**——別把該回應原樣貼進 issue、日誌或第三方工具
 - **一鍵重啟服務**：無需回到終端
 
 ### 右上角控制欄
@@ -121,9 +122,14 @@ kiro2api 內建靜態管理面板（`/admin`）與使用者面板（`/user`）�
 
 kiro2api 支援多模態內容，四種協議前端均可傳入圖片。支援三種 API 格式的圖片傳輸。
 
+> [!IMPORTANT]
+> **圖片必須內聯為 Base64**。Kiro 資料面只收內聯 base64，本服務**不會**替你去下載遠端圖片：任何 `http://` / `https://` 圖片 URL（OpenAI 的 `image_url.url`、Anthropic 的 `source.type:"url"` 或帶 http(s) `url` 的圖片來源，以及 `tool_result` 裡內嵌的這兩種圖片區塊）都會被**明確拒絕**並回 `400`（錯誤訊息是服務端原文，簡體，見下方反例）——刻意報錯而不是靜默丟圖，免得模型根本沒收到圖你卻毫不知情。請自行先把圖片抓下來轉成 `data:image/...;base64,...` 再送。（Gemini 原生格式本身只有 `inlineData`（base64），不存在遠端 URL 寫法。）
+>
+> **唯一例外是 OpenAI Responses（`/v1/responses`）的 `input_image`**：那條路徑上非 `data:` 的 URL（以及缺省的 `image_url`）是**靜默丟棄**——不報錯、不回 `400`，該張圖直接不會送到模型。所以走 Responses 時更要自己確保圖片已經是 Base64 Data URI，別指望用 `400` 幫你把關。
+
 ### OpenAI 格式
 
-在 `messages` 陣列中使用 `image_url` 類型，支援 Base64 Data URI 和遠端 HTTP URL：
+在 `messages` 陣列中使用 `image_url` 類型，`url` 必須是 Base64 Data URI：
 
 **Base64 圖片示例**：
 
@@ -150,7 +156,9 @@ curl -X POST http://localhost:8080/openai/v1/chat/completions \
   }'
 ```
 
-**遠端 URL 圖片示例**：
+**遠端 URL 會被拒絕（反例）**：
+
+下面這種寫法**不成立**，會回 `400`：
 
 ```bash
 curl -X POST http://localhost:8080/openai/v1/chat/completions \
@@ -174,6 +182,20 @@ curl -X POST http://localhost:8080/openai/v1/chat/completions \
     ]
   }'
 ```
+
+回應（`400`，OpenAI 形狀）：
+
+```json
+{
+  "error": {
+    "message": "不支持远程图片 URL(https://example.com/image.jpg);请把图片内联为 data: URL(base64)后再发送",
+    "type": "invalid_request_error",
+    "code": null
+  }
+}
+```
+
+正確做法是先把該圖片抓下來轉成 base64，改用上面的 Data URI 寫法。
 
 ### Claude 格式
 
@@ -245,7 +267,7 @@ kiro2api 的後端是 Kiro（CodeWhisperer）帳號池，**可用模型取決於
 
 **訂閱檔位決定授權**：免費檔（KIRO FREE）通常只授權 `claude-sonnet-4.5`，opus 等需更高檔位。請求**不支援的模型**會明確返回 `400`（`INVALID_MODEL_ID`），而非靜默失敗，服務**不瞎重試、不誤傷帳號**。
 
-**動態模型清單**：`GET /v1/models`（或 `/claude/v1/models`、`/v1beta/models`）返回本服務**實際可服務**的模型 id。建議客戶端 list-then-use，先查詢再使用。
+**協議端點的模型清單是寫死的**：`GET /v1/models`、`/claude/v1/models`、`/v1beta/models` 各自回傳一份**固定的**三條短清單：`/v1/models` 與 `/v1beta/models` 是同樣的 sonnet-4.5 / opus-4.6 / gpt-5.6-sol（後者依 Gemini 慣例帶 `models/` 前綴），只有 `/claude/v1/models` 那份不同——它以 haiku-4.5 取代 gpt-5.6-sol。三份**都不讀帳號池、不依訂閱檔位過濾**——池子空的時候照樣這麼回。因此**不能**把它當成「已授權模型」的白名單，清單裡的模型仍可能回 `400`。要看帳號實際授權的動態並集（快取為空時回落到 17 條靜態目錄），請用管理端的 `GET /api/admin/models`。
 
 ## 第三方客戶端整合
 
@@ -332,7 +354,7 @@ response = client.models.generate_content(
 print(response.text)
 ```
 
-> Gemini 客戶端一律用本服務的**統一驗證**（Bearer / `x-api-key` / `?token=`），而非 Google 原生的 `?key=` / `x-goog-api-key`。
+> 驗證閘接受的通道依優先順序為：`Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > 查詢參數（`?api_key=` > `?token=` > `?key=`）。Google 原生的 `x-goog-api-key` 標頭與 `?key=` 參數**同樣受理**，所以上面這段 `genai.Client(api_key=...)` 只要換掉 `base_url` 就能直接跑。要換的是**值**：`api_key` 一律填**本服務**的 API Key，不是 Google 的真金鑰。
 
 ### cURL
 
@@ -357,7 +379,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-> 流式回應在上游報錯或**傳輸中途中斷**（連線重置 / 讀取逾時 / 分塊未收尾）時，一律以該協議自身的錯誤事件收束——Anthropic `error` 事件、OpenAI 錯誤 chunk 且不補 `[DONE]`、Responses `response.failed`、Gemini 錯誤區塊（絕不報 `STOP`），逾時映射 `504`、其餘 `502`，**絕不會被當成正常完成**，客戶端的重試邏輯因此能正常觸發。命中 `max_tokens` 或上下文耗盡時，流式與非流式同口徑如實回報截斷原因（`max_tokens` / `length` / `MAX_TOKENS` / `incomplete`）。
+> 流式回應在上游報錯或**傳輸中途中斷**（連線重置 / 讀取逾時 / 分塊未收尾）時，一律以該協議自身的錯誤事件收束——Anthropic `error` 事件、OpenAI 錯誤 chunk 且不補 `[DONE]`、Responses `response.failed`、Gemini 錯誤區塊（絕不報 `STOP`），逾時映射 `504`、其餘 `502`，**絕不會被當成正常完成**，客戶端的重試邏輯因此能正常觸發。**上游自己**判定截斷（它自己的長度預算或上下文耗盡）時，流式與非流式同口徑如實回報截斷原因（`max_tokens` / `length` / `MAX_TOKENS` / `incomplete`）——注意這與你傳的 `max_tokens` / `max_output_tokens` / `maxOutputTokens` 無關：那幾個參數**相容接受但不轉發給上游，不會限制回應長度**（見 [API.md](API.md) 的參數表）。
 
 ## 令牌自癒與帳號池
 
@@ -443,7 +465,7 @@ response = client.chat.completions.create(
 
 1. 傳入的模型名做小寫化處理
 2. 與 Kiro 內部可服務模型做子字串匹配
-3. 未匹配到 → 明確返回 `400`（`INVALID_MODEL_ID`）
+3. 未匹配到 → 明確返回 `400`，訊息為「無法識別的模型名: …」（這是**本地**判定，回應體裡**沒有** `INVALID_MODEL_ID`；上游判定「該模型對當前檔位不可用」是另一種 `400`，reason 才是 `INVALID_MODEL_ID`）
 
 因此無論客戶端寫 `claude-sonnet-4.5` 還是帶前後綴的變體，只要能匹配到內部模型即可服務。
 
@@ -474,4 +496,4 @@ A：支援。四種協議前端均可傳入圖片（OpenAI `image_url` / Claude 
 A：可以。在帳號管理中納入多個帳號，服務會依 `priority` / `balanced` 策略自動輪詢，並在失敗時跨帳號重試。
 
 **Q：為什麼請求 opus 模型返回 400？**
-A：可用模型取決於帳號訂閱檔位。免費檔（KIRO FREE）通常只授權 `claude-sonnet-4.5`；請先 `GET /v1/models` 查詢當前可服務的模型 id。
+A：可用模型取決於帳號訂閱檔位。免費檔（KIRO FREE）通常只授權 `claude-sonnet-4.5`。注意**協議端點的 `GET /v1/models` 幫不上忙**——它是寫死的短清單，不依檔位過濾，`claude-opus-4.6` 本來就在裡面。要看帳號實際授權了哪些模型，請用管理端的 `GET /api/admin/models`（上游 `ListAvailableModels` 的動態並集）。

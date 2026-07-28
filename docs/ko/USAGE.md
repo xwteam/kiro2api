@@ -140,7 +140,8 @@ kiro2api는 세 가지 대화형 로그인 플로우를 지원하여, 관리 패
 
 **지출 한도의 적용 범위**:
 - 지출 한도와 사용량 집계는 **4개 프로토콜 프런트엔드(Anthropic / OpenAI / OpenAI-Responses / Gemini) 전부**에서 동일하게 적용됩니다.
-- 어느 엔드포인트로 호출하든 같은 key의 한도에 합산되며, 한도를 넘어서면 해당 프로토콜의 오류로 거부됩니다.
+- 어느 엔드포인트로 호출하든 같은 key의 한도에 합산되며, 한도를 넘어서면 `402`(`billing_error`, "api key spending limit exceeded")로 거부됩니다.
+- 판정은 요청 **진입 시점**에 이루어집니다: 응답 전에는 실제 비용을 알 수 없으므로 요청 1건당 보수적인 예상 비용(USD 기준 1.0, 크레딧 단위면 약 1.39)을 임시 예약해 두고 `누적 사용량 + 예약분 > 한도`이면 거부합니다(예약분은 요청이 끝나면 즉시 반환). 그래서 잔여 한도가 이 예상치보다 작아지는 순간부터는 한도를 아직 다 쓰지 않았어도 모든 호출이 `402`가 되며, 한도를 예상치보다 작게(예: 0.5 USD) 잡으면 그 key는 처음부터 아무 요청도 통과하지 못합니다.
 
 ### 설정
 
@@ -158,7 +159,10 @@ kiro2api는 세 가지 대화형 로그인 플로우를 지원하여, 관리 패
 **서비스 제어**:
 - 원클릭 서비스 재시작
 - 재시작·종료 시 진행 중인 요청을 기다리는 드레인 시간은 **최대 8초**로 제한되므로, 마지막 사용량 통계 플러시가 언제나 실행됩니다
-- `server-info`는 마스킹된 마스터 key와 kiro2api 버전을 표시
+- 대시보드의 시스템 정보 카드는 `GET /api/admin/server-info`로 kiro2api 버전·Rust 버전·OS·메모리·CPU·PID·실행 모드·가동 시간을 표시합니다. 위 "인증 키" 항목이 보여주는 마스킹된 key 값은 이와 별개인 `GET /api/admin/config/auth-keys`에서 옵니다
+
+> [!WARNING]
+> `GET /api/admin/server-info`가 돌려주는 `masterApiKey`는 **마스킹되지 않은 완전한 평문**입니다(패널이 브라우저 쪽에서 가려 보여줄 뿐이고, "복사" 버튼이 실제 값을 필요로 하기 때문에 서버는 일부러 잘라 보내지 않습니다). 이 엔드포인트의 응답을 이슈·로그·채팅·서드파티 도구에 그대로 붙여넣으면 마스터 key가 그대로 유출됩니다. 마스킹된 형태가 필요하면 `GET /api/admin/config/auth-keys`를 사용하십시오.
 
 모든 변경사항은 즉시 적용됩니다.
 
@@ -180,7 +184,10 @@ kiro2api는 이미지 입력을 포함한 멀티모달 콘텐츠를 지원합니
 
 ### OpenAI 형식
 
-`messages` 배열에서 `image_url` 타입을 사용합니다. Base64 Data URI와 원격 HTTP URL을 모두 지원합니다.
+`messages` 배열에서 `image_url` 타입을 사용합니다.
+
+> [!IMPORTANT]
+> **Base64 Data URI(`data:image/...;base64,...`)만 지원합니다. 원격 `http(s)` URL은 지원하지 않습니다.** 업스트림 Kiro는 인라인 base64 이미지만 받기 때문에, `{"url": "https://example.com/image.jpg"}`처럼 원격 URL을 보내면 이미지가 조용히 빠진 채 처리되는 것이 아니라 요청 전체가 `400 invalid_request_error`로 거부됩니다(이미지를 못 본 모델이 엉뚱한 답을 내놓는 것보다 낫다는 판단에 따른 의도적 동작). 원격 이미지를 쓰려면 클라이언트에서 먼저 내려받아 Data URI로 인라인해 보내십시오. 같은 규칙이 Claude 형식(`source.type`은 `base64`만, `url`은 거부)에도 적용됩니다.
 
 **Base64 이미지 예시**:
 
@@ -199,31 +206,6 @@ curl -X POST http://localhost:8080/openai/v1/chat/completions \
             "type": "image_url",
             "image_url": {
               "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-            }
-          }
-        ]
-      }
-    ]
-  }'
-```
-
-**원격 URL 이미지 예시**:
-
-```bash
-curl -X POST http://localhost:8080/openai/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-당신의API키" \
-  -d '{
-    "model": "claude-sonnet-4.5",
-    "messages": [
-      {
-        "role": "user",
-        "content": [
-          {"type": "text", "text": "이 이미지를 분석하세요"},
-          {
-            "type": "image_url",
-            "image_url": {
-              "url": "https://example.com/image.jpg"
             }
           }
         ]
@@ -329,7 +311,7 @@ kiro2api의 백엔드는 Kiro(CodeWhisperer) 계정 풀입니다. **사용 가�
 
 **모델명 매핑**: 클라이언트가 전달한 모델명은 **소문자 부분 문자열** 매칭으로 Kiro 내부 모델에 해석됩니다. 매칭되지 않으면 `400`(`INVALID_MODEL_ID`)을 명확히 반환하며, 무작정 재시도하거나 계정에 피해를 주지 않습니다.
 
-**목록 후 사용 권장**: `GET /v1/models`(또는 `/claude/v1/models`, `/v1beta/models`)로 본 서비스가 실제로 서빙 가능한 모델 id를 먼저 조회한 뒤 사용하는 것을 권장합니다.
+**`/models`가 알려주는 것과 알려주지 않는 것**: `GET /v1/models`(또는 `/claude/v1/models`, `/v1beta/models`)는 **고정된 짧은 목록**을 돌려줍니다 — 계정 풀이나 구독 등급으로 필터링되지 않으며 프로토콜마다 항목도 다릅니다(OpenAI: `claude-sonnet-4.5` / `claude-opus-4.6` / `gpt-5.6-sol`, Anthropic: `claude-sonnet-4.5` / `claude-opus-4.6` / `claude-haiku-4.5`, Gemini: `claude-sonnet-4.5` / `claude-opus-4.6` / `gpt-5.6-sol`). 즉 목록에 있어도 등급이 인가하지 않으면 `400`(`INVALID_MODEL_ID`)이 나고, 목록에 없는 id라도 이름 매핑만 되면 정상 동작합니다. 더 넓은 목록은 관리 패널이나 `GET /api/admin/models`에서 확인하십시오 — 이쪽은 계정들의 업스트림 합집합(캐시)을 우선 반환하고, 합집합이 비어 있을 때만 내장 정적 카탈로그 17종으로 대체하므로 그 경우의 응답은 등급 인가 여부를 반영하지 않습니다.
 
 ## 서드파티 클라이언트 연동
 
@@ -476,14 +458,14 @@ OpenAI Responses 엔드포인트(`/v1/responses`)에서는 `previous_response_id
 **해결책**:
 1. API Key 확인 (로그 또는 `.env` 파일)
 2. 요청 헤더에 `Authorization: Bearer sk-...` 포함 확인
-3. 또는 `x-api-key: sk-...` 헤더, 혹은 `?token=sk-...` 쿼리 사용
+3. 헤더를 바꾸기 어렵다면 다른 채널도 됩니다 — 게이트는 `Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > 쿼리(`?api_key=` > `?token=` > `?key=`) 순으로 6개 채널을 모두 받습니다
 
 ### 400 INVALID_MODEL_ID
 
 **원인**: 요청한 모델이 계정 구독 등급에서 인가되지 않았거나, 모델명이 내부 모델에 매칭되지 않음
 
 **해결책**:
-1. `GET /v1/models`로 실제 사용 가능한 모델 id 확인
+1. `GET /api/admin/models`로 더 넓은 모델 목록 확인 — 계정들의 업스트림 합집합(캐시)이며, 합집합이 비면 내장 정적 17종으로 대체되므로 그 경우엔 등급 인가 여부를 반영하지 않습니다(프로토콜의 `GET /v1/models`는 등급으로 필터링되지 않는 고정 3종 목록이므로 여기 있다고 인가된 것은 더더욱 아님)
 2. 무료 등급(KIRO FREE)은 일반적으로 `claude-sonnet-4.5`만 인가됨
 3. opus/GPT 등이 필요하면 더 높은 구독 등급의 계정 추가
 

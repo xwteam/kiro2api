@@ -202,7 +202,7 @@ curl http://localhost:8080/health
 
 예상 응답:
 ```json
-{"service":"kiro2api","status":"ok","version":"0.1.0"}
+{"service":"kiro2api","status":"ok","version":"0.2.1"}
 ```
 
 ### 모델 목록 조회
@@ -232,12 +232,11 @@ AI 응답 텍스트가 보이면 배포 성공입니다. 401 반환 시 API 키 
 **해결책**:
 1. 사용 가능한 모델은 계정 구독 등급에 따라 결정됩니다
 2. 무료 등급(KIRO FREE)은 보통 `claude-sonnet-4.5`만 허용
-3. `/v1/models` 엔드포인트로 실제 서비스 가능한 모델 id 확인 후 사용(list-then-use)
-4. 모델 목록 조회:
+3. 더 넓은 모델 목록(계정들의 업스트림 합집합, 비어 있으면 내장 정적 17종)은 관리 API `GET /api/admin/models`로 확인하십시오. 다만 중계가 실제로 받아들이는 id는 이 목록보다 넓습니다 — 이름 매핑이 소문자 부분 문자열로 해석해 내기만 하면 목록에 없는 별칭도 통과합니다. 프로토콜의 `GET /v1/models`는 계정 풀도 구독 등급도 읽지 않는 **컴파일 시점 고정 목록**이므로, 거기 있다고 서비스 가능한 것도 아니고 거기 없다고 못 쓰는 것도 아닙니다:
 
 ```bash
-curl http://localhost:8080/v1/models \
-  -H "Authorization: Bearer sk-당신의API키"
+curl http://localhost:8080/api/admin/models \
+  -H "Authorization: Bearer sk-당신의관리키"
 ```
 
 ### 포트 충돌
@@ -260,14 +259,17 @@ PORT=8081
 
 **해결책**:
 
-1. 프로토콜 호출에는 다음 중 하나로 키를 전달해야 합니다:
+1. 프로토콜 호출에는 키를 실어 보내야 합니다. 게이트는 아래 채널을 `Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > 쿼리(`api_key` > `token` > `key`) 우선순위로 모두 받아들이므로, 어느 것을 써도 됩니다:
 ```bash
 # Authorization: Bearer (권장)
 curl -H "Authorization: Bearer sk-당신의API키" ...
 # 또는 x-api-key
 curl -H "x-api-key: sk-당신의API키" ...
-# 또는 쿼리 파라미터
+# 또는 Gemini 네이티브 헤더 x-goog-api-key (공식 google-genai SDK가 쓰는 채널)
+curl -H "x-goog-api-key: sk-당신의API키" ...
+# 또는 쿼리 파라미터 api_key / token / key
 curl "http://localhost:8080/v1/models?token=sk-당신의API키"
+curl "http://localhost:8080/v1beta/models?key=sk-당신의API키"
 ```
 
 2. `/health`, `/v1/ping`은 인증이 필요 없습니다

@@ -190,7 +190,7 @@ curl http://localhost:8080/health
 
 Expected response:
 ```json
-{"service":"kiro2api","status":"ok","version":"0.1.0"}
+{"service":"kiro2api","status":"ok","version":"0.2.1"}
 ```
 
 ### List Available Models
@@ -222,7 +222,7 @@ You should receive an AI response. If you get a 401 error, verify your API Key i
 
 **Solutions:**
 1. Available models depend on the account's subscription tier — the free tier (KIRO FREE) usually only authorizes `claude-sonnet-4.5`
-2. Call `/v1/models` first and use one of the returned model ids (list-then-use)
+2. `/v1/models` will not tell you which ids work: it is a fixed, hard-coded three-entry list that is not derived from your pool. Use `GET /api/admin/models` for the real catalog, and fall back to `claude-sonnet-4.5`
 3. This is a deterministic error: the service does **not** retry it and does not penalize the account
 
 ### Port Already in Use
@@ -258,7 +258,7 @@ kill -9 <PID>
 **Symptom:** Every request returns `401 Unauthorized`
 
 **Solutions:**
-1. Include a valid key via one of: `Authorization: Bearer <key>`, `x-api-key: <key>`, or `?token=<key>`
+1. Include a valid key on any of the six accepted channels, tried in this order: `Authorization: Bearer <key>`, `x-api-key: <key>`, `x-goog-api-key: <key>`, `?api_key=<key>`, `?token=<key>`, `?key=<key>`
 2. Verify `API_KEY` (or `config.json` `apiKey`) matches the key you send
 3. `/health` and `/v1/ping` do not require auth — use them to confirm the service is up
 
@@ -269,7 +269,7 @@ kill -9 <PID>
 **Solutions:**
 1. Check network latency to AWS CodeWhisperer / Kiro endpoints (`*.amazonaws.com`)
 2. Add more accounts so load spreads across the pool
-3. Raise `MAX_RPM_PER_CREDENTIAL` if a single account is being throttled by the local RPM cap (`0` = unlimited)
+3. Raise `MAX_RPM_PER_CREDENTIAL` if a single account is being held back by the local RPM cap (`0` = unlimited). Note the symptom: an account over its local cap is simply **skipped during selection** — it never returns `429`. If every account is skipped, the caller gets a `503` (`no available upstream account`). A `429` reaching your client always came from an upstream throttle, never from this setting, so do not alert or back off on `429` to detect your own cap
 4. Increase the request timeout in your client code
 
 ## Configuration Reference
@@ -284,10 +284,10 @@ Precedence: **command-line flags > environment variables > `config.json` > built
 | `PORT` | 8080 | Service port (the compose port mapping and the healthcheck both follow this value) |
 | `REGION` | us-east-1 | Default AWS region (the region inside an account's `profileArn` takes precedence) |
 | `LOAD_BALANCING_MODE` | priority | Load balancing: `priority` (even round-robin) or `balanced` (weighted by `weight`) |
-| `MAX_RPM_PER_CREDENTIAL` | 0 | Per-account requests-per-minute cap; `0` = unlimited |
-| `CREDENTIALS_PATH` | `credentials.json` (image ships `/app/data/credentials.json`) | Path to the credentials file; overridden by the `--credentials` flag |
+| `MAX_RPM_PER_CREDENTIAL` | 0 | Per-account requests-per-minute cap; `0` = unlimited. Exceeding it makes that account unselectable — it does **not** return `429`; with every account excluded the request ends as `503` |
+| `CREDENTIALS_PATH` | `credentials.json`, resolved next to the `-c` config file (so `/app/data/credentials.json` in the container) | Path to the credentials file; overridden by the `--credentials` flag |
 
-> The credentials path also decides where usage stats (`stats/`), API-KEY storage (`api_keys.json`), and the balance cache are written — all of them use the parent directory of `credentials.json`. The image default already puts them on the mounted volume; if you set a custom path, keep it inside the volume too, or the data is gone the moment the container is recreated.
+> The credentials path also decides where usage stats (`stats/`), API-KEY storage (`api_keys.json`), and the balance cache are written — all of them use the parent directory of `credentials.json`. The built-in default resolves next to the mounted `config.json`, so they land on the volume by themselves; the image deliberately sets **no** `CREDENTIALS_PATH` (its only `ENV` is `HOST=0.0.0.0`), which is what keeps `credentialsPath` in `config.json` effective — an image-level env var would outrank it. If you set a custom path, keep it inside the volume too, or the data is gone the moment the container is recreated.
 
 **`data/config.json`** (camelCase, all fields optional; `logCapacity` is configured only here):
 

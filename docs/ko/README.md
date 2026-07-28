@@ -81,7 +81,7 @@
 
 ### 🔐 통합 인증 게이트
 
-- 셋 중 하나: `Authorization: Bearer` / `x-api-key` / `?token=`, 상수 시간 비교, 실패 시 즉시 `401`
+- 키 추출 채널은 6개이며 `Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > 쿼리(`?api_key=` > `?token=` > `?key=`) 순으로 모두 받습니다. 값은 상수 시간 비교, 실패 시 즉시 `401`
 - `adminApiKey`(미설정 시 `apiKey`로 폴백)로 `/api/admin/*` 보호, 둘 다 설정되지 않으면 이 게이트는 개방 모드; 보유자는 자신의 **API-KEY**로 `/api/user/*` 액세스
 - `/health`, `/v1/ping` 등 헬스 엔드포인트는 인증 불필요
 
@@ -118,7 +118,7 @@
 ### 🧭 모델 이름 매핑
 
 - 클라이언트가 전달한 모델 이름을 **소문자 부분 문자열** 기준으로 Kiro 내부 모델에 매칭(미매칭 시 → `400`)
-- `/models` 엔드포인트는 본 서비스가 실제로 제공 가능한 모델 id를 반환하며, 클라이언트는 list-then-use 방식 권장
+- 프로토콜의 `/models`는 **고정된 짧은 목록**(프로토콜당 3종)을 반환하며 계정 구독 등급으로 필터링되지 않습니다 — 목록에 있어도 등급 미인가면 `400`이 날 수 있고, 목록에 없어도 이름 매핑만 되면 동작합니다. 더 넓은 목록(계정들의 업스트림 합집합, 비어 있으면 내장 정적 17종)은 `GET /api/admin/models` 참고
 
 ### ⚡ 고성능 아키텍처
 
@@ -214,9 +214,9 @@ docker compose logs -f
 ```bash
 # 헬스 체크
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.1.0"}
+# {"service":"kiro2api","status":"ok","version":"0.2.1"}
 
-# 사용 가능한 모델 보기
+# 프로토콜 고정 모델 목록 조회
 curl http://localhost:8080/v1/models \
   -H "Authorization: Bearer sk-당신의API키"
 
@@ -234,9 +234,11 @@ AI 응답 텍스트가 표시되면 배포 성공입니다. 401이 반환되면 
 ## 🧪 통합 예제
 
 > [!NOTE]
-> 모든 API 요청에는 API Key가 필요합니다. 두 가지 방식 지원:
+> 모든 API 요청에는 API Key가 필요합니다. 게이트는 아래 채널을 이 우선순위로 모두 받아들이므로, 어느 것을 써도 됩니다:
 > - `Authorization: Bearer sk-xxx`(권장, OpenAI/Anthropic SDK 호환)
 > - `x-api-key: sk-xxx`
+> - `x-goog-api-key: sk-xxx`(공식 `google-genai` SDK가 기본으로 쓰는 채널)
+> - 쿼리 파라미터 `?api_key=sk-xxx` / `?token=sk-xxx` / `?key=sk-xxx`(헤더를 설정할 수 없는 브라우저 SSE, Gemini 생태 표준)
 >
 > base URL은 **표준 베어 프리픽스**를 사용합니다: OpenAI = `{host}/v1`, Anthropic = `{host}`(SDK가 자동으로 `/v1/messages` 보완), Gemini = `{host}/v1beta`. 명시적 벤더 프리픽스 `/openai/v1`, `/claude/v1`, `/gemini/v1beta`도 사용 가능합니다.
 
@@ -361,7 +363,7 @@ resp = client.chat.completions.create(
 
 | 메서드 | 엔드포인트 | 기능 |
 |------|------|------|
-| GET | `/models` | 사용 가능한 모델 목록 |
+| GET | `/models` | 프로토콜 고정 모델 목록(컴파일 시점 고정, 구독 등급으로 필터링되지 않음) |
 | POST | `/chat/completions` | 대화 완성(스트리밍은 `chat.completion.chunk` + `[DONE]` 반환, 도구/이미지 포함) |
 
 ### OpenAI Responses (`/v1/responses` 또는 `/openai/v1/responses`)
@@ -399,7 +401,7 @@ resp = client.chat.completions.create(
 
 > URL 안의 `localhost:8080`은 예시일 뿐이며, 포트는 `PORT`/`config.json`으로 설정하므로 배포 환경에 맞게 교체하십시오.
 >
-> Gemini/OpenAI 클라이언트도 모두 본 서비스의 **통합 인증**(Bearer/`x-api-key`/`?token=`)을 사용하며, 벤더 네이티브의 `?key=`/`x-goog-api-key`가 아닙니다.
+> 인증 게이트는 `Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > 쿼리(`?api_key=` > `?token=` > `?key=`) 순으로 어느 채널이든 받아들입니다. Gemini 네이티브의 `x-goog-api-key`와 `?key=`도 지원하므로 공식 `google-genai` SDK는 `base_url`만 바꾸면 됩니다. 바뀌어야 하는 건 **값**으로, 언제나 **본 서비스의** API Key를 넘기고 실제 Google/OpenAI 벤더 키를 넘기지 마십시오.
 
 ---
 
@@ -512,7 +514,7 @@ kiro2api/
 - [x] 토큰 싱글플라이트 자동 갱신 + 원자적 저장
 - [x] 엔드포인트 폴백(Kiro/CodeWhisperer/AmazonQ) + 크로스 계정 재시도
 - [x] body-aware 실패 분류(영구 무효만 비활성화, 나머지는 쿨다운 자가 치유)
-- [x] 통합 인증 게이트(Bearer / x-api-key / ?token=)
+- [x] 통합 인증 게이트(Bearer / x-api-key / x-goog-api-key / 쿼리 키 `?api_key=`·`?token=`·`?key=`)
 - [x] 웹 관리 패널(자격 증명/로그인/API-KEY/사용량/로그/잔액/설정)
 - [x] 사용자 패널(보유자가 자신의 API-KEY로 로그인)
 - [x] 3가지 대화형 로그인 플로우(Builder ID / IAM SSO / 소셜 토큰)

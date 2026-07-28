@@ -81,7 +81,7 @@
 
 ### 🔐 Unified Authentication Gate
 
-- Choose one of three: `Authorization: Bearer` / `x-api-key` / `?token=`, constant-time comparison, `401` on failure
+- Six accepted channels, first match wins: `Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > `?api_key=` > `?token=` > `?key=`, constant-time comparison, `401` on failure
 - `adminApiKey` (falling back to `apiKey`) protects `/api/admin/*` — when neither is configured the gate runs in open mode; holders use their own **API-KEY** to reach `/api/user/*`
 - Liveness endpoints such as `/health` and `/v1/ping` require no authentication
 
@@ -117,8 +117,8 @@
 
 ### 🧭 Model Name Mapping
 
-- The model name passed by the client is matched to an internal Kiro model by **lowercase substring** (no match → `400`)
-- The `/models` endpoint returns the model IDs this service can actually serve; clients are encouraged to list-then-use
+- The model name passed by the client is matched to one of 18 internal Kiro model ids by **lowercase substring** (no match → `400`) — the 17 of the admin catalog plus `auto`, which that catalog does not list
+- The protocol `/models` endpoints return a **fixed, hard-coded three-entry list** — it is compiled in, not derived from your pool, so it is neither tier-filtered nor the full set of accepted names. `GET /api/admin/models` is the real catalog (live per-pool union, falling back to all 17)
 
 ### ⚡ High-Performance Architecture
 
@@ -259,7 +259,7 @@ docker compose logs -f
 ```bash
 # Health check
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.1.0"}
+# {"service":"kiro2api","status":"ok","version":"0.2.1"}
 
 # View available models
 curl http://localhost:8080/v1/models \
@@ -279,9 +279,11 @@ Seeing AI response text means deployment succeeded. If you get 401, check your A
 ## 🧪 Integration Examples
 
 > [!NOTE]
-> All API requests require an API Key. Two methods are supported:
+> All API requests require an API Key. Six channels are accepted, tried in this order:
 > - `Authorization: Bearer sk-xxx` (recommended, compatible with OpenAI/Anthropic SDKs)
 > - `x-api-key: sk-xxx`
+> - `x-goog-api-key: sk-xxx` (used by the official Gemini SDKs)
+> - `?api_key=sk-xxx`, `?token=sk-xxx` or `?key=sk-xxx` in the query string, for clients that cannot set headers
 >
 > Use the **standard bare prefix** for the base URL: OpenAI = `{host}/v1`, Anthropic = `{host}` (the SDK appends `/v1/messages` automatically), Gemini = `{host}/v1beta`. You may also use the explicit vendor prefixes `/openai/v1`, `/claude/v1`, `/gemini/v1beta`.
 
@@ -444,7 +446,7 @@ resp = client.chat.completions.create(
 
 > The `localhost:8080` in the URLs is just an example; the port is configured via `PORT`/`config.json` — replace it for your deployment.
 >
-> Gemini/OpenAI clients all use this service's **unified authentication** (Bearer/`x-api-key`/`?token=`), not the vendors' native `?key=`/`x-goog-api-key`.
+> The key may ride on any channel the gate accepts, in priority order `Authorization: Bearer` > `x-api-key` > `x-goog-api-key` > query (`?api_key=` > `?token=` > `?key=`). Gemini's native `x-goog-api-key` header and `?key=` parameter **are** honored, so the official SDK works with just a `base_url` swap — what must change is the *value*: always pass **this service's** key, never a real vendor key.
 
 ---
 
@@ -499,9 +501,13 @@ Priority: **command-line flags > environment variables > `config.json` > built-i
 
 3. **Token self-healing**: tokens are refreshed in memory automatically on expiry and atomically written back to `credentials.json`; only genuine credential invalidation is permanently disabled, while quota/risk-control/rate-limit all cool down and self-heal.
 
-4. **Streaming Output**: all four protocols support streaming; when `stream:false`, the service still decodes the event stream internally and returns the complete JSON in one shot after collection. An upstream error or a mid-stream transport interruption always ends the stream with that protocol's own error event — never a normal finish — and hitting `max_tokens` or exhausting the context is reported with the matching truncation reason instead of a clean stop.
+4. **Streaming Output**: all four protocols support streaming; when `stream:false`, the service still decodes the event stream internally and returns the complete JSON in one shot after collection. An upstream error or a mid-stream transport interruption always ends the stream with that protocol's own error event — never a normal finish — and hitting the upstream's output budget or exhausting the context is reported with the matching truncation reason (`length` / `max_tokens` / `MAX_TOKENS`) instead of a clean stop.
 
 5. **Network Environment**: the deployment server must be able to reach the AWS CodeWhisperer/Kiro endpoints (`*.amazonaws.com`).
+
+6. **Generation parameters are accepted but ignored**: `temperature` (and every other sampling knob), `max_tokens` / `max_output_tokens` / `maxOutputTokens`, and `tool_choice` are all dropped — the Kiro data plane has no wire fields for them, so nothing is forwarded and nothing errors. `max_tokens` does not cap the answer, and a tool cannot be forced. The one exception is Gemini `toolConfig` with `functionCallingConfig.mode: "NONE"`, honored by withholding the tool definitions. See [API.md](API.md#post-openaiv1chatcompletions).
+
+7. **Images must be inline base64**: remote `http(s)://` image URLs are **rejected with `400`**, not fetched — encode the image as a `data:` URI (OpenAI `image_url`), an Anthropic `source.type: "base64"` block, or Gemini `inlineData`.
 
 ---
 
@@ -557,7 +563,7 @@ kiro2api/
 - [x] Single-flight automatic token refresh + atomic write-back
 - [x] Endpoint fallback (Kiro/CodeWhisperer/AmazonQ) + cross-account retry
 - [x] Body-aware failure classification (only permanent invalidation is disabled, the rest cool down and self-heal)
-- [x] Unified auth gate (Bearer / x-api-key / ?token=)
+- [x] Unified auth gate (Bearer / x-api-key / x-goog-api-key / ?api_key= / ?token= / ?key=)
 - [x] Web management panel (credentials/login/API-KEY/usage/logs/balance/settings)
 - [x] User panel (holder signs in with their own API-KEY)
 - [x] Three interactive login flows (Builder ID / IAM SSO / social token)
