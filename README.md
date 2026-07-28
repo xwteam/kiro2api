@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-07-28 | v0.7.1 - 🐛 修复 Responses 接口无法接入 codex:工具数组里的**内置工具**(`web_search`/`local_shell`/`file_search`,照 OpenAI 规范就没有 `name`)此前会让整轮请求死在反序列化(`tools[13]: missing field \`name\``),一个内置工具废掉整个会话,且错误只报下标、看不出是哪类工具。现在内置工具可解析、被丢弃并落 WARN(`responses_builtin_tool_dropped`)。同时修掉紧随其后的第二个坑:多轮回灌的 `reasoning`/`local_shell_call` 等条目此前判错,会导致**第一轮能通、第二轮必炸**,现改为整条跳过;函数工具也允许省略 `parameters` |
 | 2026-07-28 | v0.7.0 - 令牌刷新失败此前被完全吞掉:日志只有「刷新中」紧接「跨账号重试」,中间**为什么失败**整个消失。线上真实事故:上游对整批账号回 `access_denied`,面板上只表现为「账号全过期了」,不手工 curl 上游根本分不清是账号被处置了还是中转坏了。现在失败即记录上游状态码与响应体,并写进 `statusReason`,新增「续期被拒」一档——与「过期了刷一下就好」严格分开,因为它刷多少次都没用。账号页另加「全选本页」与「批量禁用」 |
 | 2026-07-28 | v0.6.0 - 账号列表每 30 秒静默自动刷新,并显示新鲜度。此前页面打开即冻结:账号被封、冷却结束恢复、令牌过期,屏幕上都不会变,除非手动刷新。照着一屏过时徽章做判断比没有徽章更糟——「封禁账号 (0)」看着像结论,其实可能是十分钟前的。只重拉便宜的列表接口,**绝不**按定时重跑余额扇出(那是逐个打上游的)。静默刷新保留页码、筛选、选中态与滚动位置;工具栏显示数字是几秒前的,刷新链路断了会转为警示色 |
 | 2026-07-28 | v0.5.1 - 健康徽章与新加的状态筛选各算各的:筛选走 v0.5.0 的分档,徽章仍只看 `healthStatus`,于是「过期账号」那一档里的行照样挂着绿色「健康」。现在两者同源。额度耗尽此前也只认「被选中并失败过一次」,账号还没轮到就已经没额度的情况完全覆盖不到 —— 现在余额查询回来的剩余归零同样判为额度耗尽(与「还没查过」严格区分),且每条余额回来即刷新该行徽章与下拉条数 |
