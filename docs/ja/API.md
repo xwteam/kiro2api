@@ -865,7 +865,7 @@ curl -X PUT http://localhost:8080/api/admin/config/auth-keys \
 ```json
 {
   "masterApiKey": "sk-マスターキーの平文",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -972,7 +972,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.2.1"
+  "version": "0.3.0"
 }
 ```
 
