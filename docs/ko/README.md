@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.6.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 날짜 | 업데이트 내용 |
 |------|----------|
+| 2026-07-28 | v0.7.0 - 토큰 갱신 실패가 완전히 삼켜지고 있었습니다. 로그에는 「갱신 중」 직후 「다른 계정으로 재시도」만 찍히고 **왜 실패했는지**가 통째로 빠져 있었습니다. 실제 장애에서 업스트림이 계정 전체에 `access_denied`를 반환했지만 화면에는 「전부 만료됨」으로만 보여, 수동으로 업스트림에 curl하지 않으면 릴레이 자체 고장과 구분할 수 없었습니다. 이제 실패 시 업스트림 상태 코드와 본문을 기록하고 `statusReason`에 새 구간 `refresh_denied`로 반영합니다. 아무리 재시도해도 해결되지 않으므로 단순 만료와 엄격히 구분합니다. 계정 페이지에는 「이 페이지 전체 선택」과 「일괄 비활성화」도 추가 |
 | 2026-07-28 | v0.6.0 - 계정 목록이 30초마다 조용히 자동 새로 고침되며 신선도 라벨이 붙습니다. 기존에는 페이지를 연 시점에서 멈춰 있어, 계정이 정지되거나 쿨다운에서 복귀하거나 만료되어도 수동으로 새로 고치기 전까지 화면이 그대로였습니다. 오래된 배지를 보고 판단하는 것은 배지가 없는 것보다 나쁩니다 — 「정지됨 (0)」 같은 숫자는 결론처럼 보이지만 10분 전 값일 수 있습니다. 다시 가져오는 것은 저렴한 목록 엔드포인트뿐이며, 잔액 팬아웃을 타이머로 재실행하지는 않습니다. 조용한 새로 고침은 페이지·필터·선택·스크롤 위치를 유지하고, 툴바에 숫자가 몇 초 전 것인지 표시합니다 |
 | 2026-07-28 | v0.5.1 - 헬스 배지와 새 상태 필터가 서로 다른 판단을 했습니다: 필터는 v0.5.0의 분류를 쓰는데 배지는 `healthStatus`만 보고 있어 「만료됨」 구간의 행에 초록색 「정상」 배지가 그대로 달렸습니다. 이제 둘 다 같은 분류에서 나옵니다. 한도 소진도 「선택되어 실제로 실패한」 경우에만 감지되어, 아직 선택되지 않았지만 잔액이 없는 계정을 놓쳤습니다. 잔액 조회 결과 잔여가 0이면 동일하게 한도 소진으로 판정하며(「아직 조회하지 않음」과 엄격히 구분), 잔액이 도착할 때마다 해당 행의 배지와 드롭다운 개수를 갱신합니다 |
 | 2026-07-28 | v0.5.0 - 계정 관리에 상태 필터(전체 / 정상 / 이상 / 비활성 / 정지됨 / 만료됨 / 한도 소진, 각 항목에 실시간 개수)를 추가하고 「이상」을 운영자가 실제로 다르게 대응하는 단위로 분리했습니다. 업스트림이 계정을 정지하면 응답 본문에 `suspend`가 담기고 코드도 이를 인식했지만, 「영구 비활성화 대신 쿨다운」 판단에만 쓰고 곧바로 버렸습니다. `GET /api/admin/credentials`의 새 필드 `statusReason`이 마지막 실패 사유를 노출합니다. 정지 판정은 스로틀링보다 우선하며, 분류는 표시 계층에만 영향을 줍니다 |
@@ -220,7 +221,7 @@ docker compose logs -f
 ```bash
 # 헬스 체크
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.6.0"}
+# {"service":"kiro2api","status":"ok","version":"0.7.0"}
 
 # 프로토콜 고정 모델 목록 조회
 curl http://localhost:8080/v1/models \

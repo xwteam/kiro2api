@@ -159,21 +159,54 @@ async fn report_refresh_failure(
     err: &LoginError,
     now_unix: u64,
 ) {
+    // 先把**为什么失败**记下来,再反馈池。
+    //
+    // 此前这里只反馈分类、不记日志:调用方看到的只有"令牌即将过期,刷新中"紧接着"跨账号
+    // 重试",中间那句原因整个消失。真出事时(例如上游对整批账号回 access_denied)运维在
+    // 面板上只看到"账号全过期了",无从判断是账号被上游处置了、还是中转自己坏了 —— 只能
+    // 手工拿凭据去 curl 上游才问得出来。这正是本函数存在的意义:把上游的原话留下来。
+    let (status, detail) = match err {
+        LoginError::UpstreamHttp { status, body } => (*status, body.as_str()),
+        LoginError::Upstream(msg) => (0u16, msg.as_str()),
+        _ => (0u16, ""),
+    };
+    let reason = crate::kiro::pool::refresh_reason_from(status, detail);
+    tracing::warn!(
+        event = "token_refresh_failed",
+        credential_id = %credential_id,
+        status = status,
+        reason = reason.as_str(),
+        // 响应体截断:上游错误体通常很短,但不能假设;不含令牌明文(错误体里没有)。
+        detail = %detail.chars().take(300).collect::<String>(),
+        "令牌刷新失败"
+    );
+
     let mut pool_lock = pool.lock().await;
     match err {
         LoginError::UpstreamHttp { status, body } => {
-            pool_lock.report_failure(
+            pool_lock.report_failure_with_reason(
                 credential_id,
                 classify_refresh_failure(*status, body),
+                reason,
                 now_unix,
             );
         }
         LoginError::Upstream(msg) => {
             // 无 HTTP 状态可依,只能据语义短标签判;命不中确证即落瞬时类。
-            pool_lock.report_failure(credential_id, classify_refresh_failure(0, msg), now_unix);
+            pool_lock.report_failure_with_reason(
+                credential_id,
+                classify_refresh_failure(0, msg),
+                reason,
+                now_unix,
+            );
         }
         _ => {
-            pool_lock.report_failure(credential_id, FailureKind::Transient, now_unix);
+            pool_lock.report_failure_with_reason(
+                credential_id,
+                FailureKind::Transient,
+                reason,
+                now_unix,
+            );
             pool_lock.note_refresh_transport_failure(credential_id);
         }
     }

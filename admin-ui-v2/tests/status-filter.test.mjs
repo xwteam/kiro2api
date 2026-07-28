@@ -54,6 +54,12 @@ test('额度耗尽优先于过期:两者都成立时,先看到「额度耗尽」
   assert.equal(bucket({ expiresAt: PAST }, 0), 'quota');
 });
 
+test('续期被拒单列一档 —— 与「过期了刷一下就好」不是一回事', () => {
+  // 线上真实事故:上游对整批账号回 access_denied,若混进「异常」或「过期」,
+  // 运维会一直等它自愈,而它永远不会自愈。
+  assert.equal(bucket({ statusReason: 'refresh_denied', healthStatus: 'unhealthy', expiresAt: PAST }), 'refreshDenied');
+});
+
 test('封禁与额度耗尽从「异常」里分出来', () => {
   assert.equal(bucket({ statusReason: 'banned', healthStatus: 'unhealthy', expiresAt: FUTURE }), 'banned');
   assert.equal(bucket({ statusReason: 'quota', healthStatus: 'unhealthy', expiresAt: FUTURE }), 'quota');

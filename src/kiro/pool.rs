@@ -148,6 +148,12 @@ pub enum StatusReason {
     TokenExpired,
     /// 限流 / 上游风控临时拦截。
     Throttled,
+    /// **续期被上游拒绝**(如 `access_denied`):refreshToken 本身在,格式也对,是上游不给续。
+    ///
+    /// 与 [`StatusReason::TokenExpired`] 的区别很要紧:后者刷一下就好,前者刷多少次都没用,
+    /// 通常意味着这批账号在上游被整体处置(权限收回 / 组织侧禁用 / 密钥轮换)。运维看到这一
+    /// 档就该去找账号来源,而不是继续等它自愈。
+    RefreshDenied,
 }
 
 impl StatusReason {
@@ -159,6 +165,7 @@ impl StatusReason {
             StatusReason::QuotaExhausted => "quota",
             StatusReason::TokenExpired => "token_expired",
             StatusReason::Throttled => "throttled",
+            StatusReason::RefreshDenied => "refresh_denied",
         }
     }
 }
@@ -181,6 +188,28 @@ pub fn status_reason_from_body(body: &str) -> StatusReason {
         || lower.contains("security precaution")
     {
         StatusReason::Throttled
+    } else {
+        StatusReason::None
+    }
+}
+
+/// 从**令牌刷新**的失败结果判定原因。
+///
+/// 与 [`status_reason_from_body`](自 relay 数据面响应体判定)分开:刷新端点的措辞是 OAuth
+/// 那一套(`access_denied` / `invalid_grant` / `expired_token`),和数据面的异常名不同源。
+pub fn refresh_reason_from(status: u16, detail: &str) -> StatusReason {
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("access_denied") || lower.contains("access denied") {
+        StatusReason::RefreshDenied
+    } else if lower.contains("invalid_grant") {
+        // 授权已作废 —— 同样是"刷多少次都没用",归入同一档,运维的处置动作一致。
+        StatusReason::RefreshDenied
+    } else if lower.contains("expired") {
+        StatusReason::TokenExpired
+    } else if lower.contains("throttl") || lower.contains("too many requests") || status == 429 {
+        StatusReason::Throttled
+    } else if lower.contains("quota") {
+        StatusReason::QuotaExhausted
     } else {
         StatusReason::None
     }
@@ -1159,6 +1188,39 @@ mod tests {
             StatusReason::Throttled
         );
         assert_eq!(status_reason_from_body("{}"), StatusReason::None);
+    }
+
+    /// 刷新失败的原因必须能和"过期了刷一下就好"区分开。
+    ///
+    /// 今天线上就栽在这:上游对整批账号回 `access_denied`,而失败原因既没落日志也没进状态,
+    /// 面板上只看到"账号全过期了" —— 运维无从判断是账号被上游处置了、还是中转自己坏了,
+    /// 只能手工拿凭据去 curl 上游才问得出来。
+    #[test]
+    fn refresh_denial_is_distinguishable_from_a_merely_expired_token() {
+        // 上游明确拒绝续期:刷多少次都没用,必须单列。
+        assert_eq!(
+            refresh_reason_from(
+                400,
+                r#"{"error":"access_denied","error_description":"Access denied"}"#
+            ),
+            StatusReason::RefreshDenied
+        );
+        // 授权已作废,处置动作与上者一致(换号),归同一档。
+        assert_eq!(
+            refresh_reason_from(400, r#"{"error":"invalid_grant"}"#),
+            StatusReason::RefreshDenied
+        );
+        // 令牌过期是可自愈的,绝不能和上面混为一档。
+        assert_eq!(
+            refresh_reason_from(400, r#"{"error":"expired_token"}"#),
+            StatusReason::TokenExpired
+        );
+        assert_eq!(
+            refresh_reason_from(429, "slow down"),
+            StatusReason::Throttled
+        );
+        assert_eq!(refresh_reason_from(500, "internal"), StatusReason::None);
+        assert_eq!(StatusReason::RefreshDenied.as_str(), "refresh_denied");
     }
 
     /// 原因进得去、出得来,而且**一次成功就清空** —— 否则恢复了的账号会一直挂在"封禁"档。

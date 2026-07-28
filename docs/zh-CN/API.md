@@ -655,7 +655,7 @@ curl http://localhost:8080/api/admin/credentials \
 > [!NOTE]
 > 账号池是**每次请求**现选账号，并不存在一个持久的"当前账号"：`currentId` 恒为 `-1`、每行的 `isCurrent` 恒为 `false`，两个字段是给未来的粘性选择模式预留的。请勿依赖它们做判断。
 
-`healthStatus` 为 `healthy` / `warning`(有失败计数但仍会被选中)/ `unhealthy`(在冷却窗口内,到期自动恢复)/ `disabled`(已关闭,不会自动恢复)。`statusReason` 记录**最近一次失败的原因**——`none` / `banned`(被上游停用)/ `quota` / `token_expired` / `throttled`——与 `healthStatus` 正交:后者答「能不能被选中」,本字段答「为什么不能」。它由上游原始响应体判定,**只影响展示**(不改变选号纪律、冷却时长与禁用判定),账号成功一次即清空。
+`healthStatus` 为 `healthy` / `warning`(有失败计数但仍会被选中)/ `unhealthy`(在冷却窗口内,到期自动恢复)/ `disabled`(已关闭,不会自动恢复)。`statusReason` 记录**最近一次失败的原因**——`none` / `banned`(被上游停用)/ `quota` / `token_expired` / `throttled` / `refresh_denied`——与 `healthStatus` 正交:后者答「能不能被选中」,本字段答「为什么不能」。它由上游原始响应体判定,**只影响展示**(不改变选号纪律、冷却时长与禁用判定),账号成功一次即清空。
 
 ### POST /api/admin/credentials
 
@@ -1184,7 +1184,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1372,7 +1372,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.6.0"
+  "version": "0.7.0"
 }
 ```
 

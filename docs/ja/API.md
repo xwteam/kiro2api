@@ -652,7 +652,7 @@ curl http://localhost:8080/api/admin/credentials \
 }
 ```
 
-`statusReason` は**直近の失敗理由**を示します(`none` / `banned` = 上流による利用停止 / `quota` / `token_expired` / `throttled`)。「選択可能かどうか」を答える `healthStatus` とは直交する情報です。上流の生レスポンスボディから判定され、**表示にのみ影響**します(アカウント選択の規律・クールダウン時間・無効化判定には関与しません)。次回の成功時にクリアされます。
+`statusReason` は**直近の失敗理由**を示します(`none` / `banned` = 上流による利用停止 / `quota` / `token_expired` / `throttled` / `refresh_denied`)。「選択可能かどうか」を答える `healthStatus` とは直交する情報です。上流の生レスポンスボディから判定され、**表示にのみ影響**します(アカウント選択の規律・クールダウン時間・無効化判定には関与しません)。次回の成功時にクリアされます。
 
 > **注意**: プールはリクエストごとにアカウントを選ぶため、「現在のアカウント」という永続的な状態は存在しません。`currentId` は常に `-1`、各行の `isCurrent` は常に `false` を返します（どちらも将来のスティッキー選択モード用の予約フィールドです）。この 2 つで分岐しないでください。
 
@@ -1155,7 +1155,7 @@ curl -X PUT http://localhost:8080/api/admin/config/auth-keys \
 ```json
 {
   "masterApiKey": "sk-マスターキーの平文",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1383,7 +1383,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.6.0"
+  "version": "0.7.0"
 }
 ```
 

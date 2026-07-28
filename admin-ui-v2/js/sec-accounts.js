@@ -213,6 +213,9 @@
     if (acc.disabled) return 'disabled';
     var reason = acc.statusReason || 'none';
     if (reason === 'banned') return 'banned';
+    // 续期被拒:refreshToken 在、格式也对,是上游不给续。刷多少次都没用,和"过期了刷一下
+    // 就好"是两回事 —— 必须单列一档,否则运维会一直等它自愈。
+    if (reason === 'refresh_denied') return 'refreshDenied';
     // 额度耗尽有两条来源,缺一不可:
     //  ① 上游明确回过配额错误(statusReason==='quota')——但这要等到该账号真被选中并失败;
     //  ② 余额查询回来的剩余已归零——账号可能还没轮到就已经没额度了,只等①会一直把它
@@ -309,7 +312,7 @@
     if (K.i18n) K.i18n.apply(badge);
   }
 
-  var STATUS_FILTERS = ['all', 'healthy', 'abnormal', 'disabled', 'banned', 'expired', 'quota'];
+  var STATUS_FILTERS = ['all', 'healthy', 'abnormal', 'disabled', 'banned', 'refreshDenied', 'expired', 'quota'];
 
   // 重建下拉选项:文案 + 实时条数。每次列表变化都要重画,否则条数会停在上一轮。
   function paintStatusFilter() {
@@ -429,6 +432,11 @@
       paintStatusFilter();            // 条数随筛选后的列表刷新
     });
 
+    // 全选当前页 —— 也放一份在工具栏。批量条只有选中后才出现,而"一个都还没选"恰恰是
+    // 最需要全选的时刻,只把它放在批量条里等于永远够不着。
+    var selectPageTop = elI18n('button', 'btn btn-outline', 'acc.selectPage'); selectPageTop.type = 'button';
+    selectPageTop.addEventListener('click', function () { selectCurrentPage(); });
+
     // 新鲜度提示 —— 紧挨筛选下拉。数字看着像结论,必须让人知道它是几秒前的。
     var freshness = el('span', 'text-muted');
     freshness.id = 'accountsFreshness';
@@ -437,6 +445,7 @@
     // reference toolbar order: 新鲜度 → 状态筛选 → 查询信息 → 清除已禁用 → KAM 导入 → 批量导入 → 添加账号
     actions.appendChild(freshness);
     actions.appendChild(statusSel);
+    actions.appendChild(selectPageTop);
     actions.appendChild(queryInfoBtn);
     actions.appendChild(clearDisabledBtn);
     actions.appendChild(kamImportBtn);
@@ -560,6 +569,7 @@
       unhealthy: ['badge-danger', 'dash.unhealthy'],
       disabled: ['badge-muted', 'common.disabled'],
       banned: ['badge-danger', 'acc.state.banned'],
+      refreshDenied: ['badge-danger', 'acc.state.refreshDenied'],
       expired: ['badge-warning', 'acc.state.expired'],
       quota: ['badge-warning', 'acc.state.quota']
     };
@@ -912,6 +922,10 @@
     count.textContent = t('acc.selectedN', { n: n });
     bar.appendChild(count);
 
+    var selectPage = elI18n('button', 'btn btn-sm btn-outline', 'acc.selectPage'); selectPage.type = 'button';
+    selectPage.addEventListener('click', function () { selectCurrentPage(); });
+    bar.appendChild(selectPage);
+
     var deselect = elI18n('button', 'btn btn-sm btn-outline', 'acc.deselectAll'); deselect.type = 'button';
     deselect.addEventListener('click', function () { clearSelection(); renderList(); updateBatchBar(); });
     bar.appendChild(deselect);
@@ -926,11 +940,44 @@
     resetBtn.addEventListener('click', function () { batchReset(resetBtn); });
     bar.appendChild(resetBtn);
 
+    var disableBtn = elI18n('button', 'btn btn-sm btn-outline', 'acc.batchDisable'); disableBtn.type = 'button';
+    disableBtn.addEventListener('click', function () { batchDisable(disableBtn); });
+    bar.appendChild(disableBtn);
+
     var delBtn = elI18n('button', 'btn btn-sm btn-danger', 'acc.batchDelete'); delBtn.type = 'button';
     delBtn.addEventListener('click', function () { batchDelete(delBtn); });
     bar.appendChild(delBtn);
 
     if (K.i18n) K.i18n.apply(bar);
+  }
+
+  // 全选**当前页 + 当前筛选**下可见的那些账号。
+  //
+  // 刻意不是"全选全部 1000 个":当前页看得见的才是运维正在审视的那一批,一键选中一千个
+  // 看不见的行,随后一个批量删除下去,后果不可挽回。要跨页操作就先用筛选缩小范围。
+  function selectCurrentPage() {
+    var shown = filteredAccounts();
+    var start = (page - 1) * PAGE_SIZE;
+    shown.slice(start, start + PAGE_SIZE).forEach(function (a) { selectedIds[String(a.id)] = true; });
+    renderList();
+    updateBatchBar();
+  }
+
+  // 批量禁用:只对**当前还启用**的那些发请求 —— 已禁用的再发一遍纯属白打,
+  // 也会让结果里的"失败数"变得没法解读。
+  function batchDisable(btn) {
+    var targets = selectedAccounts().filter(function (a) { return !a.disabled; });
+    if (!targets.length) { api.toast(t('acc.noEnabledSelected'), 'info'); return; }
+    if (btn) btn.disabled = true;
+    var ok = 0, fail = 0;
+    Promise.allSettled(targets.map(function (a) {
+      return api.post('/credentials/' + a.id + '/disabled', { disabled: true })
+        .then(function () { ok++; }, function () { fail++; });
+    })).then(function () {
+      if (btn) btn.disabled = false;
+      api.toast(t('imp.result', { added: ok, total: targets.length, failed: fail }), fail ? 'info' : 'success');
+      loadAccounts();
+    });
   }
 
   function selectedAccounts() {

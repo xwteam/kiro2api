@@ -576,7 +576,7 @@ curl http://localhost:8080/api/admin/credentials \
 }
 ```
 
-`statusReason` 記錄**最近一次失敗的原因**——`none` / `banned`(被上游停用)/ `quota` / `token_expired` / `throttled`——與 `healthStatus` 正交:後者答「能不能被選中」,本欄位答「為什麼不能」。它由上游原始回應體判定,**只影響展示**(不改變選號紀律、冷卻時長與停用判定),帳號成功一次即清空。
+`statusReason` 記錄**最近一次失敗的原因**——`none` / `banned`(被上游停用)/ `quota` / `token_expired` / `throttled` / `refresh_denied`——與 `healthStatus` 正交:後者答「能不能被選中」,本欄位答「為什麼不能」。它由上游原始回應體判定,**只影響展示**(不改變選號紀律、冷卻時長與停用判定),帳號成功一次即清空。
 
 > **注意：** 帳號池是**每次請求**現選帳號，沒有「當前帳號」這種持久狀態，因此 `currentId` 恆為 `-1`、每一列的 `isCurrent` 恆為 `false`——兩個欄位都是為將來的黏著選號模式預留的，**請勿據此分支**。`priority` 即池內 `weight`（同一個值的兩種呈現）。`healthStatus` 取值為 `disabled` | `unhealthy` | `warning` | `healthy`。
 
@@ -1183,7 +1183,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.6.0"}
+{"service":"kiro2api","status":"ok","version":"0.7.0"}
 ```
 
 ### GET /v1/ping

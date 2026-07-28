@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.6.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-07-28 | v0.7.0 - 權杖刷新失敗此前被完全吞掉:日誌只有「刷新中」緊接「跨帳號重試」,中間**為什麼失敗**整個消失。線上真實事故:上游對整批帳號回 `access_denied`,面板上只表現為「帳號全過期了」。現在失敗即記錄上游狀態碼與回應體,並寫進 `statusReason`,新增「續期被拒」一檔——與「過期了刷一下就好」嚴格分開。帳號頁另加「全選本頁」與「批次停用」 |
 | 2026-07-28 | v0.6.0 - 帳號列表每 30 秒靜默自動重新整理,並顯示新鮮度。此前頁面開啟即凍結:帳號被封、冷卻結束恢復、權杖過期,螢幕上都不會變,除非手動重新整理。照著一屏過時徽章做判斷比沒有徽章更糟——「封禁帳號 (0)」看著像結論,其實可能是十分鐘前的。只重拉便宜的列表介面,**絕不**按定時重跑餘額扇出。靜默重新整理保留頁碼、篩選、選取態與捲動位置;工具列顯示數字是幾秒前的 |
 | 2026-07-28 | v0.5.1 - 健康徽章與新加的狀態篩選各算各的:篩選走 v0.5.0 的分檔,徽章仍只看 `healthStatus`,於是「過期帳號」那一檔裡的行照樣掛著綠色「健康」。現在兩者同源。額度耗盡此前也只認「被選中並失敗過一次」,帳號還沒輪到就已經沒額度的情況完全覆蓋不到 —— 現在餘額查詢回來的剩餘歸零同樣判為額度耗盡(與「還沒查過」嚴格區分),且每條餘額回來即刷新該行徽章與下拉條數 |
 | 2026-07-28 | v0.5.0 - 帳號管理新增狀態篩選下拉(全部 / 健康 / 異常 / 停用 / 封禁 / 過期 / 額度耗盡,每檔帶即時條數),並把「異常」拆成維運真正要分別處置的幾檔。上游停用帳號時回應體帶 `suspend` 字樣,程式原本識別它,但只用來決定「別永久停用、讓它冷卻」,分類完就丟了。現經 `GET /api/admin/credentials` 的新欄位 `statusReason` 透出最近一次失敗的具體原因。封禁判定優先於限流;分類只進展示層,不改變選號紀律 |
@@ -223,7 +224,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.6.0"}
+# {"service":"kiro2api","status":"ok","version":"0.7.0"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \
