@@ -588,7 +588,11 @@ pub async fn responses(
     let created = now;
     let is_stream = req.stream == Some(true);
     // 客户端 IP:优先 XFF/Real-IP(反代场景),否则 socket 对端地址(见 extract_client_ip)。
-    let client_ip = extract_client_ip(&headers, connect_info.map(|axum::Extension(ci)| ci.0));
+    let client_ip = extract_client_ip(
+        &headers,
+        connect_info.map(|axum::Extension(ci)| ci.0),
+        state.cfg.trusted_proxy_hops,
+    );
 
     let hub_req = match responses_to_hub(req) {
         Err(ResponsesConvertError::PreviousResponseUnsupported) => {

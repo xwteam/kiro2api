@@ -27,6 +27,18 @@ pub struct Config {
     pub max_rpm_per_credential: u32,
     /// 负载均衡模式:"priority"(默认,等权轮询)或 "balanced"(按权重轮询)。
     pub load_balancing_mode: String,
+    /// 本服务与调用方之间**可信反代的跳数**,决定从 `X-Forwarded-For` 的哪一项取客户端 IP。
+    ///
+    /// 转发头是普通请求头,谁都能自己写一个;XFF 的**最左**项恰恰是客户端可控的那一项。
+    /// 而每一跳反代会把它**自己看到的对端**追加到最右,所以从右往左数第 `n` 项 = 第 `n` 跳
+    /// 反代亲眼观测到的地址,伪造不了。
+    ///
+    /// - `1`(默认):服务前面只有一层自己的反代(Caddy / nginx / 直连回源的 CDN)。
+    /// - `2`:CDN → 自己的反代 → 本服务,依此类推。
+    /// - `0`:裸跑、无反代,一律不采信任何转发头,直接用 socket 对端。
+    ///
+    /// 设大了会取到客户端可控的位置(可伪造),设小了只会记成上一跳反代的地址(不准但安全)。
+    pub trusted_proxy_hops: u8,
     /// 实时日志历史环形缓冲容量(条数)。>0 时启用日志捕获(admin 日志端点回放/流式);
     /// 0 = 关闭捕获(不建缓冲、不挂捕获层,admin 日志端点返回 503)。默认 5000
     /// (对齐 gemini2api 的"全量连续日志"体验:每请求一条 INFO + 关键生命周期事件,容量要够大
@@ -51,6 +63,7 @@ impl Default for Config {
             node_version: "22.22.0".into(),
             max_rpm_per_credential: 0,
             load_balancing_mode: "priority".into(),
+            trusted_proxy_hops: 1,
             log_capacity: 5000,
             config_path: "config.json".into(),
         }
@@ -132,6 +145,11 @@ impl Config {
         }
         if let Some(v) = env_non_empty("LOAD_BALANCING_MODE") {
             self.load_balancing_mode = v;
+        }
+        if let Ok(v) = std::env::var("TRUSTED_PROXY_HOPS")
+            && let Ok(n) = v.parse()
+        {
+            self.trusted_proxy_hops = n;
         }
     }
 }

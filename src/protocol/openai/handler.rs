@@ -288,6 +288,9 @@ pub(crate) fn upstream_exception_to_openai(
 ///   chunk 后收束,**不发** `finish_reason` 与 `[DONE]` —— 那会把上游故障伪装成正常完成。
 ///
 /// 同一个 `id`(`chatcmpl-<hex>`)在本次流的所有 chunk 间保持不变,照 OpenAI 规范。
+// 参数个数照中枢 relay 的既定形状(state/req/created/api_key_id/client_ip/bound/now/include_usage)
+// 逐项对齐;拆成 struct 会让四个协议的流式入口彼此不一致,故按需放行该 lint。
+#[allow(clippy::too_many_arguments)]
 pub async fn chat_completions_stream(
     state: MessagesState,
     hub_req: MessagesRequest,
@@ -526,7 +529,11 @@ pub async fn chat_completions(
     let created = now;
     let is_stream = req.stream == Some(true);
     // 客户端 IP:优先 XFF/Real-IP(反代场景),否则 socket 对端地址(见 extract_client_ip)。
-    let client_ip = extract_client_ip(&headers, connect_info.map(|axum::Extension(ci)| ci.0));
+    let client_ip = extract_client_ip(
+        &headers,
+        connect_info.map(|axum::Extension(ci)| ci.0),
+        state.cfg.trusted_proxy_hops,
+    );
     // stream_options 只对流式有意义(非流式响应恒带 usage)。
     let include_usage = req
         .stream_options

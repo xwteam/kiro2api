@@ -558,6 +558,9 @@ pub async fn stream_generate_content(
 /// 函数回 Gemini 形状的 400,而不是 axum 默认的 `text/plain` 400/422/415 —— 后者 SDK 用
 /// `response.json()` 读错误时只会抛 JSONDecodeError,真正的失败原因被吞掉;且 422/415 也不在
 /// Gemini 的错误码契约里。
+// 参数个数由 axum 提取器决定(state/path/query/headers/连接信息/api_key_id/bound/payload),
+// 每一项都是框架层必需的提取器,合并会失去提取失败时的精确错误,故按需放行该 lint。
+#[allow(clippy::too_many_arguments)]
 pub async fn generate_content(
     State(state): State<MessagesState>,
     Path(model_action): Path<String>,
@@ -579,7 +582,11 @@ pub async fn generate_content(
     // store-key 绑定白名单(鉴权闸解析;扩展缺席 = 不受限)。下传给选号层执行。
     let bound = bound.map(|axum::Extension(b)| b);
     // 客户端 IP:优先 XFF/Real-IP(反代场景),否则 socket 对端地址(见 extract_client_ip)。
-    let client_ip = extract_client_ip(&headers, connect_info.map(|axum::Extension(ci)| ci.0));
+    let client_ip = extract_client_ip(
+        &headers,
+        connect_info.map(|axum::Extension(ci)| ci.0),
+        state.cfg.trusted_proxy_hops,
+    );
 
     match action.as_str() {
         "generateContent" => {
@@ -604,7 +611,9 @@ pub async fn generate_content(
                 Err(e) => return convert_error_to_gemini(e),
             };
             let wire = wire_format(query.alt.as_deref());
-            match stream_generate_content(state, hub_req, api_key_id, client_ip, bound, wire, now).await {
+            match stream_generate_content(state, hub_req, api_key_id, client_ip, bound, wire, now)
+                .await
+            {
                 Ok(resp) => resp,
                 Err(e) => relay_error_to_gemini(e),
             }

@@ -75,13 +75,39 @@ fn peer_is_trusted(peer: Option<std::net::SocketAddr>) -> bool {
     }
 }
 
+/// 把一段文本收敛成**合法 IP 字面量**;解析不出就丢弃。
+///
+/// 转发头的值完全由外部写入,之前只做了 `trim()` 就原样落库,于是任何字符串(超长文本、
+/// 控制字符、伪造成 SQL/日志格式的片段)都能进用量记录、失败日志和管理面展示。审计字段的
+/// 第一要求是"可信且可比对",解析不出 IP 的值没有任何审计价值,宁可留空。
+///
+/// 顺带把 `[::1]:443` / `1.2.3.4:5678` 这类带端口的形态剥成纯 IP:部分反代会连端口一起写。
+fn sanitize_ip(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        return Some(ip.to_string());
+    }
+    if let Ok(sock) = s.parse::<std::net::SocketAddr>() {
+        return Some(sock.ip().to_string());
+    }
+    // `[::1]` 这种只加了方括号、没带端口的写法。
+    let unbracketed = s.strip_prefix('[').and_then(|t| t.strip_suffix(']'))?;
+    unbracketed
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| ip.to_string())
+}
+
 pub(crate) fn extract_client_ip(
     headers: &axum::http::HeaderMap,
     peer: Option<std::net::SocketAddr>,
+    trusted_proxy_hops: u8,
 ) -> Option<String> {
     // 转发头一律**只在对端是私网/回环时**才采信:这些头是普通请求头,任何能直连本服务的
-    // 客户端都能自己写一个。之前无条件采信,等于谁都能决定自己被记成哪个 IP(用量记录、
-    // 失败日志、面板展示全被污染)。反代/CDN 回源必然来自私网或回环,故按对端网段判别。
+    // 客户端都能自己写一个。反代/CDN 回源必然来自私网或回环,故先按对端网段判别。
     //
     // ⚠️ 局限(照实说明):经 Docker `-p` 端口映射时,**直连公网端口的请求**在容器内看到的
     // 对端同样是 docker 网关(172.x,私网),与经反代回源无法区分。要真正堵死伪造,需把
@@ -89,35 +115,48 @@ pub(crate) fn extract_client_ip(
     if !peer_is_trusted(peer) {
         return peer.map(|p| p.ip().to_string());
     }
-    // CDN 边缘设置的权威真实客户端头(边缘写入),优先级最高。
-    // - Cloudflare:`CF-Connecting-IP`;
-    // - Akamai / Cloudflare 企业版:`True-Client-IP`。
-    // 放在 XFF 之前,避免"客户端伪造 XFF 首跳、CDN 只在其后追加真实 IP"导致取到伪造值。
-    for h in ["cf-connecting-ip", "true-client-ip"] {
-        if let Some(s) = headers.get(h).and_then(|v| v.to_str().ok()) {
-            let ip = s.trim();
-            if !ip.is_empty() {
-                return Some(ip.to_string());
-            }
-        }
+    // hops = 0 表示前面根本没有反代:任何转发头都只可能是调用方自己写的,一律不采信。
+    if trusted_proxy_hops == 0 {
+        return peer.map(|addr| addr.ip().to_string());
     }
-    // X-Forwarded-For 首跳(最左 = 最原始客户端;通用反代 / 腾讯 EdgeOne 默认形态)。
+    // **从右往左数第 hops 项**,而不是最左那项。
+    //
+    // 这是本函数唯一真正防伪造的地方:XFF 的最左项是"最原始客户端"没错,但它同样是**调用方
+    // 自己就能写死的那一项** —— 客户端发 `X-Forwarded-For: 1.2.3.4`,反代只会在其右侧追加
+    // 自己看到的对端,于是取最左恒等于采信伪造值。每一跳可信反代追加的是它**亲眼看到的**
+    // 地址,所以倒数第 hops 项 = 最外层可信反代观测到的调用方,伪造不了。
+    //
+    // 例:客户端伪造 "1.2.3.4" → 到达本服务时 XFF = "1.2.3.4, <真实IP>";hops=1 取倒数第 1
+    // 项 = 真实 IP。CDN → 自己的反代 → 本服务则设 hops=2。
     if let Some(val) = headers.get("x-forwarded-for")
         && let Ok(s) = val.to_str()
     {
-        let ip = s.split(',').next().unwrap_or("").trim();
-        if !ip.is_empty() {
-            return Some(ip.to_string());
+        let hops: Vec<&str> = s.split(',').collect();
+        if let Some(entry) = hops.len().checked_sub(trusted_proxy_hops as usize)
+            && let Some(ip) = hops.get(entry).and_then(|h| sanitize_ip(h))
+        {
+            return Some(ip);
+        }
+    }
+    // CDN 边缘写入的权威客户端头。放在 XFF **之后**:Caddy/nginx 这类反代会把客户端自带的
+    // 同名头原样透传(它们只管 X-Forwarded-*),所以在有 XFF 可用时,反代亲眼观测到的那一项
+    // 比这些"声称由边缘写入"的头更可信;只有在压根没有 XFF 时才回退到它们。
+    for h in ["cf-connecting-ip", "true-client-ip"] {
+        if let Some(ip) = headers
+            .get(h)
+            .and_then(|v| v.to_str().ok())
+            .and_then(sanitize_ip)
+        {
+            return Some(ip);
         }
     }
     // X-Real-IP(nginx / 部分反代注入的直连客户端)。
-    if let Some(val) = headers.get("x-real-ip")
-        && let Ok(s) = val.to_str()
+    if let Some(ip) = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(sanitize_ip)
     {
-        let ip = s.trim();
-        if !ip.is_empty() {
-            return Some(ip.to_string());
-        }
+        return Some(ip);
     }
     // 无任何反代头 → socket 对端(直连公网时即真实客户端 IP)。
     peer.map(|addr| addr.ip().to_string())
@@ -315,6 +354,7 @@ async fn record_classified_failure(
     credential_id: u32,
     kind: FailureKind,
     status: u16,
+    response_body: &str,
     now_unix: u64,
 ) {
     // 生命周期日志(#7):上游/账号级失败,带分类与 HTTP 状态码(不含响应体/令牌)。
@@ -337,12 +377,12 @@ async fn record_classified_failure(
                 401
             };
             stats
-                .record_failure(credential_id, "api", code, "", now_i64)
+                .record_failure(credential_id, "api", code, response_body, now_i64)
                 .await;
         }
         FailureKind::Quota => {
             stats
-                .record_throttle(credential_id, "api", "", now_i64)
+                .record_throttle(credential_id, "api", response_body, now_i64)
                 .await;
         }
         FailureKind::Transient => { /* 瞬时错误不落账号级事件日志 */ }
@@ -527,7 +567,11 @@ pub(crate) async fn select_and_call_once(
         Ok(r) => Ok(r),
         // 两类鉴权失败(永久失效 / 歧义冷却)都先强制刷新令牌重试一次:AuthAmbiguous 常为
         // 令牌抖动/过期,刷新后即自愈;AuthInvalid 刷新多半也失败,回落原失败交由反馈池禁用。
-        Err((orig_kind @ (FailureKind::AuthInvalid | FailureKind::AuthAmbiguous), status)) => {
+        Err((
+            orig_kind @ (FailureKind::AuthInvalid | FailureKind::AuthAmbiguous),
+            status,
+            orig_body,
+        )) => {
             // 生命周期日志(#7):数据面鉴权失败,触发强制换新令牌重试一次。含 HTTP 状态码,无令牌明文。
             tracing::info!(
                 event = "token_refresh",
@@ -560,7 +604,7 @@ pub(crate) async fn select_and_call_once(
                     call_data_plane(state, &fresh, &imp2, &body).await
                 }
                 // 刷新失败:回落到**原**鉴权失败类别,交由下方反馈池/禁用(保留 Invalid/Ambiguous 语义)。
-                Err(_) => Err((orig_kind, 0u16)),
+                Err(_) => Err((orig_kind, 0u16, orig_body)),
             }
         }
         Err(other) => Err(other),
@@ -570,7 +614,7 @@ pub(crate) async fn select_and_call_once(
     //      **非账号故障** —— 换任何同档账号都会同样失败。故此处**不反馈池**(不冷却/不禁用/
     //      不累计 strike)、**不落账号级失败日志**,直接返回 [`RelayError::InvalidModel`],
     //      由 [`select_and_call_with_retry`] 当作致命错误**不重试**、以 400 把清晰的不可用说明回客户端。
-    if let Err((FailureKind::InvalidRequest, _)) = &outcome {
+    if let Err((FailureKind::InvalidRequest, _, _)) = &outcome {
         let msg = format!(
             "Invalid model '{}': not available for the current account. Please select a different model to continue.",
             req.model
@@ -579,23 +623,23 @@ pub(crate) async fn select_and_call_once(
     }
 
     // 6) 依最终结果反馈池(短暂持锁)。分类失败随后在池锁释放外落统计。
-    let failure_to_record: Option<(FailureKind, u16)> = {
+    let failure_to_record: Option<(FailureKind, u16, String)> = {
         let mut pool = state.pool.lock().await;
         match &outcome {
             Ok(_) => {
                 pool.report_success(&cred.id);
                 None
             }
-            Err((kind, status)) => {
+            Err((kind, status, body)) => {
                 pool.report_failure(&cred.id, *kind, now_unix);
-                Some((*kind, *status))
+                Some((*kind, *status, body.clone()))
             }
         }
     };
 
     // 分类失败落库(池锁已释放,fire-and-forget,不阻塞热路径的其它请求)。
-    if let Some((kind, status)) = failure_to_record {
-        record_classified_failure(&state.stats, credential_id, kind, status, now_unix).await;
+    if let Some((kind, status, body)) = failure_to_record {
+        record_classified_failure(&state.stats, credential_id, kind, status, &body, now_unix).await;
         return Err((
             RelayError::Upstream("data-plane request failed".to_string()),
             Some(tried_id),
@@ -648,7 +692,7 @@ async fn call_data_plane(
     cred: &crate::kiro::credential::Credential,
     imp: &Impersonation,
     body: &[u8],
-) -> Result<reqwest::Response, (FailureKind, u16)> {
+) -> Result<reqwest::Response, (FailureKind, u16, String)> {
     match &state.endpoint_override {
         Some(url) => {
             let ep = Endpoint {
@@ -668,7 +712,7 @@ async fn call_data_plane(
                         LoginError::UpstreamHttp { status, body } => (*status, body.as_str()),
                         _ => (0u16, ""),
                     };
-                    Err((classify_with_body(status, body), status))
+                    Err((classify_with_body(status, body), status, body.to_string()))
                 }
             }
         }
@@ -685,16 +729,17 @@ async fn call_data_plane(
         // 生产端点回退路径:`try_endpoints`(provider.rs)在终态(尤其 401/403)已**读响应体**
         // 并用 body-aware `classify_with_body(status, &body)` 分类,故真凭据失效信号已在此处到达
         // 分类、AuthInvalid(永久禁用)在生产路径同样可达——`FailureKind` 已反映真响应体。
-        // provider 的这层只回 `FailureKind`(不含原始状态码),故这里由 kind 反推一个代表性状态码
-        // 供统计日志用:Auth→403、Quota→429、Transient→0(record_classified_failure 再兜底)。
-        .map_err(|kind| {
-            let status = match kind {
+        // provider 这层不回原始状态码,故由 kind 反推一个代表性状态码供统计日志用:
+        // Auth→403、Quota→429、Transient→0(record_classified_failure 再兜底)。响应体则由
+        // `DataPlaneFailure` 原样带上来,落进失败/限流日志的"详情"列。
+        .map_err(|f| {
+            let status = match f.kind {
                 FailureKind::AuthInvalid | FailureKind::AuthAmbiguous => 403u16,
                 FailureKind::Quota => 429u16,
                 FailureKind::Transient => 0u16,
                 FailureKind::InvalidRequest => 400u16,
             };
-            (kind, status)
+            (f.kind, status, f.body)
         }),
     }
 }
@@ -1227,7 +1272,11 @@ pub async fn messages(
     // 客户端 IP:优先 X-Forwarded-For/X-Real-IP(反代场景),否则取 socket 对端地址。
     // ConnectInfo 经 make-service 塞进请求扩展,以 `Option<Extension<..>>` 读取:单测用 oneshot
     // 不带连接信息,此时为 None、回落到仅头部提取(ConnectInfo 本身在 axum 0.8 无 Option 提取器)。
-    let client_ip = extract_client_ip(&headers, connect_info.map(|axum::Extension(ci)| ci.0));
+    let client_ip = extract_client_ip(
+        &headers,
+        connect_info.map(|axum::Extension(ci)| ci.0),
+        state.cfg.trusted_proxy_hops,
+    );
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1387,41 +1436,69 @@ mod tests {
     use crate::kiro::pool::LbMode;
     use axum::body::Body;
 
-    /// extract_client_ip 优先级:XFF 首跳 → X-Real-IP → socket 对端。
+    /// `extract_client_ip` 的取值契约。
+    ///
+    /// **不是**取 XFF 最左那项 —— 最左恰恰是调用方自己就能写死的一项。每一跳可信反代会把它
+    /// 亲眼看到的对端追加到最右,所以取"倒数第 `trusted_proxy_hops` 项"才是伪造不了的那个。
     #[test]
-    fn extract_client_ip_prefers_forwarded_first_hop() {
+    fn extract_client_ip_takes_the_hop_the_trusted_proxy_observed() {
         let peer: std::net::SocketAddr = "10.0.0.9:5555".parse().unwrap();
 
-        // XFF 首跳(最左)优先,忽略后续跳与 X-Real-IP。
+        // 一层反代:客户端伪造了最左的 203.0.113.7,反代在其右追加真实对端 70.0.0.1。
         let mut h = axum::http::HeaderMap::new();
         h.insert("x-forwarded-for", "203.0.113.7, 70.0.0.1".parse().unwrap());
         h.insert("x-real-ip", "9.9.9.9".parse().unwrap());
         assert_eq!(
-            extract_client_ip(&h, Some(peer)).as_deref(),
-            Some("203.0.113.7")
+            extract_client_ip(&h, Some(peer), 1).as_deref(),
+            Some("70.0.0.1"),
+            "一层反代应取反代自己观测到的最右项,而不是客户端可控的最左项"
         );
 
-        // 无 XFF → X-Real-IP。
+        // 两层(CDN → 自己的反代):倒数第 2 项 = CDN 写入的访客 IP。
         let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            "x-forwarded-for",
+            "1.1.1.1, 198.51.100.23, 70.0.0.1".parse().unwrap(),
+        );
+        assert_eq!(
+            extract_client_ip(&h, Some(peer), 2).as_deref(),
+            Some("198.51.100.23")
+        );
+
+        // hops 比实际跳数大 → 越过最左端,回落而不是采信伪造值。
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
         h.insert("x-real-ip", "198.51.100.4".parse().unwrap());
         assert_eq!(
-            extract_client_ip(&h, Some(peer)).as_deref(),
+            extract_client_ip(&h, Some(peer), 5).as_deref(),
             Some("198.51.100.4")
         );
 
-        // 二者皆无 → socket 对端 IP(去端口)。
-        let h = axum::http::HeaderMap::new();
+        // hops = 0(裸跑、前面没有反代)→ 一切转发头都不采信。
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        h.insert("cf-connecting-ip", "1.2.3.4".parse().unwrap());
         assert_eq!(
-            extract_client_ip(&h, Some(peer)).as_deref(),
-            Some("10.0.0.9")
+            extract_client_ip(&h, Some(peer), 0).as_deref(),
+            Some("10.0.0.9"),
+            "没有反代时任何转发头都只可能是调用方自己写的"
         );
 
-        // 无头亦无对端(单测 oneshot)→ None。
-        assert_eq!(extract_client_ip(&h, None), None);
+        // 无 XFF → X-Real-IP;二者皆无 → socket 对端;无对端 → None。
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-real-ip", "198.51.100.4".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&h, Some(peer), 1).as_deref(),
+            Some("198.51.100.4")
+        );
+        let h = axum::http::HeaderMap::new();
+        assert_eq!(
+            extract_client_ip(&h, Some(peer), 1).as_deref(),
+            Some("10.0.0.9")
+        );
+        assert_eq!(extract_client_ip(&h, None, 1), None);
     }
 
-    /// CDN 权威头(CF-Connecting-IP / True-Client-IP)优先级高于 XFF/X-Real-IP,
-    /// 使伪造的 XFF 首跳无法覆盖 Cloudflare 边缘写入的真实访客 IP。
     /// 回归:公网对端伪造的转发头**不得**被采信——否则任何人都能决定自己被记成哪个 IP,
     /// 污染用量记录、失败日志与面板展示。私网/回环对端(反代回源)才继续采信。
     #[test]
@@ -1434,50 +1511,92 @@ mod tests {
         // 公网对端:全部转发头忽略,只认 socket 对端。
         let public: std::net::SocketAddr = "203.0.113.7:5555".parse().unwrap();
         assert_eq!(
-            extract_client_ip(&h, Some(public)).as_deref(),
+            extract_client_ip(&h, Some(public), 1).as_deref(),
             Some("203.0.113.7"),
             "公网对端的转发头必须忽略,否则可任意伪造日志 IP"
         );
 
-        // 私网对端(反代/CDN 回源,含 docker 网关):继续采信最高优先级的头。
+        // 私网对端(反代/CDN 回源,含 docker 网关):采信反代观测到的那一跳。
         for p in ["127.0.0.1:1", "172.17.0.1:1", "10.0.0.5:1", "192.168.1.9:1"] {
             let peer: std::net::SocketAddr = p.parse().unwrap();
             assert_eq!(
-                extract_client_ip(&h, Some(peer)).as_deref(),
-                Some("1.2.3.4"),
-                "私网对端({p})应继续采信 CDN 权威头"
+                extract_client_ip(&h, Some(peer), 1).as_deref(),
+                Some("5.6.7.8"),
+                "私网对端({p})应采信 XFF 里反代观测到的那一项"
             );
         }
     }
 
+    /// CDN 权威头只在**压根没有 XFF** 时才回退采用。
+    ///
+    /// 反代(Caddy/nginx)只管 `X-Forwarded-*`,会把客户端自带的 `CF-Connecting-IP` 原样透传,
+    /// 所以它并不比反代亲眼观测到的那一跳更可信 —— 之前把它排在 XFF 之前,等于给了调用方一个
+    /// 绕过 XFF 的伪造通道。
     #[test]
-    fn extract_client_ip_prefers_cdn_authoritative_headers() {
+    fn cdn_headers_are_only_a_fallback_when_no_forwarded_for() {
         let peer: std::net::SocketAddr = "10.0.0.9:5555".parse().unwrap();
 
-        // CF-Connecting-IP 压过被伪造的 XFF 首跳。
+        // 有 XFF 时:以反代观测到的那一跳为准,CDN 头不得覆盖它。
         let mut h = axum::http::HeaderMap::new();
         h.insert("x-forwarded-for", "1.2.3.4, 70.0.0.1".parse().unwrap());
         h.insert("cf-connecting-ip", "198.51.100.23".parse().unwrap());
         assert_eq!(
-            extract_client_ip(&h, Some(peer)).as_deref(),
+            extract_client_ip(&h, Some(peer), 1).as_deref(),
+            Some("70.0.0.1")
+        );
+
+        // 没有 XFF 时才回退到 CF-Connecting-IP / True-Client-IP。
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("cf-connecting-ip", "198.51.100.23".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&h, Some(peer), 1).as_deref(),
             Some("198.51.100.23")
         );
-
-        // 无 CF 头时回落到 True-Client-IP(Akamai/CF 企业版)。
         let mut h = axum::http::HeaderMap::new();
         h.insert("true-client-ip", "203.0.113.99".parse().unwrap());
-        h.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
         assert_eq!(
-            extract_client_ip(&h, Some(peer)).as_deref(),
+            extract_client_ip(&h, Some(peer), 1).as_deref(),
             Some("203.0.113.99")
         );
+    }
 
-        // 无任何 CDN 权威头 → 仍按 XFF 首跳(EdgeOne/通用反代)。
+    /// 转发头的值解析不出 IP 就必须丢弃:审计字段之前只做 `trim()`,任意字符串(控制字符、
+    /// 超长文本、伪造成日志格式的片段)都能原样落进用量记录与管理面。
+    #[test]
+    fn forwarded_headers_must_parse_as_ip_or_be_discarded() {
+        let peer: std::net::SocketAddr = "10.0.0.9:5555".parse().unwrap();
+
+        // XFF 该跳不是合法 IP → 丢弃,回落到下一优先级。
         let mut h = axum::http::HeaderMap::new();
-        h.insert("x-forwarded-for", "203.0.113.7, 70.0.0.1".parse().unwrap());
+        h.insert("x-forwarded-for", "1.2.3.4, not-an-ip".parse().unwrap());
+        h.insert("x-real-ip", "198.51.100.4".parse().unwrap());
         assert_eq!(
-            extract_client_ip(&h, Some(peer)).as_deref(),
+            extract_client_ip(&h, Some(peer), 1).as_deref(),
+            Some("198.51.100.4")
+        );
+
+        // 垃圾值一路到底 → 回落 socket 对端,绝不把垃圾写进审计。
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-forwarded-for", "'; DROP TABLE".parse().unwrap());
+        h.insert("cf-connecting-ip", "<script>x</script>".parse().unwrap());
+        h.insert("x-real-ip", "……".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&h, Some(peer), 1).as_deref(),
+            Some("10.0.0.9")
+        );
+
+        // 带端口 / 方括号的合法写法要剥成纯 IP。
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.7:44321".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&h, Some(peer), 1).as_deref(),
             Some("203.0.113.7")
+        );
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-real-ip", "[2001:db8::1]".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&h, Some(peer), 1).as_deref(),
+            Some("2001:db8::1")
         );
     }
     use axum::http::Request;
@@ -1827,6 +1946,51 @@ mod tests {
         assert_eq!(v["content"][0]["text"], "pong");
     }
 
+    /// 上游错误体必须经**生产链路**落进失败日志,而不是只在单测里手工注入。
+    ///
+    /// 修复前 `record_classified_failure` 收到的 response_body 恒为空串:provider 明明读了
+    /// 响应体、分类完就丢。于是面板上"失败/限流"详情列线上永远是 `—`,运维点开什么也看不到,
+    /// 真正的上游原因(权限不足?模型不可用?令牌失效?)只存在于进程日志里。
+    #[tokio::test]
+    async fn upstream_error_body_reaches_the_failure_log() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                r#"{"__type":"AccessDeniedException","message":"no entitlement"}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        // 专属 stats 目录,避免与共享 temp_dir 的其它测试串扰。
+        let dir = std::env::temp_dir().join(format!("kiro2api_errbody_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let stats = StatsManager::load_from_dir(&dir);
+        let mut st = state(&server.uri(), vec![cred()]);
+        st.stats = stats.clone();
+
+        let req: MessagesRequest = serde_json::from_str(
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        let _ = relay_core(&st, req, 1000).await; // 必然失败,这里只关心落库内容
+
+        let page = stats
+            .failure_log
+            .records_for_credential(credential_id_num(&cred().id), 1, 10)
+            .await;
+        assert_eq!(page.total, 1, "403 应落一条失败日志");
+        assert!(
+            page.items[0]
+                .response_body
+                .contains("AccessDeniedException"),
+            "失败日志必须带上上游原始响应体,实际: {:?}",
+            page.items[0].response_body
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 绑定必须**真的**约束选号,而不是"白名单送到了扩展里"就算修好。
     ///
     /// 上一轮的回归测试只断言扩展在场,选号层从没读过它,于是绑定形同虚设却带着"已修复"
@@ -1865,8 +2029,7 @@ mod tests {
         // 绑定到池里不存在的 4242:必须 503,而不是回落到健康的 3 号。
         let app = messages_router(st).layer(axum::middleware::from_fn(
             |mut req: Request<Body>, next: axum::middleware::Next| async move {
-                req.extensions_mut()
-                    .insert(BoundCredentialIds(vec![4242]));
+                req.extensions_mut().insert(BoundCredentialIds(vec![4242]));
                 next.run(req).await
             },
         ));

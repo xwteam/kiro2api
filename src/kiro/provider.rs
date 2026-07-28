@@ -166,14 +166,35 @@ fn strongest(a: FailureKind, b: FailureKind) -> FailureKind {
     }
 }
 
-/// 内部:按给定端点列表尝试,429 回退下一个;返回 Response 或分类失败。
+/// 数据面失败:分类 + **上游原始响应体**(可能为空:传输层失败或 429 端点回退时没读体)。
+///
+/// 之前只回 `FailureKind`,响应体分类完就丢,于是失败日志里的"详情"列在生产恒为空 ——
+/// 运维点开只看到一个 `—`,真正的上游错误信息(权限不足?模型不可用?令牌失效?)只存在于
+/// 进程日志里,面板上查不到。这里把它一并带上来,落进失败/限流日志。
+#[derive(Debug, Clone)]
+pub struct DataPlaneFailure {
+    pub kind: FailureKind,
+    /// 上游原始响应体(已按 `ERROR_BODY_CAP` 截断);无体时为空串。
+    pub body: String,
+}
+
+impl DataPlaneFailure {
+    fn bare(kind: FailureKind) -> Self {
+        Self {
+            kind,
+            body: String::new(),
+        }
+    }
+}
+
+/// 内部:按给定端点列表尝试,429 回退下一个;返回 Response 或分类失败(带响应体)。
 async fn try_endpoints(
     client: &reqwest::Client,
     eps: &[Endpoint],
     cred: &Credential,
     imp: &Impersonation,
     body: &[u8],
-) -> Result<reqwest::Response, FailureKind> {
+) -> Result<reqwest::Response, DataPlaneFailure> {
     let mut last = FailureKind::Transient;
     for ep in eps {
         let inv = new_invocation_id();
@@ -208,7 +229,11 @@ async fn try_endpoints(
                     body = %raw.chars().take(400).collect::<String>(),
                     "上游返回非 2xx,按响应体分类后重试下一个端点/账号"
                 );
-                return Err(classify_with_body(status, &raw)); // 其余终态错误按原始响应体分类后返回
+                // 其余终态错误按原始响应体分类后返回,并把响应体一并交给上层落库。
+                return Err(DataPlaneFailure {
+                    kind: classify_with_body(status, &raw),
+                    body: raw,
+                });
             }
             Err(e) => {
                 // 传输层错误(连接被重置/超时/请求或解码失败等):无 HTTP 状态可依,归
@@ -229,7 +254,7 @@ async fn try_endpoints(
             }
         }
     }
-    Err(last)
+    Err(DataPlaneFailure::bare(last))
 }
 
 /// 选出的账号 + 端点回退 + 反馈池。成功返回 Response;失败已 report 并返回 `(LoginError, FailureKind)`。
@@ -256,8 +281,9 @@ pub async fn call_with_fallback(
             pool.report_success(&cred.id);
             Ok(r)
         }
-        Err(kind) => {
-            pool.report_failure(&cred.id, kind, now_unix);
+        Err(f) => {
+            pool.report_failure(&cred.id, f.kind, now_unix);
+            let kind = f.kind;
             Err((
                 LoginError::Upstream(format!("data-plane failed: {kind:?}")),
                 kind,
@@ -281,7 +307,7 @@ pub async fn call_with_fallback_no_report(
     cred: &Credential,
     imp: &Impersonation,
     body: &[u8],
-) -> Result<reqwest::Response, FailureKind> {
+) -> Result<reqwest::Response, DataPlaneFailure> {
     let eps = sorted(region, preferred, fallback);
     try_endpoints(client, &eps, cred, imp, body).await
 }
@@ -468,7 +494,7 @@ mod tests {
             target: None,
         }];
         let r = try_endpoints(&client, &eps, &cred(), &imp(), b"body").await;
-        assert!(matches!(r, Err(FailureKind::AuthInvalid)));
+        assert!(matches!(&r, Err(f) if f.kind == FailureKind::AuthInvalid));
     }
 
     #[tokio::test]
@@ -522,7 +548,7 @@ mod tests {
             },
         ];
         let r = try_endpoints(&client, &eps, &cred(), &imp(), b"body").await;
-        assert!(matches!(r, Err(FailureKind::Quota)));
+        assert!(matches!(&r, Err(f) if f.kind == FailureKind::Quota));
     }
 
     #[tokio::test]
@@ -551,7 +577,7 @@ mod tests {
         ];
         let r = try_endpoints(&client, &eps, &cred(), &imp(), b"body").await;
         assert!(
-            matches!(r, Err(FailureKind::Quota)),
+            matches!(&r, Err(f) if f.kind == FailureKind::Quota),
             "429 的配额信号不得被后续端点的传输错误降级,got {r:?}"
         );
     }
@@ -604,7 +630,7 @@ mod tests {
         ];
         let r = try_endpoints(&client, &eps, &cred(), &imp(), b"body").await;
         // 数据面拿不到响应体,裸 403 保守归类为 AuthAmbiguous(冷却,不永久禁用)。
-        assert!(matches!(r, Err(FailureKind::AuthAmbiguous)));
+        assert!(matches!(&r, Err(f) if f.kind == FailureKind::AuthAmbiguous));
     }
 
     #[tokio::test]
@@ -716,7 +742,7 @@ mod tests {
         }];
         let r = try_endpoints(&client, &eps, &cred(), &imp(), b"body").await;
         assert!(
-            matches!(r, Err(FailureKind::AuthAmbiguous)),
+            matches!(&r, Err(f) if f.kind == FailureKind::AuthAmbiguous),
             "expired → ambiguous, got {r:?}"
         );
     }
@@ -740,7 +766,7 @@ mod tests {
         }];
         let r = try_endpoints(&client, &eps, &cred(), &imp(), b"body").await;
         assert!(
-            matches!(r, Err(FailureKind::AuthInvalid)),
+            matches!(&r, Err(f) if f.kind == FailureKind::AuthInvalid),
             "invalid_grant __type → invalid, got {r:?}"
         );
     }
@@ -762,9 +788,9 @@ mod tests {
         let r = try_endpoints(&client, &eps, &cred(), &imp(), b"body").await;
         // 裸 403 → AuthAmbiguous:上报一次只记 1 个 strike(未达 AUTH_AMBIGUOUS_STRIKES=2),
         // 不进冷却、不永久禁用,账号仍然可用(与旧的"Auth 一次即永久禁用"契约相区分)。
-        assert!(matches!(r, Err(FailureKind::AuthAmbiguous)));
-        if let Err(kind) = r {
-            pool.report_failure("a", kind, 0);
+        assert!(matches!(&r, Err(f) if f.kind == FailureKind::AuthAmbiguous));
+        if let Err(f) = r {
+            pool.report_failure("a", f.kind, 0);
         }
         assert_eq!(pool.active_count(0), 1); // AuthAmbiguous 单次不禁用,仍可用
     }

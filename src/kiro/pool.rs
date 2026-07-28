@@ -1089,7 +1089,10 @@ mod tests {
         // 只绑 7 号:轮询转多少圈都只能选到 7。
         let only7 = BoundCredentialIds(vec![7]);
         for _ in 0..10 {
-            assert_eq!(p.select_with_exclude(0, &none, Some(&only7)).unwrap().id, "7");
+            assert_eq!(
+                p.select_with_exclude(0, &none, Some(&only7)).unwrap().id,
+                "7"
+            );
         }
         // 绑定 + 排除集叠加:绑 3/7 而 7 已试过 → 只剩 3。
         let three_seven = BoundCredentialIds(vec![3, 7]);
@@ -1097,7 +1100,9 @@ mod tests {
         ex.insert("7".to_string());
         for _ in 0..10 {
             assert_eq!(
-                p.select_with_exclude(0, &ex, Some(&three_seven)).unwrap().id,
+                p.select_with_exclude(0, &ex, Some(&three_seven))
+                    .unwrap()
+                    .id,
                 "3"
             );
         }
