@@ -82,12 +82,28 @@ curl http://localhost:8080/openai/v1/models \
 
 **レスポンス:**
 
+3 プロトコル共通のカタログ（17 件）を定義順にそのまま返します。`object` は常に `"model"`、`created` は定数 `1700000000`、`owned_by` は定数 `"kiro2api"` です（いずれもハードコードで、時計も上流も読みません）。
+
 ```json
 {
   "object": "list",
   "data": [
     {"id": "claude-sonnet-4.5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-sonnet-4.6", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-sonnet-5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-opus-4.5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
     {"id": "claude-opus-4.6", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-opus-4.7", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-opus-4.8", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-haiku-4.5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-fable-5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "deepseek-3.2", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "glm-5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "qwen3-coder-next", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "minimax-m2.1", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "minimax-m2.5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "gpt-5.6-terra", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "gpt-5.6-luna", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
     {"id": "gpt-5.6-sol", "object": "model", "created": 1700000000, "owned_by": "kiro2api"}
   ]
 }
@@ -98,7 +114,11 @@ curl http://localhost:8080/openai/v1/models \
 > - `opus` / `GPT` などのモデルはより上位の階層が必要です。
 > - サポートされていないモデルをリクエストすると、静かに失敗するのではなく明確に `400`（`INVALID_MODEL_ID`）を返します。
 >
-> ⚠️ ただし各プロトコルの `/models` が返すのは**固定の短いリスト**です（OpenAI/Gemini は `claude-sonnet-4.5` / `claude-opus-4.6` / `gpt-5.6-sol`、Anthropic は `claude-sonnet-4.5` / `claude-opus-4.6` / `claude-haiku-4.5`）。アカウントプールもサブスクリプション階層も参照しない静的な値なので、**list-then-use は利用可否の保証にはなりません**——ここに載っているモデルでも階層が足りなければ `400`（`INVALID_MODEL_ID`）になります。より広いカタログは `GET /api/admin/models` を参照してください（各アカウントの上流モデル一覧の**和集合**、なければ静的な 17 件にフォールバック）。なお中継が受け付けるモデル名はこれらのリストの完全一致に限りません——モデル名は小文字化して部分一致で内部 id に写像されるため、どのリストにも載らない綴りが通ることもあります。
+> ⚠️ 各プロトコルの `/models` が返すのは**バイナリに焼き込まれた共通カタログ**（17 件）です。`GET /v1/models`（= `/openai/v1/models`）・`GET /claude/v1/models`・`GET /v1beta/models`（= `/gemini/v1beta/models`）の 3 つは**同じ id を同じ並び順**で返し、違うのは各プロトコルの形式だけです。アカウントプールもサブスクリプション階層も参照せず、時計も上流も読みません。
+>
+> このカタログの id は**すべて中継側が解釈できる**ため、「一覧を引いて、返ってきた id をそのまま指定する」という標準的な流儀が成立します。ただし**利用可否の保証にはなりません**——名前の解決に成功しても、階層が足りないモデルは上流が拒否するため `400`（`INVALID_MODEL_ID`）になり得ます。`400` には別物が 2 つある点に注意してください：**中継が名前を解決できない**場合（メッセージはソース上の文字列そのままで `无法识别的模型名: <name>`）と、**名前は解決できたが当該アカウントの階層で提供されない**場合（上流の `INVALID_MODEL_ID`）です。カタログの id が返すのは常に後者だけです。
+>
+> 逆に、中継が受け付けるモデル名はカタログの完全一致に限りません——モデル名は小文字化して部分一致で内部 id に写像されるため、カタログに載らない綴り（`claude-3-5-sonnet-…` など）や、どの `/models` にも現れないルーティング別名 `auto` も通ります。**各アカウントの階層で実際に使える集合**が見たい場合は `GET /api/admin/models` を参照してください（上流モデル一覧の**和集合**。キャッシュが空のときはこの同じカタログにフォールバックします）。
 
 ### POST /openai/v1/chat/completions
 
@@ -341,7 +361,7 @@ Anthropic Claude SDK と互換性のあるエンドポイントです（内部�
 
 ### GET /claude/v1/models
 
-Anthropic 形式のモデル一覧を取得します（OpenAI の `/v1/models` との衝突を避けます）。他のプロトコルの `/models` と同じく**バイナリに焼き込まれた固定リスト**です（[GET /openai/v1/models](#get-openaiv1models) の注記を参照）。OpenAI/Gemini 側が `gpt-5.6-sol` で終わるのに対し、Claude 形式のリストは `claude-haiku-4.5` で終わる点に注意してください。
+Anthropic 形式のモデル一覧を取得します（OpenAI の `/v1/models` との衝突を避けます）。中身は他の 2 プロトコルの `/models` と**同一の共通カタログ**（17 件・同じ並び順）で、違うのは形式だけです（[GET /openai/v1/models](#get-openaiv1models) の注記を参照）。`display_name` はカタログの表示名、`created_at` は全件に同じ定数 `2026-01-01T00:00:00Z` が入ります。`has_more` は常に `false`、`first_id` / `last_id` はこの一覧の先頭と末尾の id（それぞれ `claude-sonnet-4.5` と `gpt-5.6-sol`）です。
 
 **リクエスト:**
 
@@ -356,12 +376,26 @@ curl http://localhost:8080/claude/v1/models \
 {
   "data": [
     {"type": "model", "id": "claude-sonnet-4.5", "display_name": "Claude Sonnet 4.5", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "claude-sonnet-4.6", "display_name": "Claude Sonnet 4.6", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "claude-sonnet-5", "display_name": "Claude Sonnet 5", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "claude-opus-4.5", "display_name": "Claude Opus 4.5", "created_at": "2026-01-01T00:00:00Z"},
     {"type": "model", "id": "claude-opus-4.6", "display_name": "Claude Opus 4.6", "created_at": "2026-01-01T00:00:00Z"},
-    {"type": "model", "id": "claude-haiku-4.5", "display_name": "Claude Haiku 4.5", "created_at": "2026-01-01T00:00:00Z"}
+    {"type": "model", "id": "claude-opus-4.7", "display_name": "Claude Opus 4.7", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "claude-opus-4.8", "display_name": "Claude Opus 4.8", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "claude-haiku-4.5", "display_name": "Claude Haiku 4.5", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "claude-fable-5", "display_name": "Claude Fable 5", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "deepseek-3.2", "display_name": "DeepSeek 3.2", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "glm-5", "display_name": "GLM-5", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "qwen3-coder-next", "display_name": "Qwen3 Coder Next", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "minimax-m2.1", "display_name": "MiniMax M2.1", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "minimax-m2.5", "display_name": "MiniMax M2.5", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "gpt-5.6-terra", "display_name": "GPT-5.6 Terra", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "gpt-5.6-luna", "display_name": "GPT-5.6 Luna", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "gpt-5.6-sol", "display_name": "GPT-5.6 Sol", "created_at": "2026-01-01T00:00:00Z"}
   ],
   "has_more": false,
   "first_id": "claude-sonnet-4.5",
-  "last_id": "claude-haiku-4.5"
+  "last_id": "gpt-5.6-sol"
 }
 ```
 
@@ -453,7 +487,7 @@ Google Gemini API と互換性のあるエンドポイントです。**すべて
 
 ### GET /gemini/v1beta/models
 
-モデル一覧を取得します。他のプロトコルの `/models` と同じく**バイナリに焼き込まれた固定リスト**です（[GET /openai/v1/models](#get-openaiv1models) の注記を参照）。各エントリが持つのは `name` と `supportedGenerationMethods` だけで、`displayName` は出力されず、`description` / `inputTokenLimit` / `outputTokenLimit` といったフィールドはありません。
+モデル一覧を取得します。中身は他の 2 プロトコルの `/models` と**同一の共通カタログ**（17 件・同じ並び順）で、違うのは形式だけです（[GET /openai/v1/models](#get-openaiv1models) の注記を参照）。各エントリが持つのは `name`（`models/` を前置した id）と `supportedGenerationMethods`（全件で同じ 2 要素の定数）だけで、`displayName` は出力されず（カタログに表示名はありますが Gemini 形式では常に省略されます）、`description` / `inputTokenLimit` / `outputTokenLimit` といったフィールドもありません。
 
 **リクエスト:**
 
@@ -468,7 +502,21 @@ curl http://localhost:8080/gemini/v1beta/models \
 {
   "models": [
     {"name": "models/claude-sonnet-4.5", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/claude-sonnet-4.6", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/claude-sonnet-5", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/claude-opus-4.5", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
     {"name": "models/claude-opus-4.6", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/claude-opus-4.7", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/claude-opus-4.8", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/claude-haiku-4.5", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/claude-fable-5", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/deepseek-3.2", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/glm-5", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/qwen3-coder-next", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/minimax-m2.1", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/minimax-m2.5", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/gpt-5.6-terra", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/gpt-5.6-luna", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
     {"name": "models/gpt-5.6-sol", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
   ]
 }
@@ -787,9 +835,188 @@ curl -X POST http://localhost:8080/api/admin/login/sso-token \
 | GET | `/api/admin/credentials/{id}/failure-logs` | 直近の失敗イベント |
 | GET | `/api/admin/credentials/{id}/throttle-logs` | 直近のスロットルイベント |
 | GET | `/api/admin/credentials/{id}/balance` | アカウント残高（5 分キャッシュ） |
+| GET | `/api/admin/credits/global` | 全アカウントの残り積分合計（キャッシュのみ） |
 | GET | `/api/admin/usage/daily` | 日次使用量サマリー |
 | GET | `/api/admin/usage/daily/{date}/records` | 指定日の記録 |
+| GET | `/api/admin/usage/summary` | 時間窓の使用量集計＋分桶系列＋稼働指標 |
 | GET | `/api/admin/rpm` | リアルタイム RPM スナップショット |
+
+> **ページングの共通規約**: ページ分割される管理エンドポイントはすべてクエリ `?page=&page_size=`（**snake_case**。`pageSize` ではありません）を取り、既定は `page=1` / `page_size=20` です。値はサーバー側で丸められます——`page_size` は最低 `1`、`page` は `[1, totalPages]` にクランプされ、空集合では `page=1` / `totalPages=0` になります。レスポンスは `{records, total, page, pageSize, totalPages}`（本体は camelCase）で共通です。`{id}` にプールに無いアカウントを渡しても**これらの読み取り系は `404` にはならず**、空ページ（`total: 0`）が `200` で返ります（数値でない id は `0` として扱われます）。
+
+### GET /api/admin/credentials/{id}/usage/today
+
+アカウントの**当日（CST / UTC+8）**使用量サマリーを取得します。クエリパラメータはありません。
+
+**リクエスト:**
+
+```bash
+curl http://localhost:8080/api/admin/credentials/12345/usage/today \
+  -H "Authorization: Bearer sk-管理端のキー"
+```
+
+**レスポンス:**
+
+```json
+{
+  "date": "2026-07-26",
+  "credentialId": 12345,
+  "totalRequests": 42,
+  "totalInputTokens": 1200,
+  "totalOutputTokens": 3400,
+  "totalCost": 0.85,
+  "totalCredits": 1.18
+}
+```
+
+`date` は CST の暦日キー（`YYYY-MM-DD`）で、日境界は UTC+8 の 0 時です。`credentialId` はパスの id を数値化したもので、**数値でない id は `0` になります**。未知のアカウントでも `404` にはならず、全項目 0 のサマリーが `200` で返ります。`totalCreditsSaved` フィールドは実装上の予約枠で、現状**常に省略されます**（Phase 1 の集計は値を生成しません）。
+
+### GET /api/admin/credentials/{id}/throttle-logs
+
+アカウントの直近のスロットル（上流 `429`）イベントをページ分割で取得します（新しい順）。`failure-logs`（`401`/`403`）と**同じ形状**です。
+
+**リクエスト:**
+
+```bash
+curl "http://localhost:8080/api/admin/credentials/12345/throttle-logs?page=1&page_size=20" \
+  -H "Authorization: Bearer sk-管理端のキー"
+```
+
+**レスポンス:**
+
+```json
+{
+  "records": [
+    {
+      "credentialId": 12345,
+      "requestType": "api",
+      "statusCode": 429,
+      "responseBody": "ThrottlingException: ...",
+      "createdAt": "2026-07-26T10:30:00Z"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "pageSize": 20,
+  "totalPages": 1
+}
+```
+
+`statusCode` はこのエンドポイントでは**常に定数 `429`**（記録時にハードコードされます）、`requestType` は中継の記録経路が固定文字列 `"api"` を渡すため実運用では常に `"api"` です。`responseBody` は**200 文字に切り詰められます**（`failure-logs` 側は 2000 文字）。`createdAt` は RFC3339（UTC・秒精度・`Z` 終端）。イベントログはアカウントごとに上限のある LRU なので、古いものから捨てられます（＝ここに見えるのは直近分だけです）。
+
+### GET /api/admin/usage/daily/{date}/records
+
+指定した**CST の暦日**（パス `{date}` は `YYYY-MM-DD`）の使用量記録をページ分割で取得します（新しい順）。
+
+**リクエスト:**
+
+```bash
+curl "http://localhost:8080/api/admin/usage/daily/2026-07-26/records?page=1&page_size=20" \
+  -H "Authorization: Bearer sk-管理端のキー"
+```
+
+**レスポンス:**
+
+```json
+{
+  "records": [
+    {
+      "model": "claude-sonnet-4.5",
+      "inputTokens": 120,
+      "outputTokens": 340,
+      "estimatedCost": 0.0051,
+      "creditsUsed": 0.0071,
+      "createdAt": "2026-07-26T10:30:00Z",
+      "credentialId": 12345,
+      "credentialLabel": "a@example.com",
+      "clientIp": "203.0.113.9"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "pageSize": 20,
+  "totalPages": 1
+}
+```
+
+ページングの前に**その日の新しい順で 2000 件に切り詰められます**（それより古い記録はこのエンドポイントからは見えません）。`credentialLabel` はプールのスナップショットから解決した表示名（ニックネーム → メール → `#{id}` の優先順）で、プールに該当 id が無ければ省略されます。`creditsUsed` / `cacheReadInputTokens` / `cacheCreationInputTokens` / `clientIp` は値が無ければ省略されます。`creditsSaved` は予約枠で**常に省略されます**。日付の綴りが暦日キーと一致しなければ（不正な日付を含め）空ページが `200` で返ります。
+
+### GET /api/admin/usage/summary
+
+時間窓を指定して全アカウント横断の使用量を集計し、グラフ用の時系列分桶と稼働健全性の指標を返します。
+
+**クエリパラメータ:**
+
+| パラメータ | 型 | 必須 | 説明 |
+|-----------|-----|------|------|
+| `range` | string | ❌ | `6h` / `24h` / `3d` / `7d` / `30d` のいずれか。指定時は `hours` より**優先** |
+| `hours` | integer | ❌ | 任意の正整数の時間数（`range` 省略時に使用） |
+
+両方とも省略した場合は `24h`。`range` が上記以外の値なら `400`（`{"error":"invalid range","allowed":[…],"hint":"…"}`）、`hours=0` も `400`（`{"error":"hours must be a positive integer"}`）です。
+
+**リクエスト:**
+
+```bash
+curl "http://localhost:8080/api/admin/usage/summary?range=24h" \
+  -H "Authorization: Bearer sk-管理端のキー"
+```
+
+**レスポンス:**
+
+```json
+{
+  "range": "24h",
+  "windowSecs": 86400,
+  "sinceUnix": 1785060000,
+  "untilUnix": 1785146400,
+  "bucketSecs": 3600,
+  "totalRequests": 128,
+  "totalInputTokens": 40960,
+  "totalOutputTokens": 81920,
+  "totalCost": 2.45,
+  "totalCredits": 3.4,
+  "dailyFallbackApplied": false,
+  "series": [
+    {"bucketStartUnix": 1785060000, "totalRequests": 12, "totalCost": 0.21, "totalCredits": 0.29}
+  ],
+  "successfulRequests": 128,
+  "failedRequests": 3,
+  "errorRate": 0.0228,
+  "avgLatencyMs": 1840.5,
+  "rotationSuccessRate": 0.9771
+}
+```
+
+- `range` は正規化後のラベルの**エコー**です（`hours=5` を渡した場合は `"5h"`）。`untilUnix` は現在時刻、`sinceUnix` は `untilUnix - windowSecs`。
+- `bucketSecs` は窓幅から自動決定されます：24 時間以下なら `3600`（1 時間ごと）、それより長ければ `86400`（1 日ごと）。`series` は桶の開始時刻の昇順で、活動が無ければ空配列です。
+- `dailyFallbackApplied` は、**1 日を超える窓**で生記録の欠落分を日次ロールアップで補填したかどうかを示します（生記録はアカウントごとに上限があり古いものが淘汰されるため）。補填されるのは `totalRequests` / `totalCost` / `totalCredits` だけで、**トークン数には日次集計が無いため補填されません**——`true` のときトークン合計は過小になり得ます。
+- `successfulRequests` は窓内の使用量記録の件数、`failedRequests` は窓内の失敗ログ（`401`/`403`）＋スロットルログ（`429`）の件数です。イベントログは LRU 上限があるので `failedRequests` は**下界**であり、`errorRate` は過小に出る側に倒れます。
+- `errorRate` = `failedRequests / (successfulRequests + failedRequests)`、`rotationSuccessRate` = `1 - errorRate`（この近似では両者の和は常に 1）。分母が 0 のときは `errorRate = 0.0` / `rotationSuccessRate = 1.0` です。`rotationSuccessRate` は「最終的に成功記録が残ったか」を成功シグナルとする**近似**で、アカウント間リトライの実回数を数えたものではありません。
+- `avgLatencyMs` は `latency_ms` を持つ成功記録の平均です（この項目を持たない古い記録は分母に入りません。サンプルが無ければ `0.0`）。なお `latency_ms` 自体は使用量記録のレスポンスには出力されません。
+- 数値は丸めずに f64 の精度のまま返します。ストレージが空／窓内に活動が無い場合も `500` ではなく全 0 ＋空 `series` の `200` です。
+
+### GET /api/admin/credits/global
+
+プール全体の**残り積分の合計**を取得します。クエリパラメータはありません。
+
+**リクエスト:**
+
+```bash
+curl http://localhost:8080/api/admin/credits/global \
+  -H "Authorization: Bearer sk-管理端のキー"
+```
+
+**レスポンス:**
+
+```json
+{
+  "globalCredits": 4820.5,
+  "cachedCount": 12,
+  "totalCount": 15,
+  "oldestCacheUnix": 1785146000
+}
+```
+
+**共有の残高キャッシュを読むだけで、上流は一切叩きません**。まだ新鮮な（TTL 5 分）キャッシュを持つアカウントだけを合計するため、`cachedCount`（合計に参加した件数）が `totalCount`（プール内の総アカウント数）より少ないのが通常です。キャッシュが無い／期限切れのアカウントは**素通し**され、この呼び出しでは補充されません（補充はアカウント画面の残高取得や `GET /api/admin/credentials/{id}/balance` の役目です）。`oldestCacheUnix` は合計に使ったキャッシュのうち最も古い取得時刻（Unix 秒）で、「◯分前時点」の表示に使えます。1 件も命中しなかった場合は `globalCredits: 0`、`cachedCount: 0`、`oldestCacheUnix: null` です。
 
 ### GET /api/admin/config
 
@@ -822,7 +1049,67 @@ curl http://localhost:8080/api/admin/config \
 
 ### GET /api/admin/models
 
-`display_name` / `type` / `max_tokens` を含むモデル一覧を取得します（フィールド名はパネルに合わせて snake_case）。各アカウントの上流モデル一覧の**和集合**（キャッシュ）を返し、キャッシュが空なら静的な 17 モデルのカタログにフォールバックします。プロトコル側の `/v1/models` などが返す固定 3 件とは**別物で、こちらのほうが広い集合**です。
+`display_name` / `type` / `max_tokens` を含むモデル一覧を取得します（フィールド名はパネルに合わせて snake_case）。各アカウントの上流モデル一覧の**和集合**（キャッシュ）を返し、キャッシュが空なら**プロトコル側の `/models` と同じ共通カタログ**（17 件）にフォールバックします。したがってフォールバック時の id 集合はプロトコル側と一致し、違うのは形式だけです（こちらは `display_name` / `type` / `max_tokens` を持ちます）。和集合が非空のときだけ**上流が実際に返した集合**（＝アカウント階層ごとの真の可用性）になり、カタログより広いことも狭いこともあります。
+
+`type` は常に `"chat"`、`created` は定数 `1700000000`。`rate_multiplier` は上流の値がある場合のみ現れます（カタログへのフォールバック時は常に省略）。`max_tokens` は上流が `0`／未提供のとき `200000` に丸められます。和集合が空だった場合、応答はブロックせずに返しつつ、バックグラウンドで上流の実取得を 1 回だけ起動します（プロセス単位のシングルフライト＋ 60 秒クールダウンで制御されるため、同時アクセスで何度も走ることはありません。次回以降のリクエストで動的な一覧に切り替わります）。
+
+### POST /api/admin/credentials/{id}/models/refresh
+
+指定アカウントの上流モデル一覧を実取得してキャッシュに書き戻します（ボディなし）。
+
+**リクエスト:**
+
+```bash
+curl -X POST http://localhost:8080/api/admin/credentials/12345/models/refresh \
+  -H "Authorization: Bearer sk-管理端のキー"
+```
+
+**レスポンス:**
+
+```json
+{
+  "success": true,
+  "id": "12345",
+  "count": 18
+}
+```
+
+`id` は**パスに渡した文字列そのまま**（数値化されません）、`count` は今回キャッシュに格納したモデル件数です。プールに存在しない id は `404`（`{"error":"account not found","id":"…"}`）。**無効化済みのアカウントは除外されません**——プールに居れば見つかり、そのまま上流へ問い合わせます。上流の取得に失敗した場合は `502` で、`error` に上流の状態コードと説明を含む文字列がそのまま入ります。
+
+```json
+{
+  "success": false,
+  "id": "12345",
+  "error": "models upstream HTTP 403: ..."
+}
+```
+
+### POST /api/admin/credentials/models/refresh
+
+サブスクリプション階層ごとに代表アカウントを 1 件ずつ選んでモデル一覧を実取得し、キャッシュに書き戻します（ボディなし）。全アカウントを舐めるわけではありません：無効化済みアカウントは飛ばし、階層が既知のものは階層ごとに 1 件だけ、階層が不明なものは**有界の探索**（和集合が 3 回連続で増えない／成功が 12 件に達する／試し尽くす、のいずれかで打ち切り）を行います。
+
+**リクエスト:**
+
+```bash
+curl -X POST http://localhost:8080/api/admin/credentials/models/refresh \
+  -H "Authorization: Bearer sk-管理端のキー"
+```
+
+**レスポンス:**
+
+```json
+{
+  "success": true,
+  "refreshed": 2,
+  "failed": 1,
+  "errors": [
+    {"id": 12345, "error": "models upstream HTTP 403: ..."}
+  ],
+  "tiers": ["KIRO FREE", "KIRO PRO+"]
+}
+```
+
+個々のアカウントが失敗しても呼び出し自体は成功扱いで、常に `200` と `success: true` を返します（失敗は `failed` 件数と `errors[]` に出ます）。`errors[].id` は**数値**です（解析できない id は `0`）。階層名は残高キャッシュの `subscriptionTitle` そのもの（例: `KIRO FREE` / `KIRO PRO+`）で、残高が未取得・期限切れのアカウントは「階層不明」として探索側に回ります。`tiers` は今回カバーできた階層名の一覧で、探索段階でも階層を特定できなかった場合は `"unknown"` が混ざります。既知の階層が 1 つも無く探索も空振りなら `refreshed` は `0` になり得ます。
 
 ### 負荷分散モードの読み取り / 切り替え
 
@@ -865,7 +1152,7 @@ curl -X PUT http://localhost:8080/api/admin/config/auth-keys \
 ```json
 {
   "masterApiKey": "sk-マスターキーの平文",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -874,6 +1161,89 @@ curl -X PUT http://localhost:8080/api/admin/config/auth-keys \
 ```
 
 `masterApiKey` は設定済み `apiKey` の**完全な平文**（未設定なら `null`）で、ここでは**マスキングされません**——パネルがブラウザ側でマスクして表示し、コピーボタンは実値を使います。マスキング済みの値が必要なら `GET /api/admin/config/auth-keys` を使ってください。`version` は kiro2api のバージョン、`kiroVersion` は偽装した上流 UA のバージョン、`rustVersion` はビルド時の rustc バージョンです。ほかに実行時メトリクス（`serverTime`、`serverTimeUnix`、`os`、`memoryUsedBytes`、`memoryTotalBytes`、`cpuPercent`、`runMode`、`pid`、`uptimeSecs`）も含まれます。
+
+### GET /api/admin/check-update
+
+GitHub の最新リリースを引いて、現在のバージョンと比較します。クエリパラメータはありません。
+
+**リクエスト:**
+
+```bash
+curl http://localhost:8080/api/admin/check-update \
+  -H "Authorization: Bearer sk-管理端のキー"
+```
+
+**レスポンス:**
+
+```json
+{
+  "current": "0.4.0",
+  "latest": "0.4.1",
+  "hasUpdate": true,
+  "updateUrl": "https://github.com/xwteam/kiro2api/releases/tag/v0.4.1",
+  "releaseNotes": "..."
+}
+```
+
+`current` はビルドに焼き込まれた kiro2api のバージョン、`latest` はリポジトリ `xwteam/kiro2api` の `releases/latest` の `tag_name` から先頭の `v` を除いたものです。`hasUpdate` は 2 つの文字列が**一致しないこと**だけを見ます（セマンティックバージョンの大小比較はしません）。`updateUrl` はリリースの `html_url`、無ければリリース一覧ページ。
+
+**この端点は失敗しません**——ネットワークエラー、リリースが 1 件も無い、プライベートリポジトリで `404`、といった場合はすべて保守的に `hasUpdate: false` / `latest = current` / `releaseNotes: ""` / `updateUrl` = リリース一覧ページ、で `200` を返します（エラーで UI を止めないため）。
+
+### POST /api/admin/update
+
+更新手順を返します。**サーバー上で何かを実行するわけではありません**——実行すべきコマンド文字列を返すだけで、プロセスもコンテナも触りません（パネルはこれをコピーボタン付きで表示します）。リクエストボディは不要です。
+
+**リクエスト:**
+
+```bash
+curl -X POST http://localhost:8080/api/admin/update \
+  -H "Authorization: Bearer sk-管理端のキー"
+```
+
+**レスポンス:**
+
+```json
+{
+  "status": "ok",
+  "message": "请在服务器上执行以下命令完成更新:",
+  "command": "docker compose pull && docker compose up -d"
+}
+```
+
+3 フィールドとも**ハードコードされた定数**で、入力にも実行環境にも依存しません（`message` は上記の中国語の文字列がそのまま返ります）。常に `200`。
+
+### POST /api/admin/restart
+
+プロセスを終了させ、コンテナ／プロセス監視の再起動ポリシーに拾わせます。**誤操作防止のためクエリ `?confirm=true` が必須**です。リクエストボディは不要です。
+
+**リクエスト:**
+
+```bash
+curl -X POST "http://localhost:8080/api/admin/restart?confirm=true" \
+  -H "Authorization: Bearer sk-管理端のキー"
+```
+
+**レスポンス:**
+
+```json
+{
+  "status": "ok",
+  "message": "Server restarting..."
+}
+```
+
+`confirm` が無い／`true` でない場合は再起動せず `400` を返します：
+
+```json
+{
+  "error": {
+    "message": "重启需二次确认,请带查询参数 ?confirm=true",
+    "type": "confirmation_required"
+  }
+}
+```
+
+レスポンスは**先に**返り、その後バックグラウンドで 0.5 秒待ってから遅延書き込み中の状態（使用量統計・API-KEY ストア・残高キャッシュ・失敗/スロットルイベントログ）をディスクへフラッシュし、`exit(0)` します。したがって直前に行った API-KEY の削除や作成は取り消されません。コンテナは `restart: unless-stopped` で動いていれば自動的に起動し直されますが、**守護プロセスの無いベアメタル運用ではこれは単なる停止と等価**です（systemd / supervisor 等での保活が前提）。
 
 ### リアルタイムログ
 
@@ -899,6 +1269,20 @@ curl "http://localhost:8080/api/admin/logs/stream?api_key=sk-あなたのキー"
 | GET | `/admin/api/config` | マスキングされた設定 |
 | POST | `/admin/api/accounts/{id}/enable` | 手動での有効化（メモリ上のみ、再起動でファイルの値にリセット） |
 | POST | `/admin/api/accounts/{id}/disable` | 手動での無効化（メモリ上のみ、再起動でファイルの値にリセット） |
+
+`POST /admin/api/accounts/{id}/disable` は [`POST /api/admin/credentials/{id}/disabled`](#post-apiadmincredentialsiddisabled) に `{"disabled": true}` を送るのと**同じプール操作**の旧綴りです（`…/enable` は同じく `{"disabled": false}` 相当）。新旧で違うのは呼び出し方と応答の形だけなので、ここでは重複して仕様を書きません——新しいほうを使ってください。
+
+旧側の固有の作法：リクエストボディを取らず（`Content-Type` も不要）、`disabled` の値はパスの動詞で決まります。応答は `{success, message}` ではなく次の形で、`id` は**パスに渡した文字列がそのまま**返ります。
+
+```json
+{
+  "ok": true,
+  "id": "12345",
+  "disabled": true
+}
+```
+
+プールに存在しない id は `404`（`{"error":"account not found","id":"…"}`）。なお「メモリ上のみ」という性質は新旧どちらも同じで（両者とも同一のプール操作を呼ぶだけでディスクへは書きません）、旧側だけの制限ではありません。
 
 ## ユーザー API
 
@@ -945,7 +1329,7 @@ curl http://localhost:8080/api/user/usage \
 
 ### GET /api/user/usage/records
 
-その key の使用量記録をページ分割で取得します（`?page=&page_size=`、新しい順）。
+その key の使用量記録をページ分割で取得します（`?page=&page_size=`、新しい順）。管理側と違い、**既定の `page_size` は `50`** です（`page` の既定は同じく `1`）。クエリ名は snake_case（`pageSize` ではありません）で、丸めの規約は管理側と同じ——`page_size` は最低 `1`、`page` は `[1, totalPages]` にクランプされます。
 
 **リクエスト:**
 
@@ -953,6 +1337,30 @@ curl http://localhost:8080/api/user/usage \
 curl "http://localhost:8080/api/user/usage/records?page=1&page_size=20" \
   -H "x-api-key: sk-あなたのキー"
 ```
+
+**レスポンス:**
+
+```json
+{
+  "records": [
+    {
+      "model": "claude-sonnet-4.5",
+      "inputTokens": 120,
+      "outputTokens": 340,
+      "estimatedCost": 0.0051,
+      "creditsUsed": 0.0071,
+      "createdAt": "2026-07-26T10:30:00Z",
+      "clientIp": "203.0.113.9"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "pageSize": 50,
+  "totalPages": 1
+}
+```
+
+返るのは**その key に紐づく記録だけ**です。1 件のレコードが持ち得るのは `model` / `inputTokens` / `outputTokens` / `estimatedCost` / `createdAt` と、値がある場合のみ現れる `creditsUsed` / `cacheReadInputTokens` / `cacheCreationInputTokens` / `clientIp` です。管理側の同種レスポンスと違い**`credentialId` は含まれません**（どのアカウントで処理されたかは利用者側には出しません）。`creditsSaved` と `credentialLabel` はこのエンドポイントでは解決されず**常に省略されます**。key が有効で記録が 1 件も無ければ `500` ではなく空ページ（`total: 0`、`totalPages: 0`、`page: 1`）が `200` で返ります。key が無効／停用／期限切れなら `401`（`{"error":"…"}`）。
 
 ## 運用
 
@@ -972,7 +1380,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.3.1"
+  "version": "0.4.0"
 }
 ```
 
@@ -1000,7 +1408,7 @@ API エラーは以下のコードで返されます。
 
 | コード | 説明 | 対応 |
 |--------|------|------|
-| 400 | パラメータエラー / マッピングされていないモデル（`INVALID_MODEL_ID`） | リクエストパラメータとモデル名を確認 |
+| 400 | パラメータエラー / 中継が解決できないモデル名 / 上流がアカウント階層で提供しないモデル（`INVALID_MODEL_ID`）。管理エンドポイント固有では `POST /api/admin/restart` に `?confirm=true` が無い場合と、`GET /api/admin/usage/summary` に未知の `range` または `hours=0` を渡した場合 | リクエストパラメータとモデル名を確認 |
 | 401 | 未認証（key がない、誤った key、無効化/期限切れのストア key） | API Key を確認 |
 | 402 | ストア管理の API-KEY が消費上限に到達（本体は `{"type":"error","error":{"type":"billing_error","message":"…"}}`）。判定には在途分の予約（USD 単位で `1.0`、`credits` 単位で約 `1.39`）が含まれるため、**残りが 1 回分の見積を下回った時点で**上限を使い切る前に拒否が始まります | key の上限を引き上げるか、使用量をリセット |
 | 403 | 禁止 | 権限がない |

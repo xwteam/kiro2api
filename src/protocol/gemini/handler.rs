@@ -624,30 +624,20 @@ pub async fn generate_content(
 
 /// axum handler:`GET /v1beta/models`(与 `/gemini/v1beta/models` 共用)。固定列表,不读时钟。
 pub async fn models() -> Json<GeminiModelList> {
-    let methods = || {
-        vec![
-            "generateContent".to_string(),
-            "streamGenerateContent".to_string(),
-        ]
-    };
+    // 目录来自 `models_catalog::CATALOG`(与 OpenAI / Anthropic 侧及管理端点同源);
+    // 此前这里硬编码三条,与另外两个协议列的还各不相同。
     Json(GeminiModelList {
-        models: vec![
-            GeminiModel {
-                name: "models/claude-sonnet-4.5".to_string(),
+        models: crate::models_catalog::CATALOG
+            .iter()
+            .map(|e| GeminiModel {
+                name: format!("models/{}", e.id),
                 display_name: None,
-                supported_generation_methods: methods(),
-            },
-            GeminiModel {
-                name: "models/claude-opus-4.6".to_string(),
-                display_name: None,
-                supported_generation_methods: methods(),
-            },
-            GeminiModel {
-                name: "models/gpt-5.6-sol".to_string(),
-                display_name: None,
-                supported_generation_methods: methods(),
-            },
-        ],
+                supported_generation_methods: vec![
+                    "generateContent".to_string(),
+                    "streamGenerateContent".to_string(),
+                ],
+            })
+            .collect(),
     })
 }
 

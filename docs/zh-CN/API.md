@@ -122,14 +122,18 @@ cat data/config.json | grep apiKey
 | `gpt`+`terra`/`luna`/`sol`/`5.6` | `gpt-5.6-terra`/`-luna`/`-sol` |
 | `auto` | `auto` |
 
+三个协议的 `/models` 端点（`GET /v1/models`、`GET /claude/v1/models`、`GET /v1beta/models`）返回的是**同一份编译期目录**（共 17 条，顺序一致，只是各自换成本协议的条目形状）。目录内容与上表**一一对应**——列出来的每个 id 都是本地映射认得的名字，唯一不在列表里的可用名是路由别名 `auto`。因此"先列模型、再拿列出的 id 发请求"这条客户端标准流程在本服务上成立，不会列出一个调用即 `400` 的名字。目录全量（即三个端点的返回顺序）：
+
+`claude-sonnet-4.5`、`claude-sonnet-4.6`、`claude-sonnet-5`、`claude-opus-4.5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-haiku-4.5`、`claude-fable-5`、`deepseek-3.2`、`glm-5`、`qwen3-coder-next`、`minimax-m2.1`、`minimax-m2.5`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.6-sol`。
+
 > [!TIP]
-> **可用模型取决于账号订阅档位**：免费档（KIRO FREE）通常只授权 `claude-sonnet-4.5`，opus/GPT 等需更高档位。注意各协议的 `/models` 端点返回的是一份**编译期写死的常用模型短清单**，**不读账号池、也不按订阅档位过滤**（三个协议的固定清单彼此还略有出入）；完整模型目录请用 `GET /api/admin/models`。因此不能拿协议 `/models` 的返回当"可用性"依据——列表里的模型若不在你账号的授权范围内，请求照样返回 `400`（`INVALID_MODEL_ID`）。
+> **可用模型取决于账号订阅档位**：免费档（KIRO FREE）通常只授权 `claude-sonnet-4.5`，opus/GPT 等需更高档位。协议侧的 `/models` 是**编译期常量**，**不读账号池、也不打上游、更不按订阅档位过滤**，所以它答的是"本网关认得哪些模型名"，不是"你的账号能用哪些"：列表里的模型若不在你账号的授权范围内，请求照样返回 `400`（上游 reason 码 `INVALID_MODEL_ID`）。要看**账号实际授权**的集合，用 `GET /api/admin/models`——它在上游模型并集缓存命中时返回各账号 `ListAvailableModels` 的并集（缓存为空时回落到同一份 17 条目录）。
 
 ## OpenAI 兼容 API
 
 ### GET /v1/models
 
-获取模型列表（固定短清单，非账号池实际可服务集，详见上文提示）。也可使用带前缀路径 `/openai/v1/models`。
+获取模型列表——本网关的**完整目录全量**（17 条），编译期常量，不读账号池、不打上游，故可用性仍受账号档位限制（详见上文提示）。也可使用带前缀路径 `/openai/v1/models`。
 
 **请求**：
 ```bash
@@ -137,13 +141,27 @@ curl http://localhost:8080/v1/models \
   -H "Authorization: Bearer sk-你的API密钥"
 ```
 
-**响应**：
+**响应**：下面就是**全部** 17 条与它们的固定顺序。每条的 `created` 恒为常量 `1700000000`、`owned_by` 恒为 `"kiro2api"`（占位值，既不是真实发布时间也不是真实归属方）：
 ```json
 {
   "object": "list",
   "data": [
     {"id": "claude-sonnet-4.5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-sonnet-4.6", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-sonnet-5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-opus-4.5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
     {"id": "claude-opus-4.6", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-opus-4.7", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-opus-4.8", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-haiku-4.5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-fable-5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "deepseek-3.2", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "glm-5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "qwen3-coder-next", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "minimax-m2.1", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "minimax-m2.5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "gpt-5.6-terra", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "gpt-5.6-luna", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
     {"id": "gpt-5.6-sol", "object": "model", "created": 1700000000, "owned_by": "kiro2api"}
   ]
 }
@@ -406,7 +424,7 @@ data: {"type":"response.completed","sequence_number":8,"response":{...}}
 
 ### GET /claude/v1/models
 
-获取模型列表（Anthropic 形状，避开与 OpenAI 裸路径 `/v1/models` 冲突）。
+获取模型列表（Anthropic 形状，避开与 OpenAI 裸路径 `/v1/models` 冲突）。**id 与顺序同 `GET /v1/models` 逐条相同**——同一份 17 条目录，只是换成 Anthropic 的条目形状并多了 `display_name`。
 
 **请求**：
 ```bash
@@ -414,16 +432,17 @@ curl http://localhost:8080/claude/v1/models \
   -H "Authorization: Bearer sk-你的API密钥"
 ```
 
-**响应**：
+**响应**：`has_more` 恒为 `false`（目录一次发完，本服务不做游标分页），`first_id` / `last_id` 即目录首尾；每条的 `created_at` 恒为常量 `"2026-01-01T00:00:00Z"`（占位，不是真实发布时间）。下例**只截取了首二条与末一条**，中间 14 条按上文目录顺序同形排列：
 ```json
 {
   "data": [
-    {
-      "id": "claude-sonnet-4.5",
-      "type": "model",
-      "display_name": "Claude Sonnet 4.5"
-    }
-  ]
+    {"type": "model", "id": "claude-sonnet-4.5", "display_name": "Claude Sonnet 4.5", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "claude-sonnet-4.6", "display_name": "Claude Sonnet 4.6", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "gpt-5.6-sol", "display_name": "GPT-5.6 Sol", "created_at": "2026-01-01T00:00:00Z"}
+  ],
+  "has_more": false,
+  "first_id": "claude-sonnet-4.5",
+  "last_id": "gpt-5.6-sol"
 }
 ```
 
@@ -515,12 +534,22 @@ curl -X POST http://localhost:8080/v1/messages/count_tokens \
 
 ### GET /v1beta/models
 
-获取模型列表。也可使用带前缀路径 `/gemini/v1beta/models`。
+获取模型列表。也可使用带前缀路径 `/gemini/v1beta/models`。**id 与顺序同 `GET /v1/models` 逐条相同**——同一份 17 条目录，换成 Gemini 的条目形状。
 
 **请求**：
 ```bash
 curl http://localhost:8080/v1beta/models \
   -H "Authorization: Bearer sk-你的API密钥"
+```
+
+**响应**：`name` 为 `models/<id>`；每条的 `supportedGenerationMethods` 恒为 `["generateContent","streamGenerateContent"]` 这两项；**没有** `displayName` 字段（本服务不下发，序列化时整键省略）。下例**只截取了首末各一条**，中间 15 条按上文目录顺序同形排列：
+```json
+{
+  "models": [
+    {"name": "models/claude-sonnet-4.5", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/gpt-5.6-sol", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
+  ]
+}
 ```
 
 ### POST /v1beta/models/{model}:generateContent
@@ -666,7 +695,7 @@ curl -X DELETE http://localhost:8080/api/admin/credentials/12345 \
 
 ### POST /api/admin/credentials/{id}/disabled
 
-启用/禁用账号。
+启用/禁用账号。请求体 `{"disabled": <布尔>}`，该字段**必填**（缺失 `422`）。改的是**内存态**、不落盘，重启后复位为 `credentials.json` 里的值。旧路径 `POST /admin/api/accounts/{id}/enable|disable` 是本端点的别名，见文末「旧管理端点」。
 
 **请求**：
 ```bash
@@ -676,11 +705,11 @@ curl -X POST http://localhost:8080/api/admin/credentials/12345/disabled \
   -d '{"disabled": true}'
 ```
 
-**响应**：
+**响应**：`message` 只有两个取值——`"credential disabled"` 或 `"credential enabled"`；id 不在池内 → `404`，体 `{"error":"account not found","id":"12345"}`。
 ```json
 {
   "success": true,
-  "message": "..."
+  "message": "credential disabled"
 }
 ```
 
@@ -846,11 +875,99 @@ curl "http://localhost:8080/api/admin/api-keys/7/usage/records?page=1&page_size=
 
 ### GET /api/admin/credentials/{id}/usage/records · /usage/today
 
-单账号分页用量记录 / 当日汇总。
+单账号分页用量记录 / 当日汇总。两者都**不校验账号是否存在**：未知 id 回空页 / 全零汇总，不是 `404`（路径 id 按数值解析，非数值回落 `0`）。
+
+`/usage/records` 的分页参数是 **snake_case 的 `?page=&page_size=`**（缺省 `page=1`、`page_size=20`；`page_size` 至少按 1 计，`page` 越界钳到最后一页，空集回 `page=1`、`totalPages=0`），响应体字段则是 camelCase：
+
+**请求**：
+```bash
+curl "http://localhost:8080/api/admin/credentials/12345/usage/records?page=1&page_size=20" \
+  -H "Authorization: Bearer sk-你的管理密钥"
+```
+
+**响应**：
+```json
+{
+  "records": [
+    {
+      "model": "claude-sonnet-4.5",
+      "inputTokens": 1200,
+      "outputTokens": 340,
+      "estimatedCost": 0.0123,
+      "creditsUsed": 1.7,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "createdAt": "2026-07-25T12:00:00Z",
+      "credentialId": 12345,
+      "credentialLabel": "a@x.io",
+      "clientIp": "203.0.113.7"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "pageSize": 20,
+  "totalPages": 1
+}
+```
+
+记录按时间降序（最新在前）。`creditsUsed`、`cacheReadInputTokens`、`cacheCreationInputTokens`、`credentialLabel`、`clientIp` 无值时**整个键不出现**（不是 `null`）；`creditsSaved` 目前**恒无数据源**，永远不会出现。`credentialLabel` 由账号池现算：昵称 → 邮箱 → `#<数值 id>`。
+
+`/usage/today` 不收任何参数，按 **CST（UTC+8）** 定"今天"：
+
+**请求**：
+```bash
+curl http://localhost:8080/api/admin/credentials/12345/usage/today \
+  -H "Authorization: Bearer sk-你的管理密钥"
+```
+
+**响应**：
+```json
+{
+  "date": "2026-07-25",
+  "credentialId": 12345,
+  "totalRequests": 12,
+  "totalInputTokens": 3400,
+  "totalOutputTokens": 900,
+  "totalCost": 0.12,
+  "totalCredits": 0.34
+}
+```
+
+`totalCredits` 是当日各条记录里**上游回报的积分消耗**之和（缺该值的记录按 0 计），不是由 `totalCost` 换算而来。`totalCreditsSaved` 同样恒无数据源、不会出现。
 
 ### GET /api/admin/credentials/{id}/failure-logs · /throttle-logs
 
-单账号近期失败 / 限流事件。
+单账号近期失败 / 限流事件。两者**同形同参**：`?page=&page_size=`（缺省 `page=1`、`page_size=20`，降序、最新在前），未知 id 回空页而非 `404`。区别只在数据源与几个恒定字段：
+
+- `failure-logs`：中转过程中判为账号级**鉴权失败**的事件，`statusCode` 为 `401` 或 `403`（无从解析时按 `401` 记），`responseBody` 截断到 **2000** 字符。
+- `throttle-logs`：判为**配额/限流**的事件，`statusCode` **恒为 `429`**（写入时硬编码的常量，不是上游原样状态码），`responseBody` 截断到 **200** 字符。
+
+两者都按账号各留最近 **500** 条（超出丢最旧的，所以这两个列表都不能当完整审计流水）。`requestType` 目前中转侧只会写 `"api"` 一个值。
+
+**请求**：
+```bash
+curl "http://localhost:8080/api/admin/credentials/12345/throttle-logs?page=1&page_size=20" \
+  -H "Authorization: Bearer sk-你的管理密钥"
+```
+
+**响应**：
+```json
+{
+  "records": [
+    {
+      "credentialId": 12345,
+      "requestType": "api",
+      "statusCode": 429,
+      "responseBody": "ThrottlingException: ...",
+      "createdAt": "2026-07-25T12:00:00Z"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "pageSize": 20,
+  "totalPages": 1
+}
+```
 
 ### GET /api/admin/credentials/{id}/balance
 
@@ -862,9 +979,97 @@ curl http://localhost:8080/api/admin/credentials/12345/balance \
   -H "Authorization: Bearer sk-你的管理密钥"
 ```
 
+### GET /api/admin/credits/global
+
+全局剩余积分聚合，**只读上面那份共享余额缓存、零上游调用**：遍历池内全部账号 id，只累加**仍新鲜**（同一份 5 分钟 TTL 缓存）的快照的 `remaining`；缓存 miss / 过期的账号直接跳过，本端点**不会**替它们去打上游。因此 `cachedCount < totalCount` 时 `globalCredits` 是**部分和**，要补全得先由账号页 / 仪表盘去查各账号余额把缓存填热。
+
+**请求**：
+```bash
+curl http://localhost:8080/api/admin/credits/global \
+  -H "Authorization: Bearer sk-你的管理密钥"
+```
+
+**响应**：
+```json
+{
+  "globalCredits": 1234.5,
+  "cachedCount": 8,
+  "totalCount": 10,
+  "oldestCacheUnix": 1753444800
+}
+```
+
+`oldestCacheUnix` 是参与求和的缓存条目里**最旧**的抓取时刻（Unix 秒），供前端显示"更新于 X 之前"；一条都没命中时为 `null`（此时 `globalCredits` 为 `0`、`cachedCount` 为 `0`）。恒返回 `200`。
+
 ### GET /api/admin/usage/daily · /usage/daily/{date}/records
 
-每日用量汇总 / 指定日期的记录（含客户端 IP 与账号标签）。
+每日用量汇总 / 指定日期的记录（含客户端 IP 与账号标签）。日界一律按 **CST（UTC+8）**，`{date}` 写 `YYYY-MM-DD`。
+
+`/usage/daily` 不收参数，返回按日期降序的数组（空存储 → `[]`）：
+
+**响应**：
+```json
+[
+  {"date": "2026-07-25", "totalRequests": 120, "totalCost": 1.23, "totalCredits": 3.4}
+]
+```
+
+只有这四个字段（没有 tokens 计数）；`totalCreditsSaved` 恒无数据源、不会出现。
+
+`/usage/daily/{date}/records` 的分页参数同为 `?page=&page_size=`（缺省 `page=1`、`page_size=20`），未知日期回空页而非 `404`。注意服务端在分页**之前**先把该日记录截到最新 **2000** 条，故 `total` 最大就是 2000，再往后翻也取不到更旧的。记录形状与 `GET /api/admin/credentials/{id}/usage/records` 完全一致（同样含 `credentialId`、`credentialLabel`、`clientIp`）。
+
+**请求**：
+```bash
+curl "http://localhost:8080/api/admin/usage/daily/2026-07-25/records?page=1&page_size=20" \
+  -H "Authorization: Bearer sk-你的管理密钥"
+```
+
+### GET /api/admin/usage/summary
+
+时间窗口内跨全部账号的用量聚合 + 图表分桶 + 运行健康指标。
+
+窗口二选一：`?range=` 取枚举 `6h` | `24h` | `3d` | `7d` | `30d`（**优先**），或 `?hours=<正整数>` 给任意小时数；两个都不给按 `24h`。非法 `range`、`hours=0` → `400`。分桶宽度由窗口自动决定：窗口 ≤ 24 小时按小时（`bucketSecs` 为 `3600`），更长按天（`86400`）。
+
+**请求**：
+```bash
+curl "http://localhost:8080/api/admin/usage/summary?range=24h" \
+  -H "Authorization: Bearer sk-你的管理密钥"
+```
+
+**响应**：
+```json
+{
+  "range": "24h",
+  "windowSecs": 86400,
+  "sinceUnix": 1753358400,
+  "untilUnix": 1753444800,
+  "bucketSecs": 3600,
+  "totalRequests": 117,
+  "totalInputTokens": 34000,
+  "totalOutputTokens": 9000,
+  "totalCost": 1.23,
+  "totalCredits": 3.4,
+  "dailyFallbackApplied": false,
+  "series": [
+    {"bucketStartUnix": 1753358400, "totalRequests": 5, "totalCost": 0.05, "totalCredits": 0.14}
+  ],
+  "successfulRequests": 117,
+  "failedRequests": 3,
+  "errorRate": 0.025,
+  "avgLatencyMs": 812.5,
+  "rotationSuccessRate": 0.975
+}
+```
+
+各字段口径（都按实际实现说，别当精确埋点用）：
+
+- `range` 回显规整后的窗口标签（用 `?hours=N` 时是 `"<N>h"`）；`untilUnix` 为当前时刻，`sinceUnix = untilUnix - windowSecs`，闭区间。
+- 数值一律是**未预舍入**的 f64/i64 原始精度，格式化交给前端。
+- `dailyFallbackApplied`：窗口 > 1 天时，服务端会拿每日汇总与原始记录逐个**完整 CST 日**取较大值，用差额补齐 requests/cost/credits（原始记录按账号有条数上限，长窗最旧的可能已被淘汰）。补过就是 `true`——**此时 tokens 两项没有对应的每日汇总、补不了，可能偏低**。
+- `successfulRequests` = 窗口内用量记录条数（含上面兜底补齐的部分），与 `totalRequests` 同源同值；`failedRequests` = 窗口内失败日志（401/403）+ 限流日志（429）条数。事件日志按账号有 500 条上限，极高频失败时最旧的已被淘汰，故 `failedRequests` 是**下界**、`errorRate` 只会偏保守。
+- `errorRate` = 失败 /（成功 + 失败）；`rotationSuccessRate` 就是 `1 - errorRate`（近似值：跨账号重试链路本身没有单独埋点，只以"最终有没有落一条成功用量记录"来近似）。窗口内无任何活动时，二者分别为 `0.0` 与 `1.0`。
+- `avgLatencyMs` 只统计带延迟样本的成功记录（早期记录没有该字段，不计入），无样本 → `0.0`。
+- `series` 按桶起始升序；空窗口 → `[]`。
 
 ### GET /api/admin/rpm
 
@@ -899,7 +1104,53 @@ curl http://localhost:8080/api/admin/config \
 
 ### GET /api/admin/models
 
-带 `display_name`/`type`/`max_tokens` 的模型列表（**snake_case 字段名**，同上）。这里返回的是各账号上游 `ListAvailableModels` 的**并集**（缓存命中即用；并集为空时后台惰性回填，本次先回落到内置的 17 条静态目录）——与协议侧 `/v1/models` 的固定短清单**不是同一个集合**，本端点才是完整目录。
+带 `display_name`/`type`/`max_tokens` 的模型列表（**snake_case 字段名**，同上）。取值优先级：各账号上游 `ListAvailableModels` 的**并集**（缓存命中即用）→ 并集为空时回落到与协议侧 `/models` **同一份** 17 条编译期目录，同时在后台惰性触发一次回填（单飞 + 60 秒冷却 + 有界扫描，不阻塞本次响应，下次请求才可能拿到并集）。所以本端点与协议 `/models` 现在只差一处：缓存热时它给的是**上游按档位实际授权**的并集，协议侧则恒定给目录全量。
+
+条目形状：`{id, object:"model", created, owned_by, display_name, type, max_tokens, rate_multiplier?}`。`created` 恒为常量 `1700000000`、`type` 恒为 `"chat"`；`rate_multiplier` 只有上游并集条目带该值时才出现（回落目录的条目不带）。`owned_by` 在回落条目上恒为 `"kiro2api"`，在并集条目上由 id **本地推断**（`auto` → `kiro`，含 `claude` → `anthropic`，含 `gpt` → `openai`，另有 `deepseek`/`minimax`/`glm`/`qwen`，都不匹配则 `unknown`），并非上游下发的字段。并集条目的 `max_tokens` 取上游 `tokenLimits.maxOutputTokens`，缺失（0）时按 `200000` 回落。
+
+### POST /api/admin/credentials/models/refresh · /credentials/{id}/models/refresh
+
+手动实拉上游 `ListAvailableModels` 并回填模型缓存（即上面那份并集的来源）。两个端点都**不收请求体**，无需 `Content-Type`。
+
+**单账号**（`/api/admin/credentials/{id}/models/refresh`）：路径 id 必须在池内，**已禁用的账号也照刷**（单账号端点不跳过禁用）；池里没有这个 id → `404`，体 `{"error":"account not found","id":"…"}`。上游失败 → `502`，`error` 里带真因（上游状态码 + 短说明），且不写缓存。
+
+**请求**：
+```bash
+curl -X POST http://localhost:8080/api/admin/credentials/12345/models/refresh \
+  -H "Authorization: Bearer sk-你的管理密钥"
+```
+
+**响应**：
+```json
+{
+  "success": true,
+  "id": "12345",
+  "count": 18
+}
+```
+
+`id` 原样回显路径里的字符串（不转数值），`count` 为该账号本次拉到并写入缓存的模型条数。
+
+**全池**（`/api/admin/credentials/models/refresh`）：并**不会**挨个刷全部账号——先跳过已禁用账号，再按**订阅档位**分组，每个已缓存档位只刷**一个代表账号**；档位未知的账号走有界发现（并集连续 3 次不再增长、或累计成功 12 个、或试完即停）。**恒返回 `200`**：批量调用本身算成功，逐账号失败只进 `errors[]` 与 `failed` 计数（全失败时也是 `200` + `refreshed:0`）。
+
+**请求**：
+```bash
+curl -X POST http://localhost:8080/api/admin/credentials/models/refresh \
+  -H "Authorization: Bearer sk-你的管理密钥"
+```
+
+**响应**：
+```json
+{
+  "success": true,
+  "refreshed": 2,
+  "failed": 1,
+  "errors": [{"id": 12345, "error": "models upstream HTTP 403: ..."}],
+  "tiers": ["KIRO FREE", "KIRO PRO+"]
+}
+```
+
+`errors[].id` 是**数值**账号 id（非数值 id 回落 `0`）；`tiers` 是本次实际刷成功所涵盖的档位列表，发现阶段刷成功、但档位仍拿不到的账号会让列表里多一个 `"unknown"` 占位。
 
 ### GET /api/admin/config/load-balancing · PUT
 
@@ -929,13 +1180,77 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
   "uptimeSecs": 3600
 }
 ```
+
+### GET /api/admin/check-update
+
+查 GitHub Releases 的最新版并与当前版本比对。服务端出站打 `https://api.github.com/repos/xwteam/kiro2api/releases/latest`。
+
+**请求**：
+```bash
+curl http://localhost:8080/api/admin/check-update \
+  -H "Authorization: Bearer sk-你的管理密钥"
+```
+
+**响应**：
+```json
+{
+  "current": "0.4.0",
+  "latest": "0.4.1",
+  "hasUpdate": true,
+  "updateUrl": "https://github.com/xwteam/kiro2api/releases/tag/v0.4.1",
+  "releaseNotes": "..."
+}
+```
+
+`current` 是本进程编译进去的 crate 版本；`latest` 取 Release 的 `tag_name` 去掉前导 `v`；`updateUrl` 取该 Release 的 `html_url`，`releaseNotes` 取其正文。`hasUpdate` 只是 `latest != current` 的**字符串不等**判断，不做语义化版本比较（回退到旧版部署时也会显示"有更新"）。本端点**永不报错**：网络不通、仓库没有 Release、私有仓 404 等一律保守回 `200` + `latest = current` + `hasUpdate: false`，`updateUrl` 退成仓库 releases 首页、`releaseNotes` 为空串。
+
+### POST /api/admin/update
+
+**不会自动更新**——只返回一段要你自己去服务器上执行的命令（配合面板的"复制"按钮）。不收请求体，恒 `200`，三个字段全是硬编码常量：
+
+**请求**：
+```bash
+curl -X POST http://localhost:8080/api/admin/update \
+  -H "Authorization: Bearer sk-你的管理密钥"
+```
+
+**响应**：
+```json
+{
+  "status": "ok",
+  "message": "请在服务器上执行以下命令完成更新:",
+  "command": "docker compose pull && docker compose up -d"
+}
+```
+
+### POST /api/admin/restart
+
+**真的会退出当前进程**，靠容器的 `restart` 策略（或 systemd/supervisor）把它重新拉起；裸机无守护时等同于停机。
+
+必须带 `?confirm=true` 二次确认。缺这个参数、或传 `confirm=false` 时 handler 直接回 `400`，体为 `{"error":{"message":"重启需二次确认,请带查询参数 ?confirm=true","type":"confirmation_required"}}`（`confirm` 只认布尔字面量，写别的值会在进 handler 之前被查询串反序列化拒掉）。确认后**先**回 `200`，再由后台任务等 0.5 秒、把统计 / API-KEY / 余额缓存 / 失败限流日志这四份去抖存储**全部刷盘**，然后 `exit(0)`——所以刚在面板上删掉的 key 不会因为这次重启而复活。不收请求体。
+
+**请求**：
+```bash
+curl -X POST "http://localhost:8080/api/admin/restart?confirm=true" \
+  -H "Authorization: Bearer sk-你的管理密钥"
+```
+
+**响应**：
+```json
+{
+  "status": "ok",
+  "message": "Server restarting..."
+}
+```
+
+`status` 与 `message` 均为硬编码常量。
 
 ### GET /api/admin/logs/stream
 
@@ -953,8 +1268,14 @@ curl "http://localhost:8080/api/admin/logs/stream?api_key=sk-你的管理密钥"
 ### 旧管理端点（保留向后兼容）
 
 - `GET /admin/api/stats` — `{accounts:[…], summary:{total,active,disabled,in_cooldown}}`
-- `GET /admin/api/config` — 脱敏配置
-- `POST /admin/api/accounts/{id}/enable` | `disable` — 手动启停（内存态，重启复位为文件值）
+- `GET /admin/api/config` — 脱敏配置（与 `GET /api/admin/config` 是**同一个 handler**，响应逐字相同）
+- `POST /admin/api/accounts/{id}/enable` | `disable` — 手动启停。这两条是 `POST /api/admin/credentials/{id}/disabled` 的**旧别名**：走同一个池方法，同样只改内存、不落盘（重启后复位为 `credentials.json` 里的值），`enable` 等价于新端点传 `{"disabled": false}`、`disable` 等价于 `{"disabled": true}`。差别只有两点：旧端点**不收请求体**（启停写在路径上，不必带 `Content-Type`），以及响应形状不同——回 `{"ok":true,"id":"12345","disabled":true}`（`id` 原样回显路径里的字符串），而不是新端点的 `{"success":true,"message":"…"}`。id 不在池内 → `404`，体 `{"error":"account not found","id":"12345"}`。
+
+**请求**：
+```bash
+curl -X POST http://localhost:8080/admin/api/accounts/12345/disable \
+  -H "Authorization: Bearer sk-你的管理密钥"
+```
 
 ## 用户 API
 
@@ -998,13 +1319,38 @@ curl http://localhost:8080/api/user/usage \
 
 ### GET /api/user/usage/records
 
-该 key 的用量记录，分页（`?page=&page_size=`，降序）。
+该 key 的用量记录，分页（降序、最新在前）。参数名是 **snake_case 的 `?page=&page_size=`**；缺省 `page=1`、**`page_size=50`**（与管理端同名端点的 `20` **不一样**），`page` 越界钳到最后一页。key 校验失败 → `401`；key 有效但一条记录都没有 → 空页（`total=0`），不是 `404`。
 
 **请求**：
 ```bash
 curl "http://localhost:8080/api/user/usage/records?page=1&page_size=20" \
   -H "x-api-key: sk-你的API密钥"
 ```
+
+**响应**：
+```json
+{
+  "records": [
+    {
+      "model": "claude-sonnet-4.5",
+      "inputTokens": 1200,
+      "outputTokens": 340,
+      "estimatedCost": 0.0123,
+      "creditsUsed": 1.7,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "createdAt": "2026-07-25T12:00:00Z",
+      "clientIp": "203.0.113.7"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "pageSize": 20,
+  "totalPages": 1
+}
+```
+
+无值的可选键**整个不出现**（不是 `null`）：`creditsUsed`、`cacheReadInputTokens`、`cacheCreationInputTokens`、`clientIp` 均如此；`creditsSaved` 与 `credentialLabel` 则是**恒定无值**（前者没有数据源，后者用户面不解析账号标签），永远不会出现。用户面的记录里也**没有** `credentialId`——用哪个账号中转只在管理端可见。
 
 ## 系统 API
 
@@ -1022,7 +1368,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.3.1"
+  "version": "0.4.0"
 }
 ```
 

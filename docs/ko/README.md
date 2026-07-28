@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.3.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.4.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 날짜 | 업데이트 내용 |
 |------|----------|
+| 2026-07-28 | v0.4.0 - 프로토콜 측 `/models`가 제공 가능한 17개 모델을 모두 나열하며 세 프로토콜의 결과가 일치합니다. 기존에는 `GET /v1/models`·`GET /claude/v1/models`·`GET /v1beta/models`가 각각 **서로 다른 3개**를 하드코딩했고 관리 엔드포인트는 17개였습니다 — 「모델 목록을 받아 그 id로 호출」이라는 표준 흐름이 불완전한, 게다가 프로토콜마다 다른 집합을 반환했습니다. 이제 단일 카탈로그(`src/models_catalog.rs`)가 네 엔드포인트를 모두 뒷받침하며, 카탈로그의 모든 id가 `map_model`로 해석되는지와 세 목록이 일치하는지를 테스트가 보장합니다. API 레퍼런스에 한 번도 없던 12개 라우트도 추가 |
 | 2026-07-28 | v0.3.1 - `POST /v1/messages/count_tokens`가 잘못된 요청 본문에 대해 Anthropic 오류 객체가 아니라 axum 기본 평문 `422`를 반환했습니다. v0.3.0에서 4개 대화 엔드포인트에는 명시적 거부 처리를 넣었지만, 동일한 Anthropic 프로토콜에 속하며 SDK가 직접 호출하는 이 엔드포인트만 누락되었습니다 —— 평문 본문에 `response.json()`을 쓰면 파싱 예외만 발생하고 실제 실패 원인은 사라집니다 |
 | 2026-07-28 | v0.3.0 - 🔍 v0.2.1 자체 수정에 대한 독립 재검증. 확인된 39건 중 **9건은 일부만 막혔는데도** 완료로 공지되었고, **13건의 후보는 아예 판정된 적이 없었다**(검증 에이전트가 도중에 중단됨). 그중 12건이 실제 결함으로 확인되어 본 버전에서 21건을 모두 막았다. 가장 중대한 것은 v0.2.1이 「이제 실제로 적용된다」고 공지한 API-KEY 자격증명 바인딩이 **한 번도 적용된 적이 없었다**는 점이다 — 게이트가 화이트리스트를 요청 확장에 넣기만 했을 뿐 하위 어디에서도 읽지 않아, 특정 계정에 묶인 키도 풀의 아무 계정으로나 처리되었다(모든 프로토콜 공통). 그 밖에: 클라이언트 IP는 여전히 위조 가능했고(`X-Forwarded-For`의 최좌측 항목, 즉 호출자가 직접 쓸 수 있는 항목을 채택했음), `api_keys.json` 손상 시 `next_id`가 0으로 돌아가 새 키가 이전 사용자의 사용 내역과 누적 지출을 그대로 물려받았으며, 종료 시 잔액 캐시와 이벤트 로그가 유실되었고, 업스트림 오류 본문이 저장되지 않아 패널의 실패 상세가 항상 비어 있었다. `temperature`·`max_tokens`·`tool_choice` 세 파라미터는 문서에만 있고 실제로는 무시되므로 그대로 명시했다. v0.2.1이 바인딩에 대해 작성한 회귀 테스트는 「값이 요청 확장에 도달했는지」를 검증했을 뿐 「계정 선택이 이를 따르는지」는 검증하지 않았다 — 죽은 기능이 테스트 전부 통과 상태로 출시된 이유가 이것이다. 이번 라운드에 추가한 모든 테스트는 수정 전 코드에서 실패하는 것을 직접 확인했다 |
 | 2026-07-27 | v0.2.1 - 🛠 후속 감사 수정: 적대적 검토로 확인된 39건의 문제(한 번도 감사한 적 없던 패널과 문서 포함). 보안: 비밀 정보가 담긴 파일(`api_keys.json`, `config.json`)이 누구나 읽을 수 있는 권한으로 저장되고, 수동으로 `chmod`해도 flush 때마다 조용히 다시 넓어지던 문제; 포트에 직접 닿을 수 있는 사람이면 누구나 클라이언트 IP를 위조할 수 있던 문제; 저장만 되고 실제로는 적용되지 않던 API-KEY의 자격 증명 바인딩. 수정: 대시보드를 열 때마다 `GET /api/admin/models`가 계정 풀 전체에 무제한 업스트림 조회를 유발하던 문제(이제 단일 실행·상한·쿨다운 적용); 손상된 자격 증명 파일을 빈 풀로 간주한 뒤 덮어써 모든 계정이 사라지던 문제(이제 백업 후 항목 단위로 복구); 종료 시 API-KEY 변경 사항이 유실되던 문제; OpenAI 병렬 도구 호출이 잘못된 도구 왕복을 만들던 문제; 일부 Gemini 페이로드(내장 도구, snake_case 키, 이미지가 아닌 `inlineData`)가 거부되거나 손상되던 문제; 2 MB 본문 제한이 약 1.5 MB 이미지를 거부하던 문제; 그 외 다수의 관리자/사용자 패널 수정 |
@@ -216,7 +217,7 @@ docker compose logs -f
 ```bash
 # 헬스 체크
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.3.1"}
+# {"service":"kiro2api","status":"ok","version":"0.4.0"}
 
 # 프로토콜 고정 모델 목록 조회
 curl http://localhost:8080/v1/models \

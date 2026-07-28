@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-28
+
+### Changed
+
+- **协议侧 `/models` 现在列出全部 17 个可服务模型,三个协议结果一致**。此前 `GET /v1/models`、`GET /claude/v1/models`、`GET /v1beta/models` 各自硬编码**三条**,而且三组**互不相同**(OpenAI 列 `claude-sonnet-4.5` / `claude-opus-4.6` / `gpt-5.6-sol`,Anthropic 列三条 claude,Gemini 又是另一组),管理接口却有 17 条。于是客户端"先列模型、再按列出的 id 调用"这条标准流程在本服务上不成立:列出来的只是残缺子集,换个协议看到的还不一样。现新增 `src/models_catalog.rs` 作为唯一目录,四个端点(三协议 + 管理侧静态回落)同源。测试保证目录里每个 id 都能被 `map_model` 识别(否则就是列出一个"调用即 400"的模型)、三协议逐项一致、id 不重复。
+  - 管理接口 `GET /api/admin/models` 行为不变:缓存有上游并集时仍优先回并集,本目录是它的回落项。协议侧一律用目录而不取并集 —— 客户端的模型发现需要稳定可预期的结果,不应随缓存冷热在重启前后变化,也不该为一次 `/models` 给账号池加压。
+
+### Documentation
+
+- 补齐此前从未写进 API 参考的 12 个线上路由:`/api/admin/restart`、`/api/admin/update`、`/api/admin/check-update`、`/api/admin/credits/global`、`/api/admin/usage/summary`、`/api/admin/usage/daily/{date}/records`、`/api/admin/credentials/{id}/throttle-logs`、`/api/admin/credentials/{id}/usage/today`、`/api/admin/credentials/models/refresh`、`/api/admin/credentials/{id}/models/refresh`、`/api/user/usage/records`,以及 `/admin/api/*` 旧别名组。
+- 五套 `API.md` 中关于协议侧 `/models` 的描述全部按上述变更重写(此前写作"固定短清单",并建议改用管理接口查真实可用模型 —— 该建议已不再必要)。
+
+
 ## [0.3.1] - 2026-07-28
 
 ### Fixed

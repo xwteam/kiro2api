@@ -196,7 +196,7 @@ data: [DONE]
 
 ### GET /openai/v1/models
 
-프로토콜 고정 모델 목록 조회 (컴파일 시점 고정 목록이며 계정 풀·구독 등급으로 필터링되지 않습니다 — 아래 ⚠️ 참고)
+프로토콜 모델 목록 조회 (컴파일 시점에 고정된 카탈로그. 계정 풀·구독 등급으로 필터링되지 않습니다 — 아래 💡 참고)
 
 **요청**:
 
@@ -205,28 +205,53 @@ curl http://localhost:8080/openai/v1/models \
   -H "Authorization: Bearer sk-당신의키"
 ```
 
-**응답**:
+**응답** (지면 관계로 앞 세 항목만 발췌. 실제로는 아래 「모델 카탈로그」 17종이 그 순서 그대로 실립니다):
 
 ```json
 {
   "object": "list",
   "data": [
-    {
-      "id": "claude-sonnet-4.5",
-      "object": "model",
-      "created": 1700000000,
-      "owned_by": "kiro2api"
-    }
+    {"id": "claude-sonnet-4.5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-sonnet-4.6", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-sonnet-5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"}
   ]
 }
 ```
 
-> 💡 **모델 선택 가이드**: 실제로 사용 가능한 모델은 **Kiro 계정의 구독 등급**에 따라 달라집니다.
-> - 무료 등급(KIRO FREE)은 보통 `claude-sonnet-4.5`만 인가됩니다.
-> - opus / GPT 계열 등은 더 높은 등급이 필요합니다.
+`object`는 항상 `"model"`이고, `created`(`1700000000`)와 `owned_by`(`"kiro2api"`)는 **모든 항목에 똑같이 박히는 하드코딩 상수**입니다 — 실제 공개 시각이나 소유자가 아니므로 정렬·필터에 쓰지 마십시오.
+
+**모델 카탈로그(세 프로토콜 공통)**:
+
+`GET /v1/models`(=`/openai/v1/models`) · `GET /claude/v1/models` · `GET /v1beta/models`(=`/gemini/v1beta/models`) 세 목록은 **모두 같은 카탈로그를 같은 순서로** 반환합니다(형식만 프로토콜별로 다릅니다). 카탈로그의 id는 전부 이 서비스의 모델명 매핑이 받아들이는 값이므로, **「목록에서 고른 id를 그대로 호출한다」는 흐름이 그대로 성립합니다**.
+
+| # | id | 표시 이름 | 컨텍스트 상한 |
+|---|----|----------|--------------|
+| 1 | `claude-sonnet-4.5` | Claude Sonnet 4.5 | 200,000 |
+| 2 | `claude-sonnet-4.6` | Claude Sonnet 4.6 | 200,000 |
+| 3 | `claude-sonnet-5` | Claude Sonnet 5 | 200,000 |
+| 4 | `claude-opus-4.5` | Claude Opus 4.5 | 200,000 |
+| 5 | `claude-opus-4.6` | Claude Opus 4.6 | 200,000 |
+| 6 | `claude-opus-4.7` | Claude Opus 4.7 | 200,000 |
+| 7 | `claude-opus-4.8` | Claude Opus 4.8 | 200,000 |
+| 8 | `claude-haiku-4.5` | Claude Haiku 4.5 | 200,000 |
+| 9 | `claude-fable-5` | Claude Fable 5 | 200,000 |
+| 10 | `deepseek-3.2` | DeepSeek 3.2 | 128,000 |
+| 11 | `glm-5` | GLM-5 | 128,000 |
+| 12 | `qwen3-coder-next` | Qwen3 Coder Next | 256,000 |
+| 13 | `minimax-m2.1` | MiniMax M2.1 | 192,000 |
+| 14 | `minimax-m2.5` | MiniMax M2.5 | 192,000 |
+| 15 | `gpt-5.6-terra` | GPT-5.6 Terra | 400,000 |
+| 16 | `gpt-5.6-luna` | GPT-5.6 Luna | 400,000 |
+| 17 | `gpt-5.6-sol` | GPT-5.6 Sol | 128,000 |
+
+> 「표시 이름」은 `GET /claude/v1/models`의 `display_name`과 `GET /api/admin/models`의 `display_name`에만 실립니다(OpenAI·Gemini 목록에는 아예 없는 필드입니다). 「컨텍스트 상한」은 카탈로그가 들고 있는 메타데이터로 `GET /api/admin/models`의 `max_tokens`로만 노출되며, 요청에 넣는 `max_tokens`는 여전히 무시됩니다(위 「생성 파라미터에 대한 주의」 참고).
+
+> 💡 **모델 선택 가이드**: 카탈로그에 있다고 호출이 반드시 통과하는 것은 아닙니다 — 실제 인가는 **Kiro 계정의 구독 등급**이 정하며, 이 서비스는 그 목록을 미리 알지 못합니다.
+> - 등급이 낮을수록(무료 등급 `KIRO FREE` 등) 인가되는 모델 수가 적고, 상위 등급(`KIRO PRO+` 등)일수록 많습니다.
+> - 어떤 계정에 무엇이 인가되어 있는지 실제로 알아보려면 `POST /api/admin/credentials/{id}/models/refresh`로 그 계정의 업스트림 목록을 가져온 뒤 `GET /api/admin/models`로 확인하십시오.
 > - 인가되지 않은 모델을 요청하면 정적 실패가 아니라 명확히 `400`(`INVALID_MODEL_ID`)을 반환합니다 — 헛되이 재시도하지 않고 계정을 손상시키지도 않습니다.
 >
-> ⚠️ 프로토콜의 `/models`는 **컴파일 시점에 고정된 짧은 목록**을 반환합니다. 계정 풀이나 구독 등급으로 필터링되지 않으며, 프로토콜마다 항목도 서로 다릅니다 — OpenAI: `claude-sonnet-4.5` / `claude-opus-4.6` / `gpt-5.6-sol`, Anthropic(`/claude/v1/models`): `claude-sonnet-4.5` / `claude-opus-4.6` / `claude-haiku-4.5`, Gemini(`/v1beta/models`): `claude-sonnet-4.5` / `claude-opus-4.6` / `gpt-5.6-sol`. 따라서 목록에 있는 모델이라도 등급이 인가하지 않으면 `400`(`INVALID_MODEL_ID`)이 날 수 있고, 반대로 목록에 없는 id도 이름 매핑만 되면 정상 동작합니다. 이름 매핑이 해석해 내는 내부 모델 id는 정적 카탈로그 17종에 `auto`를 더한 18종이며, 관리 API `GET /api/admin/models`는 계정들의 업스트림 합집합(캐시)을 우선 반환하고 합집합이 비어 있을 때만 그 정적 17종으로 대체합니다.
+> ⚠️ 프로토콜의 `/models`는 계정 풀이나 구독 등급으로 **필터링되지 않으며**, 목록을 만들려고 업스트림을 치지도 않습니다(컴파일 시점 카탈로그를 그대로 내보냅니다). 따라서 목록에 있는 모델이라도 등급이 인가하지 않으면 `400`(`INVALID_MODEL_ID`)이 날 수 있습니다. 반대로 카탈로그에 없는 표기라도 이름 매핑에 걸리면 정상 동작합니다(예: `gpt-5.6` → `gpt-5.6-sol`, `claude-3-5-sonnet` → `claude-sonnet-4.5`). 이름 매핑이 해석해 내는 내부 모델 id는 카탈로그 17종에 라우팅 별칭 `auto`를 더한 18종입니다. 관리 API `GET /api/admin/models`는 계정들의 업스트림 합집합(캐시)을 우선 반환하고, 합집합이 비어 있을 때 **바로 이 카탈로그 17종**으로 대체합니다.
 
 
 ### POST /openai/v1/responses
@@ -424,7 +449,7 @@ curl -X POST http://localhost:8080/claude/v1/messages \
 
 ### GET /claude/v1/models
 
-Claude(Anthropic) 형식 모델 목록. 베어 `/v1/models`가 OpenAI 형식을 반환하므로, Anthropic 형태 목록이 필요하면 이 경로를 사용합니다.
+Claude(Anthropic) 형식 모델 목록. 베어 `/v1/models`가 OpenAI 형식을 반환하므로, Anthropic 형태 목록이 필요하면 이 경로를 사용합니다. 내용물은 위 「모델 카탈로그」 17종으로 OpenAI·Gemini 목록과 **완전히 같고 순서도 같습니다** — 형식만 Anthropic 규격일 뿐, Claude 계열만 골라 담지 않습니다(`deepseek-3.2`, `glm-5`, `gpt-5.6-*` 등도 그대로 실립니다).
 
 **요청**:
 
@@ -432,6 +457,22 @@ Claude(Anthropic) 형식 모델 목록. 베어 `/v1/models`가 OpenAI 형식을 
 curl http://localhost:8080/claude/v1/models \
   -H "Authorization: Bearer sk-당신의키"
 ```
+
+**응답** (앞 두 항목만 발췌):
+
+```json
+{
+  "data": [
+    {"type": "model", "id": "claude-sonnet-4.5", "display_name": "Claude Sonnet 4.5", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "claude-sonnet-4.6", "display_name": "Claude Sonnet 4.6", "created_at": "2026-01-01T00:00:00Z"}
+  ],
+  "has_more": false,
+  "first_id": "claude-sonnet-4.5",
+  "last_id": "gpt-5.6-sol"
+}
+```
+
+> 이 엔드포인트만 Anthropic 공개 규격에 맞춰 **snake_case**입니다. `created_at`은 모든 항목에 똑같이 박히는 하드코딩 상수 `"2026-01-01T00:00:00Z"`이고, `has_more`는 **항상 `false`**(커서 페이지네이션 미구현)이며, `first_id`/`last_id`는 카탈로그의 첫·마지막 id입니다.
 
 ### POST /claude/v1/messages/count_tokens
 
@@ -463,7 +504,7 @@ curl -X POST http://localhost:8080/claude/v1/messages/count_tokens \
 
 ### GET /gemini/v1beta/models
 
-Gemini 모델 목록
+Gemini 모델 목록. 내용물은 위 「모델 카탈로그」 17종으로 OpenAI·Anthropic 목록과 같고 순서도 같으며, Gemini 규격대로 `name`에 `models/` 접두사가 붙습니다.
 
 **요청**:
 
@@ -471,6 +512,19 @@ Gemini 모델 목록
 curl http://localhost:8080/gemini/v1beta/models \
   -H "Authorization: Bearer sk-당신의키"
 ```
+
+**응답** (앞 두 항목만 발췌):
+
+```json
+{
+  "models": [
+    {"name": "models/claude-sonnet-4.5", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/claude-sonnet-4.6", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
+  ]
+}
+```
+
+> `supportedGenerationMethods`는 전 항목 공통의 하드코딩 상수 2종입니다(`countTokens`는 여기에 넣지 않습니다). `displayName`은 채우지 않으므로 **응답에 아예 나타나지 않습니다** — 표시 이름이 필요하면 `GET /claude/v1/models` 또는 `GET /api/admin/models`를 쓰십시오.
 
 ### POST /gemini/v1beta/models/{model}:generateContent
 
@@ -759,7 +813,7 @@ curl http://localhost:8080/api/admin/api-keys/usage \
 
 ### GET /api/admin/usage/daily
 
-일별 사용량 요약 (특정 날짜 기록은 `.../daily/{date}/records`, 계정별 기록은 `/api/admin/credentials/{id}/usage/records`·`.../usage/today`)
+일별(CST=UTC+8) 사용량 요약, 날짜 내림차순. 특정 날짜의 개별 기록은 아래 `.../daily/{date}/records`, 계정 단위는 `/api/admin/credentials/{id}/usage/records`와 `.../usage/today` 항목을 보십시오.
 
 **요청**:
 
@@ -767,6 +821,126 @@ curl http://localhost:8080/api/admin/api-keys/usage \
 curl http://localhost:8080/api/admin/usage/daily \
   -H "Authorization: Bearer sk-당신의키"
 ```
+
+### GET /api/admin/usage/daily/{date}/records
+
+특정 CST 날짜의 사용량 기록 페이지 조회
+
+`{date}`는 `YYYY-MM-DD`(CST=UTC+8) 형식입니다. 최신순(내림차순)으로 정렬한 뒤 **2000건까지 자르고 나서** 페이지를 나누므로, `total`은 그날의 전체 건수가 아니라 잘린 뒤의 건수입니다. 존재하지 않는 날짜나 빈 저장소도 `404`가 아니라 빈 페이지(`total: 0`, `totalPages: 0`, `page: 1`)를 200으로 돌려줍니다.
+
+**페이지 파라미터(관리 API 공통)**: `page`(기본 `1`) / `page_size`(기본 `20`). 이름은 응답과 달리 **snake_case**입니다. 범위를 벗어난 `page`는 `[1, totalPages]`로 조여지고 `page_size=0`은 1로 올라갑니다.
+
+**요청**:
+
+```bash
+curl "http://localhost:8080/api/admin/usage/daily/2026-07-25/records?page=1&page_size=20" \
+  -H "Authorization: Bearer sk-당신의키"
+```
+
+**응답**:
+
+```json
+{
+  "records": [
+    {
+      "model": "claude-sonnet-4.5",
+      "inputTokens": 1200,
+      "outputTokens": 340,
+      "estimatedCost": 0.0123,
+      "creditsUsed": 0.25,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "createdAt": "2026-07-25T09:12:33Z",
+      "credentialId": 12345,
+      "credentialLabel": "a@example.com",
+      "clientIp": "203.0.113.7"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "pageSize": 20,
+  "totalPages": 1
+}
+```
+
+> `creditsUsed` / `cacheReadInputTokens` / `cacheCreationInputTokens` / `credentialLabel` / `clientIp`는 값이 없으면 `null`이 아니라 **필드 자체가 빠집니다**. `creditsUsed`는 업스트림이 보고한 실제 적립금 소비량이지 `estimatedCost`에서 환산한 값이 **아닙니다**(업스트림이 주지 않으면 필드가 없고, 이 API는 비용에서 역산하지 않습니다). `credentialLabel`은 저장된 값이 아니라 계정 풀에서 닉네임 → 이메일 → `#{id}` 순으로 만들어 붙이는 표시용 이름입니다. `creditsSaved`는 이 저장소가 산출하지 않으므로 **항상 빠집니다**.
+
+### GET /api/admin/usage/summary
+
+시간 창 단위 사용량 집계 + 운영 건강 지표 (전 계정 합산)
+
+쿼리 파라미터는 둘 중 하나입니다 — `range`(`6h` | `24h` | `3d` | `7d` | `30d`, 이쪽이 우선) 또는 `hours`(양의 정수). 둘 다 없으면 **24h**로 봅니다. 열거값 밖의 `range`는 `400` + `{"error":"invalid range","allowed":["6h","24h","3d","7d","30d"],"hint":"use ?range=<enum> or ?hours=<positive int>"}`, `hours=0`은 `400` + `{"error":"hours must be a positive integer"}`. 빈 저장소나 활동 없는 창은 200 + 전부 0입니다.
+
+**요청**:
+
+```bash
+curl "http://localhost:8080/api/admin/usage/summary?range=24h" \
+  -H "Authorization: Bearer sk-당신의키"
+```
+
+**응답**:
+
+```json
+{
+  "range": "24h",
+  "windowSecs": 86400,
+  "sinceUnix": 1753400000,
+  "untilUnix": 1753486400,
+  "bucketSecs": 3600,
+  "totalRequests": 128,
+  "totalInputTokens": 240000,
+  "totalOutputTokens": 61000,
+  "totalCost": 1.2345,
+  "totalCredits": 32.0,
+  "dailyFallbackApplied": false,
+  "series": [
+    {"bucketStartUnix": 1753400000, "totalRequests": 12, "totalCost": 0.11, "totalCredits": 0.15}
+  ],
+  "successfulRequests": 128,
+  "failedRequests": 3,
+  "errorRate": 0.022900763358778626,
+  "avgLatencyMs": 1843.5,
+  "rotationSuccessRate": 0.9770992366412213
+}
+```
+
+> - `range`는 입력을 정규화해 되돌려 준 라벨입니다(`hours=N`으로 물었으면 `"<N>h"`). 창은 `[untilUnix - windowSecs, untilUnix]`이고 `untilUnix`는 요청 처리 시각입니다.
+> - `bucketSecs`는 창이 24시간 이하면 3600(시간별), 그보다 길면 86400(일별)입니다. `series`는 버킷 시작 오름차순이며 활동이 없으면 빈 배열입니다.
+> - 창이 **1일보다 길면** 원본 기록의 계정당 상한(10000건) 탓에 오래된 건이 이미 밀려났을 수 있어, 창에 통째로 들어가는 CST 하루마다 일별 집계와 대조해 `max(원본, 일별)`의 차액으로 requests/cost/credits만 메웁니다. 그렇게 메웠으면 `dailyFallbackApplied: true`가 되며, **토큰 합계는 메우지 않으므로 낮게 나올 수 있습니다**.
+> - `failedRequests`는 창 안의 실패 로그(401/403) + 스로틀 로그(429) 건수입니다. 이벤트 로그는 계정당 500건 LRU 상한이 있어 이 값은 **하한**이고, 따라서 `errorRate`는 보수적으로(낮게) 나옵니다.
+> - `avgLatencyMs`는 지연이 기록된 성공 건만의 평균이며(옛 기록에는 지연이 없습니다) 표본이 하나도 없으면 `0.0`입니다.
+> - `rotationSuccessRate`는 `1 − errorRate`인 **근사치**입니다 — 계정 교체 재시도 자체를 따로 계측하지 않고 "성공 기록이 남았는가"를 성공 신호로 삼습니다. 창 안에 활동이 전혀 없으면 `errorRate: 0.0` / `rotationSuccessRate: 1.0`.
+> - `totalCredits`는 각 기록에 실린 **업스트림 보고 적립금 소비량의 합**입니다 — `totalCost`에서 환산한 값이 아니며, 적립금 값이 없는 기록은 0으로 칩니다.
+> - 수치는 전부 반올림하지 않은 원본이므로 자릿수는 클라이언트가 알아서 다듬으십시오.
+
+### GET /api/admin/credentials/{id}/usage/today
+
+계정 1건의 **오늘**(CST=UTC+8) 사용량 요약
+
+쿼리 파라미터 없음. 알 수 없는 id도 `404`가 아니라 전부 0인 요약을 200으로 돌려줍니다. `credentialId`는 경로의 id를 u32로 파싱한 값이며, 숫자가 아니면 `0`이 됩니다.
+
+**요청**:
+
+```bash
+curl http://localhost:8080/api/admin/credentials/12345/usage/today \
+  -H "Authorization: Bearer sk-당신의키"
+```
+
+**응답**:
+
+```json
+{
+  "date": "2026-07-25",
+  "credentialId": 12345,
+  "totalRequests": 42,
+  "totalInputTokens": 81000,
+  "totalOutputTokens": 20500,
+  "totalCost": 0.4321,
+  "totalCredits": 10.5
+}
+```
+
+> `totalCreditsSaved`는 이 저장소가 산출하지 않아 **항상 빠집니다**. `totalCredits`는 업스트림이 보고한 적립금 소비량의 합이며 `totalCost`에서 환산한 값이 아닙니다. 집계 대상은 살아 있는 원본 기록뿐이므로, 오늘 하루 요청이 계정당 상한(10000건)을 넘길 만큼 많으면 밀려난 만큼 낮게 나옵니다.
 
 ### GET /api/admin/credentials/{id}/balance
 
@@ -779,9 +953,35 @@ curl http://localhost:8080/api/admin/credentials/12345/balance \
   -H "Authorization: Bearer sk-당신의키"
 ```
 
+### GET /api/admin/credits/global
+
+전 계정 잔여 적립금 합계 (**캐시만 읽고 업스트림은 절대 호출하지 않음**)
+
+풀에 있는 각 계정의 잔액 캐시(5분 TTL) 중 **아직 신선한 것만** 골라 `remaining`을 더합니다. 캐시가 없거나 만료된 계정은 그냥 건너뜁니다 — 이 엔드포인트는 새 값을 가져오지 않으며, 캐시를 채우는 쪽은 위 `GET /api/admin/credentials/{id}/balance`입니다. 쿼리 파라미터 없음, 항상 200.
+
+**요청**:
+
+```bash
+curl http://localhost:8080/api/admin/credits/global \
+  -H "Authorization: Bearer sk-당신의키"
+```
+
+**응답**:
+
+```json
+{
+  "globalCredits": 1234.5,
+  "cachedCount": 3,
+  "totalCount": 5,
+  "oldestCacheUnix": 1753486000
+}
+```
+
+> `cachedCount`(합계에 실제로 참여한 계정 수)가 `totalCount`(풀 전체 계정 수)보다 작으면 그 차이만큼 **합계가 과소 집계된 상태**라는 뜻이므로 그대로 "전체 잔액"이라고 표시하지 마십시오. `oldestCacheUnix`는 합계에 참여한 캐시 중 가장 오래된 것의 취득 시각(Unix 초)이며, 참여한 계정이 하나도 없으면 **`null`**입니다(필드는 빠지지 않고 항상 나옵니다).
+
 ### GET /api/admin/credentials/{id}/failure-logs
 
-최근 실패 이벤트 (스로틀 이벤트는 `.../throttle-logs`)
+최근 실패 이벤트(401/403). 429 스로틀 이벤트는 아래 `.../throttle-logs` 항목을 보십시오.
 
 **요청**:
 
@@ -789,6 +989,41 @@ curl http://localhost:8080/api/admin/credentials/12345/balance \
 curl http://localhost:8080/api/admin/credentials/12345/failure-logs \
   -H "Authorization: Bearer sk-당신의키"
 ```
+
+### GET /api/admin/credentials/{id}/throttle-logs
+
+계정 1건의 429 스로틀 이벤트 페이지 조회
+
+페이지 파라미터는 관리 API 공통(`page` 기본 `1` / `page_size` 기본 `20`)이고, 응답 모양도 위 `.../failure-logs`와 같습니다. 알 수 없는 id나 빈 저장소도 `404`가 아니라 빈 페이지를 200으로 돌려줍니다.
+
+**요청**:
+
+```bash
+curl "http://localhost:8080/api/admin/credentials/12345/throttle-logs?page=1&page_size=20" \
+  -H "Authorization: Bearer sk-당신의키"
+```
+
+**응답**:
+
+```json
+{
+  "records": [
+    {
+      "credentialId": 12345,
+      "requestType": "api",
+      "statusCode": 429,
+      "responseBody": "{\"message\":\"Too many requests\"}",
+      "createdAt": "2026-07-25T09:12:33Z"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "pageSize": 20,
+  "totalPages": 1
+}
+```
+
+> `statusCode`는 이 로그에서 **항상 429**입니다(기록 시점에 상수로 박습니다). `requestType`도 현재 중계가 남기는 값이 `"api"` 하나뿐입니다. `responseBody`는 업스트림 응답 본문을 **200자**에서 자른 것입니다(실패 로그 쪽은 2000자). 이벤트는 계정당 500건 LRU 상한이라 오래된 것부터 밀려납니다.
 
 ### GET /api/admin/rpm
 
@@ -871,9 +1106,90 @@ curl http://localhost:8080/api/admin/server-info \
   -H "Authorization: Bearer sk-당신의키"
 ```
 
+### GET /api/admin/check-update
+
+GitHub Releases의 최신 버전과 현재 실행 중인 버전 비교 (읽기 전용, 아무것도 바꾸지 않음)
+
+`https://api.github.com/repos/xwteam/kiro2api/releases/latest`를 조회해 `tag_name`에서 앞의 `v`를 떼고 빌드에 박힌 버전과 **문자열 비교**합니다. 네트워크 실패·릴리스 없음·비공개 저장소 404 등은 오류로 만들지 않고 보수적으로 `hasUpdate: false` / `latest = current` / `updateUrl = https://github.com/xwteam/kiro2api/releases` / `releaseNotes = ""`로 답합니다 — **항상 200**이므로 "확인에 실패했는지"는 이 응답만으로 구분할 수 없습니다.
+
+**요청**:
+
+```bash
+curl http://localhost:8080/api/admin/check-update \
+  -H "Authorization: Bearer sk-당신의키"
+```
+
+**응답**:
+
+```json
+{
+  "current": "0.4.0",
+  "latest": "0.4.1",
+  "hasUpdate": true,
+  "updateUrl": "https://github.com/xwteam/kiro2api/releases/tag/v0.4.1",
+  "releaseNotes": "릴리스 노트 본문"
+}
+```
+
+> `hasUpdate`는 `latest != current`라는 단순 문자열 불일치이므로 태그가 되돌아가면 다운그레이드도 `true`가 됩니다(의미 기반 버전 비교가 아닙니다). `updateUrl`은 릴리스의 `html_url`이고 그게 없으면 저장소 릴리스 목록 주소로 대체하며, `releaseNotes`는 릴리스 본문 원문(없으면 빈 문자열)입니다.
+
+### POST /api/admin/update
+
+업데이트 **명령문만** 돌려줍니다 — 서버는 아무것도 실행하지 않습니다
+
+요청 본문 없음. 세 필드 모두 하드코딩된 상수이고 실제 업데이트는 운영자가 서버에서 직접 실행해야 합니다(패널은 이 문자열을 복사 버튼과 함께 보여줄 뿐입니다). 항상 200.
+
+**요청**:
+
+```bash
+curl -X POST http://localhost:8080/api/admin/update \
+  -H "Authorization: Bearer sk-당신의키"
+```
+
+**응답**:
+
+```json
+{
+  "status": "ok",
+  "message": "请在服务器上执行以下命令完成更新:",
+  "command": "docker compose pull && docker compose up -d"
+}
+```
+
+> `message`는 서버가 내보내는 **문자 그대로의 값**이며 현재 중국어로 하드코딩되어 있습니다(뜻: "서버에서 다음 명령을 실행해 업데이트를 완료하세요:"). `status`도 상수 `"ok"`라 성공/실패 신호로 쓸 수 없습니다.
+
+### POST /api/admin/restart
+
+프로세스를 종료해 재기동을 유도합니다 (**파괴적 · 2차 확인 필수**)
+
+`?confirm=true`가 없으면 아무 일도 하지 않고 `400`입니다. 확인이 있으면 먼저 200을 돌려준 뒤, 백그라운드에서 0.5초 기다렸다가 디바운스 저장소(사용량 통계 · API Key · 잔액 캐시 · 실패/스로틀 이벤트 로그)를 전부 디스크에 내리고 `exit(0)` 합니다. **되살리는 주체는 이 서비스가 아니라 실행 환경입니다** — `restart: unless-stopped`로 도는 컨테이너면 곧바로 다시 뜨지만, 감시자 없는 베어메탈에서는 그냥 정지이므로 systemd/supervisor 같은 보호 장치가 필요합니다.
+
+**요청**:
+
+```bash
+curl -X POST "http://localhost:8080/api/admin/restart?confirm=true" \
+  -H "Authorization: Bearer sk-당신의키"
+```
+
+**응답**:
+
+```json
+{"status": "ok", "message": "Server restarting..."}
+```
+
+두 값 모두 하드코딩된 상수입니다. 확인 없이 부르면 `400`:
+
+```json
+{"error": {"message": "重启需二次确认,请带查询参数 ?confirm=true", "type": "confirmation_required"}}
+```
+
+> 이 `message`도 서버가 내보내는 문자 그대로의 값입니다(뜻: "재시작에는 2차 확인이 필요합니다. 쿼리 파라미터 `?confirm=true`를 붙이십시오"). 분기에는 문구가 아니라 `type: "confirmation_required"`를 보십시오.
+
 ### GET /api/admin/models
 
-`display_name` / `type` / `max_tokens`를 포함한 모델 목록. 계정들의 업스트림 `ListAvailableModels` 합집합(캐시)을 우선 반환하고, 합집합이 비어 있으면 정적 17종 목록으로 대체합니다 — 즉 프로토콜의 `/v1/models`가 반환하는 고정 3종보다 **넓은 집합**입니다. 응답 필드명은 패널에 맞춰 **snake_case**입니다(`display_name`, `owned_by`, `max_tokens`).
+`display_name` / `type` / `max_tokens`를 포함한 모델 목록. 동작은 그대로입니다 — 계정들의 업스트림 `ListAvailableModels` 합집합(캐시)이 비어 있지 않으면 그것을 반환하고, 비어 있으면 세 프로토콜의 `/models`가 쓰는 것과 **똑같은 카탈로그 17종**으로 대체합니다. 즉 캐시가 식어 있는 동안에는 프로토콜 목록과 내용이 같고, 캐시가 채워지면 계정 등급이 실제로 인가한 집합을 반영합니다(합집합에만 있는 모델도, 카탈로그에만 있고 합집합에는 없는 모델도 생길 수 있습니다). 응답 필드명은 패널에 맞춰 **snake_case**입니다(`display_name`, `owned_by`, `max_tokens`, 그리고 `type`).
+
+합집합이 비어 있을 때는 이번 응답을 정적 카탈로그로 돌려주면서 뒤에서 회수를 한 번 시도합니다(응답을 막지 않으며, 단일 비행 + 60초 쿨다운 + 실패 상한이 걸려 있습니다). 즉시 채우고 싶으면 아래 `POST /api/admin/credentials/models/refresh`를 쓰십시오.
 
 **요청**:
 
@@ -881,6 +1197,83 @@ curl http://localhost:8080/api/admin/server-info \
 curl http://localhost:8080/api/admin/models \
   -H "Authorization: Bearer sk-당신의키"
 ```
+
+**응답** (앞 한 항목만 발췌):
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "claude-sonnet-4.5",
+      "object": "model",
+      "created": 1700000000,
+      "owned_by": "kiro2api",
+      "display_name": "Claude Sonnet 4.5",
+      "type": "chat",
+      "max_tokens": 200000
+    }
+  ]
+}
+```
+
+> `created`(`1700000000`)와 `type`(`"chat"`)은 하드코딩 상수입니다. `owned_by`는 정적 카탈로그로 대체할 때 `"kiro2api"`이고, 업스트림 합집합을 낼 때는 업스트림 값이 아니라 **id에서 추론한 제공자**(`anthropic` / `openai` / `deepseek` / `minimax` / `glm` / `qwen` / `kiro`, 어디에도 안 걸리면 `unknown`)가 들어갑니다. 합집합 경로의 `display_name`은 업스트림 값이며 업스트림이 주지 않으면 id를 그대로 씁니다. `rate_multiplier`는 업스트림이 주지 않으면 **필드 자체가 빠집니다**(정적 대체 경로에서는 항상 빠집니다). 업스트림 항목의 `max_tokens`가 0이면 200000으로 채워 내보냅니다.
+
+### POST /api/admin/credentials/models/refresh
+
+구독 등급별 대표 계정만 골라 모델 목록 캐시를 채웁니다 (**업스트림 실호출**)
+
+요청 본문 없음. 전 계정을 훑지 않습니다 — 비활성 계정을 뺀 뒤 잔액 캐시가 등급을 알고 있는 계정들에 대해 **등급마다 대표 1개**만 갱신하고(등급이 다르면 서비스되는 모델도 다르므로 그 합집합이 전 등급을 덮습니다), 등급을 아직 모르는 계정에는 **한계가 걸린 탐색**을 돌립니다: 합집합 크기가 연속 3회 늘지 않거나, 성공이 12건에 도달하거나, 후보가 떨어지면 멈춥니다. 개별 계정 실패는 `errors[]`에 모으고 나머지는 계속 진행하므로 **전부 실패해도 HTTP는 200 + `success: true`**입니다 — 성패는 `failed`와 `errors[]`로 판단하십시오.
+
+**요청**:
+
+```bash
+curl -X POST http://localhost:8080/api/admin/credentials/models/refresh \
+  -H "Authorization: Bearer sk-당신의키"
+```
+
+**응답**:
+
+```json
+{
+  "success": true,
+  "refreshed": 2,
+  "failed": 1,
+  "errors": [
+    {"id": 12346, "error": "models upstream HTTP 403: Your User ID is suspended"}
+  ],
+  "tiers": ["KIRO FREE", "KIRO PRO+"]
+}
+```
+
+> 「등급」은 잔액 캐시에 담긴 구독 이름(`KIRO FREE`, `KIRO PRO+` 등)이며, 캐시가 신선(5분 TTL)할 때만 인정됩니다. `tiers`는 이번 호출이 실제로 덮은 등급 목록이고, 끝내 등급을 알 수 없는 계정을 갱신했으면 `"unknown"`이 섞입니다. `errors[].id`는 계정 id를 **숫자로** 파싱한 값이라 숫자가 아닌 id는 `0`이 됩니다(아래 단건 엔드포인트는 같은 id를 문자열로 되돌려 주므로 형이 다릅니다). 재기동 직후처럼 신선한 잔액 캐시가 하나도 없으면 알려진 등급이 0개라 탐색만 돌게 되고, 그 탐색까지 전부 실패하면 `refreshed: 0`으로 끝날 수도 있습니다.
+
+### POST /api/admin/credentials/{id}/models/refresh
+
+계정 1건의 모델 목록을 업스트림에서 실제로 가져와 캐시에 채웁니다
+
+요청 본문 없음. 풀에 없는 id면 `404` + `{"error":"account not found","id":"…"}`이고, 업스트림 호출이 실패하면 `502`입니다. 비활성 계정이라는 이유로 거부하지는 않습니다.
+
+**요청**:
+
+```bash
+curl -X POST http://localhost:8080/api/admin/credentials/12345/models/refresh \
+  -H "Authorization: Bearer sk-당신의키"
+```
+
+**응답**:
+
+```json
+{"success": true, "id": "12345", "count": 18}
+```
+
+`count`는 업스트림 응답을 정규화하고 중복 id를 제거한 뒤 캐시에 넣은 모델 개수입니다(계정 등급에 따라 달라집니다). 업스트림 실패 시 `502`:
+
+```json
+{"success": false, "id": "12345", "error": "models upstream HTTP 403: Your User ID is suspended"}
+```
+
+> `error`에는 상태 코드와 업스트림 설명이 그대로 실려 화면에 진짜 원인을 띄울 수 있습니다. 토큰류는 포함되지 않습니다.
 
 ### GET /api/admin/logs/stream
 
@@ -903,6 +1296,32 @@ curl "http://localhost:8080/api/admin/logs/stream?api_key=sk-당신의키"
 ```bash
 curl http://localhost:8080/api/admin/logs/snapshot \
   -H "Authorization: Bearer sk-당신의키"
+```
+
+### POST /admin/api/accounts/{id}/disable · POST /admin/api/accounts/{id}/enable (레거시 별칭)
+
+계정 수동 비활성화/활성화. 위 `POST /api/admin/credentials/{id}/disabled`와 **같은 일**(풀에 있는 그 계정의 `disabled` 플래그를 뒤집기)을 하는 구 경로이므로 계약을 여기서 되풀이하지 않습니다. 다만 **모양이 다릅니다**:
+
+- 요청 본문이 없습니다 — 켜고 끄는 것을 본문의 `disabled`가 아니라 **경로**(`/enable` 대 `/disable`)로 정합니다.
+- 성공 응답이 `{success,message}`가 아니라 `{ok,id,disabled}`이고, `id`는 경로에 넣은 문자열 그대로입니다.
+- 없는 id일 때 `404` + `{"error":"account not found","id":"…"}`인 것은 양쪽이 같습니다.
+
+새로 붙이는 통합에는 `/api/admin/credentials/{id}/disabled` 쪽을 쓰십시오. 두 경로 모두 같은 admin 게이트 뒤에 있습니다.
+
+**요청**:
+
+```bash
+curl -X POST http://localhost:8080/admin/api/accounts/12345/disable \
+  -H "Authorization: Bearer sk-당신의키"
+
+curl -X POST http://localhost:8080/admin/api/accounts/12345/enable \
+  -H "Authorization: Bearer sk-당신의키"
+```
+
+**응답**:
+
+```json
+{"ok": true, "id": "12345", "disabled": true}
 ```
 
 ## 사용자 API
@@ -939,7 +1358,7 @@ curl -X POST http://localhost:8080/api/user/login \
 
 ### GET /api/user/usage
 
-해당 key의 사용량 요약 (`byModel[]` 포함. 페이지 기록은 `.../usage/records?page=&page_size=`)
+해당 key의 사용량 요약 (`byModel[]` 포함). 개별 기록 페이지는 아래 `.../usage/records` 항목을 보십시오.
 
 **요청**:
 
@@ -947,6 +1366,47 @@ curl -X POST http://localhost:8080/api/user/login \
 curl http://localhost:8080/api/user/usage \
   -H "x-api-key: sk-당신의키"
 ```
+
+### GET /api/user/usage/records
+
+해당 key의 사용량 기록 페이지 조회 (최신순)
+
+`page`(기본 `1`) / `page_size`(**기본 `50`** — 관리 API 쪽 기본값 20과 다릅니다). 인증은 이 절 머리말대로 헤더 3종에서만 읽으며 쿼리로는 key를 넘길 수 없고, key가 유효하지 않으면 `401` + `{"error":"…"}`입니다. 유효한 key인데 기록이 없으면 빈 페이지를 200으로 돌려줍니다.
+
+**요청**:
+
+```bash
+curl "http://localhost:8080/api/user/usage/records?page=1&page_size=50" \
+  -H "x-api-key: sk-당신의키"
+```
+
+**응답**:
+
+```json
+{
+  "records": [
+    {
+      "model": "claude-sonnet-4.5",
+      "inputTokens": 1200,
+      "outputTokens": 340,
+      "estimatedCost": 0.0123,
+      "creditsUsed": 0.25,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "createdAt": "2026-07-25T09:12:33Z",
+      "clientIp": "203.0.113.7"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "pageSize": 50,
+  "totalPages": 1
+}
+```
+
+> 관리 API의 같은 이름 응답과 달리 `credentialId`라는 필드가 **아예 없고**(어느 계정으로 중계됐는지는 사용자 면에 노출하지 않습니다), `credentialLabel`과 `creditsSaved`도 채우지 않으므로 **항상 빠집니다**. `creditsUsed` / `cacheReadInputTokens` / `cacheCreationInputTokens` / `clientIp`도 값이 없으면 필드째 빠집니다.
+>
+> 이 절 머리말의 `credits = cost / 0.72`는 **요약**(`POST /api/user/login`·`GET /api/user/usage`의 `totalCredits`)에만 해당하는 환산식입니다. 여기 기록 하나하나의 `creditsUsed`는 업스트림이 보고한 실제 소비량이라 `estimatedCost / 0.72`와 일치하지 않는 것이 정상이며, 둘을 더해 비교하지 마십시오.
 
 ## 운영
 
@@ -963,7 +1423,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.3.1"}
+{"service":"kiro2api","status":"ok","version":"0.4.0"}
 ```
 
 ### GET /v1/ping

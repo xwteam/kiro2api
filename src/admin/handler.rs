@@ -212,36 +212,24 @@ fn model_item_from_info(m: &crate::models_cache::ModelInfo) -> ModelItem {
 }
 
 /// 静态 17 模型目录(动态并集为空时的回落)。抽成独立函数以便动态/回落两路共用形状。
+/// 静态回落目录:上游模型并集缓存为空时用它作答。
+///
+/// 内容来自 [`crate::models_catalog::CATALOG`] —— 与三个协议侧 `/models` 同一份数据源,
+/// 改一处即四个端点同步生效,不会再出现"管理面 17 条、协议侧各三条且互不相同"的分裂。
 fn build_static_model_list() -> Vec<ModelItem> {
-    let mk = |id: &str, name: &str, max: u32| ModelItem {
-        id: id.to_string(),
-        object: "model".to_string(),
-        created: MODEL_CREATED,
-        owned_by: "kiro2api".to_string(),
-        display_name: name.to_string(),
-        kind: "chat".to_string(),
-        max_tokens: max,
-        rate_multiplier: None,
-    };
-    vec![
-        mk("claude-sonnet-4.5", "Claude Sonnet 4.5", 200_000),
-        mk("claude-sonnet-4.6", "Claude Sonnet 4.6", 200_000),
-        mk("claude-sonnet-5", "Claude Sonnet 5", 200_000),
-        mk("claude-opus-4.5", "Claude Opus 4.5", 200_000),
-        mk("claude-opus-4.6", "Claude Opus 4.6", 200_000),
-        mk("claude-opus-4.7", "Claude Opus 4.7", 200_000),
-        mk("claude-opus-4.8", "Claude Opus 4.8", 200_000),
-        mk("claude-haiku-4.5", "Claude Haiku 4.5", 200_000),
-        mk("claude-fable-5", "Claude Fable 5", 200_000),
-        mk("deepseek-3.2", "DeepSeek 3.2", 128_000),
-        mk("glm-5", "GLM-5", 128_000),
-        mk("qwen3-coder-next", "Qwen3 Coder Next", 256_000),
-        mk("minimax-m2.1", "MiniMax M2.1", 192_000),
-        mk("minimax-m2.5", "MiniMax M2.5", 192_000),
-        mk("gpt-5.6-terra", "GPT-5.6 Terra", 400_000),
-        mk("gpt-5.6-luna", "GPT-5.6 Luna", 400_000),
-        mk("gpt-5.6-sol", "GPT-5.6 Sol", 128_000),
-    ]
+    crate::models_catalog::CATALOG
+        .iter()
+        .map(|e| ModelItem {
+            id: e.id.to_string(),
+            object: "model".to_string(),
+            created: MODEL_CREATED,
+            owned_by: "kiro2api".to_string(),
+            display_name: e.display_name.to_string(),
+            kind: "chat".to_string(),
+            max_tokens: e.max_tokens,
+            rate_multiplier: None,
+        })
+        .collect()
 }
 
 /// `GET /api/admin/models`:返回各账号上游 `ListAvailableModels` 并集(缓存命中即用),

@@ -575,24 +575,16 @@ pub async fn chat_completions(
 
 /// axum handler:`GET /v1/models`(与 `/openai/v1/models` 共用)。固定列表,不读时钟。
 pub async fn models() -> Json<ModelList> {
+    // 目录来自 `models_catalog::CATALOG`,与 Anthropic / Gemini 侧 `/models` 及管理端点的
+    // 静态回落同源。此前这里硬编码三条、且三个协议各列各的,客户端"先列模型再按 id 调用"
+    // 会拿到一个残缺且随协议而异的子集。
     const FIXED_CREATED: u64 = 1_700_000_000;
-    Json(ModelList::new(vec![
-        ModelObject::new(
-            "claude-sonnet-4.5".to_string(),
-            FIXED_CREATED,
-            "kiro2api".to_string(),
-        ),
-        ModelObject::new(
-            "claude-opus-4.6".to_string(),
-            FIXED_CREATED,
-            "kiro2api".to_string(),
-        ),
-        ModelObject::new(
-            "gpt-5.6-sol".to_string(),
-            FIXED_CREATED,
-            "kiro2api".to_string(),
-        ),
-    ]))
+    Json(ModelList::new(
+        crate::models_catalog::CATALOG
+            .iter()
+            .map(|e| ModelObject::new(e.id.to_string(), FIXED_CREATED, "kiro2api".to_string()))
+            .collect(),
+    ))
 }
 
 /// 带自身状态的 OpenAI 兼容子路由(供 `build_router` 合并;与 `/v1/messages` 同一 `MessagesState`)。

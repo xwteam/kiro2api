@@ -17,6 +17,7 @@ pub mod http;
 pub mod kiro;
 pub mod logcap;
 pub mod models_cache;
+pub mod models_catalog;
 pub mod protocol;
 pub mod server;
 pub mod stats;

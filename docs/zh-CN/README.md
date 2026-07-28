@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.3.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.4.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-07-28 | v0.4.0 - 协议侧 `/models` 现在列出全部 17 个可服务模型,三个协议结果一致。此前 `GET /v1/models`、`GET /claude/v1/models`、`GET /v1beta/models` 各自硬编码**三条且互不相同**,而管理接口有 17 条——客户端「先列模型再按 id 调用」拿到的只是残缺子集,换个协议看到的还不一样。现由唯一目录 `src/models_catalog.rs` 支撑四个端点,并有测试保证目录里每个 id 都能被 `map_model` 识别、三协议逐项一致。另补齐 12 个从未写进 API 参考的线上路由 |
 | 2026-07-28 | v0.3.1 - `POST /v1/messages/count_tokens` 的畸形请求体回 axum 默认的纯文本 `422` 而非 Anthropic 错误体。v0.3.0 把四个协议对话端点都改成了显式接管拒收,唯独漏了这个同属 Anthropic 协议、同样由 SDK 直接调用的端点——SDK 用 `response.json()` 读纯文本只会抛解析异常,真正的失败原因被吞掉 |
 | 2026-07-28 | v0.3.0 - 🔍 对 v0.2.1 自身修复的独立复查。39 条确认项里**有 9 条只关掉了一部分**却被写成已完成,另有 **13 条候选从未被裁决**(复核者中途崩溃),其中 12 条确属真实缺陷,本版把这 21 处全部关掉。最要紧的一条:v0.2.1 宣称「已真正生效」的 API-KEY 凭据绑定**从头到尾没有生效过**——鉴权闸把白名单解析出来塞进请求扩展,而下游没有任何代码读它,绑定到某个账号的 key 照样被分到池里任意账号,四协议皆然。另修:客户端 IP 仍可伪造(`X-Forwarded-For` 取的是最左项,恰恰是调用方能写死的那一项);`api_keys.json` 损坏时 `next_id` 仍会归零,新建的 key 直接继承前任的用量明细与累计消费;停机仍会丢掉余额缓存与事件日志;上游错误体从未落库,面板失败详情线上恒空;`temperature`、`max_tokens`、`tool_choice` 三个参数文档写了但根本不生效,现已如实标注。v0.2.1 给绑定写的回归测试断言的是「值传到了请求扩展」,而不是「选号照它执行」——这正是一个死功能能带着全绿测试发版的原因;本轮每条修复的测试都先在修复前的代码上跑过、亲眼看它失败 |
 | 2026-07-27 | v0.2.1 - 🔒 二轮审计修复（对抗式复核确认 39 项，含此前从未审计过的面板与文档）：密钥文件（`api_keys.json`、`config.json`）此前以全局可读权限落盘，手动 `chmod` 后每次写盘又被悄悄改回；客户端 IP 可被直连端口的任何人伪造；API-KEY 的凭据绑定只存不生效；`GET /api/admin/models` 每次打开面板都触发全量账号池上游扫描（改为单飞、限量并加冷却）；凭据文件损坏时被当成空池并覆写、导致账号全灭（改为先备份再逐条抢救）；API-KEY 变更在关停时丢失；OpenAI 并行工具调用产生非法的工具往返；部分 Gemini 请求体（内置工具、snake_case 字段、非图片 inlineData）被拒绝或改坏；2 MB 请求体上限会拒掉约 1.5 MB 的图片；另修复大量管理面板/用户面板问题 |
@@ -244,7 +245,7 @@ kiro2api 内置令牌自愈机制：token 到期**自动内存刷新**（单飞�
 ```bash
 # 健康检查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.3.1"}
+# {"service":"kiro2api","status":"ok","version":"0.4.0"}
 
 # 查看协议侧模型清单（固定短清单，不代表账号档位真的授权）
 curl http://localhost:8080/v1/models \

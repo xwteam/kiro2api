@@ -65,31 +65,32 @@ curl http://localhost:8080/openai/v1/models \
   -H "Authorization: Bearer sk-your-api-key"
 ```
 
-**Response:**
+**Response** (abridged — the list has 17 entries):
 ```json
 {
   "object": "list",
   "data": [
     {"id": "claude-sonnet-4.5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
-    {"id": "claude-opus-4.6", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
-    {"id": "gpt-5.6-sol", "object": "model", "created": 1700000000, "owned_by": "kiro2api"}
+    {"id": "claude-sonnet-4.6", "object": "model", "created": 1700000000, "owned_by": "kiro2api"},
+    {"id": "claude-sonnet-5", "object": "model", "created": 1700000000, "owned_by": "kiro2api"}
   ]
 }
 ```
 
-> ⚠️ **This list is hard-coded, not derived from your pool.** The protocol `/models` endpoints return a fixed three-entry shortlist compiled into the binary. They do **not** query your accounts, so the list is neither filtered by subscription tier nor equal to the set of names the service accepts. The three protocols do not even agree with each other:
-> - `GET /openai/v1/models` (and bare `/v1/models`) → `claude-sonnet-4.5`, `claude-opus-4.6`, `gpt-5.6-sol`
-> - `GET /claude/v1/models` → `claude-sonnet-4.5`, `claude-opus-4.6`, `claude-haiku-4.5`
-> - `GET /gemini/v1beta/models` → `claude-sonnet-4.5`, `claude-opus-4.6`, `gpt-5.6-sol`
+`created` is the hard-coded constant `1700000000` on every entry (not a real publication date), and `owned_by` is the literal `"kiro2api"`.
+
+> ℹ️ **All three protocol lists serve the same catalog.** `GET /openai/v1/models` (and bare `/v1/models`), `GET /claude/v1/models` and `GET /gemini/v1beta/models` are rendered from one catalog compiled into the binary, in this order:
+> `claude-sonnet-4.5`, `claude-sonnet-4.6`, `claude-sonnet-5`, `claude-opus-4.5`, `claude-opus-4.6`, `claude-opus-4.7`, `claude-opus-4.8`, `claude-haiku-4.5`, `claude-fable-5`, `deepseek-3.2`, `glm-5`, `qwen3-coder-next`, `minimax-m2.1`, `minimax-m2.5`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.6-sol`.
+> Only the per-protocol JSON shape differs; the ids and their order are identical. **List-then-use works**: every id above is one the gateway's model resolution accepts, so an id taken from this response never trips the gateway's own `400`.
 >
-> For the real catalog use `GET /api/admin/models`, which serves the live per-pool capability union when accounts have been probed and falls back to the full 17-model catalog otherwise.
+> The list is still **compiled in, not derived from your pool**: it does not query your accounts and is therefore not filtered by subscription tier. The pool-aware view is `GET /api/admin/models`, which prefers the live per-account capability union once accounts have been probed and falls back to this very same catalog otherwise.
 
 > 💡 **Model Availability Guide**: which models actually *work* depends on the subscription tier of the Kiro (CodeWhisperer) accounts in your pool.
 > - Free tier (KIRO FREE): typically authorizes only `claude-sonnet-4.5`.
 > - Higher tiers unlock additional Claude-family models (opus/haiku, etc.).
 > - Requesting a model your accounts cannot serve returns a clear `400` (`INVALID_MODEL_ID`) — it is **not** retried and does **not** penalize the account.
 >
-> Because the list is static, a listed id is no guarantee and an unlisted id is not necessarily rejected: incoming model names are resolved by **lowercase substring match** to one of 18 internal Kiro model ids (the 17 of the admin catalog plus `auto`, which that catalog does not list), and only a name matching none of them is rejected with `400` by the gateway itself. Treat `/models` as a hint, and be ready to handle `400` (`INVALID_MODEL_ID`) for any id. This service's streaming interface is true incremental streaming, pushing tokens as soon as they arrive over the AWS eventstream.
+> So a listed id always clears the gateway but is still no guarantee *upstream*, and an unlisted id is not necessarily rejected: incoming model names are resolved by **lowercase substring match** to one of 18 internal Kiro model ids (the 17 catalog ids plus the routing alias `auto`, which the catalog does not list), and only a name matching none of them is rejected with `400` by the gateway itself. Be ready to handle `400` (`INVALID_MODEL_ID`) for any id whose tier your pool does not have. This service's streaming interface is true incremental streaming, pushing tokens as soon as they arrive over the AWS eventstream.
 
 ### POST /openai/v1/chat/completions
 
@@ -355,7 +356,7 @@ These endpoints follow Anthropic Claude API format. Anthropic Messages is the **
 
 ### GET /claude/v1/models
 
-List available models. Like the other protocol `/models` endpoints this is a **fixed, hard-coded list** — see the note under [GET /openai/v1/models](#get-openaiv1models). Note the Claude-shaped list ends with `claude-haiku-4.5` where the OpenAI/Gemini ones end with `gpt-5.6-sol`.
+List available models. Same 17-entry catalog as the other protocol `/models` endpoints, in the same order, rendered in Anthropic's shape — see the note under [GET /openai/v1/models](#get-openaiv1models). `has_more` is always `false` (there is no cursor pagination), `first_id` / `last_id` are the catalog's first and last ids, and `created_at` is the hard-coded constant `2026-01-01T00:00:00Z` on every entry.
 
 **Request:**
 ```bash
@@ -363,17 +364,17 @@ curl http://localhost:8080/claude/v1/models \
   -H "Authorization: Bearer sk-your-api-key"
 ```
 
-**Response:**
+**Response** (abridged — `data` has 17 entries):
 ```json
 {
   "data": [
     {"type": "model", "id": "claude-sonnet-4.5", "display_name": "Claude Sonnet 4.5", "created_at": "2026-01-01T00:00:00Z"},
-    {"type": "model", "id": "claude-opus-4.6", "display_name": "Claude Opus 4.6", "created_at": "2026-01-01T00:00:00Z"},
-    {"type": "model", "id": "claude-haiku-4.5", "display_name": "Claude Haiku 4.5", "created_at": "2026-01-01T00:00:00Z"}
+    {"type": "model", "id": "claude-sonnet-4.6", "display_name": "Claude Sonnet 4.6", "created_at": "2026-01-01T00:00:00Z"},
+    {"type": "model", "id": "claude-sonnet-5", "display_name": "Claude Sonnet 5", "created_at": "2026-01-01T00:00:00Z"}
   ],
   "has_more": false,
   "first_id": "claude-sonnet-4.5",
-  "last_id": "claude-haiku-4.5"
+  "last_id": "gpt-5.6-sol"
 }
 ```
 
@@ -465,7 +466,7 @@ These endpoints follow Google Gemini API format. **Responses are always camelCas
 
 ### GET /gemini/v1beta/models
 
-List available models. Like the other protocol `/models` endpoints this is a **fixed, hard-coded list** — see the note under [GET /openai/v1/models](#get-openaiv1models). Each entry carries only `name` and `supportedGenerationMethods`; `displayName` is omitted, and there are no `description` / `inputTokenLimit` / `outputTokenLimit` fields.
+List available models. Same 17-entry catalog as the other protocol `/models` endpoints, in the same order — see the note under [GET /openai/v1/models](#get-openaiv1models). Each entry carries only `name` (the catalog id prefixed with `models/`) and `supportedGenerationMethods` (the same two methods on every entry); `displayName` is omitted, and there are no `description` / `inputTokenLimit` / `outputTokenLimit` fields.
 
 **Request:**
 ```bash
@@ -473,13 +474,13 @@ curl http://localhost:8080/gemini/v1beta/models \
   -H "Authorization: Bearer sk-your-api-key"
 ```
 
-**Response:**
+**Response** (abridged — `models` has 17 entries):
 ```json
 {
   "models": [
     {"name": "models/claude-sonnet-4.5", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
-    {"name": "models/claude-opus-4.6", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
-    {"name": "models/gpt-5.6-sol", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
+    {"name": "models/claude-sonnet-4.6", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    {"name": "models/claude-sonnet-5", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
   ]
 }
 ```
@@ -558,6 +559,10 @@ The admin panel at `/admin` (a static SPA embedded via rust-embed) is backed by 
 
 > [!WARNING]
 > Admin responses are **not** secret-free. `GET`/`POST /api/admin/api-keys` return every outbound key as full plaintext in the `key` field, and `GET /api/admin/server-info` returns `masterApiKey` as full plaintext; only `GET /api/admin/config/auth-keys` and `GET /api/admin/config` are masked. There is no read-only admin role — anything holding the admin key can read, create and rotate every key. Treat admin responses as secrets: do not paste them into issues, logs or third-party tooling.
+
+> [!NOTE]
+> **Every paginated admin endpoint shares one convention.** The query keys are `?page=` and `?page_size=` — **snake_case**, matching the request struct; a camelCase `pageSize` in the query string is simply an unknown key and the default applies. Defaults are `page=1` and `page_size=20`. `page_size` is raised to at least `1`, `page` is clamped into `[1, totalPages]`, and the response envelope is camelCase: `{records, total, page, pageSize, totalPages}`. An unknown id or an empty store is **not** a `404` — it answers `records: []` with `total: 0`, `page: 1`, `totalPages: 0`.
+> This applies to `/api/admin/credentials/{id}/usage/records`, `/failure-logs`, `/throttle-logs`, `/api/admin/usage/daily/{date}/records` and `/api/admin/api-keys/{id}/usage/records`. The user-facing `GET /api/user/usage/records` uses the same shape and query keys but defaults to `page_size=50`.
 
 ### GET /api/admin/credentials
 
@@ -808,7 +813,7 @@ curl http://localhost:8080/api/admin/api-keys/usage \
 
 ### GET /api/admin/credentials/{id}/usage/records · /usage/today
 
-Paginated per-account usage records, or today's summary for one account.
+Paginated per-account usage records (newest first), or today's summary for one account. Both take the numeric account id in the path and neither `404`s on an unknown id — records answers an empty page, `usage/today` answers a zero summary.
 
 **Request:**
 ```bash
@@ -816,15 +821,82 @@ curl "http://localhost:8080/api/admin/credentials/12345/usage/records?page=1&pag
   -H "Authorization: Bearer sk-your-admin-key"
 ```
 
+**Response** (`/usage/records`):
+```json
+{
+  "records": [
+    {
+      "model": "claude-sonnet-4.5",
+      "inputTokens": 1200,
+      "outputTokens": 340,
+      "estimatedCost": 0.0123,
+      "creditsUsed": 0.0171,
+      "createdAt": "2026-07-25T11:59:00Z",
+      "credentialId": 12345,
+      "credentialLabel": "Primary",
+      "clientIp": "203.0.113.7"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "pageSize": 20,
+  "totalPages": 1
+}
+```
+
+`model`, `inputTokens`, `outputTokens`, `estimatedCost`, `createdAt` and `credentialId` always serialize; `creditsUsed`, `cacheReadInputTokens`, `cacheCreationInputTokens`, `clientIp` and `credentialLabel` are omitted when absent. `credentialLabel` is resolved from the pool as nickname → email → `#{id}`. `creditsSaved` is declared on the record but never produced, so it is always absent.
+
+**Request** (`/usage/today`):
+```bash
+curl http://localhost:8080/api/admin/credentials/12345/usage/today \
+  -H "Authorization: Bearer sk-your-admin-key"
+```
+
+**Response:**
+```json
+{
+  "date": "2026-07-28",
+  "credentialId": 12345,
+  "totalRequests": 42,
+  "totalInputTokens": 50000,
+  "totalOutputTokens": 12000,
+  "totalCost": 0.42,
+  "totalCredits": 0.58
+}
+```
+
+`date` is the **UTC+8** calendar day, and so is the window being summed — the day rolls over at 16:00 UTC, not at midnight UTC. `totalCreditsSaved` is declared but never produced, so it is always absent. This endpoint takes no query parameters.
+
 ### GET /api/admin/credentials/{id}/failure-logs · /throttle-logs
 
-Recent failure / throttle events for one account.
+Recent failure / throttle events for one account, newest first. `failure-logs` holds the auth failures (`statusCode` is the real `401` / `403`), `throttle-logs` holds the upstream throttles (`statusCode` is the hard-coded constant `429`). Both share one response shape and the paginated-endpoint convention above, and both answer an empty page instead of `404` for an unknown id.
 
 **Request:**
 ```bash
-curl http://localhost:8080/api/admin/credentials/12345/failure-logs \
+curl "http://localhost:8080/api/admin/credentials/12345/throttle-logs?page=1&page_size=20" \
   -H "Authorization: Bearer sk-your-admin-key"
 ```
+
+**Response:**
+```json
+{
+  "records": [
+    {
+      "credentialId": 12345,
+      "requestType": "api",
+      "statusCode": 429,
+      "responseBody": "<upstream response body, truncated>",
+      "createdAt": "2026-07-25T11:59:00Z"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "pageSize": 20,
+  "totalPages": 1
+}
+```
+
+`requestType` is the literal `"api"` on every event today — nothing else is ever recorded. `responseBody` is the upstream body truncated to 2000 characters for failures and to **200** characters for throttles. Both logs keep at most 500 events per account (oldest dropped), so they are a recent-history window, not a complete audit trail.
 
 ### GET /api/admin/credentials/{id}/balance
 
@@ -836,15 +908,102 @@ curl http://localhost:8080/api/admin/credentials/12345/balance \
   -H "Authorization: Bearer sk-your-admin-key"
 ```
 
+### GET /api/admin/credits/global
+
+Aggregate remaining credits across the pool. **Read-only over the shared balance cache — it never calls upstream.**
+
+For every account in the pool it reads that account's still-fresh (5-minute TTL) balance snapshot and sums `remaining`; accounts whose entry is missing or stale are skipped silently, not fetched. So `cachedCount` < `totalCount` simply means the rest have not been warmed yet — warm them via `GET /api/admin/credentials/{id}/balance` (or by opening the accounts page). Takes no parameters and always returns `200`.
+
+**Request:**
+```bash
+curl http://localhost:8080/api/admin/credits/global \
+  -H "Authorization: Bearer sk-your-admin-key"
+```
+
+**Response:**
+```json
+{
+  "globalCredits": 1234.5,
+  "cachedCount": 2,
+  "totalCount": 3,
+  "oldestCacheUnix": 1785000000
+}
+```
+
+`oldestCacheUnix` is the fetch time of the oldest snapshot that went into the sum (for an "updated N ago" label); it is `null` — present, not omitted — when nothing was cached, in which case `globalCredits` is `0` and `cachedCount` is `0`.
+
 ### GET /api/admin/usage/daily · /usage/daily/{date}/records
 
 Daily usage summary, or records for a specific day (includes client IP and account label).
+
+`GET /api/admin/usage/daily` takes no parameters and returns a **bare JSON array**, newest day first. `GET /api/admin/usage/daily/{date}/records` takes the day as `YYYY-MM-DD` in the path — a **UTC+8** calendar day, the same day key `usage/today` reports — plus the shared `?page=&page_size=` convention. The day's records are capped at the newest 2000 before pagination, so `total` never exceeds 2000 however busy the day was. An unknown or malformed date is not an error: it answers an empty page.
 
 **Request:**
 ```bash
 curl http://localhost:8080/api/admin/usage/daily \
   -H "Authorization: Bearer sk-your-admin-key"
 ```
+
+**Response:**
+```json
+[
+  {"date": "2026-07-28", "totalRequests": 128, "totalCost": 1.23, "totalCredits": 1.71}
+]
+```
+
+`totalCreditsSaved` is declared but never produced, so it is always absent, and there are no token totals on this rollup — only requests / cost / credits.
+
+**Request** (one day's records):
+```bash
+curl "http://localhost:8080/api/admin/usage/daily/2026-07-28/records?page=1&page_size=20" \
+  -H "Authorization: Bearer sk-your-admin-key"
+```
+
+The response is the same envelope and the same record fields as [`/api/admin/credentials/{id}/usage/records`](#get-apiadmincredentialsidusagerecords--usagetoday), across all accounts rather than one.
+
+### GET /api/admin/usage/summary
+
+Aggregate usage over a time window, with a bucketed series for charting and best-effort health metrics.
+
+The window is chosen by **one** of two query parameters: `?range=` takes the enum `6h` | `24h` | `3d` | `7d` | `30d` and wins when both are given; `?hours=` takes any positive integer. With neither, the window is `24h`. An unrecognized `range` or `hours=0` returns `400` with `{"error": "...", ...}` (`invalid range` also carries `allowed` and `hint`). `bucketSecs` is derived, never passed in: `3600` for windows up to 24h, `86400` beyond.
+
+**Request:**
+```bash
+curl "http://localhost:8080/api/admin/usage/summary?range=24h" \
+  -H "Authorization: Bearer sk-your-admin-key"
+```
+
+**Response** (`series` abridged):
+```json
+{
+  "range": "24h",
+  "windowSecs": 86400,
+  "sinceUnix": 1784913600,
+  "untilUnix": 1785000000,
+  "bucketSecs": 3600,
+  "totalRequests": 128,
+  "totalInputTokens": 500000,
+  "totalOutputTokens": 120000,
+  "totalCost": 1.23,
+  "totalCredits": 1.71,
+  "dailyFallbackApplied": false,
+  "series": [
+    {"bucketStartUnix": 1784916000, "totalRequests": 12, "totalCost": 0.11, "totalCredits": 0.15}
+  ],
+  "successfulRequests": 128,
+  "failedRequests": 3,
+  "errorRate": 0.0229,
+  "avgLatencyMs": 2450.0,
+  "rotationSuccessRate": 0.9771
+}
+```
+
+Every field above always serializes; an empty window returns zeros with `series: []` (still `200`), `series` is ordered by bucket start ascending, and `range` echoes the effective label (`"<N>h"` when you passed `hours`). Read the derived numbers with their caveats:
+
+- `successfulRequests` counts the window's usage records (one per relayed request, including anything added by the daily top-up below); `failedRequests` counts auth-failure plus throttle events in it. Those event logs are capped per account, so `failedRequests` is a **lower bound** and `errorRate` errs low.
+- `errorRate` = `failedRequests / (successfulRequests + failedRequests)`, `rotationSuccessRate` is its complement — it is an approximation of "requests that eventually reached upstream", not an instrumented count of cross-account retries. With no activity at all they are `0.0` and `1.0`.
+- `avgLatencyMs` averages only records that carry a latency; records written before latency was tracked are excluded, and with no samples it is `0.0`.
+- `dailyFallbackApplied` is `true` when a window longer than a day had to be topped up from the daily rollups because raw records had been evicted. Only requests / cost / credits are topped up — token totals cannot be, so they may read low on long windows.
 
 ### GET /api/admin/rpm
 
@@ -887,7 +1046,9 @@ curl http://localhost:8080/api/admin/config \
 
 The real model catalog, with `display_name` / `type` / `max_tokens`. This response is **snake_case**, not camelCase.
 
-Unlike the protocol `/models` endpoints (which return a fixed trio), this one serves the live per-pool capability union once accounts have been probed, and otherwise falls back to the full built-in catalog of 17 models — so the two lists routinely differ.
+This one is pool-aware: it serves the live per-account capability union once accounts have been probed, and otherwise falls back to the same built-in 17-model catalog the protocol `/models` endpoints always serve — so with a warm cache the two lists can differ, and with a cold one they hold the same ids.
+
+When the union is empty it also kicks off a background refill (single-flight, bounded, with a 60-second cooldown) so a later call can answer from the union; the current call still answers from the catalog. `rate_multiplier` only appears on union entries that carry one — the catalog fallback never emits it.
 
 **Request:**
 ```bash
@@ -912,6 +1073,52 @@ curl http://localhost:8080/api/admin/models \
   ]
 }
 ```
+
+### POST /api/admin/credentials/models/refresh · /credentials/{id}/models/refresh
+
+Refresh the model cache that `GET /api/admin/models` reads from. **Both call upstream** (`ListAvailableModels` once per account touched, refreshing that account's token first if it is about to expire), so they are the manual counterpart to the background refill `GET /api/admin/models` triggers on its own. Neither takes a body or query parameters — a posted body is simply unused.
+
+`POST /api/admin/credentials/{id}/models/refresh` refreshes exactly one account:
+
+**Request:**
+```bash
+curl -X POST http://localhost:8080/api/admin/credentials/12345/models/refresh \
+  -H "Authorization: Bearer sk-your-admin-key"
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "id": "12345",
+  "count": 18
+}
+```
+
+`id` is echoed as the **string** from the path and `count` is how many models that account reported. An id that is not in the pool returns `404` `{"error": "account not found", "id": "…"}` (a disabled account is still refreshable — being disabled is not a `404`). An upstream failure returns `502` `{"success": false, "id": "…", "error": "<upstream message>"}`, where `error` carries the real reason (status code plus the upstream's own text) rather than a generic string.
+
+`POST /api/admin/credentials/models/refresh` refreshes the pool, but **not account by account**: it groups enabled accounts by subscription tier, refreshes one representative per known tier, then probes accounts of unknown tier until the union stops growing (3 consecutive no-growth successes), 12 successful probes are reached, or they run out. That is deliberate — a pool of hundreds would otherwise mean hundreds of upstream calls per click.
+
+**Request:**
+```bash
+curl -X POST http://localhost:8080/api/admin/credentials/models/refresh \
+  -H "Authorization: Bearer sk-your-admin-key"
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "refreshed": 2,
+  "failed": 1,
+  "errors": [{"id": 12346, "error": "models upstream HTTP 403: ..."}],
+  "tiers": ["KIRO FREE", "KIRO PRO+"]
+}
+```
+
+The batch endpoint always returns `200` with `success: true` — it reports per-account outcomes instead of failing: `refreshed` / `failed` are counts, `errors[]` holds one `{id, error}` per failed account (here `id` is a **number**, and unparseable ids become `0`), and `tiers[]` lists the tiers actually covered. A pool where every call fails still answers `200` with `refreshed: 0`.
+
+The tier strings are not an enum of this service's making — they are the upstream subscription titles, the same value `GET /api/admin/credentials/{id}/balance` returns as `subscriptionTitle`. Grouping therefore depends on the balance cache being warm; an account with no cached title counts as unknown-tier and can only enter the bounded probe. `tiers[]` uses the literal `"unknown"` for a probed account whose title is still uncached afterwards.
 
 ### GET /api/admin/config/load-balancing · PUT
 
@@ -953,13 +1160,92 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
   "uptimeSecs": 3600
 }
 ```
+
+### GET /api/admin/check-update
+
+Compare the running version against the latest GitHub Release of `xwteam/kiro2api`.
+
+Takes no parameters and **always returns `200`** — it is deliberately forgiving: a network failure, a rate-limited or `404` GitHub API, a repository with no releases, and an unparseable payload all degrade to `hasUpdate: false` with `latest` equal to `current`, never an error the panel would have to render. It is the only endpoint here that talks to GitHub (`api.github.com`), so a deployment without egress to it simply always reports no update.
+
+**Request:**
+```bash
+curl http://localhost:8080/api/admin/check-update \
+  -H "Authorization: Bearer sk-your-admin-key"
+```
+
+**Response:**
+```json
+{
+  "current": "0.4.0",
+  "latest": "0.4.1",
+  "hasUpdate": true,
+  "updateUrl": "https://github.com/xwteam/kiro2api/releases/tag/v0.4.1",
+  "releaseNotes": "..."
+}
+```
+
+`current` is this build's crate version. `latest` is the release `tag_name` with a leading `v` stripped, and `hasUpdate` is a plain string inequality against `current`, not a semver comparison — a differently-shaped tag reads as "update available". `updateUrl` is the release's `html_url`, falling back to `https://github.com/xwteam/kiro2api/releases`; `releaseNotes` is the release body verbatim, `""` when there is none.
+
+### POST /api/admin/update
+
+Return the shell command that updates this deployment. **It does not update anything** — nothing is downloaded, nothing is restarted; the panel just shows the command with a copy button. Takes no body or parameters and always returns `200`.
+
+**Request:**
+```bash
+curl -X POST http://localhost:8080/api/admin/update \
+  -H "Authorization: Bearer sk-your-admin-key"
+```
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "message": "请在服务器上执行以下命令完成更新:",
+  "command": "docker compose pull && docker compose up -d"
+}
+```
+
+All three values are hard-coded constants: `status` is always `"ok"`, `message` is that fixed Chinese sentence ("run the following command on the server to finish updating"), and `command` is the Docker Compose pair regardless of how you actually deployed. On a bare-metal or Kubernetes deployment, treat it as a reminder rather than a runnable instruction.
+
+### POST /api/admin/restart
+
+Exit the process so that whatever supervises it starts a fresh one. **This is the only admin endpoint that touches the running process itself.**
+
+`?confirm=true` is required. Without it (or with `confirm=false`) the request is refused with `400` and the process is untouched:
+
+```json
+{
+  "error": {
+    "message": "重启需二次确认,请带查询参数 ?confirm=true",
+    "type": "confirmation_required"
+  }
+}
+```
+
+The message is that fixed Chinese sentence ("restarting needs a second confirmation, pass the query parameter `?confirm=true`"); match on `error.type` rather than on the text. With confirmation the response is returned **first**, then a background task waits 0.5 s, flushes the debounced stores (usage stats, balance cache, failure/throttle event logs, and the API-KEY store) and calls `exit(0)`. So a `200` means "the process is about to go away", not "the process has restarted" — expect in-flight requests to be cut off and the port to drop for as long as your supervisor takes to bring it back.
+
+**Request:**
+```bash
+curl -X POST "http://localhost:8080/api/admin/restart?confirm=true" \
+  -H "Authorization: Bearer sk-your-admin-key"
+```
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "message": "Server restarting..."
+}
+```
+
+Both fields are hard-coded constants. Note that "restart" is really "exit": whether the service comes back is entirely up to what supervises it. Under Docker with `restart: unless-stopped` (or systemd with a restart policy) it returns on its own; run bare with no supervisor and this endpoint simply stops the service.
 
 ### GET /api/admin/logs/stream · /snapshot · /download
 
@@ -980,8 +1266,28 @@ curl "http://localhost:8080/api/admin/logs/stream?api_key=sk-your-admin-key"
 ### Legacy admin endpoints (kept for backward compatibility)
 
 - `GET /admin/api/stats` — `{accounts:[…], summary:{total,active,disabled,in_cooldown}}`.
-- `GET /admin/api/config` — redacted config.
-- `POST /admin/api/accounts/{id}/enable` | `disable` — manual enable/disable (in-memory; resets to the file value on restart).
+- `GET /admin/api/config` — redacted config, the same view as `GET /api/admin/config`.
+- `POST /admin/api/accounts/{id}/enable` | `disable` — manual enable/disable.
+
+`POST /admin/api/accounts/{id}/disable` is the legacy alias of [`POST /api/admin/credentials/{id}/disabled`](#post-apiadmincredentialsiddisabled) with `{"disabled": true}` (and `/enable` the same with `false`). It runs the identical pool mutation; what differs is the calling convention:
+
+- **No body.** The state is fixed by the path segment, so there is nothing to post and a body is ignored.
+- **A different response shape** — `{ok, id, disabled}` instead of the modern `{success, message}`, with `id` echoed as the string from the path:
+
+```bash
+curl -X POST http://localhost:8080/admin/api/accounts/12345/disable \
+  -H "Authorization: Bearer sk-your-admin-key"
+```
+
+```json
+{
+  "ok": true,
+  "id": "12345",
+  "disabled": true
+}
+```
+
+An id that is not in the pool returns `404` `{"error": "account not found", "id": "…"}`, exactly as the modern endpoint does. Both variants only flip the flag on the in-memory pool — neither writes `credentials.json` itself, so a restart normally reverts to the file's value. Do not lean on that either way: the pool is written out whenever something else persists it (a token refresh, or any credential create / update / delete), and the flag is part of what gets written, so it can become durable as a side effect.
 
 ## User API
 
@@ -1023,6 +1329,37 @@ curl http://localhost:8080/api/user/usage \
   -H "x-api-key: sk-your-api-key"
 ```
 
+`GET /api/user/usage/records` uses the same envelope as the admin record endpoints but defaults to **`page_size=50`** (the admin default is 20); `page=1` and the clamping rules are the same. Records are scoped to the calling key — there is no id in the path, so a key can only ever read its own usage. A valid key with no records answers an empty page, not a `404`; an invalid, disabled or expired key answers `401` `{"error": "…"}`.
+
+**Request:**
+```bash
+curl "http://localhost:8080/api/user/usage/records?page=1&page_size=50" \
+  -H "x-api-key: sk-your-api-key"
+```
+
+**Response:**
+```json
+{
+  "records": [
+    {
+      "model": "claude-sonnet-4.5",
+      "inputTokens": 1200,
+      "outputTokens": 340,
+      "estimatedCost": 0.0123,
+      "creditsUsed": 0.0171,
+      "createdAt": "2026-07-25T11:59:00Z",
+      "clientIp": "203.0.113.7"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "pageSize": 50,
+  "totalPages": 1
+}
+```
+
+`model`, `inputTokens`, `outputTokens`, `estimatedCost`, `createdAt` and the envelope counters always serialize; `creditsUsed`, `cacheReadInputTokens`, `cacheCreationInputTokens` and `clientIp` are omitted when absent. Two further fields are declared on this record but never populated on the user side, so they are **always absent**: `creditsSaved` (no data source) and `credentialLabel` (the user view does not resolve account labels — unlike the admin records, which do). Note there is no `credentialId` either: which pooled account served a request is not exposed to the key's owner.
+
 ## System Endpoints
 
 ### GET /health
@@ -1039,7 +1376,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.3.1"
+  "version": "0.4.0"
 }
 ```
 
@@ -1072,7 +1409,7 @@ The error body shape varies by protocol:
 | Code | Meaning | Description |
 |------|---------|-------------|
 | 200 | OK | Request succeeded |
-| 400 | Bad Request | Three different causes: a body the relay endpoints cannot deserialize (they answer `400`, never `422`); a model name matching nothing in the internal map — rejected by the gateway itself, message `无法识别的模型名: <name>`; or a mapped model the account's tier cannot serve — refused upstream (reason `INVALID_MODEL_ID`) and reported as `Invalid model '<name>': not available for the current account. …` |
+| 400 | Bad Request | On the relay endpoints, three causes: a body they cannot deserialize (they answer `400`, never `422`); a model name matching nothing in the internal map — rejected by the gateway itself, message `无法识别的模型名: <name>`; or a mapped model the account's tier cannot serve — refused upstream (reason `INVALID_MODEL_ID`) and reported as `Invalid model '<name>': not available for the current account. …`. Two admin endpoints add their own: `POST /api/admin/restart` without `?confirm=true`, and `GET /api/admin/usage/summary` with an unrecognized `range` or `hours=0` |
 | 401 | Unauthorized | Missing or invalid API Key (when `apiKey` is configured); also a disabled or expired store key |
 | 402 | Payment Required | A store-managed key has reached its spending limit (`{"type":"error","error":{"type":"billing_error",…}}`) |
 | 404 | Not Found | Admin endpoints only: unknown account / API-KEY / login-session id |
@@ -1086,7 +1423,7 @@ The error body shape varies by protocol:
 |-------|---------|----------|
 | Invalid API Key | Key missing or wrong | Verify the value on whichever of the six channels you use (`Authorization: Bearer` / `x-api-key` / `x-goog-api-key` / `?api_key=` / `?token=` / `?key=`); remember the header channels outrank the query ones, so a stale header masks a correct query parameter |
 | Spending limit reached (`402`) | A store-managed key is at or over its configured limit | Raise or clear the key's limit in the admin panel, or issue a new key |
-| `INVALID_MODEL_ID` | Model not served by your pool | `/v1/models` is a fixed list and cannot tell you this — check `GET /api/admin/models` and your accounts' subscription tier; the account is **not** penalized. The code is the *upstream* reason string and is not echoed in the response body: match on the `400` plus its message, never on the literal `INVALID_MODEL_ID` |
+| `INVALID_MODEL_ID` | Model not served by your pool | `/v1/models` lists what the gateway accepts, not what your tier authorizes, so it cannot tell you this — check `GET /api/admin/models` and your accounts' subscription tier; the account is **not** penalized. The code is the *upstream* reason string and is not echoed in the response body: match on the `400` plus its message, never on the literal `INVALID_MODEL_ID` |
 | No account available | All accounts in cooldown / disabled / over RPM | Add accounts, wait for cooldown, or reset failure counters |
 | Upstream failure | Kiro / CodeWhisperer / AmazonQ error | Endpoint fallback and cross-account retry are automatic; check the admin logs |
 

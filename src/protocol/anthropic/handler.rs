@@ -1398,26 +1398,17 @@ pub async fn count_tokens(
 /// `GET /claude/v1/models`:固定的 Anthropic 形状模型列表(本中转支持的模型),
 /// 不读时钟、不打网络。
 pub async fn anthropic_models() -> Json<AnthropicModelList> {
-    let data = vec![
-        AnthropicModel {
+    // 目录来自 `models_catalog::CATALOG`(与 OpenAI / Gemini 侧及管理端点同源);
+    // 此前这里硬编码三条 claude,列出来的远少于实际能服务的模型。
+    let data: Vec<AnthropicModel> = crate::models_catalog::CATALOG
+        .iter()
+        .map(|e| AnthropicModel {
             kind: "model".to_string(),
-            id: "claude-sonnet-4.5".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
+            id: e.id.to_string(),
+            display_name: e.display_name.to_string(),
             created_at: MODEL_CREATED_AT.to_string(),
-        },
-        AnthropicModel {
-            kind: "model".to_string(),
-            id: "claude-opus-4.6".to_string(),
-            display_name: "Claude Opus 4.6".to_string(),
-            created_at: MODEL_CREATED_AT.to_string(),
-        },
-        AnthropicModel {
-            kind: "model".to_string(),
-            id: "claude-haiku-4.5".to_string(),
-            display_name: "Claude Haiku 4.5".to_string(),
-            created_at: MODEL_CREATED_AT.to_string(),
-        },
-    ];
+        })
+        .collect();
     let first_id = data.first().map(|m| m.id.clone());
     let last_id = data.last().map(|m| m.id.clone());
     Json(AnthropicModelList {
