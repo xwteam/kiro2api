@@ -59,9 +59,7 @@ pub enum InputItem {
     /// **整个** output 原样回灌,里面必然带这类条目;若判成错误,第一轮能通、第二轮必炸,
     /// 且错误信息只说"不支持的条目类型",排查要从头翻报文。故整条跳过而非拒绝整轮请求。
     /// 保留 `kind` 是为了转换阶段能记出到底跳过了什么。
-    Unsupported {
-        kind: String,
-    },
+    Unsupported { kind: String },
 }
 
 /// 从 JSON 对象里取一个必填字符串字段;缺失/非字符串 → `missing_field` 错误。

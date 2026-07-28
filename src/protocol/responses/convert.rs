@@ -693,7 +693,8 @@ mod tests {
                 {"type": "file_search", "vector_store_ids": ["vs_1"]}
             ]
         });
-        let req: ResponsesRequest = serde_json::from_value(raw).expect("内置工具不得导致整轮请求被拒");
+        let req: ResponsesRequest =
+            serde_json::from_value(raw).expect("内置工具不得导致整轮请求被拒");
         let hub = responses_to_hub(req).expect("应转换成功");
         let tools = hub.tools.expect("tools 应存在");
         assert_eq!(tools.len(), 1, "只有带 name 的函数工具能映射到中枢");
@@ -712,7 +713,10 @@ mod tests {
         let req: ResponsesRequest = serde_json::from_value(raw).expect("应解析成功");
         let hub = responses_to_hub(req).expect("应转换成功");
         let tools = hub.tools.expect("tools 应存在");
-        assert_eq!(tools[0].input_schema, json!({"type": "object", "properties": {}}));
+        assert_eq!(
+            tools[0].input_schema,
+            json!({"type": "object", "properties": {}})
+        );
     }
 
     /// 多轮时客户端把上一轮 output 整个回灌,里面带 `reasoning` 等中枢没有的条目。
@@ -729,7 +733,8 @@ mod tests {
                 {"type": "message", "role": "assistant", "content": "there"}
             ]
         });
-        let req: ResponsesRequest = serde_json::from_value(raw).expect("未知条目不得导致整轮请求被拒");
+        let req: ResponsesRequest =
+            serde_json::from_value(raw).expect("未知条目不得导致整轮请求被拒");
         let hub = responses_to_hub(req).expect("应转换成功");
         assert_eq!(hub.messages.len(), 2, "两条 message 保留,其余跳过");
         assert_eq!(hub.messages[0].role, "user");
