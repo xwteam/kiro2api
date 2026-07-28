@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.5.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.5.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-07-28 | v0.5.1 - 健康徽章与新加的状态筛选各算各的:筛选走 v0.5.0 的分档,徽章仍只看 `healthStatus`,于是「过期账号」那一档里的行照样挂着绿色「健康」。现在两者同源。额度耗尽此前也只认「被选中并失败过一次」,账号还没轮到就已经没额度的情况完全覆盖不到 —— 现在余额查询回来的剩余归零同样判为额度耗尽(与「还没查过」严格区分),且每条余额回来即刷新该行徽章与下拉条数 |
 | 2026-07-28 | v0.5.0 - 账号管理新增状态筛选下拉(全部 / 健康 / 异常 / 禁用 / 封禁 / 过期 / 额度耗尽,每档带实时条数),并把「异常」拆成运维真正要分别处置的几档。上游停用账号时响应体带 `suspend` 字样,代码原本识别它,但只用来决定「别永久禁用、让它冷却」,分类完就丢了。现经 `GET /api/admin/credentials` 的新字段 `statusReason` 透出最近一次失败的具体原因。封禁判定优先于限流(上游停用响应常同时带限流措辞);分类只进展示层,不改变选号纪律——分错最多标签不准,绝不能让健康账号因措辞匹配被判死 |
 | 2026-07-28 | v0.4.0 - 协议侧 `/models` 现在列出全部 17 个可服务模型,三个协议结果一致。此前 `GET /v1/models`、`GET /claude/v1/models`、`GET /v1beta/models` 各自硬编码**三条且互不相同**,而管理接口有 17 条——客户端「先列模型再按 id 调用」拿到的只是残缺子集,换个协议看到的还不一样。现由唯一目录 `src/models_catalog.rs` 支撑四个端点,并有测试保证目录里每个 id 都能被 `map_model` 识别、三协议逐项一致。另补齐 12 个从未写进 API 参考的线上路由 |
 | 2026-07-28 | v0.3.1 - `POST /v1/messages/count_tokens` 的畸形请求体回 axum 默认的纯文本 `422` 而非 Anthropic 错误体。v0.3.0 把四个协议对话端点都改成了显式接管拒收,唯独漏了这个同属 Anthropic 协议、同样由 SDK 直接调用的端点——SDK 用 `response.json()` 读纯文本只会抛解析异常,真正的失败原因被吞掉 |
@@ -263,7 +264,7 @@ docker compose logs -f
 ```bash
 # 健康检查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.5.0"}
+# {"service":"kiro2api","status":"ok","version":"0.5.1"}
 
 # 查看可用模型
 curl http://localhost:8080/v1/models \

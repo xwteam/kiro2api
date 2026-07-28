@@ -193,11 +193,20 @@
   //
   // `statusReason` 由后端按上游响应体判定(封禁/额度/令牌过期/限流),`healthStatus` 只答
   // "能不能选中"。两者正交,所以这里要一起看。
-  function accountBucket(acc) {
+  //
+  // `remaining` 为该账号最近一次余额查询的剩余积分(尚未查过则 undefined)。**必须显式传入**
+  // 而不是在函数里读 balanceMap:分档要保持纯函数才好单测,也才好在"余额刚回来"时按单个
+  // 账号重算而不必重绘整张表。
+  function accountBucket(acc, remaining) {
     if (acc.disabled) return 'disabled';
     var reason = acc.statusReason || 'none';
     if (reason === 'banned') return 'banned';
+    // 额度耗尽有两条来源,缺一不可:
+    //  ① 上游明确回过配额错误(statusReason==='quota')——但这要等到该账号真被选中并失败;
+    //  ② 余额查询回来的剩余已归零——账号可能还没轮到就已经没额度了,只等①会一直把它
+    //     显示成健康,而它下一次被选中必然失败。
     if (reason === 'quota') return 'quota';
+    if (typeof remaining === 'number' && remaining <= 0) return 'quota';
     // 过期:令牌到期时刻已过。注意这与 statusReason==='token_expired' 不同 —— 后者是
     // 上游明确回过"令牌过期",前者只按本地记录的到期时刻判断,刷新一次通常就能自愈。
     if (acc.expiresAt) {
@@ -209,6 +218,31 @@
     return 'abnormal';   // unhealthy(冷却中)/ warning(有失败但仍可选)
   }
 
+  // 该账号最近一次查到的剩余积分;没查过返回 undefined(而不是 0 —— 二者含义完全不同:
+  // 前者是"还不知道",后者是"确实没额度了")。
+  function remainingOf(acc) {
+    var b = balanceMap[String(acc.id)];
+    return b && typeof b.remaining === 'number' ? b.remaining : undefined;
+  }
+
+  function bucketOf(acc) { return accountBucket(acc, remainingOf(acc)); }
+
+  // 原地替换某一行的健康徽章。行不在当前页(或已被筛掉)时静默跳过。
+  function refreshRowBadge(acc, rowSel) {
+    var row = document.querySelector(rowSel);
+    if (!row) return;
+    var badge = row.querySelector('[data-health-badge]');
+    if (!badge) return;
+    // 原地重建内容而不是 replaceChild:后者依赖 parentNode 语义,行被重绘/移动时会静默失效,
+    // 也不必要地把节点换掉(选中态、事件绑定都挂在这一行上)。
+    var fresh = healthBadge(acc);
+    var kids = Array.prototype.slice.call(fresh.childNodes || []);
+    badge.className = fresh.className;
+    badge.innerHTML = '';
+    kids.forEach(function (c) { badge.appendChild(c); });
+    if (K.i18n) K.i18n.apply(badge);
+  }
+
   var STATUS_FILTERS = ['all', 'healthy', 'abnormal', 'disabled', 'banned', 'expired', 'quota'];
 
   // 重建下拉选项:文案 + 实时条数。每次列表变化都要重画,否则条数会停在上一轮。
@@ -218,7 +252,7 @@
     var counts = { all: accounts.length };
     STATUS_FILTERS.forEach(function (k) { if (k !== 'all') counts[k] = 0; });
     accounts.forEach(function (a) {
-      var b = accountBucket(a);
+      var b = bucketOf(a);
       if (counts[b] != null) counts[b]++;
     });
     var prev = sel.value || statusFilter;
@@ -235,7 +269,7 @@
 
   function filteredAccounts() {
     if (statusFilter === 'all') return accounts;
-    return accounts.filter(function (a) { return accountBucket(a) === statusFilter; });
+    return accounts.filter(function (a) { return bucketOf(a) === statusFilter; });
   }
 
   function selectedCount() { return Object.keys(selectedIds).length; }
@@ -439,17 +473,26 @@
       default: return 'muted';
     }
   }
+  // 徽章**必须**由 accountBucket 驱动:此前徽章只看 healthStatus、筛选只看分档,于是
+  // 「过期账号」那一档里的行照样挂着绿色的「健康」,余额已归零的账号也一直显示健康 ——
+  // 同一行在两处给出互相矛盾的结论。现在两者同源,只在"异常"这一档内再按 healthStatus
+  // 细分成 警告(有失败但仍可选)/ 异常(冷却中),保留原有的信息量。
   function healthBadge(acc) {
-    var h = acc.healthStatus || (acc.disabled ? 'disabled' : 'healthy');
+    var b0 = bucketOf(acc);
+    if (b0 === 'abnormal') b0 = acc.healthStatus === 'warning' ? 'warning' : 'unhealthy';
     var map = {
       healthy: ['badge-success', 'dash.healthy'],
       warning: ['badge-warning', 'dash.warning'],
-      degraded: ['badge-warning', 'acc.status.degraded'],
       unhealthy: ['badge-danger', 'dash.unhealthy'],
-      disabled: ['badge-muted', 'common.disabled']
+      disabled: ['badge-muted', 'common.disabled'],
+      banned: ['badge-danger', 'acc.state.banned'],
+      expired: ['badge-warning', 'acc.state.expired'],
+      quota: ['badge-warning', 'acc.state.quota']
     };
+    var h = b0;
     var m = map[h] || map.healthy;
     var b = el('span', 'badge ' + m[0]);
+    b.dataset.healthBadge = '1';
     b.appendChild(dot(healthClass(h)));
     b.appendChild(elI18n('span', null, m[1]));
     return b;
@@ -890,9 +933,14 @@
         if (authFailed) { autoQueryToken++; stop(); return; }
         if (cancelled()) { stop(); return; }
         // update the matching row's remaining cell if it is on-screen
-        var node = document.querySelector('.account-row[data-acct-id="' + cssEscape(String(acc.id)) + '"] .stat-n[data-bal-cell]');
+        var rowSel = '.account-row[data-acct-id="' + cssEscape(String(acc.id)) + '"]';
+        var node = document.querySelector(rowSel + ' .stat-n[data-bal-cell]');
         var b = balanceMap[String(acc.id)];
         if (node && b && b.remaining != null) node.textContent = fmtCredits(b.remaining);
+        // 余额可能把这一行从"健康"改判成"额度耗尽",徽章与筛选条数都要跟着走 ——
+        // 否则查完信息,剩余列显示 0 而徽章还挂着绿色的「健康」。
+        refreshRowBadge(acc, rowSel);
+        paintStatusFilter();
         renderStats();
         next();
       });
