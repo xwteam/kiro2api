@@ -258,7 +258,11 @@ curl -X POST http://localhost:8080/openai/v1/responses \
 
 - `{"type":"message","role":"user"|"assistant"|"system","content":[...]}` — content のパーツ: `{"type":"input_text","text":...}`、`{"type":"input_image","image_url":"..."}`、`{"type":"output_text","text":...}`
 - `{"type":"function_call","call_id","name","arguments"}` — 直前のアシスタントによるツール呼び出しターン（複数ターンの履歴として自身で再送する場合に使用）
-- `{"type":"function_call_output","call_id","output"}` — 送り返すツールの実行結果（`type` はこの綴りのみ。`"tool_result"` など他の値を送ると `400` になります）
+- `{"type":"function_call_output","call_id","output"}` — 送り返すツールの実行結果（`type` はこの綴りのみ）
+
+> ⚠️ 上記**以外**の `type`（`reasoning`、`local_shell_call` など Responses 側の生成物）は**その項目だけスキップ**され、リクエスト全体が拒否されることはありません。マルチターンではクライアントが直前の `output` をそのまま送り返すため、この種の項目は必ず含まれます。エラー扱いだと**一巡目は通り二巡目で必ず落ちる**状態でした（v0.7.1 で修正）。
+> ⚠️ **`tools` 配列内の組み込みツールは破棄されます。** OpenAI 仕様では `tools` に `type:"function"` 以外に `web_search`、`local_shell`、`file_search` などの**組み込みツール**も含まれます。これらは OpenAI 側のサービスが実行するもので、**仕様上 `name` フィールドを持ちません**。本サーバーの中枢には等価物がなく代理実行もできないため、**解析したうえで破棄し WARN を記録**します（`responses_builtin_tool_dropped`、`tool_type` 付き）。リクエスト自体は失敗しません（v0.7.1 より前は `400 tools[N]: missing field name` となり、組み込みツール一つでターン全体が失敗していました）。**影響**: モデルはその組み込み機能（ウェブ検索など）を利用できません。`name` を持つ `function` / `custom` ツールは従来どおり有効で、`parameters` は省略可能（空オブジェクトスキーマとして扱われます）。
+
 
 **サポートされていません（暗黙の無視ではなく明示的エラー）:** `previous_response_id` — 本サーバーはサーバー側で会話状態を保持しません。指定した場合、黙って無視するのではなく 400 の `invalid_request_error` を返します。毎回のリクエストで会話全体を `input` に含めて送信してください（Codex CLI は既にこの方式で動作しています）。
 
@@ -1155,7 +1159,7 @@ curl -X PUT http://localhost:8080/api/admin/config/auth-keys \
 ```json
 {
   "masterApiKey": "sk-マスターキーの平文",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1383,7 +1387,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.7.0"
+  "version": "0.7.1"
 }
 ```
 

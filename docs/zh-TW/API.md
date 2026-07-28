@@ -223,7 +223,9 @@ curl -X POST http://localhost:8080/v1/responses \
 | `tool_choice` | string 或 object | ❌ | **無效**：`auto`、`none`、`required`、`{"type":"function","name":"..."}` 都能解析通過，但與 Chat Completions 同理**不會轉發給上游**，無法真的強制或禁止某個工具 |
 | `max_output_tokens` | number | ❌ | **無效**：同 Chat Completions 的 `max_tokens`，解析後不轉發，不會限制回應長度 |
 
-**`input` 陣列條目類型**（**只認**這三種：`function_call`、`function_call_output`、`message`；`type` 缺省但帶 `role` 時視同 `message`。其餘任何 `type` 值都會被拒，訊息為 `不支持的输入条目类型: <type>`——而且 `input` 是 untagged 聯合，**一條壞條目就否掉整個請求體**，回 `400`）：
+**`input` 陣列條目類型**（能映射到中樞的**只有**這三種：`function_call`、`function_call_output`、`message`；`type` 缺省但帶 `role` 時視同 `message`。其餘 `type` 值——`reasoning`、`local_shell_call` 等 Responses 側產物——**整條跳過，不影響其餘條目**，不再否掉整個請求：客戶端做多輪時會把上一輪的**整個** `output` 原樣回灌，裡面必然帶這類條目，判成錯誤的後果是第一輪能通、第二輪必炸，v0.7.1 已修正）：
+> ⚠️ **工具陣列裡的內建工具會被丟棄。** 照 OpenAI 規範，`tools` 裡除了 `type:"function"`，還可以有 `web_search`、`local_shell`、`file_search` 等**內建工具**——它們由 OpenAI 服務端自己執行，**照規範就沒有 `name` 欄位**。本服務的中樞沒有等價物，無法代為執行，故**解析後丟棄並記一條 WARN**（`responses_builtin_tool_dropped`，帶 `tool_type`），不會因此拒絕整個請求（v0.7.1 之前會回 `400 tools[N]: missing field name`，一個內建工具就廢掉整輪對話）。**後果**：模型不具備該內建能力（如聯網搜尋）。帶 `name` 的 `function` / `custom` 工具照常生效；`parameters` 可省略，缺省按空物件 schema 處理。
+
 - `{"type":"message","role":"user"|"assistant"|"system","content":[...]}` —— 內容區塊也只認三種：`{"type":"input_text","text":...}`、`{"type":"input_image","image_url":"data:image/...;base64,..."}`、`{"type":"output_text","text":...}`
 - `{"type":"function_call","call_id","name","arguments"}` —— 歷史裡助手呼叫工具的那一輪（多輪續聊需要客戶端自己重發完整歷史）
 - `{"type":"function_call_output","call_id","output"}` —— 客戶端回傳的工具執行結果。本服務**沒有** `tool_result` 這個條目類型（`tool_result` 是 Anthropic Messages 的內容區塊名，不是 Responses 的輸入條目）：寫成 `{"type":"tool_result",…}` 不會被當成同義詞，而是整條請求 `400`
@@ -1183,7 +1185,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.7.0"}
+{"service":"kiro2api","status":"ok","version":"0.7.1"}
 ```
 
 ### GET /v1/ping

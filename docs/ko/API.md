@@ -283,7 +283,9 @@ curl -X POST http://localhost:8080/openai/v1/responses \
 | `max_output_tokens` | integer | ❌ | **받기만 하고 무시됩니다** — 응답 길이를 제한하지 않습니다(위 「생성 파라미터에 대한 주의」 참고) |
 | `tool_choice` | string 또는 object | ❌ | **받기만 하고 무시됩니다** — `required`나 `{"type":"function","name":"..."}`로 특정 도구를 강제할 수 없습니다(위 「생성 파라미터에 대한 주의」 참고) |
 
-**`input` 배열 항목 유형**: 아래 **세 가지뿐**입니다. `type`을 생략하면 `role` 유무로 message 항목으로 판정하며, 그 밖의 `type` 문자열(예: `tool_result`)을 하나라도 넣으면 그 항목만 무시되는 것이 아니라 **요청 전체가 `400`으로 거부**됩니다.
+**`input` 배열 항목 유형**: 중계 허브로 매핑되는 것은 아래 **세 가지뿐**입니다. `type`을 생략하면 `role` 유무로 message 항목으로 판정합니다. 그 밖의 `type` 문자열(`reasoning`, `local_shell_call` 등 Responses 측 산출물)은 **해당 항목만 건너뛰며**, 더 이상 요청 전체를 거부하지 않습니다. 멀티턴에서는 클라이언트가 직전 `output`을 통째로 되돌려 보내므로 이런 항목이 반드시 포함되며, 오류로 처리하면 **첫 턴은 되고 둘째 턴에서 반드시 터졌습니다**(v0.7.1에서 수정).
+> ⚠️ **`tools` 배열의 내장 도구는 폐기됩니다.** OpenAI 규격상 `tools`에는 `type:"function"` 외에 `web_search`, `local_shell`, `file_search` 같은 **내장 도구**도 들어갑니다. 이들은 OpenAI 자체 서비스가 실행하며 **규격상 `name` 필드 자체가 없습니다**. 본 서버의 허브에는 등가물이 없고 대신 실행할 수도 없으므로, **파싱한 뒤 폐기하고 WARN을 남깁니다**(`responses_builtin_tool_dropped`, `tool_type` 포함). 요청 자체가 실패하지는 않습니다(v0.7.1 이전에는 `400 tools[N]: missing field name`으로, 내장 도구 하나가 턴 전체를 무너뜨렸습니다). **영향**: 모델은 해당 내장 기능(웹 검색 등)을 사용할 수 없습니다. `name`이 있는 `function` / `custom` 도구는 종전대로 동작하며, `parameters`는 생략 가능하고 빈 객체 스키마로 처리됩니다.
+
 
 - `{"type":"message","role":"user"|"assistant"|"system","content":[...]}` — 콘텐츠 파트는 `{"type":"input_text","text":...}`, `{"type":"output_text","text":...}`, `{"type":"input_image","image_url":"..."}` 세 가지. `content`에 문자열을 바로 넣어도 됩니다.
   - ⚠️ `input_image`의 `image_url`은 **`data:<mime>;base64,<데이터>` 형식만** 처리됩니다. 원격 `http(s)` URL을 넣으면 오류가 나지 않고 그 이미지 블록이 **조용히 버려져** 모델이 이미지를 보지 못합니다. 반드시 Base64 Data URI로 인라인하십시오.
@@ -1426,7 +1428,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.7.0"}
+{"service":"kiro2api","status":"ok","version":"0.7.1"}
 ```
 
 ### GET /v1/ping

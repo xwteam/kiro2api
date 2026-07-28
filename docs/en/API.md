@@ -252,7 +252,9 @@ curl -X POST http://localhost:8080/openai/v1/responses \
 - `{"type":"function_call","call_id","name","arguments"}` — a prior assistant tool-call turn (for multi-turn history you resend yourself)
 - `{"type":"function_call_output","call_id","output"}` — a tool's result you're sending back
 
-> ⚠️ **This spelling only.** There is no `tool_result` item type and no other alias. Any item carrying an unrecognized `type` fails deserialization, and because `input` is parsed as a whole, **one bad item rejects the entire request** with `400` — the rest of the conversation is not partially accepted. Extra keys *within* an accepted item (`id`, `status`, … as returned in a previous response's `output`) are ignored, so replaying prior output items verbatim is fine.
+> ⚠️ **These three are what map to the hub.** Items carrying any other `type` — `reasoning`, `local_shell_call` and other Responses-side artifacts — are **skipped individually** and no longer reject the whole request. A client doing multi-turn replays the *entire* previous `output`, which necessarily contains such items, so treating them as errors failed on **turn two, not turn one** (fixed in v0.7.1). Extra keys *within* an accepted item (`id`, `status`, … as returned in a previous response's `output`) are ignored, so replaying prior output items verbatim is fine.
+> ⚠️ **Built-in tools in the `tools` array are dropped.** Per the OpenAI spec a tools array carries more than `type:"function"` — `web_search`, `local_shell`, `file_search` and friends are **built-ins executed by OpenAI's own service, and by spec they have no `name` field at all**. This server's hub has no equivalent and cannot execute them, so they are **parsed, dropped, and logged as a WARN** (`responses_builtin_tool_dropped`, carrying `tool_type`) rather than failing the request (before v0.7.1 this returned `400 tools[N]: missing field name` — a single built-in killed the whole turn). **Consequence:** the model does not get that built-in capability (web search, for instance). Named `function` / `custom` tools work as before; `parameters` may be omitted and defaults to an empty object schema.
+
 
 **Not supported (explicit, not silent):** `previous_response_id` — this server does not keep server-side conversation state. Sending a **non-empty** value returns a `400` `invalid_request_error` rather than silently ignoring it (an explicit `null` or `""` is treated as absent and passes). Resend the full conversation in `input` on every request (this is what Codex CLI already does).
 
@@ -1163,7 +1165,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1379,7 +1381,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.7.0"
+  "version": "0.7.1"
 }
 ```
 

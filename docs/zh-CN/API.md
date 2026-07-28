@@ -343,7 +343,9 @@ curl -X POST http://localhost:8080/v1/responses \
 | `max_output_tokens` | number | 否 | **接受但不生效**，同 `max_tokens`（见「OpenAI 兼容 API」下的生成参数说明） |
 | `tool_choice` | string 或 object | 否 | **接受但不生效**，同上 |
 
-**`input` 数组条目类型**——**只认下面三种**（`type` 缺省时按带 `role` 视为 `message`）。写任何其它 `type` 值（例如 `tool_result`，本服务**没有**这个条目类型）会让**整个请求**反序列化失败，返回 `400`：
+**`input` 数组条目类型**——能映射到中枢的**只有下面三种**（`type` 缺省时按带 `role` 视为 `message`）。其它 `type` 值（`reasoning`、`local_shell_call` 等 Responses 侧产物）**整条跳过，不影响其余条目**，不再拒绝整个请求：客户端做多轮时会把上一轮的**整个** `output` 原样回灌，里面必然带这类条目，判成错误的后果是第一轮能通、第二轮必炸（v0.7.1 修正）：
+> ⚠️ **工具数组里的内置工具会被丢弃。** 照 OpenAI 规范，`tools` 里除了 `type:"function"`，还可以有 `web_search`、`local_shell`、`file_search` 等**内置工具**——它们由 OpenAI 服务端自己执行，**照规范就没有 `name` 字段**。本服务的中枢没有等价物，无法代为执行，故**解析后丢弃并记一条 WARN**（`responses_builtin_tool_dropped`，带 `tool_type`），不会因此拒绝整个请求（v0.7.1 之前会返回 `400 tools[N]: missing field name`，一个内置工具就废掉整轮对话）。**后果**：模型不具备该内置能力（如联网搜索）。带 `name` 的 `function` / `custom` 工具照常生效；`parameters` 可省略，缺省按空对象 schema 处理。
+
 - `{"type":"message","role":"user"|"assistant"|"system","content":[...]}` —— 内容块：`{"type":"input_text","text":...}`、`{"type":"input_image","image_url":"..."}`、`{"type":"output_text","text":...}`。`input_image` 的 `image_url` **只支持 `data:` Base64 URI**；远程 http(s) URL 会被**静默跳过**（该图片不进上游，不报错），别指望服务端替你抓图
 - `{"type":"function_call","call_id","name","arguments"}` —— 历史里助手调用工具的那一轮
 - `{"type":"function_call_output","call_id","output"}` —— 客户端回传的工具执行结果
@@ -1184,7 +1186,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1372,7 +1374,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.7.0"
+  "version": "0.7.1"
 }
 ```
 
