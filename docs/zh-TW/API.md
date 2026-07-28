@@ -747,7 +747,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.3.0"}
+{"service":"kiro2api","status":"ok","version":"0.3.1"}
 ```
 
 ### GET /v1/ping
@@ -774,7 +774,7 @@ curl http://localhost:8080/v1/ping
 | 402 | API-KEY 消費已達上限，體為 `{"type":"error","error":{"type":"billing_error","message":"api key spending limit exceeded"}}`。判定含在途預留（USD 單位 `1.0`／credits 單位約 `1.39`），故**剩餘額度不足一次預留時就開始拒**，並非真的花到滿 |
 | 403 | 禁止 |
 | 404 | 找不到（路徑不存在；或管理端點傳入了池中不存在的帳號 / key id） |
-| 422 | 請求體反序列化失敗（欄位缺失或型別不符）。四個協議的對話端點已自行接管拒收、改回各自形狀的 `400`；`422` 主要出現在 `/api/admin/*`、`/api/user/login` 與 `/v1/messages/count_tokens` 這類直接用 `Json` 提取器的端點 |
+| 422 | 請求體反序列化失敗（欄位缺失或型別不符）。四個協議的對話端點與 `/v1/messages/count_tokens` 已自行接管拒收、改回各自形狀的 `400`；`422` 主要出現在 `/api/admin/*` 與 `/api/user/login` 這類直接用 `Json` 提取器的端點 |
 | 429 | **上游**回報限流（事件流裡的 `ThrottlingException` 一類）。本服務自己的 `MAX_RPM_PER_CREDENTIAL` **不會**回 `429`——超限的帳號只是暫時不參與選號，全部帳號都選不出來時回的是 `503` |
 | 502 | 上游 Kiro 失敗 |
 | 503 | 服務不可用（無可用帳號：全冷卻 / 停用 / 超 RPM） |

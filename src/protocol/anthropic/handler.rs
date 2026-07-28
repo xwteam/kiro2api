@@ -1346,7 +1346,22 @@ fn count_content_chars(content: &crate::protocol::anthropic::types::ContentIn) -
 /// **以及 `tools` 定义、`tool_use` 的 input、`tool_result` 的 content、图片**(#19):
 /// 文本/JSON 按字符数 ÷ 4;图片按每张固定 token 估算。下限 1。**非官方 tokenizer**,仅供参考;
 /// 纯函数:不选账号、不打网络。
-pub async fn count_tokens(Json(req): Json<MessagesRequest>) -> Json<CountTokensResponse> {
+///
+/// 请求体以 `Result<Json<..>, JsonRejection>` 提取,与 `/v1/messages` 同法:解析失败时回标准
+/// Anthropic 错误体的 400,而不是 axum 默认的纯文本 422 —— 后者 SDK 用 `response.json()` 读
+/// 错误时只会抛解析异常,真正的失败原因被吞掉;且 422 也不在 Anthropic 的错误码契约里。
+pub async fn count_tokens(
+    payload: Result<Json<MessagesRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let req = match payload {
+        Ok(Json(req)) => req,
+        Err(rejection) => {
+            return anthropic_error_response(
+                StatusCode::BAD_REQUEST.as_u16(),
+                &rejection.body_text(),
+            );
+        }
+    };
     let mut chars = req
         .system
         .as_ref()
@@ -1377,7 +1392,7 @@ pub async fn count_tokens(Json(req): Json<MessagesRequest>) -> Json<CountTokensR
     }
 
     let input_tokens = (chars / CHARS_PER_TOKEN + images * IMAGE_TOKEN_ESTIMATE).max(1) as u32;
-    Json(CountTokensResponse { input_tokens })
+    (StatusCode::OK, Json(CountTokensResponse { input_tokens })).into_response()
 }
 
 /// `GET /claude/v1/models`:固定的 Anthropic 形状模型列表(本中转支持的模型),
@@ -2049,6 +2064,39 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "绑定未命中任何账号时必须选不出账号(503),绝不能漏给未授权账号"
         );
+    }
+
+    /// `count_tokens` 的畸形请求体必须回 Anthropic 形状的 400,而不是 axum 默认的纯文本 422。
+    ///
+    /// 上一轮把四个中转端点都改成了 `Result<Json<..>, JsonRejection>`,唯独漏了这个端点 ——
+    /// SDK 用 `response.json()` 读错误时,纯文本体只会抛解析异常,真正的原因被吞掉。
+    #[tokio::test]
+    async fn count_tokens_malformed_body_returns_anthropic_error_not_plain_422() {
+        let server = MockServer::start().await;
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages/count_tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":123,"messages":"not-an-array"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "畸形体应回 400,而不是 axum 的 422"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("错误体必须是 JSON,否则 SDK 解析不了");
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
     }
 
     /// 空池 → 503。
@@ -2916,8 +2964,13 @@ mod tests {
 
     async fn count_for(body: &str) -> u64 {
         let req: MessagesRequest = serde_json::from_str(body).unwrap();
-        let Json(resp) = count_tokens(Json(req)).await;
-        resp.input_tokens as u64
+        let resp = count_tokens(Ok(Json(req))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v["input_tokens"].as_u64().unwrap()
     }
 
     /// 带 tools 定义的请求估算应显著大于同样文本但无 tools 的请求(工具 schema 计入)。

@@ -963,7 +963,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.3.0"}
+{"service":"kiro2api","status":"ok","version":"0.3.1"}
 ```
 
 ### GET /v1/ping
@@ -991,7 +991,7 @@ curl http://localhost:8080/v1/ping
 | 402 | 지출 한도 초과 (`{"type":"error","error":{"type":"billing_error",…}}`. 판정은 요청 진입 시점에 1건당 예상 비용(USD 1.0 ≈ 1.39 크레딧)을 예약해 두고 내리므로, 잔여 한도가 그보다 작아지면 한도를 다 쓰기 전에도 거부됩니다) |
 | 403 | 금지 (권한 부족) |
 | 404 | 찾을 수 없음 (엔드포인트 없음, 또는 관리 API에서 존재하지 않는 id 지정 — 예: `{"error":"api key not found","id":…}`, 만료된 로그인 세션) |
-| 422 | 요청 본문 역직렬화 실패 (기본 `Json` 추출기가 그대로 거부 — 필수 필드 누락이나 타입 불일치. 예: `POST /api/admin/credentials/batch-import`를 `{"data": …}` 래퍼 없이 호출. `Json`을 직접 쓰는 `/api/admin/*`, `POST /api/user/login`, `POST /v1/messages/count_tokens`에서 발생합니다. 반면 프로토콜 4종의 **대화** 엔드포인트(`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1beta/models/{m}:generateContent`)만은 같은 상황을 각 프로토콜 형태의 `400` 본문으로 변환해 돌려줍니다) |
+| 422 | 요청 본문 역직렬화 실패 (기본 `Json` 추출기가 그대로 거부 — 필수 필드 누락이나 타입 불일치. 예: `POST /api/admin/credentials/batch-import`를 `{"data": …}` 래퍼 없이 호출. `Json`을 직접 쓰는 `/api/admin/*`, `POST /api/user/login`에서 발생합니다. 반면 프로토콜 4종의 **대화** 엔드포인트(`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1beta/models/{m}:generateContent`)와 `POST /v1/messages/count_tokens`는 같은 상황을 각 프로토콜 형태의 `400` 본문으로 변환해 돌려줍니다) |
 | 429 | 업스트림 Kiro의 스로틀링(`ThrottlingException` 계열 예외를 변환한 결과). `MAX_RPM_PER_CREDENTIAL` 초과는 이 코드가 되지 않습니다 — 해당 계정이 선택 대상에서 빠져 다른 계정으로 넘어가고, 전부 빠졌을 때만 `503`입니다 |
 | 500 | 서버 오류 (내부 오류) |
 | 502 | 업스트림 Kiro 실패 |

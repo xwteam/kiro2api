@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.3.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.3.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-07-28 | v0.3.1 - `POST /v1/messages/count_tokens` 的畸形請求體回 axum 預設的純文字 `422` 而非 Anthropic 錯誤體。v0.3.0 把四個協議對話端點都改成了顯式接管拒收,唯獨漏了這個同屬 Anthropic 協議、同樣由 SDK 直接呼叫的端點——SDK 用 `response.json()` 讀純文字只會拋解析例外,真正的失敗原因被吞掉 |
 | 2026-07-28 | v0.3.0 - 🔍 對 v0.2.1 自身修復的獨立複查。39 條確認項裡**有 9 條只關掉了一部分**卻被寫成已完成,另有 **13 條候選從未被裁決**(複核者中途崩潰),其中 12 條確屬真實缺陷,本版把這 21 處全部關掉。最要緊的一條:v0.2.1 宣稱「已真正生效」的 API-KEY 憑證綁定**從頭到尾沒有生效過**——鑑權閘把白名單解析出來塞進請求擴充,而下游沒有任何程式碼讀它,綁定到某個帳號的 key 照樣被分到池裡任意帳號,四協議皆然。另修:用戶端 IP 仍可偽造(`X-Forwarded-For` 取的是最左項,恰恰是呼叫方能寫死的那一項);`api_keys.json` 損壞時 `next_id` 仍會歸零,新建的 key 直接繼承前任的用量明細與累計消費;停機仍會丟掉餘額快取與事件日誌;上游錯誤體從未落庫,面板失敗詳情線上恆空;`temperature`、`max_tokens`、`tool_choice` 三個參數文件寫了但根本不生效,現已如實標註。v0.2.1 給綁定寫的迴歸測試斷言的是「值傳到了請求擴充」,而不是「選號照它執行」——這正是一個死功能能帶著全綠測試發版的原因;本輪每條修復的測試都先在修復前的程式碼上跑過、親眼看它失敗 |
 | 2026-07-27 | v0.2.1 - 🛡 補充審計修復（對抗式複查確認 39 項問題，含此前從未受審的面板與文件）：安全面，帶機密的檔案（`api_keys.json`、`config.json`）以任何人可讀的權限落盤，且每次寫回都會靜默放寬回去、手動 `chmod` 也守不住；客戶端 IP 可被任何直連連接埠的人偽造；API-KEY 上綁定的憑證只儲存、從未生效。另修復：`GET /api/admin/models` 每次開儀表板都觸發無上限的整池上游掃描（現改為單次合流、限量並加冷卻）；憑證檔損毀時被當成空池並隨即覆寫、毀掉全部帳號（現改為先備份再逐條搶救）；API-KEY 變更在關閉時遺失；OpenAI 平行工具呼叫產生不合法的工具往返；部分 Gemini 酬載（內建工具、snake_case 鍵、非圖片 inlineData）被拒或被改壞；2 MB 請求體上限擋掉約 1.5 MB 的圖片；以及大量管理面板／使用者面板修復 |
 | 2026-07-26 | v0.2.0 - 🔒 全鏈路審計修復：API-KEY 消費上限現在於 Anthropic / OpenAI / OpenAI-Responses / Gemini 四協議一律生效（此前只在 Anthropic 端點生效，改用其餘三協議即可無限消費，且這些流量的用量顯示為零）；只設定了使用者級 API-KEY 時管理面不再開放；上游錯誤、串流中途傳輸中斷與截斷不再被報成正常完成；帳號池刷新失敗會回饋到池；用量計費不再因重啟遺失、統計檔案保持可回滾；`--credentials` 與跟隨 `PORT` 的健康檢查現在真正生效 |
@@ -218,7 +219,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.3.0"}
+# {"service":"kiro2api","status":"ok","version":"0.3.1"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \

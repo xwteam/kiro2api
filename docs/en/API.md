@@ -953,7 +953,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1039,7 +1039,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.3.0"
+  "version": "0.3.1"
 }
 ```
 
@@ -1076,7 +1076,7 @@ The error body shape varies by protocol:
 | 401 | Unauthorized | Missing or invalid API Key (when `apiKey` is configured); also a disabled or expired store key |
 | 402 | Payment Required | A store-managed key has reached its spending limit (`{"type":"error","error":{"type":"billing_error",…}}`) |
 | 404 | Not Found | Admin endpoints only: unknown account / API-KEY / login-session id |
-| 422 | Unprocessable Entity | Admin endpoints, `/api/user/login` and `/v1/messages/count_tokens` only: the body does not deserialize into the expected shape (missing or wrongly typed required field). The body is axum's `text/plain` diagnostic, not any of the three JSON error shapes above. The four relay endpoints never answer `422` — they convert the same failure into a `400` carrying their protocol's error shape |
+| 422 | Unprocessable Entity | Admin endpoints and `/api/user/login` only: the body does not deserialize into the expected shape (missing or wrongly typed required field). The body is axum's `text/plain` diagnostic, not any of the three JSON error shapes above. The relay endpoints (the four conversational ones plus `/v1/messages/count_tokens`) never answer `422` — they convert the same failure into a `400` carrying their protocol's error shape |
 | 502 | Bad Gateway | Upstream Kiro / CodeWhisperer failure |
 | 503 | Service Unavailable | No account available (all in cooldown / disabled / over RPM); also the log endpoints when `logCapacity` is `0` |
 
