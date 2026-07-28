@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.4.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.5.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日付 | 更新内容 |
 |------|----------|
+| 2026-07-28 | v0.5.0 - アカウント管理にステータス絞り込み(すべて / 正常 / 異常 / 無効 / 利用停止 / 期限切れ / クォータ超過、各項目にリアルタイム件数)を追加し、「異常」を運用者が実際に対処を分ける単位に分解しました。上流がアカウントを停止するとレスポンスボディに `suspend` が含まれ、コードはこのシグナルを認識していましたが、「永久無効化ではなくクールダウン」の判断に使うだけで直後に捨てていました。`GET /api/admin/credentials` の新フィールド `statusReason` で直近の失敗理由を公開します。利用停止の判定はスロットリングより優先し、分類は表示層のみに影響します |
 | 2026-07-28 | v0.4.0 - プロトコル側の `/models` が提供可能な 17 モデルすべてを返し、3 プロトコルで一致するようになりました。従来は `GET /v1/models`・`GET /claude/v1/models`・`GET /v1beta/models` がそれぞれ**異なる 3 件**をハードコードしており、管理エンドポイントは 17 件 —— 「モデル一覧を取得してからその id で呼ぶ」という標準的な流れが、不完全かつプロトコルごとに異なる結果を返していました。単一のカタログ (`src/models_catalog.rs`) が 4 つのエンドポイントすべてを支え、カタログ内の各 id が `map_model` で解決できること、3 つの一覧が一致することをテストで保証します。API リファレンスに一度も載っていなかった 12 のルートも追記 |
 | 2026-07-28 | v0.3.1 - `POST /v1/messages/count_tokens` が不正なリクエストボディに対し、Anthropic のエラーオブジェクトではなく axum 既定の平文 `422` を返していました。v0.3.0 では 4 つの対話エンドポイントに明示的な拒否処理を入れましたが、同じ Anthropic プロトコルに属し SDK から直接呼ばれるこのエンドポイントだけ漏れていました —— 平文ボディに対する `response.json()` は解析例外を投げるだけで、本当の失敗理由が失われます |
 | 2026-07-28 | v0.3.0 - 🔍 v0.2.1 自身の修正を独立に再検証。確認済み 39 件のうち **9 件は一部しか塞がれていない**のに完了として告知され、さらに **13 件の候補は一度も判定されていなかった**(検証役が途中でクラッシュしたため)。うち 12 件が実在の欠陥と確認され、本版で 21 件すべてを塞いだ。最も重大なのは、v0.2.1 が「有効になった」と告知した API-KEY の認証情報バインドが**一度も機能していなかった**こと——ゲートはホワイトリストをリクエスト拡張に格納していたが、下流のどのコードもそれを読んでおらず、特定アカウントに紐付けた鍵でもプール内の任意のアカウントが使われていた(全プロトコル共通)。ほかに、クライアント IP は依然として偽装可能だった(`X-Forwarded-For` の最左要素、つまり呼び出し側が自由に書ける要素を採用していた);`api_keys.json` 破損時に `next_id` がゼロに戻り、新規の鍵が前任の利用明細と累計消費をそのまま引き継いでいた;終了時に残高キャッシュとイベントログが失われていた;アップストリームのエラー本文が保存されず、パネルの失敗詳細が常に空だった;`temperature`・`max_tokens`・`tool_choice` の 3 パラメータは文書化されていたが実際には無視されていたため、その旨を明記した。v0.2.1 がバインドに書いた回帰テストは「値がリクエスト拡張に届いたか」を検証しており、「アカウント選択がそれに従うか」ではなかった——動作しない機能がテスト全緑のまま出荷された理由がこれである。本ラウンドで追加した各テストは、修正前のコードで失敗することを実際に確認している |
@@ -221,7 +222,7 @@ docker compose logs -f
 ```bash
 # ヘルスチェック
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.4.0"}
+# {"service":"kiro2api","status":"ok","version":"0.5.0"}
 
 # 利用可能なモデルを表示
 curl http://localhost:8080/v1/models \

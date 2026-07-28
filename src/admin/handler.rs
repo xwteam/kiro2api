@@ -76,6 +76,9 @@ pub struct CredentialStatusItem {
     pub last_used_at: Option<String>,
     pub has_proxy: bool,
     pub health_status: &'static str,
+    /// 最近一次失败的具体原因:`none` / `banned` / `quota` / `token_expired` / `throttled`。
+    /// 与 `healthStatus` 正交 —— 前者答"能不能用",本字段答"为什么不能用"。
+    pub status_reason: &'static str,
     pub throttle_count: u64,
 }
 
@@ -107,6 +110,7 @@ fn account_to_item(a: &AccountStat) -> CredentialStatusItem {
         last_used_at: unix_to_rfc3339(a.last_used_unix),
         has_proxy: false,
         health_status: health_status(a),
+        status_reason: a.status_reason,
         throttle_count: a.failures,
     }
 }

@@ -631,7 +631,10 @@ pub(crate) async fn select_and_call_once(
                 None
             }
             Err((kind, status, body)) => {
-                pool.report_failure(&cred.id, *kind, now_unix);
+                // 顺带把这次失败的**具体原因**记进池:上游响应体在这里还在手上,分类完就丢
+                // 的话,面板永远只能显示一个笼统的"异常"(封禁/限流/额度耗尽全混在一起)。
+                let reason = crate::kiro::pool::status_reason_from_body(body);
+                pool.report_failure_with_reason(&cred.id, *kind, reason, now_unix);
                 Some((*kind, *status, body.clone()))
             }
         }

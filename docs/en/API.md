@@ -595,11 +595,14 @@ curl http://localhost:8080/api/admin/credentials \
       "lastUsedAt": "2026-07-25T11:59:00Z",
       "hasProxy": false,
       "healthStatus": "healthy",
+      "statusReason": "none",
       "throttleCount": 0
     }
   ]
 }
 ```
+
+`statusReason` records **why** the last failure happened — `none` / `banned` (upstream suspended the account) / `quota` / `token_expired` / `throttled` — and is orthogonal to `healthStatus`, which answers whether the account is selectable. It is derived from the raw upstream response body, affects presentation only (never selection, cooldown length or the disable decision), and clears on the account's next success.
 
 > [!NOTE]
 > Every field shown above always serializes. Two further fields, `email` and `nickname`, appear only when the account actually carries them. `expiresAt` and `lastUsedAt` are always present but hold `null` when the underlying timestamp is unset.
@@ -1160,7 +1163,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1376,7 +1379,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.4.0"
+  "version": "0.5.0"
 }
 ```
 

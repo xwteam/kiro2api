@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.4.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.5.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | Date | Update |
 |------|--------|
+| 2026-07-28 | v0.5.0 - The accounts page gets a status filter (all / healthy / abnormal / disabled / suspended / expired / quota exhausted, each with a live count), and "abnormal" is split into the buckets an operator actually acts on. When upstream suspends an account the response body says so, and the code already recognised that signal — but only to choose a cooldown over a permanent disable, discarding it right after. A new `statusReason` field on `GET /api/admin/credentials` now records why the last failure happened. Suspension is matched before throttling (a suspension response often carries throttling wording too), and the classification is presentation-only: it never touches selection discipline, so a misclassification costs a label and can never kill a healthy account |
 | 2026-07-28 | v0.4.0 - The protocol `/models` endpoints now list all 17 servable models and agree with each other. Previously `GET /v1/models`, `GET /claude/v1/models` and `GET /v1beta/models` each hardcoded a **different** set of three, while the admin endpoint had 17 — so list-then-use returned a partial set that also changed depending on which protocol you asked. A single catalog (`src/models_catalog.rs`) now backs all four endpoints, with tests asserting every catalogued id is one `map_model` accepts and that the three protocol lists match. Also documents 12 live routes that had never appeared in the API reference |
 | 2026-07-28 | v0.3.1 - `POST /v1/messages/count_tokens` returned axum's plain-text `422` for a malformed body instead of an Anthropic error object. v0.3.0 gave the four conversational endpoints explicit rejection handling but missed this one, which is part of the same Anthropic protocol and called directly by SDKs — `response.json()` on a plain-text body just raises a parse error and swallows the real reason |
 | 2026-07-28 | v0.3.0 - 🔍 Independent re-verification of v0.2.1's own fixes. **9 of the 39 confirmed findings had only been half-closed** while the release notes declared them done, and **13 further candidates were never adjudicated at all** (their verifier crashed mid-round); 12 of those proved real. All 21 are closed here. Most consequential: the API-KEY credential binding, which v0.2.1 announced as enforced, **was never enforced at all** — the gate parsed the whitelist into the request extensions and nothing downstream read it, so a key bound to one account was still served from any account, on every protocol. Also: the client IP was still forgeable (`X-Forwarded-For` was read from the leftmost entry, the one the caller controls); a corrupt `api_keys.json` still reset `next_id`, handing a new key an id whose surviving usage records and accumulated spend belonged to someone else; shutdown still dropped the balance cache and event logs; the upstream error body was never recorded, so the panel's failure detail was always empty; and three documented request parameters (`temperature`, `max_tokens`, `tool_choice`) turned out to be accepted and silently ignored. The regression test v0.2.1 wrote for the binding asserted that a value reached a request extension rather than that account selection honoured it — which is why a dead feature shipped green; every test added this round was first watched failing against the pre-fix code |
@@ -262,7 +263,7 @@ docker compose logs -f
 ```bash
 # Health check
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.4.0"}
+# {"service":"kiro2api","status":"ok","version":"0.5.0"}
 
 # View available models
 curl http://localhost:8080/v1/models \

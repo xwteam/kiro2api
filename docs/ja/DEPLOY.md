@@ -222,7 +222,7 @@ curl http://localhost:8080/health
 期待される応答：
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.4.0"}
+{"service":"kiro2api","status":"ok","version":"0.5.0"}
 ```
 
 ### モデル一覧の確認

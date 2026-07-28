@@ -185,6 +185,58 @@
   var dailyToday = null;                  // today's usage/daily row (credits + cost)
   var queryingInfo = false;               // guards the "query info" fan-out
   var autoQueryToken = 0;                  // bumps to cancel an in-flight auto-query when the list reloads
+  var statusFilter = 'all';                // 账号状态筛选(工具栏下拉)
+
+  // 一个账号归入哪一档。**顺序即优先级**:一个号可能同时满足多条(例如被封禁的号也在冷却里),
+  // 取最先命中的那一档,以运维要采取的动作为准 —— 封禁要换号,额度耗尽要等重置或换号,
+  // 单纯冷却等一会儿即可,三者处置完全不同,不能混成一个"异常"。
+  //
+  // `statusReason` 由后端按上游响应体判定(封禁/额度/令牌过期/限流),`healthStatus` 只答
+  // "能不能选中"。两者正交,所以这里要一起看。
+  function accountBucket(acc) {
+    if (acc.disabled) return 'disabled';
+    var reason = acc.statusReason || 'none';
+    if (reason === 'banned') return 'banned';
+    if (reason === 'quota') return 'quota';
+    // 过期:令牌到期时刻已过。注意这与 statusReason==='token_expired' 不同 —— 后者是
+    // 上游明确回过"令牌过期",前者只按本地记录的到期时刻判断,刷新一次通常就能自愈。
+    if (acc.expiresAt) {
+      var t = Date.parse(acc.expiresAt);
+      if (!isNaN(t) && t <= Date.now()) return 'expired';
+    }
+    var h = acc.healthStatus || 'healthy';
+    if (h === 'healthy') return 'healthy';
+    return 'abnormal';   // unhealthy(冷却中)/ warning(有失败但仍可选)
+  }
+
+  var STATUS_FILTERS = ['all', 'healthy', 'abnormal', 'disabled', 'banned', 'expired', 'quota'];
+
+  // 重建下拉选项:文案 + 实时条数。每次列表变化都要重画,否则条数会停在上一轮。
+  function paintStatusFilter() {
+    var sel = document.getElementById('accountsStatusFilter');
+    if (!sel) return;
+    var counts = { all: accounts.length };
+    STATUS_FILTERS.forEach(function (k) { if (k !== 'all') counts[k] = 0; });
+    accounts.forEach(function (a) {
+      var b = accountBucket(a);
+      if (counts[b] != null) counts[b]++;
+    });
+    var prev = sel.value || statusFilter;
+    sel.innerHTML = '';
+    STATUS_FILTERS.forEach(function (k) {
+      var o = document.createElement('option');
+      o.value = k;
+      o.textContent = t('acc.filter.' + k) + ' (' + counts[k] + ')';
+      sel.appendChild(o);
+    });
+    sel.value = STATUS_FILTERS.indexOf(prev) >= 0 ? prev : 'all';
+    statusFilter = sel.value;
+  }
+
+  function filteredAccounts() {
+    if (statusFilter === 'all') return accounts;
+    return accounts.filter(function (a) { return accountBucket(a) === statusFilter; });
+  }
 
   function selectedCount() { return Object.keys(selectedIds).length; }
   function clearSelection() { selectedIds = Object.create(null); }
@@ -265,7 +317,20 @@
     var reloadBtn = elI18n('button', 'btn btn-outline', 'common.refresh'); reloadBtn.type = 'button';
     reloadBtn.addEventListener('click', function () { loadAccounts(); });
 
-    // reference toolbar order: 查询信息 → 清除已禁用 → KAM 导入 → 批量导入 → 添加账号
+    // 状态筛选下拉 —— 放在「查询信息」左边。选项文案带实时条数,运维不用点进去就能知道
+    // 有多少号被封、多少号额度耗尽。
+    var statusSel = el('select', 'form-control');
+    statusSel.id = 'accountsStatusFilter';
+    statusSel.style.cssText = 'width:auto;min-width:9.5rem;';
+    statusSel.addEventListener('change', function () {
+      statusFilter = statusSel.value;
+      page = 1;                       // 换筛选必须回到第一页,否则可能停在一个已不存在的页码
+      renderList();
+      paintStatusFilter();            // 条数随筛选后的列表刷新
+    });
+
+    // reference toolbar order: 状态筛选 → 查询信息 → 清除已禁用 → KAM 导入 → 批量导入 → 添加账号
+    actions.appendChild(statusSel);
     actions.appendChild(queryInfoBtn);
     actions.appendChild(clearDisabledBtn);
     actions.appendChild(kamImportBtn);
@@ -398,7 +463,7 @@
     return b;
   }
 
-  function totalPages() { return Math.max(1, Math.ceil(accounts.length / PAGE_SIZE)); }
+  function totalPages() { return Math.max(1, Math.ceil(filteredAccounts().length / PAGE_SIZE)); }
 
   function renderList() {
     var list = document.getElementById('accountsList');
@@ -407,7 +472,8 @@
     if (!list) return;
     list.innerHTML = '';
 
-    if (!accounts.length) {
+    var shown = filteredAccounts();
+    if (!shown.length) {
       list.style.display = 'none';
       if (pager) pager.style.display = 'none';
       if (empty) empty.style.display = '';
@@ -420,16 +486,17 @@
     if (page > pages) page = pages;
     if (page < 1) page = 1;
     var start = (page - 1) * PAGE_SIZE;
-    var slice = accounts.slice(start, start + PAGE_SIZE);
+    var slice = shown.slice(start, start + PAGE_SIZE);
 
     slice.forEach(function (acc) { list.appendChild(buildRow(acc)); });
 
     renderPager(pager, pages);
     if (K.i18n) K.i18n.apply(list);
+    paintStatusFilter();
 
     if (focusId != null) {
       // jump to the page that holds the focused account
-      var idx = accounts.findIndex(function (a) { return String(a.id) === String(focusId); });
+      var idx = shown.findIndex(function (a) { return String(a.id) === String(focusId); });
       if (idx >= 0) {
         var wantPage = Math.floor(idx / PAGE_SIZE) + 1;
         if (wantPage !== page) { page = wantPage; renderList(); return; }

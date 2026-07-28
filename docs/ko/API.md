@@ -616,11 +616,14 @@ curl http://localhost:8080/api/admin/credentials \
       "hasProfileArn": true,
       "successCount": 150,
       "healthStatus": "healthy",
+      "statusReason": "none",
       "throttleCount": 0
     }
   ]
 }
 ```
+
+`statusReason`은 **마지막 실패 사유**를 기록합니다(`none` / `banned` = 업스트림이 계정을 정지 / `quota` / `token_expired` / `throttled`). 「선택 가능한지」를 답하는 `healthStatus`와는 직교하는 정보입니다. 업스트림 원본 응답 본문에서 판정되며 **표시에만 영향**을 줍니다(계정 선택 규칙·쿨다운 시간·비활성화 판정에는 관여하지 않음). 다음 성공 시 초기화됩니다.
 
 > [!NOTE]
 > - 풀은 요청마다 계정을 고르므로 "현재 계정"이라는 지속 상태가 존재하지 않습니다. `currentId`는 **항상 `-1`**, `isCurrent`는 **항상 `false`**입니다(장래의 고정 선택 모드를 위한 예약 필드) — 이 두 값으로 분기하지 마십시오.
@@ -1423,7 +1426,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.4.0"}
+{"service":"kiro2api","status":"ok","version":"0.5.0"}
 ```
 
 ### GET /v1/ping

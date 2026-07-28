@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.4.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.5.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-07-28 | v0.5.0 - 帳號管理新增狀態篩選下拉(全部 / 健康 / 異常 / 停用 / 封禁 / 過期 / 額度耗盡,每檔帶即時條數),並把「異常」拆成維運真正要分別處置的幾檔。上游停用帳號時回應體帶 `suspend` 字樣,程式原本識別它,但只用來決定「別永久停用、讓它冷卻」,分類完就丟了。現經 `GET /api/admin/credentials` 的新欄位 `statusReason` 透出最近一次失敗的具體原因。封禁判定優先於限流;分類只進展示層,不改變選號紀律 |
 | 2026-07-28 | v0.4.0 - 協議側 `/models` 現在列出全部 17 個可服務模型,三個協議結果一致。此前 `GET /v1/models`、`GET /claude/v1/models`、`GET /v1beta/models` 各自硬編碼**三條且互不相同**,而管理介面有 17 條——客戶端「先列模型再按 id 呼叫」拿到的只是殘缺子集,換個協議看到的還不一樣。現由唯一目錄 `src/models_catalog.rs` 支撐四個端點,並有測試保證目錄裡每個 id 都能被 `map_model` 識別、三協議逐項一致。另補齊 12 個從未寫進 API 參考的線上路由 |
 | 2026-07-28 | v0.3.1 - `POST /v1/messages/count_tokens` 的畸形請求體回 axum 預設的純文字 `422` 而非 Anthropic 錯誤體。v0.3.0 把四個協議對話端點都改成了顯式接管拒收,唯獨漏了這個同屬 Anthropic 協議、同樣由 SDK 直接呼叫的端點——SDK 用 `response.json()` 讀純文字只會拋解析例外,真正的失敗原因被吞掉 |
 | 2026-07-28 | v0.3.0 - 🔍 對 v0.2.1 自身修復的獨立複查。39 條確認項裡**有 9 條只關掉了一部分**卻被寫成已完成,另有 **13 條候選從未被裁決**(複核者中途崩潰),其中 12 條確屬真實缺陷,本版把這 21 處全部關掉。最要緊的一條:v0.2.1 宣稱「已真正生效」的 API-KEY 憑證綁定**從頭到尾沒有生效過**——鑑權閘把白名單解析出來塞進請求擴充,而下游沒有任何程式碼讀它,綁定到某個帳號的 key 照樣被分到池裡任意帳號,四協議皆然。另修:用戶端 IP 仍可偽造(`X-Forwarded-For` 取的是最左項,恰恰是呼叫方能寫死的那一項);`api_keys.json` 損壞時 `next_id` 仍會歸零,新建的 key 直接繼承前任的用量明細與累計消費;停機仍會丟掉餘額快取與事件日誌;上游錯誤體從未落庫,面板失敗詳情線上恆空;`temperature`、`max_tokens`、`tool_choice` 三個參數文件寫了但根本不生效,現已如實標註。v0.2.1 給綁定寫的迴歸測試斷言的是「值傳到了請求擴充」,而不是「選號照它執行」——這正是一個死功能能帶著全綠測試發版的原因;本輪每條修復的測試都先在修復前的程式碼上跑過、親眼看它失敗 |
@@ -220,7 +221,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.4.0"}
+# {"service":"kiro2api","status":"ok","version":"0.5.0"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \

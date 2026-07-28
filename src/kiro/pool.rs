@@ -130,6 +130,62 @@ pub fn body_signals_invalid_request(body: &str) -> bool {
     body.to_ascii_lowercase().contains("invalid_model_id")
 }
 
+/// 账号最近一次失败的**具体原因**,用于把笼统的"异常"拆成运维真正关心的几档。
+///
+/// 分类只影响**展示与筛选**,不改变选号纪律:`suspend` 命中的账号照旧按可自愈处理(冷却后
+/// 重新参选),因为被暂停的账号确实可能恢复;但运维需要一眼看出"这批是被上游封了",而不是
+/// 和限流、令牌过期混在同一个"异常"里查不出所以然。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatusReason {
+    /// 无最近失败,或失败原因不属于下列任何一类。
+    #[default]
+    None,
+    /// 上游响应体含 suspend/suspended:账号被上游暂停(封禁)。
+    Banned,
+    /// 配额/额度耗尽(429,或响应体含 quota)。
+    QuotaExhausted,
+    /// 令牌过期类(ExpiredTokenException 等)。刷新即可自愈,不是账号问题。
+    TokenExpired,
+    /// 限流 / 上游风控临时拦截。
+    Throttled,
+}
+
+impl StatusReason {
+    /// 出站线格式用的稳定短名(前端按它筛选)。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StatusReason::None => "none",
+            StatusReason::Banned => "banned",
+            StatusReason::QuotaExhausted => "quota",
+            StatusReason::TokenExpired => "token_expired",
+            StatusReason::Throttled => "throttled",
+        }
+    }
+}
+
+/// 从上游原始响应体判定失败原因。
+///
+/// 顺序有讲究:`suspend` 优先于 `throttl`/`quota` —— 上游把账号停用时,响应体里常常同时
+/// 带着限流措辞,先匹配限流会把封禁误报成一次普通限流,运维就永远等不到那批号"自己恢复"。
+pub fn status_reason_from_body(body: &str) -> StatusReason {
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("suspend") {
+        StatusReason::Banned
+    } else if lower.contains("quota") {
+        StatusReason::QuotaExhausted
+    } else if lower.contains("expired") {
+        StatusReason::TokenExpired
+    } else if lower.contains("throttl")
+        || lower.contains("too many requests")
+        || lower.contains("rate exceeded")
+        || lower.contains("security precaution")
+    {
+        StatusReason::Throttled
+    } else {
+        StatusReason::None
+    }
+}
+
 /// 响应体是否带有**可自愈**信号:过期/暂停/限流/配额/风控。命中 → 一律冷却(AuthAmbiguous),
 /// **绝不**永久禁用。作为 [`classify_with_body`] 401/403 分支的防御性短路(先于 invalid 判定)。
 ///
@@ -251,6 +307,8 @@ struct Entry {
     failures: u64,
     /// 最近一次被选中的时刻(用量统计)。
     last_used_unix: u64,
+    /// 最近一次失败的具体原因(仅用于展示/筛选,见 [`StatusReason`])。成功即清空。
+    status_reason: StatusReason,
 }
 
 /// 单账号用量快照(供后续 admin 只读展示用,内部观测,无需改名)。
@@ -281,6 +339,8 @@ pub struct AccountStat {
     pub has_profile_arn: bool,
     /// 连续失败计数(瞬时类 strike 累计;展示"failureCount"用)。
     pub strikes: u32,
+    /// 最近一次失败的具体原因(见 [`StatusReason::as_str`]);无则 `"none"`。
+    pub status_reason: &'static str,
     /// 当前实时 RPM:近 RPM_WINDOW_SECS 秒内被 select 选中的次数(展示"RPM"用)。
     pub rpm: u32,
 }
@@ -324,6 +384,7 @@ impl Pool {
                 successes: 0,
                 failures: 0,
                 last_used_unix: 0,
+                status_reason: StatusReason::None,
                 cred: c,
             })
             .collect();
@@ -574,6 +635,7 @@ impl Pool {
             successes: 0,
             failures: 0,
             last_used_unix: 0,
+            status_reason: StatusReason::None,
             cred,
         });
         (id, email)
@@ -735,6 +797,9 @@ impl Pool {
             e.strikes = 0;
             e.unconfirmed_refresh = false;
             e.successes += 1;
+            // 一次成功即说明上次那个原因(封禁/限流/过期…)已经过去,标签必须跟着清,
+            // 否则面板会把一个已经恢复的账号一直挂在"封禁"那一档。
+            e.status_reason = StatusReason::None;
         }
     }
 
@@ -751,8 +816,27 @@ impl Pool {
     /// 注意:调用方应尽量用 [`classify_with_body`] 依响应体分类,让"永久禁用"只在真凭据失效时发生;
     /// 拿不到响应体时用 [`classify`],401/403 会保守落在 `AuthAmbiguous`(冷却)而非永久禁用。
     pub fn report_failure(&mut self, id: &str, kind: FailureKind, now_unix: u64) {
+        self.report_failure_with_reason(id, kind, StatusReason::None, now_unix);
+    }
+
+    /// 同 [`report_failure`](Self::report_failure),但额外记下**这次失败的具体原因**
+    /// (由上游响应体判定,见 [`status_reason_from_body`]),供管理面把"异常"拆成
+    /// 封禁 / 额度耗尽 / 令牌过期 / 限流几档展示。
+    ///
+    /// 原因只进展示层:选号纪律、冷却时长、禁用判定一律不受它影响 —— 分类错了最多让面板
+    /// 上的标签不准,绝不能让一个健康账号因为措辞匹配被判死。
+    pub fn report_failure_with_reason(
+        &mut self,
+        id: &str,
+        kind: FailureKind,
+        reason: StatusReason,
+        now_unix: u64,
+    ) {
         if let Some(e) = self.find(id) {
             e.failures += 1;
+            if reason != StatusReason::None {
+                e.status_reason = reason;
+            }
             // 上一次换新令牌的尝试刚因传输层错误未成行 → 这次 AuthInvalid 背后并没有"用新令牌
             // 重试过"的确证(403 的失效措辞对被服务端轮换掉的 access_token 同样成立,那类账号
             // 强制刷新即自愈)。按保守纪律降级为冷却,标记一次性消费。
@@ -813,6 +897,7 @@ impl Pool {
                 expires_at_unix: e.cred.expires_at_unix,
                 has_profile_arn: e.cred.profile_arn.is_some(),
                 strikes: e.strikes,
+                status_reason: e.status_reason.as_str(),
                 rpm: Self::window_count(e, now_unix),
             })
             .collect()
@@ -1047,6 +1132,52 @@ mod tests {
         assert_eq!(
             classify_with_body(500, "internal error"),
             FailureKind::Transient
+        );
+    }
+
+    /// 封禁必须能从"异常"里被单独识别出来 —— 否则运维在 1000 个账号里分不清哪些是被上游
+    /// 停用、哪些只是限流,而两者的处置完全不同(前者要换号,后者等一会儿就好)。
+    #[test]
+    fn status_reason_separates_ban_from_the_other_recoverable_failures() {
+        // 优先级:上游停用账号时响应体常常同时带限流措辞,先匹配限流会把封禁误报成限流。
+        assert_eq!(
+            status_reason_from_body(
+                r#"{"__type":"AccessDeniedException","message":"Your User ID is suspended. Too many requests"}"#
+            ),
+            StatusReason::Banned
+        );
+        assert_eq!(
+            status_reason_from_body(r#"{"message":"Monthly quota exceeded"}"#),
+            StatusReason::QuotaExhausted
+        );
+        assert_eq!(
+            status_reason_from_body(r#"{"__type":"ExpiredTokenException"}"#),
+            StatusReason::TokenExpired
+        );
+        assert_eq!(
+            status_reason_from_body(r#"{"__type":"ThrottlingException"}"#),
+            StatusReason::Throttled
+        );
+        assert_eq!(status_reason_from_body("{}"), StatusReason::None);
+    }
+
+    /// 原因进得去、出得来,而且**一次成功就清空** —— 否则恢复了的账号会一直挂在"封禁"档。
+    #[test]
+    fn status_reason_is_exposed_and_cleared_on_success() {
+        let mut p = Pool::new(vec![cred("a", 1)], LbMode::Priority);
+        assert_eq!(p.stats(0)[0].status_reason, "none");
+
+        p.report_failure_with_reason("a", FailureKind::AuthAmbiguous, StatusReason::Banned, 0);
+        assert_eq!(p.stats(0)[0].status_reason, "banned");
+
+        // 分类只影响展示:AuthAmbiguous 单次不禁用,账号仍可选。
+        assert!(!p.stats(0)[0].disabled);
+
+        p.report_success("a");
+        assert_eq!(
+            p.stats(0)[0].status_reason,
+            "none",
+            "成功一次就说明那个原因过去了,标签必须跟着清"
         );
     }
 
