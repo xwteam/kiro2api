@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.5.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.6.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日付 | 更新内容 |
 |------|----------|
+| 2026-07-28 | v0.6.0 - アカウント一覧が 30 秒ごとに自動更新され、鮮度ラベルが付きました。従来はページを開いた時点で固定され、アカウントの利用停止・クールダウンからの復帰・期限切れが起きても、手動更新するまで画面は変わりませんでした。古いバッジを見て判断するのはバッジがないより悪く、「利用停止 (0)」のような数字は結論に見えて実は 10 分前のものかもしれません。再取得するのは安価な一覧エンドポイントだけで、残高のファンアウトをタイマーで再実行することは決してありません。静かな更新はページ・絞り込み・選択・スクロール位置を保ち、ツールバーには数字が何秒前のものかを表示します |
 | 2026-07-28 | v0.5.1 - ヘルスバッジと新しいステータス絞り込みが別々の判断をしていました:絞り込みは v0.5.0 の区分を使う一方、バッジは `healthStatus` だけを見ていたため、「期限切れ」区分の行に緑の「正常」バッジが付いたままでした。現在は同一の分類から導出します。クォータ超過も「選択されて実際に失敗した」場合しか検出できず、まだ選ばれていないが残高のないアカウントを取りこぼしていました。残高照会の残りがゼロなら同様にクォータ超過と判定し(「未照会」とは厳密に区別)、残高が届くたびに当該行のバッジと絞り込みの件数を更新します |
 | 2026-07-28 | v0.5.0 - アカウント管理にステータス絞り込み(すべて / 正常 / 異常 / 無効 / 利用停止 / 期限切れ / クォータ超過、各項目にリアルタイム件数)を追加し、「異常」を運用者が実際に対処を分ける単位に分解しました。上流がアカウントを停止するとレスポンスボディに `suspend` が含まれ、コードはこのシグナルを認識していましたが、「永久無効化ではなくクールダウン」の判断に使うだけで直後に捨てていました。`GET /api/admin/credentials` の新フィールド `statusReason` で直近の失敗理由を公開します。利用停止の判定はスロットリングより優先し、分類は表示層のみに影響します |
 | 2026-07-28 | v0.4.0 - プロトコル側の `/models` が提供可能な 17 モデルすべてを返し、3 プロトコルで一致するようになりました。従来は `GET /v1/models`・`GET /claude/v1/models`・`GET /v1beta/models` がそれぞれ**異なる 3 件**をハードコードしており、管理エンドポイントは 17 件 —— 「モデル一覧を取得してからその id で呼ぶ」という標準的な流れが、不完全かつプロトコルごとに異なる結果を返していました。単一のカタログ (`src/models_catalog.rs`) が 4 つのエンドポイントすべてを支え、カタログ内の各 id が `map_model` で解決できること、3 つの一覧が一致することをテストで保証します。API リファレンスに一度も載っていなかった 12 のルートも追記 |
@@ -223,7 +224,7 @@ docker compose logs -f
 ```bash
 # ヘルスチェック
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.5.1"}
+# {"service":"kiro2api","status":"ok","version":"0.6.0"}
 
 # 利用可能なモデルを表示
 curl http://localhost:8080/v1/models \

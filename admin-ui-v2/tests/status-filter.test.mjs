@@ -99,3 +99,34 @@ test('healthBadge 由 accountBucket 驱动,不再单看 healthStatus', () => {
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// 账号列表的静默自动刷新。
+//
+// 页面此前打开即冻结:账号被封、恢复、过期,面板全都不动。运维照着一屏过时徽章做判断,
+// 比没有徽章更糟 —— 尤其「封禁账号 (0)」这种数字看着像结论,其实可能是十分钟前的。
+test('自动刷新只重拉列表,绝不顺带重跑余额扇出', () => {
+  const i = SRC.indexOf('function refreshAccountsQuietly()');
+  assert.ok(i > 0, '应存在 refreshAccountsQuietly');
+  const body = SRC.slice(i, SRC.indexOf('\n  }', i));
+  assert.ok(/api\.get\('\/credentials'\)/.test(body), '应重拉列表接口');
+  assert.ok(
+    !/autoQueryBalances|runBalanceFanout/.test(body),
+    '自动刷新里绝不能触发余额扇出 —— 那是逐个打上游的,每 30 秒来一遍等于给上游送风控'
+  );
+  assert.ok(/page\s*=\s*1/.test(body) === false, '静默刷新不得重置页码,否则运维翻的页会被顶回第一页');
+});
+
+test('页面不可见时不刷新,离开分区时停掉定时器', () => {
+  const i = SRC.indexOf('function refreshAccountsQuietly()');
+  const body = SRC.slice(i, SRC.indexOf('\n  }', i));
+  assert.ok(/document\.hidden/.test(body), '标签页在后台就不该继续拉');
+  assert.ok(/stopAutoRefresh\(\)/.test(SRC.slice(SRC.indexOf('onHide: function'))), 'onHide 必须停掉定时器');
+});
+
+test('新鲜度提示存在,且超时会标记为陈旧', () => {
+  const i = SRC.indexOf('function paintFreshness()');
+  assert.ok(i > 0, '应存在 paintFreshness —— 让运维看得出屏幕上的数字是几秒前的');
+  const body = SRC.slice(i, SRC.indexOf('\n  }', i));
+  assert.ok(/is-stale/.test(body), '长时间没刷新成功要显式标记,别让陈旧快照冒充实时数据');
+});

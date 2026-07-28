@@ -187,6 +187,18 @@
   var autoQueryToken = 0;                  // bumps to cancel an in-flight auto-query when the list reloads
   var statusFilter = 'all';                // 账号状态筛选(工具栏下拉)
 
+  // 账号列表的静默自动刷新。
+  //
+  // 没有它,页面打开那一刻的快照会一直冻着:账号被上游封了、冷却结束恢复了、令牌过期了,
+  // 面板全都不会变。运维照着一屏过时的徽章做判断,比没有徽章更糟 —— 尤其是新加的状态
+  // 筛选,「封禁账号 (0)」这种数字看着像结论,其实可能是十分钟前的。
+  //
+  // 只重拉**列表接口**(读的是进程内存,便宜);**绝不**顺带重跑余额扇出 —— 那是逐个打
+  // 上游的,每 30 秒来一遍等于给 AWS 送风控。余额仍由「查询信息」按需触发。
+  var AUTO_REFRESH_MS = 30000;
+  var autoRefreshTimer = null;
+  var lastLoadedAt = 0;
+
   // 一个账号归入哪一档。**顺序即优先级**:一个号可能同时满足多条(例如被封禁的号也在冷却里),
   // 取最先命中的那一档,以运维要采取的动作为准 —— 封禁要换号,额度耗尽要等重置或换号,
   // 单纯冷却等一会儿即可,三者处置完全不同,不能混成一个"异常"。
@@ -226,6 +238,60 @@
   }
 
   function bucketOf(acc) { return accountBucket(acc, remainingOf(acc)); }
+
+  // 静默重拉列表:不清空列表、不显示 loading、不重置页码与筛选、不碰余额扇出。
+  function refreshAccountsQuietly() {
+    if (typeof document !== 'undefined' && document.hidden) return;   // 页面在后台就别打了
+    if (!document.getElementById('accountsList')) { stopAutoRefresh(); return; }
+    api.get('/credentials').then(function (data) {
+      accounts = (data && (data.credentials || data.data)) || [];
+      var live = Object.create(null);
+      accounts.forEach(function (a) { live[String(a.id)] = true; });
+      Object.keys(selectedIds).forEach(function (id) { if (!live[id]) delete selectedIds[id]; });
+      Object.keys(balanceMap).forEach(function (id) { if (!live[id]) delete balanceMap[id]; });
+      // 保留滚动位置:静默刷新不该把运维正在看的那一屏顶走。
+      var sy = (typeof window !== 'undefined' && window.scrollY) || 0;
+      renderList();
+      renderStats();
+      updateBatchBar();
+      if (typeof window !== 'undefined' && window.scrollTo) window.scrollTo(0, sy);
+      markLoaded();
+    }).catch(function () {
+      // 自动刷新失败不弹提示 —— 一次网络抖动不值得打断运维,下一拍会再试。
+    });
+  }
+
+  function markLoaded() {
+    lastLoadedAt = Date.now();
+    paintFreshness();
+  }
+
+  // 「更新于 N 秒前」。把新鲜度**显示出来**,是这条改动的另一半:即便刷新挂了,
+  // 运维也能一眼看出屏幕上的数字是几分钟前的,而不是把陈旧快照当成当前事实。
+  function paintFreshness() {
+    var elFresh = document.getElementById('accountsFreshness');
+    if (!elFresh || !lastLoadedAt) return;
+    var secs = Math.max(0, Math.round((Date.now() - lastLoadedAt) / 1000));
+    var txt;
+    if (secs < 5) txt = t('acc.freshNow');
+    else if (secs < 60) txt = t('acc.freshSec').replace('{n}', secs);
+    else txt = t('acc.freshMin').replace('{n}', Math.floor(secs / 60));
+    elFresh.textContent = txt;
+    // 超过两拍还没刷新成功 = 大概率刷新链路断了,变灰提示别再当成实时数据。
+    elFresh.className = 'text-muted' + (secs > AUTO_REFRESH_MS / 500 ? ' is-stale' : '');
+  }
+
+  function startAutoRefresh() {
+    stopAutoRefresh();
+    autoRefreshTimer = setInterval(function () {
+      paintFreshness();                                  // 秒数每拍都要走
+      if (Date.now() - lastLoadedAt >= AUTO_REFRESH_MS) refreshAccountsQuietly();
+    }, 5000);
+  }
+
+  function stopAutoRefresh() {
+    if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
+  }
 
   // 原地替换某一行的健康徽章。行不在当前页(或已被筛掉)时静默跳过。
   function refreshRowBadge(acc, rowSel) {
@@ -363,7 +429,13 @@
       paintStatusFilter();            // 条数随筛选后的列表刷新
     });
 
-    // reference toolbar order: 状态筛选 → 查询信息 → 清除已禁用 → KAM 导入 → 批量导入 → 添加账号
+    // 新鲜度提示 —— 紧挨筛选下拉。数字看着像结论,必须让人知道它是几秒前的。
+    var freshness = el('span', 'text-muted');
+    freshness.id = 'accountsFreshness';
+    freshness.style.cssText = 'font-size:0.8125rem;align-self:center;margin-right:0.25rem;';
+
+    // reference toolbar order: 新鲜度 → 状态筛选 → 查询信息 → 清除已禁用 → KAM 导入 → 批量导入 → 添加账号
+    actions.appendChild(freshness);
     actions.appendChild(statusSel);
     actions.appendChild(queryInfoBtn);
     actions.appendChild(clearDisabledBtn);
@@ -431,6 +503,8 @@
       // the user should not have to click 查询信息. Runs serially (one request
       // at a time) so we don't burst the upstream and risk rate-limits/suspension.
       autoQueryBalances();
+      markLoaded();
+      startAutoRefresh();
     }).catch(function (e) {
       api.toast(e.message || t('common.error'), 'error');
       if (list) { list.innerHTML = ''; list.appendChild(elI18n('div', 'empty-state', 'common.error')); if (K.i18n) K.i18n.apply(list); }
@@ -2230,8 +2304,19 @@
     // queryingInfo 随之释放,最多晚一发请求的时间。
     onHide: function () {
       autoQueryToken++;
+      // 离开账号页就停掉自动刷新:人都不在这一页了,继续每 30 秒拉一次列表没有意义,
+      // 401 掉线时更要停 —— 否则每一拍都再撞一次 401,把登录浮层反复重弹。
+      stopAutoRefresh();
     }
   };
+
+  // 标签页切回前台时立刻补一次:后台期间定时器可能被浏览器节流甚至冻结,回来时屏幕上
+  // 大概率是一屏过时数据,而运维恰恰是在这一刻开始看它。
+  if (typeof document !== 'undefined' && document.addEventListener) {
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden && autoRefreshTimer) refreshAccountsQuietly();
+    });
+  }
 
   // Allow dashboard to jump here focused on an account.
   K.focusAccount = function (id) {

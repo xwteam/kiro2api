@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.5.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.6.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | Date | Update |
 |------|--------|
+| 2026-07-28 | v0.6.0 - The accounts list now refreshes itself every 30 seconds, with a freshness label. The page previously froze at whatever it loaded: an account being suspended, recovering from cooldown or expiring changed nothing on screen until you hit refresh. Acting on a screen of stale badges is worse than having no badges — a count like "suspended (0)" reads as a conclusion when it may be ten minutes old. Only the cheap list endpoint is re-fetched; the balance fan-out is never re-run on a timer, since that walks the pool one upstream call at a time. The quiet refresh keeps your page, filter, selection and scroll position, and the toolbar says how long ago the numbers came from — turning warning-coloured if refreshes stop succeeding |
 | 2026-07-28 | v0.5.1 - The health badge and the new status filter disagreed: the filter used the v0.5.0 buckets while the badge still read `healthStatus` alone, so rows inside "expired" kept a green "healthy" badge. Both now derive from the same classification. Quota exhaustion was also only detected once an account had actually been picked and failed with a quota error — an account already out of credits but not yet tried stayed "healthy". A balance query returning zero remaining now counts too (never confused with "not queried yet"), and the badge plus the dropdown counts refresh as each balance arrives |
 | 2026-07-28 | v0.5.0 - The accounts page gets a status filter (all / healthy / abnormal / disabled / suspended / expired / quota exhausted, each with a live count), and "abnormal" is split into the buckets an operator actually acts on. When upstream suspends an account the response body says so, and the code already recognised that signal — but only to choose a cooldown over a permanent disable, discarding it right after. A new `statusReason` field on `GET /api/admin/credentials` now records why the last failure happened. Suspension is matched before throttling (a suspension response often carries throttling wording too), and the classification is presentation-only: it never touches selection discipline, so a misclassification costs a label and can never kill a healthy account |
 | 2026-07-28 | v0.4.0 - The protocol `/models` endpoints now list all 17 servable models and agree with each other. Previously `GET /v1/models`, `GET /claude/v1/models` and `GET /v1beta/models` each hardcoded a **different** set of three, while the admin endpoint had 17 — so list-then-use returned a partial set that also changed depending on which protocol you asked. A single catalog (`src/models_catalog.rs`) now backs all four endpoints, with tests asserting every catalogued id is one `map_model` accepts and that the three protocol lists match. Also documents 12 live routes that had never appeared in the API reference |
@@ -264,7 +265,7 @@ docker compose logs -f
 ```bash
 # Health check
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.5.1"}
+# {"service":"kiro2api","status":"ok","version":"0.6.0"}
 
 # View available models
 curl http://localhost:8080/v1/models \

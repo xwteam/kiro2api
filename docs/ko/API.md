@@ -1426,7 +1426,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.5.1"}
+{"service":"kiro2api","status":"ok","version":"0.6.0"}
 ```
 
 ### GET /v1/ping

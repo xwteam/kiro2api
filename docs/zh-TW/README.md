@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.5.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.6.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-07-28 | v0.6.0 - 帳號列表每 30 秒靜默自動重新整理,並顯示新鮮度。此前頁面開啟即凍結:帳號被封、冷卻結束恢復、權杖過期,螢幕上都不會變,除非手動重新整理。照著一屏過時徽章做判斷比沒有徽章更糟——「封禁帳號 (0)」看著像結論,其實可能是十分鐘前的。只重拉便宜的列表介面,**絕不**按定時重跑餘額扇出。靜默重新整理保留頁碼、篩選、選取態與捲動位置;工具列顯示數字是幾秒前的 |
 | 2026-07-28 | v0.5.1 - 健康徽章與新加的狀態篩選各算各的:篩選走 v0.5.0 的分檔,徽章仍只看 `healthStatus`,於是「過期帳號」那一檔裡的行照樣掛著綠色「健康」。現在兩者同源。額度耗盡此前也只認「被選中並失敗過一次」,帳號還沒輪到就已經沒額度的情況完全覆蓋不到 —— 現在餘額查詢回來的剩餘歸零同樣判為額度耗盡(與「還沒查過」嚴格區分),且每條餘額回來即刷新該行徽章與下拉條數 |
 | 2026-07-28 | v0.5.0 - 帳號管理新增狀態篩選下拉(全部 / 健康 / 異常 / 停用 / 封禁 / 過期 / 額度耗盡,每檔帶即時條數),並把「異常」拆成維運真正要分別處置的幾檔。上游停用帳號時回應體帶 `suspend` 字樣,程式原本識別它,但只用來決定「別永久停用、讓它冷卻」,分類完就丟了。現經 `GET /api/admin/credentials` 的新欄位 `statusReason` 透出最近一次失敗的具體原因。封禁判定優先於限流;分類只進展示層,不改變選號紀律 |
 | 2026-07-28 | v0.4.0 - 協議側 `/models` 現在列出全部 17 個可服務模型,三個協議結果一致。此前 `GET /v1/models`、`GET /claude/v1/models`、`GET /v1beta/models` 各自硬編碼**三條且互不相同**,而管理介面有 17 條——客戶端「先列模型再按 id 呼叫」拿到的只是殘缺子集,換個協議看到的還不一樣。現由唯一目錄 `src/models_catalog.rs` 支撐四個端點,並有測試保證目錄裡每個 id 都能被 `map_model` 識別、三協議逐項一致。另補齊 12 個從未寫進 API 參考的線上路由 |
@@ -222,7 +223,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.5.1"}
+# {"service":"kiro2api","status":"ok","version":"0.6.0"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \

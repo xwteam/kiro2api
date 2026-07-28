@@ -1462,3 +1462,9 @@
   -webkit-overflow-scrolling: touch;
 }
 .int-code code { font-family: inherit; background: none; color: inherit; padding: 0; }
+
+/* 账号列表的新鲜度提示。超过两拍还没刷新成功即转为警示色 —— 陈旧快照不该冒充实时数据,
+   运维照着过时的徽章判断,比没有徽章更糟。 */
+#accountsFreshness.is-stale {
+  color: var(--warning, #b45309);
+}
