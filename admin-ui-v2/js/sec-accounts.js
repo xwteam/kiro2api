@@ -872,7 +872,15 @@
     grid.innerHTML = '';
 
     var total = accounts.length;
-    var available = accounts.filter(function (a) { return !a.disabled; }).length;
+      // 「可用」= 健康档的账号数。老写法是 `!a.disabled`,把封禁、额度耗尽、过期的号全算了
+      // 进来 —— 封禁不等于禁用,这些账号 `disabled` 恒为 false。于是同一页上「封禁 6」与
+      // 「可用 253」并列出现,两个数字互相打架。
+      //
+      // 这里刻意**不用**后端的 `available`:后端那个数答的是"中转此刻会去尝试哪些账号",
+      // 额度耗尽与令牌过期的号冷却一过仍在其中(它们确实该被再试,额度会恢复、令牌能刷新)。
+      // 而运维看这张卡是想知道"现在有多少号是好的",两者本就不是同一个问题。分档函数还多知道
+      // 一件后端不知道的事:余额查询回来的剩余已归零 —— 那个号还没轮到就已经没额度了。
+      var available = accounts.filter(function (a) { return bucketOf(a) === 'healthy'; }).length;
 
     // 账号总数
     grid.appendChild(statCard('acc.statTotal', fmtInt(total), 'neutral'));

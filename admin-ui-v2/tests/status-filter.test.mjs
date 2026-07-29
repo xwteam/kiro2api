@@ -136,3 +136,35 @@ test('新鲜度提示存在,且超时会标记为陈旧', () => {
   const body = SRC.slice(i, SRC.indexOf('\n  }', i));
   assert.ok(/is-stale/.test(body), '长时间没刷新成功要显式标记,别让陈旧快照冒充实时数据');
 });
+
+/**
+ * 「可用账号」统计卡不得自己复算 —— 必须用后端给的 available。
+ *
+ * 老写法是 `accounts.filter(a => !a.disabled).length`,把封禁号也算作可用:封禁不等于禁用,
+ * 这些账号 `disabled` 恒为 false。结果同一页上「封禁 6」与「可用 253」并列出现,而后端
+ * 给的可用数是 247 —— 三个数字互相矛盾,运维无从判断哪个可信。
+ *
+ * 这里测源码形态而非运行时:统计卡的渲染要 DOM,而真正会再次出错的是"有人又在前端复算一遍"。
+ */
+test('可用数只数健康档,不按 disabled 复算', () => {
+  assert.ok(
+    !/accounts\.filter\(function \(a\) \{ return !a\.disabled; \}\)\.length/.test(SRC),
+    '不得用 !disabled 复算:封禁/额度耗尽/过期的号 disabled 恒为 false,会被错算成可用'
+  );
+  assert.ok(
+    /var available = accounts\.filter\(function \(a\) \{ return bucketOf\(a\) === 'healthy'; \}\)\.length;/.test(SRC),
+    '统计卡应只数健康档'
+  );
+});
+
+/** 分档本身:不健康的四类都不得落进 healthy。 */
+test('封禁/额度耗尽/过期/续期被拒 都不算健康', () => {
+  const bucket = loadBucket();
+  const base = { disabled: false, healthStatus: 'healthy', statusReason: 'none' };
+  assert.equal(bucket({ ...base, statusReason: 'banned' }, undefined), 'banned');
+  assert.equal(bucket({ ...base, statusReason: 'quota' }, undefined), 'quota');
+  assert.equal(bucket({ ...base, statusReason: 'refresh_denied' }, undefined), 'refreshDenied');
+  assert.equal(bucket({ ...base, expiresAt: '2000-01-01T00:00:00Z' }, undefined), 'expired');
+  assert.equal(bucket(base, 0), 'quota', '余额归零也算额度耗尽');
+  assert.equal(bucket(base, undefined), 'healthy');
+});

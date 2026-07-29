@@ -635,9 +635,23 @@
     if (creds && Array.isArray(creds.credentials)) {
       lastCreds = creds;
       var total = creds.total != null ? creds.total : creds.credentials.length;
-      var avail = creds.available != null
-        ? creds.available
-        : creds.credentials.filter(function (c) { return !c.disabled; }).length;
+        // 与账号页同口径:「可用」= 健康的账号数。
+        //
+        // 不用后端的 `creds.available`:那个数答的是"中转此刻会去尝试哪些账号",额度耗尽与
+        // 令牌过期的号冷却一过仍在其中(它们确实该被再试)。两张卡若各答各的问题,同一台
+        // 中转会在两个页面显示两个不同的「可用」,运维无从判断哪个可信 —— 账号页就出过这事。
+        // (本页不拉余额,判不出"余额已归零"那一类;账号页多这一项,数值可能略低,方向一致:
+        //  两边都不会把不健康的号算作可用。)
+        var avail = creds.credentials.filter(function (c) {
+          if (c.disabled) return false;
+          if ((c.statusReason || 'none') !== 'none') return false;
+          if ((c.healthStatus || 'healthy') !== 'healthy') return false;
+          if (c.expiresAt) {
+            var t = Date.parse(c.expiresAt);
+            if (!isNaN(t) && t <= Date.now()) return false;
+          }
+          return true;
+        }).length;
       els.accounts.textContent = fmtInt(avail) + '/' + fmtInt(total);
     } else {
       els.accounts.textContent = '—';
