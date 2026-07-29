@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.9-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.10-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-07-29 | v0.7.10 - 🐛 發版後面板仍顯示舊版本/舊行為(後端已 0.7.9,面板「檢查更新」卻顯示 0.7.6):靜態資源**一個快取標頭都不發**,瀏覽器因此可**啟發式快取**、自行決定存多久。服務端三個介面當時全回 0.7.9,錯的只是瀏覽器手裡那份副本。現加 `Cache-Control: no-cache` + 內容 SHA-256 強 `ETag`,支援 `If-None-Match` → `304` |
 | 2026-07-29 | v0.7.9 - 🐛 「可用帳號」把所有不健康的號都算了進去(封禁/額度耗盡/令牌過期/續期被拒):統計卡在前端複算 `!a.disabled`,而這幾類都不是「停用」,`disabled` 恆為 false。現只數健康檔;刻意不用後端的 `available`(那個數答的是「中轉此刻會去嘗試哪些帳號」,額度耗盡/過期的號冷卻一過仍在其中)。儀表板同步改成同一口徑 |
 | 2026-07-29 | v0.7.8 - 🐛 額度只用了 0.08 就被 402 攔死(v0.7.6 回歸):單次在途預留取 1.0 credits,而 v0.7.6 後「已花」終於是真值,於是 1 credit 的上限從第一發起就 `0.08 + 1.0 > 1.00`。預留改為貼近實測:credits 0.25、USD 0.05。中途試過按上限比例封頂預留,被測試否掉(`SpendCache` 的前提是 est ≥ 單次真實花費) |
 | 2026-07-29 | v0.7.7 - 🐛 「永不過期」的密鑰仍被表單顯示成「首次使用後 1 天到期」(v0.7.6 聲稱修了但改動其實沒寫進檔案)。後端存的一直是正確的 `null`,是**表單在撒謊**:每次開啟都預填「1 天」、按鈕不高亮,一旦在這個顯示下儲存,假值就變成真值 |
@@ -233,7 +234,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.9"}
+# {"service":"kiro2api","status":"ok","version":"0.7.10"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \

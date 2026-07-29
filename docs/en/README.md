@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.9-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.10-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | Date | Update |
 |------|--------|
+| 2026-07-29 | v0.7.10 - 🐛 The panel kept showing an old version and old behaviour after a release — the backend was on 0.7.9 while the panel's update check reported 0.7.6. Static assets were served with **no caching headers at all**: no `Cache-Control`, no `ETag`, no `Last-Modified`. HTTP lets a browser apply heuristic caching in that case and decide the lifetime itself, so users kept an old copy of the JS. This is a hard failure to diagnose: every server endpoint answered correctly (`/health`, `server-info` and `check-update` all reported 0.7.9) and only the copy in the browser was wrong — earlier reports of a fix "not taking effect" likely share this cause. Assets now carry `Cache-Control: no-cache` plus a strong content-SHA-256 `ETag`, with `If-None-Match` → `304`: never stale, and unchanged files are not retransmitted |
 | 2026-07-29 | v0.7.9 - 🐛 "Available accounts" counted every unhealthy account too — banned, quota-exhausted, token-expired, renewal-denied. The stat card recomputed it client-side as `!a.disabled`, and none of those states is *disabled*: they all keep `disabled: false`. The same page showed "banned 6" beside "available 253". It now counts only the healthy bucket. The backend's `available` is deliberately **not** used: that number answers "which accounts will the relay attempt right now", and quota-exhausted or expired accounts belong there once their cooldown lapses — they genuinely should be retried, since quota resets and tokens refresh. The two questions are not the same. The dashboard's available/total card moves to the same rule, so one relay no longer reports two different "available" figures on two pages |
 | 2026-07-29 | v0.7.8 - 🐛 A key was refused with 402 after spending only 0.08 of its 1.00-credit limit — a regression from v0.7.6. The per-request in-flight reservation was 1.0 credits, and once v0.7.6 made "spent" a real number, `0.08 + 1.0 > 1.00` held from the very first request: the panel showed 90% remaining while nothing could be sent. Reservations are now grounded in measurement: 0.25 credits (~0.137 observed per request) and $0.05 (~$0.0003 observed, two orders of headroom for long-context requests). Capping the reservation as a fraction of the limit was tried and rejected by the tests: `SpendCache` only reuses a snapshot soundly while est >= a single request's real cost, and shrinking est lets overspend slip through |
 | 2026-07-29 | v0.7.7 - 🐛 A never-expiring key was still shown as "expires 1 day after first use" — v0.7.6 claimed this fix but the edit never reached the file. The backend had always stored the correct `null`; the **form was lying**: it pre-filled "1 day" with the never-expire chip unlit every time the key was opened, and saving from that state made the lie true. Noted for the record: the v0.7.6 attempt used `str.replace()`, which skips silently when the pattern does not match, while the script printed "done" unconditionally — that message was not evidence |
@@ -275,7 +276,7 @@ docker compose logs -f
 ```bash
 # Health check
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.9"}
+# {"service":"kiro2api","status":"ok","version":"0.7.10"}
 
 # View available models
 curl http://localhost:8080/v1/models \

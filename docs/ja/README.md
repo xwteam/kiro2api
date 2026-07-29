@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.9-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.10-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日付 | 更新内容 |
 |------|----------|
+| 2026-07-29 | v0.7.10 - 🐛 リリース後もパネルが古いバージョン・古い挙動を表示していました(バックエンドは 0.7.9 なのに更新チェックは 0.7.6)。静的アセットに**キャッシュヘッダが一切ありません**でした(`Cache-Control`・`ETag`・`Last-Modified` すべて無し)。HTTP ではこの場合ブラウザがヒューリスティックキャッシュを適用し保持期間を自分で決めてよいため、古い JS が使われ続けます。サーバ側は全エンドポイントが 0.7.9 を返しており、誤っていたのはブラウザ内の複製だけ —— 診断が最も難しい種類の不具合です。現在は `Cache-Control: no-cache` と内容 SHA-256 による強い `ETag` を付与し、`If-None-Match` → `304` に対応します |
 | 2026-07-29 | v0.7.9 - 🐛 「利用可能」が不健全なアカウント(利用停止/クォータ枯渇/トークン期限切れ/更新拒否)まで数えていました。統計カードがクライアント側で `!a.disabled` として再計算しており、これらはいずれも「無効化」ではなく `disabled` は false のままだからです。現在は健全な区分のみを数えます。バックエンドの `available` は**意図的に使いません**:あれは「中継が今どのアカウントを試すか」に答える数で、クォータ枯渇や期限切れのアカウントもクールダウン明けには含まれます(実際に再試行されるべきです)。ダッシュボードも同じ基準に揃え、1 台の中継が 2 つの画面で異なる「利用可能」を表示しないようにしました |
 | 2026-07-29 | v0.7.8 - 🐛 1.00 credits の上限に対し 0.08 しか使っていないのに 402 で拒否されていました(v0.7.6 の回帰)。1 回あたりの予約が 1.0 credits で、v0.7.6 以降「消費済み」が実測値になった結果、最初のリクエストから `0.08 + 1.0 > 1.00` が成立。画面には 9 割残っていると表示されながら 1 件も送れませんでした。予約値を実測に基づく値へ:credits 0.25(実測約 0.137/回)、USD 0.05(実測約 \$0.0003/回)。上限に対する割合で予約を頭打ちにする案はテストが否決:`SpendCache` の健全性は est >= 1 回の実費に依存し、縮めると超過が漏れます |
 | 2026-07-29 | v0.7.7 - 🐛 「無期限」キーが依然として「初回使用から 1 日で失効」と表示されていました(v0.7.6 で修正したと記載しましたが、変更が実際にはファイルへ反映されていませんでした)。バックエンドは常に正しく `null` を保存しており、**フォームの表示が嘘をついていた**状態です。開くたびに「1 日」が事前入力され「無期限」ボタンも点灯せず、その状態で保存すると嘘が真になっていました |
@@ -234,7 +235,7 @@ docker compose logs -f
 ```bash
 # ヘルスチェック
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.9"}
+# {"service":"kiro2api","status":"ok","version":"0.7.10"}
 
 # 利用可能なモデルを表示
 curl http://localhost:8080/v1/models \
