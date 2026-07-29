@@ -134,6 +134,20 @@ impl<E: Event> EventLog<E> {
         crate::stats::usage::paginate_pub(filtered, page, page_size)
     }
 
+    /// 每个凭据各有多少条事件,一次遍历得出。
+    ///
+    /// 面板列表要给 253 个账号各显示一个计数,逐个调
+    /// [`records_for_credential`](Self::records_for_credential) 就是把整份日志扫 253 遍;
+    /// 这里只扫一遍。计数同样受 `EVENT_CAP_PER_CREDENTIAL` 的 LRU 上限约束,故是下界。
+    pub async fn counts_by_credential(&self) -> std::collections::HashMap<u32, u64> {
+        let guard = self.events.read().await;
+        let mut out: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        for e in guard.iter() {
+            *out.entry(e.credential_id()).or_insert(0) += 1;
+        }
+        out
+    }
+
     /// 时间窗口 `[since_unix, until_unix]`(闭区间,unix 秒)内的事件条数。
     /// failure-log 用它数窗口内 401/403 数、throttle-log 数 429 数,供 usage-summary 算 errorRate。
     /// 注意:事件按凭据有 `EVENT_CAP_PER_CREDENTIAL` LRU 上限,极高频失败的账号最旧事件可能已被

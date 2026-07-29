@@ -578,6 +578,8 @@ curl http://localhost:8080/api/admin/credentials \
 }
 ```
 
+> **`failureCount` 是累計失敗數,`throttleCount` 是限流事件條數。** 兩者曾經錯位,導致被封禁的帳號顯示成「限流 1、失敗 0」。
+
 `statusReason` 記錄**最近一次失敗的原因**——`none` / `banned`(被上游停用)/ `quota` / `token_expired` / `throttled` / `refresh_denied`——答「為什麼不能用」。
 
 > **`banned` 會真正把帳號擋在池外**,其餘原因只影響展示。冷卻是計時器,到點自動回池;封禁是上游給的結論(原話為「帳號已鎖定,請聯絡客服驗證身分」),不隨時間解除。若只按計時器放行,冷卻一過帳號就重新入選、再失敗、再冷卻,循環燒真實請求,而 `available` 還把它算作可用——面板一邊掛著「封禁」、計數一邊說沒事,兩個數字互相矛盾。因此封禁帳號不被選中、不計入 `available`、`healthStatus` 報 `unhealthy`。它不會自癒(永遠等不到那次成功來清標籤),**唯一出口是面板的「重置」**(`POST /api/admin/credentials/{id}/reset`,會一併清掉該結論)。其餘原因仍在帳號下次成功時自動清空。該結論隨 `credentials.json` 落盤(`statusReason` 鍵)、重啟後還原——只活在記憶體裡的話,每次發版都會把它抹掉、帳號悄悄回池。**strike 計數與冷卻截止時刻仍不落盤**:那兩個是計時器,重啟從零開始無非早重試一次;結論不同,它決定帳號能不能進池。
@@ -1187,7 +1189,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.7.4"}
+{"service":"kiro2api","status":"ok","version":"0.7.5"}
 ```
 
 ### GET /v1/ping

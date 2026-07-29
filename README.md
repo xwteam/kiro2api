@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.4-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.5-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-07-29 | v0.7.5 - 🐛 账号页「失败」「限流」两列张冠李戴:`failureCount` 装的是 `strikes`(连击数,一冷却就清零),`throttleCount` 装的是累计失败数(与限流无关)。于是被上游**封禁**的账号显示成「限流 1、失败 0」——两个数都在说假话,还把「账号被停用需联系客服」错报成「歇一会儿就好」。现在失败=累计失败数、限流=真实限流事件条数(一次遍历得出,不逐账号扫日志)。另:`admin-ui-v2/` 的 33 个面板测试**此前一次都没在 CI 跑过**,现已加入门禁 |
 | 2026-07-29 | v0.7.4 - 🐛 「重置」与「手工启停」现在立刻落盘。v0.7.3 把封禁结论做成持久的,但重置只改活池不写盘:点完重置账号确实回到可用池,**下次重启又从盘上把封禁读回来**——运维明明操作过、状态却自己弹回去。封禁账号被挡在池外后永远等不到一次成功来清标签,重置是唯一出口,这个出口必须持久。手工启停同理(此前靠后续某次刷新顺带带下去,中间重启一次就没了)。另修:测试不再把带假 token 的 `credentials.json` 写进仓库根目录(会让别处「空池应回 503」的测试变 502) |
 | 2026-07-29 | v0.7.3 - 🐛 封禁结论现在跨重启保留。v0.7.2 让封禁账号不再计入 `available`、不再被选中,但那个结论只活在内存里:每次重启/发版都会抹掉它,账号悄悄回到可用池,直到再失败一次才重新被挡——「253 个账号 1 个封禁、可用数却是 253」会在每次重启后重现,v0.7.2 只是把复现周期从「一次冷却」拉长到「一次重启」。现在结论随 `credentials.json` 落盘并在加载时还原;strike 与冷却仍不落盘(那是计时器,重启无非早重试一次) |
 | 2026-07-29 | v0.7.2 - 🐛 修复被上游封禁的账号仍被算作可用、仍会被选中:`available` 此前只看「未禁用 && 不在冷却」,不看 `statusReason`。冷却是计时器到点自动回池,而封禁是上游结论(「账号已锁定,请联系客服验证身份」)不随时间解除,于是面板挂着「封禁」、可用数却把它算在内(253 个账号 1 个封禁,可用仍显示 253),且冷却一过就重新入选、必然再失败、循环烧真实请求。现在封禁账号不被选中、不计入 `available`、`healthStatus` 报 `unhealthy`;面板「重置」会一并清掉该结论(否则封禁号再无出口) |
@@ -270,7 +271,7 @@ docker compose logs -f
 ```bash
 # 健康检查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.4"}
+# {"service":"kiro2api","status":"ok","version":"0.7.5"}
 
 # 查看可用模型
 curl http://localhost:8080/v1/models \

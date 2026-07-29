@@ -67,6 +67,10 @@ pub struct CredentialStatusItem {
     pub priority: i64,
     pub weight: u32,
     pub disabled: bool,
+    /// 累计失败次数(展示"失败"列;点开即该账号的失败日志)。
+    ///
+    /// **不是**连续失败连击数(`strikes`)。曾经装的是后者,于是一个刚失败过、但 strike 已被
+    /// 冷却分支清零的账号显示为「失败 0」,面板上看不出它出过事。
     pub failure_count: u32,
     pub is_current: bool,
     pub expires_at: Option<String>,
@@ -83,6 +87,10 @@ pub struct CredentialStatusItem {
     /// 最近一次失败的具体原因:`none` / `banned` / `quota` / `token_expired` / `throttled`。
     /// 与 `healthStatus` 正交 —— 前者答"能不能用",本字段答"为什么不能用"。
     pub status_reason: &'static str,
+    /// 限流事件条数(展示"限流"列;点开即该账号的限流日志)。
+    ///
+    /// 取自限流事件日志本身,**不是**累计失败数。曾经装的是后者,于是被上游封禁的账号
+    /// 在面板上显示成「限流 1」——把"账号被停用、需联系客服"错报成"歇一会儿就好"。
     pub throttle_count: u64,
 }
 
@@ -96,14 +104,20 @@ pub struct CredentialsStatusResponse {
     pub credentials: Vec<CredentialStatusItem>,
 }
 
-fn account_to_item(a: &AccountStat) -> CredentialStatusItem {
+/// `throttles` 是该账号在限流事件日志里的条数。
+///
+/// 此前两个计数的名字和取值是错位的:`failureCount` 装的是 `strikes`(连续失败连击数,
+/// 成功一次即清零),`throttleCount` 装的是 `failures`(累计失败总数,与限流无关)。于是一个
+/// 被上游**封禁**的账号在面板上显示为「限流 1」,而「失败」列是 0 —— 两个数都在说假话,
+/// 且都指向错误的排查方向。现在各归其位:失败=累计失败数,限流=真的限流事件条数。
+fn account_to_item(a: &AccountStat, throttles: u64) -> CredentialStatusItem {
     CredentialStatusItem {
         id: id_as_number(&a.id),
         // 池当前不区分优先级(等权/按权重轮询),priority 以 weight 兜底展示。
         priority: a.weight as i64,
         weight: a.weight,
         disabled: a.disabled,
-        failure_count: a.strikes,
+        failure_count: a.failures as u32,
         is_current: false,
         expires_at: unix_to_rfc3339(a.expires_at_unix),
         auth_method: Some(a.auth_method.clone()),
@@ -115,7 +129,7 @@ fn account_to_item(a: &AccountStat) -> CredentialStatusItem {
         has_proxy: false,
         health_status: health_status(a),
         status_reason: a.status_reason,
-        throttle_count: a.failures,
+        throttle_count: throttles,
     }
 }
 
@@ -128,7 +142,15 @@ pub async fn credentials(State(state): State<MessagesState>) -> Json<Credentials
     let available = pool.active_count(now);
     drop(pool);
 
-    let credentials: Vec<CredentialStatusItem> = accounts.iter().map(account_to_item).collect();
+    // 一次遍历取全部账号的限流条数(逐账号查会把整份日志扫 N 遍)。
+    let throttles = state.stats.throttle_log.counts_by_credential().await;
+    let credentials: Vec<CredentialStatusItem> = accounts
+        .iter()
+        .map(|a| {
+            let n = throttles.get(&id_as_u32(&a.id)).copied().unwrap_or(0);
+            account_to_item(a, n)
+        })
+        .collect();
     Json(CredentialsStatusResponse {
         total: accounts.len(),
         available,
@@ -5424,6 +5446,33 @@ mod tests {
     /// 重置必须**立刻落盘**。封禁是持久结论,账号被挡在池外后永远等不到一次成功来清它,
     /// 重置是唯一出口;只改内存的话,下次重启会从盘上把封禁读回来,账号又被挡住,
     /// 而运维明明已经点过重置了。
+    /// 两个计数曾经错位:`failureCount` 装 `strikes`(成功一次即清零),`throttleCount` 装
+    /// `failures`(累计失败数,与限流无关)。于是被上游封禁的账号在面板上显示成「限流 1、
+    /// 失败 0」——两个数都在说假话,还把"账号被停用"错报成"歇一会儿就好"。
+    #[tokio::test]
+    async fn failure_and_throttle_counts_are_not_swapped() {
+        let dir = tmp_dir("counter-mapping");
+        let state = state_with_data_dir_creds(&dir, vec![cred("1")]);
+        // 两次失败、零次限流
+        {
+            let mut pool = state.pool.lock().await;
+            for _ in 0..2 {
+                pool.report_failure_with_reason(
+                    "1",
+                    crate::kiro::pool::FailureKind::Transient,
+                    crate::kiro::pool::StatusReason::None,
+                    0,
+                );
+            }
+        }
+        let app = admin_api_router(state);
+        let (status, v) = send(&app, Method::GET, "/api/admin/credentials", None).await;
+        assert_eq!(status, HttpStatusCode::OK);
+        let c = &v["credentials"][0];
+        assert_eq!(c["failureCount"], 2, "失败列须是累计失败数");
+        assert_eq!(c["throttleCount"], 0, "没发生过限流,限流列不得借用失败数");
+    }
+
     #[tokio::test]
     async fn reset_persists_so_a_restart_does_not_resurrect_the_ban() {
         let dir = tmp_dir("reset-persist");

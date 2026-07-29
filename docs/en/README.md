@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.4-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.5-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | Date | Update |
 |------|--------|
+| 2026-07-29 | v0.7.5 - 🐛 The accounts page had its Failures and Throttles columns crossed: `failureCount` carried `strikes` (the consecutive-failure counter, reset to zero by a success or a cooldown) and `throttleCount` carried lifetime `failures`, which has nothing to do with throttling. An account **suspended upstream** therefore read "Throttles 1, Failures 0" — both numbers lying, and the pair reporting "account locked, contact support" as "it just needs a minute". Failures is now the lifetime failure count (matching the log it opens) and Throttles the real count of throttle events, taken in a single pass rather than rescanning the log per account. Also: the 33 `admin-ui-v2/` panel tests had **never once run in CI**; they are now gated |
 | 2026-07-29 | v0.7.4 - 🐛 Reset and manual enable/disable now persist immediately. v0.7.3 made the ban verdict durable, but Reset only touched the live pool: the account did return to the pool, and **the next restart read the ban straight back off disk** — the operator had acted and the state undid itself. A banned account never gets the success that would clear its label, so Reset is its only way out, and that way out has to be durable. Manual enable/disable had the same hole (it relied on some later refresh to carry the change to disk; a restart in between lost it). Also: tests no longer write a credentials.json full of fake tokens into the repo root, which made `Config::default()` load a non-empty pool and turned several "empty pool returns 503" tests into 502 |
 | 2026-07-29 | v0.7.3 - 🐛 The ban verdict now survives a restart. v0.7.2 stopped counting banned accounts as available and stopped selecting them, but the verdict lived in memory alone: every restart wiped it, the account quietly returned to the pool, and stayed there until it failed once more — so "253 accounts, one banned, 253 available" recurred after every deploy. v0.7.2 only stretched the recurrence from one cooldown to one restart. The verdict is now persisted with `credentials.json` and restored on load; strikes and cooldowns still are not, because those are timers and restarting one merely retries the account sooner |
 | 2026-07-29 | v0.7.2 - 🐛 Fixed accounts suspended upstream still counting as available and still being selected. `available` looked only at "not disabled && not in cooldown", never at `statusReason`. A cooldown is a timer and lapses on its own; a ban is a verdict from upstream ("we've locked your account, contact support") that waiting does not lift — so the panel showed "banned" while the count said all 253 of 253 were usable, and the moment the cooldown expired the account was picked again, failed again, and burned real requests in a loop. Banned accounts are now not selected, not counted in `available`, and report `healthStatus: unhealthy`; the panel's Reset clears the verdict too, since otherwise a banned account has no way back |
@@ -270,7 +271,7 @@ docker compose logs -f
 ```bash
 # Health check
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.4"}
+# {"service":"kiro2api","status":"ok","version":"0.7.5"}
 
 # View available models
 curl http://localhost:8080/v1/models \

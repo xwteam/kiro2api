@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.4-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.5-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 날짜 | 업데이트 내용 |
 |------|----------|
+| 2026-07-29 | v0.7.5 - 🐛 계정 페이지의 「실패」와 「제한」 열이 뒤바뀌어 있었습니다. `failureCount`는 `strikes`(연속 실패 수, 성공이나 쿨다운으로 0이 됨)를, `throttleCount`는 누적 `failures`(제한과 무관)를 담고 있어 업스트림에 **정지된** 계정이 「제한 1, 실패 0」으로 표시되었고, 「계정이 잠겼으니 지원팀에 문의」를 「잠시 기다리면 됨」으로 잘못 전달했습니다. 이제 실패=누적 실패 수, 제한=실제 제한 이벤트 수(계정마다 훑지 않고 한 번의 순회로 집계). 또한 33개의 `admin-ui-v2/` 패널 테스트가 **CI에서 한 번도 실행된 적이 없었으며**, 이제 게이트에 추가되었습니다 |
 | 2026-07-29 | v0.7.4 - 🐛 「초기화」와 수동 활성/비활성이 즉시 저장됩니다. v0.7.3에서 정지 결론은 영속화되었지만 초기화는 활성 풀만 건드렸습니다. 계정은 풀로 돌아가지만 **다음 재시작에서 디스크의 정지 상태를 그대로 읽어왔습니다**. 정지된 계정은 라벨을 지울 성공에 영원히 도달하지 못하므로 초기화가 유일한 출구이며, 그 출구는 영속적이어야 합니다. 수동 활성/비활성도 같은 구멍이었습니다. 또한 테스트가 가짜 토큰이 든 credentials.json을 저장소 루트에 쓰지 않도록 수정 |
 | 2026-07-29 | v0.7.3 - 🐛 정지 결론이 재시작 후에도 유지됩니다. v0.7.2에서 정지된 계정은 `available`에 집계되지 않고 선택도 되지 않게 되었지만, 그 결론은 메모리에만 있어 재시작할 때마다 지워졌고 계정은 조용히 풀로 돌아가 다시 실패할 때까지 그대로였습니다. 이제 `credentials.json`에 저장되고 기동 시 복원됩니다. strike와 쿨다운은 여전히 저장하지 않습니다(타이머이며 다시 시작해도 조금 일찍 재시도할 뿐입니다) |
 | 2026-07-29 | v0.7.2 - 🐛 업스트림이 정지한 계정이 여전히 「사용 가능」으로 집계되고 선택되던 문제 수정. `available`은 「비활성 아님 && 쿨다운 아님」만 보고 `statusReason`은 보지 않았습니다. 쿨다운은 타이머라 저절로 풀리지만 정지는 업스트림의 결론(「계정을 잠갔습니다. 지원팀에 문의하세요」)이라 기다려도 해제되지 않습니다. 그 결과 패널은 「정지」로 표시하는데 카운트는 253개 전부 사용 가능이라 했고, 쿨다운이 끝날 때마다 다시 선택되어 다시 실패하며 실제 요청을 소모했습니다. 이제 선택되지 않고 `available`에도 포함되지 않으며 `healthStatus`는 `unhealthy`를 반환합니다. 패널의 「초기화」가 이 결론도 함께 지웁니다 |
@@ -225,7 +226,7 @@ docker compose logs -f
 ```bash
 # 헬스 체크
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.4"}
+# {"service":"kiro2api","status":"ok","version":"0.7.5"}
 
 # 프로토콜 고정 모델 목록 조회
 curl http://localhost:8080/v1/models \

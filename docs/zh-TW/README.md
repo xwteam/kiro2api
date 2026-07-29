@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.4-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.5-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-07-29 | v0.7.5 - 🐛 帳號頁「失敗」「限流」兩列張冠李戴:`failureCount` 裝的是 `strikes`(連擊數,一冷卻就清零),`throttleCount` 裝的是累計失敗數(與限流無關)。於是被上游**封禁**的帳號顯示成「限流 1、失敗 0」,把「帳號被停用需聯絡客服」錯報成「歇一會兒就好」。現在失敗=累計失敗數、限流=真實限流事件條數。另:33 個面板測試此前一次都沒在 CI 跑過,現已加入門禁 |
 | 2026-07-29 | v0.7.4 - 🐛 「重置」與「手工啟停」現在立刻落盤。v0.7.3 把封禁結論做成持久的,但重置只改活池不寫盤:點完重置帳號確實回到可用池,**下次重啟又從盤上把封禁讀回來**。封禁帳號被擋在池外後永遠等不到一次成功來清標籤,重置是唯一出口,這個出口必須持久。手工啟停同理。另修:測試不再把帶假 token 的 `credentials.json` 寫進倉庫根目錄 |
 | 2026-07-29 | v0.7.3 - 🐛 封禁結論現在跨重啟保留。v0.7.2 讓封禁帳號不再計入 `available`、不再被選中,但那個結論只活在記憶體裡:每次重啟/發版都會抹掉它,帳號悄悄回到可用池,直到再失敗一次才重新被擋。現在結論隨 `credentials.json` 落盤並在載入時還原;strike 與冷卻仍不落盤(那是計時器,重啟無非早重試一次) |
 | 2026-07-29 | v0.7.2 - 🐛 修復被上游封禁的帳號仍被算作可用、仍會被選中:`available` 此前只看「未停用 && 不在冷卻」,不看 `statusReason`。冷卻是計時器到點自動回池,而封禁是上游結論(「帳號已鎖定,請聯絡客服驗證身分」)不隨時間解除,於是面板掛著「封禁」、可用數卻把它算在內,且冷卻一過就重新入選、必然再失敗、循環燒真實請求。現在封禁帳號不被選中、不計入 `available`、`healthStatus` 報 `unhealthy`;面板「重置」會一併清掉該結論 |
@@ -228,7 +229,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.4"}
+# {"service":"kiro2api","status":"ok","version":"0.7.5"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \

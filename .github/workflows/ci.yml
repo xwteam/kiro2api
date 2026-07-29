@@ -33,3 +33,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: test (阻塞)
         run: cargo test --all
+      # 面板逻辑此前完全没有门禁:33 个 admin-ui 测试一次都没在 CI 里跑过,改坏了要等人工点开面板才发现。
+      # 逐文件传入而非传目录:`node --test <目录>` 在本仓会把整个目录当一个失败用例报出来。
+      - name: 面板测试 (阻塞)
+        run: node --test admin-ui-v2/tests/*.mjs
