@@ -67,10 +67,12 @@ pub fn build_headers(
     invocation_id: &str,
 ) -> HeaderMap {
     let mut h = HeaderMap::new();
-    h.insert(
-        "authorization",
-        hv(&format!("Bearer {}", cred.access_token)),
-    );
+    h.insert("authorization", hv(&format!("Bearer {}", cred.bearer())));
+    // API Key 凭据必须显式声明令牌类型,否则上游按 OAuth 令牌解析这枚 ksk 并拒绝。
+    // 该头为功能必需的 wire 事实(照观测,无公开文档),与 bearer 取值必须同时成立。
+    if cred.is_api_key() {
+        h.insert("tokentype", HeaderValue::from_static("API_KEY"));
+    }
     h.insert("content-type", HeaderValue::from_static("application/json"));
     h.insert(
         "x-amzn-codewhisperer-optout",
@@ -314,6 +316,37 @@ pub async fn call_with_fallback_no_report(
 
 #[cfg(test)]
 mod tests {
+
+    /// ksk 凭据的两件事必须同时成立:bearer 是 ksk 本身,且带 `tokentype: API_KEY`。
+    /// 只做前者会让上游按 OAuth 令牌去解析这枚 key 并拒绝——而错误信息不会提到令牌类型,
+    /// 排查时看起来就像"这个 key 是坏的"。
+    #[test]
+    fn api_key_credential_sends_ksk_and_declares_token_type() {
+        let ep = Endpoint {
+            url: "http://x/".into(),
+            origin: "AI_EDITOR",
+            target: None,
+        };
+        let mut c = cred();
+        c.kiro_api_key = Some("ksk_live_123".into());
+        c.auth = AuthMethod::ApiKey;
+        let h = build_headers(&c, &imp(), &ep, "inv");
+        assert_eq!(h.get("authorization").unwrap(), "Bearer ksk_live_123");
+        assert_eq!(h.get("tokentype").unwrap(), "API_KEY");
+    }
+
+    /// OAuth 凭据不得带 `tokentype`:多一个上游没预期的头,风险不对称(有害无益)。
+    #[test]
+    fn oauth_credential_does_not_declare_token_type() {
+        let ep = Endpoint {
+            url: "http://x/".into(),
+            origin: "AI_EDITOR",
+            target: None,
+        };
+        let h = build_headers(&cred(), &imp(), &ep, "inv");
+        assert_eq!(h.get("authorization").unwrap(), "Bearer AT");
+        assert!(h.get("tokentype").is_none());
+    }
     use super::*;
     use crate::kiro::credential::{AuthMethod, Credential};
     use crate::kiro::endpoint::Endpoint;
@@ -326,6 +359,7 @@ mod tests {
             id: "a".into(),
             access_token: "AT".into(),
             refresh_token: "rt".into(),
+            kiro_api_key: None,
             expires_at_unix: u64::MAX,
             region: "us-east-1".into(),
             auth: AuthMethod::Social,

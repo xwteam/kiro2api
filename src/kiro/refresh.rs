@@ -23,6 +23,10 @@ pub fn endpoint(cred: &Credential) -> String {
     match cred.auth {
         AuthMethod::Social => format!("https://prod.{region}.auth.desktop.kiro.dev/refreshToken"),
         AuthMethod::Idc => format!("https://oidc.{region}.amazonaws.com/token"),
+        // API Key 没有刷新端点。调用方(ensure_fresh)在更上层就把这类凭据短路掉了,
+        // 走到这里说明短路漏了;返回空串会让请求打到一个空 URL 上、错得莫名其妙,
+        // 故给一个一眼能认出出处的哨兵值。
+        AuthMethod::ApiKey => String::from("about:blank#api-key-never-refreshes"),
     }
 }
 
@@ -56,6 +60,9 @@ pub async fn refresh_at(
             "clientId": cred.client_id, "clientSecret": cred.client_secret,
             "refreshToken": cred.refresh_token, "grantType": "refresh_token",
         }),
+        // ksk 本身就是数据面 bearer,没有可换的东西。走到这里是上层短路失效,
+        // 明确报错而不是拿着空 body 去打上游——后者会得到一个与真实病因无关的 4xx。
+        AuthMethod::ApiKey => return Err(LoginError::Http),
     };
     let resp = client
         .post(base)
@@ -79,6 +86,8 @@ pub async fn refresh_at(
     out.access_token = match cred.auth {
         AuthMethod::Idc => r.id_token.unwrap_or(r.access_token),
         AuthMethod::Social => r.access_token,
+        // 不可达:ApiKey 在函数开头就已 return。留此臂只为穷尽,不做静默回落。
+        AuthMethod::ApiKey => return Err(LoginError::Http),
     };
     if let Some(rt) = r.refresh_token {
         out.refresh_token = rt;
@@ -115,6 +124,7 @@ mod tests {
             id: "a".into(),
             access_token: "old".into(),
             refresh_token: "rt".into(),
+            kiro_api_key: None,
             expires_at_unix: 0,
             region: "us-east-1".into(),
             auth,

@@ -475,7 +475,10 @@ impl Pool {
         let entries = creds
             .into_iter()
             .map(|c| Entry {
-                disabled: c.disabled,
+                // 配置自相矛盾的凭据(声明 api_key 却没给 key)入池即禁用:它取不到 bearer,
+                // 又被判定为 API Key 凭据(故不刷新),留在池里只会在跨账号重试中反复空转。
+                // 与其让运行时每次选中都失败一次,不如在这一刻就判死。
+                disabled: c.disabled || c.is_invalid_api_key_config(),
                 // 结论从盘上还原。strike 与冷却**故意不还原**:那两个是计时器,重启后从零
                 // 开始无非让账号早重试一次;结论不还原则会让封禁账号在每次重启后悄悄回池。
                 status_reason: StatusReason::from_wire(c.status_reason.as_deref().unwrap_or("")),
@@ -865,6 +868,12 @@ impl Pool {
     /// 纯瞬态,不落盘。返回是否命中。
     pub fn reset_failures(&mut self, id: &str) -> bool {
         if let Some(e) = self.find(id) {
+            // 配置自相矛盾的凭据不得被"重置"救活:重置只清 strike/冷却/结论,
+            // 改不了"声明了 api_key 却没有 key"这件事,复活后立刻重新走回同一条错误路径。
+            // 出路是先把配置改对再重启,而不是反复点重置。(kiro.rs #134 后续修复同此结论。)
+            if e.cred.is_invalid_api_key_config() {
+                return false;
+            }
             e.strikes = 0;
             e.cooldown_until = 0;
             // 结论也要清。封禁账号被 `is_active` 挡在池外、永远轮不到成功来清标签,
@@ -1024,6 +1033,7 @@ fn auth_method_str(auth: crate::kiro::credential::AuthMethod) -> &'static str {
     match auth {
         AuthMethod::Social => "social",
         AuthMethod::Idc => "idc",
+        AuthMethod::ApiKey => "apikey",
     }
 }
 
@@ -1037,6 +1047,7 @@ mod tests {
             id: id.into(),
             access_token: "at".into(),
             refresh_token: "rt".into(),
+            kiro_api_key: None,
             expires_at_unix: u64::MAX,
             region: "us-east-1".into(),
             auth: AuthMethod::Social,
@@ -2141,5 +2152,43 @@ mod tests {
         );
         assert!(!m.contains("too long"), "不得串成上下文超长: {m}");
         assert!(!m.contains("Invalid model"), "不得串成模型不可用: {m}");
+    }
+
+    /// 声明了 `authMethod=api_key` 却没给 `kiroApiKey` 的凭据,**入池即禁用**。
+    ///
+    /// 它取不到 bearer,又因为 `is_api_key()` 取并集而被判定为 API Key 凭据(故不刷新),
+    /// 留在池里只会在跨账号重试里反复空转 —— 每次选中都在同一处失败。
+    /// (此坑由 kiro.rs #134 的后续修复提示。)
+    #[test]
+    fn a_credential_claiming_api_key_without_one_is_disabled_on_load() {
+        let mut c = cred("bad", 1);
+        c.auth = crate::kiro::credential::AuthMethod::ApiKey;
+        c.kiro_api_key = None;
+        let p = Pool::new(vec![c], LbMode::Priority);
+        assert_eq!(p.active_count(0), 0, "配置自相矛盾的凭据不得进入可用池");
+        assert!(p.stats(0)[0].disabled);
+    }
+
+    /// 「重置」不得救活配置无效的凭据:重置只清 strike/冷却/结论,改不了"声明了
+    /// api_key 却没有 key"这件事,复活后立刻重新走回同一条错误路径。
+    #[test]
+    fn reset_refuses_to_revive_an_invalid_api_key_config() {
+        let mut c = cred("bad", 1);
+        c.auth = crate::kiro::credential::AuthMethod::ApiKey;
+        c.kiro_api_key = None;
+        let mut p = Pool::new(vec![c], LbMode::Priority);
+
+        assert!(!p.reset_failures("bad"), "重置须拒绝配置无效的凭据");
+        assert_eq!(p.active_count(0), 0, "拒绝之后它仍不得回到可用池");
+    }
+
+    /// 对照:配置完整的 API Key 凭据照常入池可用。
+    #[test]
+    fn a_well_formed_api_key_credential_is_usable() {
+        let mut c = cred("good", 1);
+        c.auth = crate::kiro::credential::AuthMethod::ApiKey;
+        c.kiro_api_key = Some("ksk_abc".into());
+        let p = Pool::new(vec![c], LbMode::Priority);
+        assert_eq!(p.active_count(0), 1);
     }
 }

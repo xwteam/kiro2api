@@ -14,6 +14,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub enum AuthMethod {
     Social,
     Idc,
+    /// Kiro API Key(`ksk_…`)。与前两者根本不同:它**本身就是数据面 bearer**,
+    /// 不换取令牌、不刷新、不过期。故这类凭据不走 OAuth 刷新链路的任何一步。
+    /// 认 `apikey` 与 `api_key` 两种写法(不同工具的落盘习惯不一致)。
+    #[serde(alias = "api_key", alias = "API_KEY")]
+    ApiKey,
 }
 
 /// region 缺省值(契约 §7:credentials.json 无 region 键时回落)。
@@ -68,7 +73,12 @@ pub struct Credential {
     pub access_token: String,
     pub refresh_token: String,
     /// 过期时刻(unix 秒;磁盘上是 RFC3339 字符串 `expiresAt`)。
+    ///
+    /// API Key 凭据没有这个概念,导入时通常也不带该键;缺省落 0,并由
+    /// [`is_expired`](Self::is_expired) / [`expires_soon`](Self::expires_soon) 对这类凭据
+    /// 恒答"未过期"——否则 0 会被读成"1970 年就过期了",账号一进池就被判死。
     #[serde(
+        default,
         rename = "expiresAt",
         deserialize_with = "de_expires_at_rfc3339",
         serialize_with = "se_expires_at_rfc3339"
@@ -99,6 +109,12 @@ pub struct Credential {
     pub label: Option<String>,
     #[serde(default)]
     pub disabled: bool,
+    /// Kiro API Key(`ksk_…`)。存在即视为 API Key 凭据。
+    ///
+    /// 与 `access_token` 分开存:后者是刷新换来的、会被覆写,而 ksk 是用户给的长期密钥,
+    /// 一旦被刷新逻辑当成 access_token 覆写掉就再也拿不回来。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kiro_api_key: Option<String>,
     /// 最近一次失败的结论,落盘那份(取值见 `pool::StatusReason::as_str`)。
     ///
     /// 只有**结论**落盘,strike 计数与冷却截止时刻不落——后两者是计时器,重启后从零开始
@@ -109,14 +125,61 @@ pub struct Credential {
     pub status_reason: Option<String>,
 }
 
-impl Credential {
-    /// 是否已过期(到点即算)。
-    pub fn is_expired(&self, now_unix: u64) -> bool {
-        self.expires_at_unix <= now_unix
+#[cfg(test)]
+pub(crate) fn tests_support_cred() -> Credential {
+    Credential {
+        id: "1".into(),
+        access_token: "AT".into(),
+        refresh_token: "RT".into(),
+        kiro_api_key: None,
+        expires_at_unix: 1000,
+        region: "us-east-1".into(),
+        auth: AuthMethod::Social,
+        client_id: None,
+        client_secret: None,
+        profile_arn: None,
+        machine_id: None,
+        email: None,
+        nickname: None,
+        weight: 1,
+        label: None,
+        disabled: false,
+        status_reason: None,
     }
-    /// 是否即将在 margin_secs 内过期。
+}
+
+impl Credential {
+    /// 是否为 API Key 凭据:带 `kiroApiKey`,或 `authMethod` 显式声明。
+    ///
+    /// 两个条件取并集是刻意的:导入时只填 key 不填 authMethod 是最自然的用法,
+    /// 而只声明 authMethod 却没有 key 是配置错误——后者由取 bearer 的那一步报出来,
+    /// 不在这里静默回落成 OAuth(回落会让它拿着空 token 去打上游,错得更远)。
+    pub fn is_api_key(&self) -> bool {
+        self.kiro_api_key.is_some() || self.auth == AuthMethod::ApiKey
+    }
+    /// 配置是否自相矛盾:声明了 `authMethod=api_key` 却没给 `kiroApiKey`。
+    ///
+    /// 这类凭据取不到 bearer,又因为 [`is_api_key`](Self::is_api_key) 取并集而通过了
+    /// "是 API Key 凭据"的判定,于是每次被选中都在同一处失败 —— 不刷新(API Key 本就不刷)、
+    /// 也没有可用的 token,只能在跨账号重试里空转。故必须在**入池那一刻**就判出来并禁用,
+    /// 而不是留给运行时反复触发。(此坑由 kiro.rs #134 的后续修复提示。)
+    pub fn is_invalid_api_key_config(&self) -> bool {
+        self.auth == AuthMethod::ApiKey && self.kiro_api_key.is_none()
+    }
+    /// 数据面 bearer:API Key 凭据用 ksk 本身,其余用刷新换来的 access_token。
+    pub fn bearer(&self) -> &str {
+        match &self.kiro_api_key {
+            Some(k) if self.is_api_key() => k,
+            _ => &self.access_token,
+        }
+    }
+    /// 是否已过期(到点即算)。API Key 无过期概念,恒答否。
+    pub fn is_expired(&self, now_unix: u64) -> bool {
+        !self.is_api_key() && self.expires_at_unix <= now_unix
+    }
+    /// 是否即将在 margin_secs 内过期。API Key 无过期概念,恒答否。
     pub fn expires_soon(&self, now_unix: u64, margin_secs: u64) -> bool {
-        self.expires_at_unix <= now_unix.saturating_add(margin_secs)
+        !self.is_api_key() && self.expires_at_unix <= now_unix.saturating_add(margin_secs)
     }
     /// 负载均衡权重下限 1。
     pub fn effective_weight(&self) -> u32 {
@@ -316,6 +379,28 @@ pub async fn persist_pool_credentials_serialized(
 
 #[cfg(test)]
 mod tests {
+
+    /// ksk 凭据没有 `expiresAt`,导入时通常也不带该键 → 缺省落 0。若过期判定照常按 0 比,
+    /// 账号一进池就被读成「1970 年就过期了」,立刻被判死;必须对这类凭据恒答"未过期"。
+    #[test]
+    fn api_key_credential_never_looks_expired() {
+        let mut c = super::tests_support_cred();
+        c.kiro_api_key = Some("ksk_abc".into());
+        c.expires_at_unix = 0;
+        assert!(!c.is_expired(9_999_999_999));
+        assert!(!c.expires_soon(9_999_999_999, 300));
+        assert!(c.is_api_key());
+        assert_eq!(c.bearer(), "ksk_abc", "数据面 bearer 必须是 ksk 本身");
+    }
+
+    /// 没有 ksk 的凭据一律走原路:bearer 仍是刷新换来的 access_token,过期判定照旧。
+    #[test]
+    fn oauth_credential_is_unaffected() {
+        let c = super::tests_support_cred();
+        assert!(!c.is_api_key());
+        assert_eq!(c.bearer(), c.access_token);
+        assert!(c.is_expired(9_999_999_999));
+    }
     use super::*;
 
     fn sample() -> Credential {
@@ -323,6 +408,7 @@ mod tests {
             id: "a1".into(),
             access_token: "at".into(),
             refresh_token: "rt".into(),
+            kiro_api_key: None,
             expires_at_unix: 1000,
             region: "us-east-1".into(),
             auth: AuthMethod::Social,

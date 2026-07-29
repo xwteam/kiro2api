@@ -124,6 +124,7 @@ mod tests {
             id: id.into(),
             access_token: "AT".into(),
             refresh_token: "RT".into(),
+            kiro_api_key: None,
             expires_at_unix: expires_at,
             region: "us-east-1".into(),
             auth: AuthMethod::Social,

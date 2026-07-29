@@ -3,6 +3,15 @@
 //! 派生/归一代码为本项目自写。
 use sha2::{Digest, Sha256};
 
+/// 由 API Key 派生机器 ID:hex(SHA256("KiroAPIKey/" + ksk))。
+///
+/// 盐与 OAuth 那条**不同且不可互换**(照观测):同一账号用 ksk 和用 refreshToken
+/// 派生出的机器 ID 本就该不同,混用会让上游看到对不上的设备标识。
+pub fn derive_from_api_key(api_key: &str) -> String {
+    let salted = format!("KiroAPIKey/{api_key}");
+    hex::encode(Sha256::digest(salted.as_bytes()))
+}
+
 /// 由 refresh_token 派生机器 ID:hex(SHA256("KotlinNativeAPI/" + rt))。
 pub fn derive(refresh_token: &str) -> String {
     let salted = format!("KotlinNativeAPI/{refresh_token}");

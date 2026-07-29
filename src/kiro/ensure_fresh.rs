@@ -293,6 +293,13 @@ pub async fn ensure_fresh(
             .ok_or(EnsureFreshError::NotFound)?
     };
 
+    // 1.5) API Key 凭据永不刷新:ksk 本身就是数据面 bearer,没有可换的东西。
+    // 写成显式判断而非依赖 `expires_soon` 恒答否 —— 后者是同一事实的间接表达,
+    // 哪天有人改了过期判定,这里会静默开始拿着不存在的 refresh_token 去刷新。
+    if cred_snapshot.is_api_key() {
+        return Ok(cred_snapshot);
+    }
+
     // 2) 未即将过期 → 直接用(无网络,无需进单飞锁)。
     if !cred_snapshot.expires_soon(now_unix, margin_secs) {
         return Ok(cred_snapshot);
@@ -421,6 +428,13 @@ pub async fn force_refresh(
             .ok_or(EnsureFreshError::NotFound)?
     };
 
+    // API Key 凭据无可强刷:ksk 不是换来的,重来一次还是同一枚。数据面 401/403 若发生在
+    // 这类凭据上,那就是这枚 key 本身不被接受(过期/吊销/额度),重试只会再吃一次同样的拒绝。
+    // 明确报 `Refresh` 让上层按失败处置,而不是空转一轮再报一个含义不同的错。
+    if cred_snapshot.is_api_key() {
+        return Err(EnsureFreshError::Refresh(LoginError::Http));
+    }
+
     // 双检基线:调用方失败时用的那个令牌(必填,故不再有退化分支)。
     let baseline_token = failed_access_token;
 
@@ -509,6 +523,7 @@ mod tests {
             id: id.into(),
             access_token: "old-at".into(),
             refresh_token: "old-rt".into(),
+            kiro_api_key: None,
             expires_at_unix,
             region: region.into(),
             auth: AuthMethod::Social,

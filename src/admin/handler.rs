@@ -2410,6 +2410,10 @@ use crate::kiro::pool::CredentialUpdate;
 pub struct AddCredentialRequest {
     #[serde(default)]
     pub refresh_token: String,
+    /// Kiro API Key(`ksk_…`)。给了它就不需要 `refreshToken`:这类凭据不换令牌,
+    /// key 本身即数据面 bearer。
+    #[serde(default, alias = "ksk")]
+    pub kiro_api_key: Option<String>,
     #[serde(default)]
     pub auth_method: Option<String>,
     #[serde(default)]
@@ -2575,10 +2579,19 @@ pub async fn add_credential(
     State(state): State<MessagesState>,
     Json(req): Json<AddCredentialRequest>,
 ) -> Response {
-    if req.refresh_token.trim().is_empty() {
-        return bad_request("refreshToken is required");
+    // 两种导入方式二选一:refreshToken(OAuth)或 kiroApiKey(ksk)。
+    // ksk 凭据不换令牌,强求 refreshToken 会把这类账号挡在门外。
+    let ksk = req.kiro_api_key.filter(|s| !s.trim().is_empty());
+    if req.refresh_token.trim().is_empty() && ksk.is_none() {
+        return bad_request("refreshToken or kiroApiKey is required");
     }
-    let auth = parse_auth_method(req.auth_method.as_deref());
+    // 给了 ksk 即按 API Key 凭据处理,不看 authMethod 写了什么:显式声明 idc 却带着 ksk
+    // 会走进"必填 clientId/clientSecret"的校验,把一个本来完整的凭据判成缺字段。
+    let auth = if ksk.is_some() {
+        AuthMethod::ApiKey
+    } else {
+        parse_auth_method(req.auth_method.as_deref())
+    };
     if auth == AuthMethod::Idc
         && (req.client_id.as_deref().unwrap_or("").trim().is_empty()
             || req.client_secret.as_deref().unwrap_or("").trim().is_empty())
@@ -2604,7 +2617,8 @@ pub async fn add_credential(
         id: String::new(), // 池分配
         access_token: String::new(),
         refresh_token: req.refresh_token,
-        expires_at_unix: 0, // 首次刷新时补齐
+        kiro_api_key: ksk,
+        expires_at_unix: 0, // 首次刷新时补齐(ApiKey 无此概念,恒不判过期)
         region,
         auth,
         client_id: req.client_id.filter(|s| !s.is_empty()),
@@ -3012,6 +3026,7 @@ pub async fn import_credentials_batch(
             label: None,
             disabled: false,
             status_reason: None,
+            kiro_api_key: None,
         };
 
         // 4) 入池落盘(逐项韧性:某条落盘失败仅该条判失败,继续下条)。
@@ -3102,6 +3117,7 @@ fn minted_to_credential(m: MintedCredential, now: u64) -> Credential {
         id: String::new(),
         access_token: m.access_token,
         refresh_token: m.refresh_token,
+        kiro_api_key: None,
         expires_at_unix,
         region: m.region,
         auth: AuthMethod::Idc,
@@ -3574,6 +3590,7 @@ mod tests {
             id: id.into(),
             access_token: "SEKRET-AT".into(),
             refresh_token: "SEKRET-RT".into(),
+            kiro_api_key: None,
             expires_at_unix: u64::MAX,
             region: "us-east-1".into(),
             auth: AuthMethod::Social,
