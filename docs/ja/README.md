@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.3-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.4-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日付 | 更新内容 |
 |------|----------|
+| 2026-07-29 | v0.7.4 - 🐛 「リセット」と手動の有効/無効が即座に永続化されるようになりました。v0.7.3 で利用停止の判断は永続化されましたが、リセットはアクティブプールしか触っておらず、アカウントはプールへ戻るものの**次回の再起動でディスクから利用停止が読み戻されて**いました。利用停止アカウントはラベルを消すはずの成功に永遠に到達しないため、リセットが唯一の出口であり、その出口は永続でなければなりません。手動の有効/無効も同じ穴でした。また、テストが偽トークン入りの credentials.json をリポジトリ直下に書き出さないよう修正 |
 | 2026-07-29 | v0.7.3 - 🐛 利用停止の判断が再起動をまたいで保持されるようになりました。v0.7.2 で利用停止アカウントは `available` に数えられず選択もされなくなりましたが、その判断はメモリ上にしか無く、再起動のたびに消えてアカウントが黙ってプールへ戻り、もう一度失敗するまでそのままでした。現在は `credentials.json` に永続化され起動時に復元されます。strike とクールダウンは引き続き永続化しません(タイマーであり、やり直しても少し早く再試行するだけです) |
 | 2026-07-29 | v0.7.2 - 🐛 上流に利用停止されたアカウントが「利用可能」と数えられ、選択もされ続けていた問題を修正。`available` は「無効でない && クールダウン中でない」しか見ておらず `statusReason` を参照していませんでした。クールダウンはタイマーで自然に明けますが、利用停止は上流の判断(「アカウントをロックしました。サポートへご連絡ください」)であり待っても解除されません。その結果パネルは「利用停止」と表示しながらカウントは全 253 件が使用可能と表示し、クールダウンが明けるたびに再選択・再失敗を繰り返して実リクエストを消費していました。現在は選択されず、`available` にも数えられず、`healthStatus` は `unhealthy` を返します。パネルの「リセット」はこの判断も併せてクリアします(でなければ復帰手段がありません) |
 | 2026-07-28 | v0.7.1 - 🐛 codex が Responses 経由で接続できない問題を修正。ツール定義で `name` を必須にしていましたが、OpenAI 仕様ではツール配列に `name` を持たない**組み込みツール**(`web_search`/`local_shell`/`file_search`)も含まれるため、組み込みツール一つでデシリアライズ時にターン全体が失敗していました(`tools[13]: missing field \`name\``)。しかもエラーは添字のみで、どの種類のツールかは分かりません。組み込みツールは解析可能となり、破棄したうえで WARN(`responses_builtin_tool_dropped`)を残します。直後に控えていた二つ目の不具合も修正:未知の `input` 項目型(`reasoning`/`local_shell_call`)がエラー扱いだったため、マルチターンでは**一巡目は通り二巡目で必ず落ちる**状態でした。現在はスキップします。関数ツールは `parameters` を省略可能に |
@@ -228,7 +229,7 @@ docker compose logs -f
 ```bash
 # ヘルスチェック
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.3"}
+# {"service":"kiro2api","status":"ok","version":"0.7.4"}
 
 # 利用可能なモデルを表示
 curl http://localhost:8080/v1/models \

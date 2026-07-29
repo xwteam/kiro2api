@@ -160,6 +160,11 @@ pub async fn set_disabled(
     let mut pool = state.pool.lock().await;
     let found = pool.set_disabled(&id, req.disabled);
     drop(pool);
+    // 手工启停同样要立刻落盘:此前只改活池,靠后续某次刷新顺带把它带下去,中间重启一次
+    // 这个操作就没了——运维禁用的账号会自己回到池里。
+    if found && let Err(e) = persist_pool_credentials(&state).await {
+        tracing::warn!(error = %e, "启停后落盘失败");
+    }
     if found {
         Json(SuccessResponse {
             success: true,
@@ -2742,6 +2747,12 @@ pub async fn reset_credential_failure(
     if !found {
         return not_found(&id);
     }
+    // 必须立刻落盘。重置会清掉「封禁」这个**持久**结论,而封禁账号被挡在池外、永远等不到
+    // 一次成功来清它——重置是它唯一的出口。只改内存的话,下次重启会从盘上把封禁读回来,
+    // 账号又被挡住,而运维明明已经点过重置了。
+    if let Err(e) = persist_pool_credentials(&state).await {
+        tracing::warn!(error = %e, "重置后落盘失败");
+    }
     Json(SuccessResponse {
         success: true,
         message: "failure count reset".into(),
@@ -3918,7 +3929,10 @@ mod tests {
 
     #[tokio::test]
     async fn set_disabled_endpoint_toggles_and_returns_success() {
-        let state = state_with(vec![cred("7")], Config::default());
+        // 落盘路径必须落在临时目录:启停现在会立刻写 credentials.json,用 `Config::default()`
+        // 的相对路径会把带假 token 的凭据文件写进仓库根目录,`Config::default()` 从此加载到
+        // 非空池,别处「空池应回 503」的测试全部变 502(实际踩过)。
+        let state = state_with(vec![cred("7")], cfg_with_temp_creds());
         let app = admin_api_router(state);
 
         // disable via body {disabled:true}
@@ -5405,6 +5419,33 @@ mod tests {
         // 未知 id → 404
         let (status2, _) = send(&app, Method::POST, "/api/admin/credentials/999/reset", None).await;
         assert_eq!(status2, HttpStatusCode::NOT_FOUND);
+    }
+
+    /// 重置必须**立刻落盘**。封禁是持久结论,账号被挡在池外后永远等不到一次成功来清它,
+    /// 重置是唯一出口;只改内存的话,下次重启会从盘上把封禁读回来,账号又被挡住,
+    /// 而运维明明已经点过重置了。
+    #[tokio::test]
+    async fn reset_persists_so_a_restart_does_not_resurrect_the_ban() {
+        let dir = tmp_dir("reset-persist");
+        let state = state_with_data_dir_creds(&dir, vec![cred("1")]);
+        let creds_path = state.cfg.credentials_path.clone();
+        state.pool.lock().await.report_failure_with_reason(
+            "1",
+            crate::kiro::pool::FailureKind::AuthAmbiguous,
+            crate::kiro::pool::StatusReason::Banned,
+            0,
+        );
+        let app = admin_api_router(state);
+
+        let (status, _) = send(&app, Method::POST, "/api/admin/credentials/1/reset", None).await;
+        assert_eq!(status, HttpStatusCode::OK);
+
+        // 从盘上读回来——模拟重启
+        let on_disk = crate::kiro::credential::load(&creds_path).expect("凭据文件应可读");
+        assert_eq!(
+            on_disk[0].status_reason, None,
+            "重置没落盘,重启后封禁结论会复活"
+        );
     }
 
     #[tokio::test]
