@@ -13,9 +13,6 @@ use subtle::ConstantTimeEq;
 use crate::apikey::{ApiKeyAuthResult, ApiKeyStore};
 use crate::stats::StatsManager;
 
-/// USD→credits 换算基:credits = cost / 0.72(与 admin/user 展示层同规约)。
-const CREDITS_PER_USD_DIVISOR: f64 = 0.72;
-
 /// 单次在途请求对消费上限的“预留额”估算(USD)。准入时无法预知本次真实 cost
 /// (cost 依赖响应后的 token 计数),故用一个保守的名义单次上限做在途预留:
 /// 把消费上限的并发 check-then-act 收敛为原子 reserve-then-reconcile,令越界
@@ -24,6 +21,16 @@ const CREDITS_PER_USD_DIVISOR: f64 = 0.72;
 /// 取值口径:一次大请求的量级上限的保守估计;偏大只会让接近上限时更早 402(更保守),
 /// 不会漏放导致无界超支。credits 单位下按 CREDITS_PER_USD_DIVISOR 同步换算。
 const EST_COST_PER_REQUEST_USD: f64 = 1.0;
+
+/// credits 单位下的单次在途预留(credits 原生,不由 USD 除算)。
+///
+/// 曾经写作 `EST_COST_PER_REQUEST_USD / 0.72` = 1.389 credits。那是 cost 反算时代的产物:
+/// 当时"已花"也是反算的极小值(实测 0.0037),两个错配的量纲凑在一起看不出问题。改用真实
+/// credits 后,已花是真实量级(实测约 0.137/次),再配 1.389 的预留就成了 10 倍超额预留 ——
+/// 一个 2 credits 的上限会在真实只用掉 0.6 时就开始 402,用户看着还剩七成却发不出请求。
+/// 取 1.0:Kiro 自身的名义口径(一次请求 ≈ 1 credit),仍比实测保守约 7 倍,
+/// 偏大只会更早 402(保守方向),不会漏放。
+const EST_CREDITS_PER_REQUEST: f64 = 1.0;
 
 /// 鉴权闸解析出的 store-key id,经请求扩展下传给 relay 做用量归属。
 /// `None` = 全局 key / 开放模式(无 store-key 归属,relay 记 id=0)。
@@ -388,7 +395,9 @@ pub async fn require_api_key(
 async fn current_spent(stats: &StatsManager, api_key_id: u32, limit_unit: &str) -> f64 {
     let summary = stats.get_summary_by_api_key(api_key_id).await;
     if limit_unit.eq_ignore_ascii_case("credits") {
-        summary.total_cost / CREDITS_PER_USD_DIVISOR
+        // 真实 credits,不由 cost 反算。闸门比错了数比面板显示错更糟:面板错你看得见,
+        // 闸门错的表现是「限额设了却永远不触发」——以为有保护,其实没有。
+        summary.total_credits
     } else {
         summary.total_cost
     }
@@ -563,7 +572,7 @@ async fn spent_for_admission(
 /// key 每一发请求都回 402 —— 展示与执行两回事,用户无从判断自己到底还能不能用。
 pub fn est_cost_in_unit(limit_unit: &str) -> f64 {
     if limit_unit.eq_ignore_ascii_case("credits") {
-        EST_COST_PER_REQUEST_USD / CREDITS_PER_USD_DIVISOR
+        EST_CREDITS_PER_REQUEST
     } else {
         EST_COST_PER_REQUEST_USD
     }

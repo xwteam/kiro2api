@@ -865,12 +865,18 @@ pub async fn relay_core_outcome(
         .and_then(|m| m.cache_creation_input_tokens);
 
     // 成功中转 → 记录一条用量(池锁已释放,异步/批量存储,不阻塞热路径)。
-    // token 数取自解码后的 usage:meteringEvent 带真实计量时即上游口径,缺项才回退
-    // (input → 0、output → 字符估算);credits 取自 meteringEvent。
-    // estimated_cost 按定价表由 token 数换算(USD 等值基线)。
+    // token 数取自解码后的 usage:meteringEvent 带真实计量时即上游口径。上游只回报 credits、
+    // 不含 token,故实际总是走回退:output = 响应字符数/4,input 此前**恒为 0**。
+    // input 为 0 不是"没有输入",是解码器看不到请求;而这里请求就在手边,故补上估算——
+    // 否则 USD 少算了成本里通常更大的一半,按 USD 设的上限会系统性偏松。
+    let input_tokens = if out.usage.input_tokens == 0 {
+        estimate_request_input_tokens(&req)
+    } else {
+        out.usage.input_tokens
+    };
     let estimated_cost = crate::stats::pricing::calculate_cost(
         &req.model,
-        out.usage.input_tokens as i32,
+        input_tokens as i32,
         out.usage.output_tokens as i32,
     );
     state
@@ -880,7 +886,7 @@ pub async fn relay_core_outcome(
             credential_id,
             api_key_id,
             req.model.clone(),
-            out.usage.input_tokens as i32,
+            input_tokens as i32,
             out.usage.output_tokens as i32,
             estimated_cost,
             credits,
@@ -1353,6 +1359,39 @@ fn count_content_chars(content: &crate::protocol::anthropic::types::ContentIn) -
 /// 请求体以 `Result<Json<..>, JsonRejection>` 提取,与 `/v1/messages` 同法:解析失败时回标准
 /// Anthropic 错误体的 400,而不是 axum 默认的纯文本 422 —— 后者 SDK 用 `response.json()` 读
 /// 错误时只会抛解析异常,真正的失败原因被吞掉;且 422 也不在 Anthropic 的错误码契约里。
+/// 由请求估算输入 token(与 `/v1/messages/count_tokens` 同一口径)。
+///
+/// 上游 meteringEvent 只回报 credits、不含 token 计量,故记账时输入项此前**硬编码为 0**——
+/// 等于把成本里通常更大的那一半整个抹掉,USD 上限因此系统性偏松(长上下文尤甚)。
+/// 这里复用 count_tokens 的统计口径,不另起一套平行实现,免得两处估算各说各话。
+pub fn estimate_request_input_tokens(req: &MessagesRequest) -> u32 {
+    let mut chars = req
+        .system
+        .as_ref()
+        .map(|s| s.text().chars().count())
+        .unwrap_or(0);
+    let mut images = 0usize;
+    for m in &req.messages {
+        let (c, i) = count_content_chars(&m.content);
+        chars += c;
+        images += i;
+    }
+    if let Some(tools) = &req.tools {
+        for t in tools {
+            chars += t.name.chars().count();
+            chars += t
+                .description
+                .as_deref()
+                .map(|d| d.chars().count())
+                .unwrap_or(0);
+            chars += serde_json::to_string(&t.input_schema)
+                .map(|s| s.len())
+                .unwrap_or(0);
+        }
+    }
+    (chars / CHARS_PER_TOKEN + images * IMAGE_TOKEN_ESTIMATE).max(1) as u32
+}
+
 pub async fn count_tokens(
     payload: Result<Json<MessagesRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {

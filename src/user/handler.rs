@@ -20,13 +20,12 @@ use crate::server::auth::extract_key;
 use crate::stats::model::UsageRecord as StoredUsageRecord;
 use crate::stats::usage::{ApiKeyUsageSummary, ModelUsageAgg, Page};
 
-/// credits 换算系数：cost($) / 0.72 = credits（与前端、admin、auth 闸同规约）。
-const CREDITS_PER_USD: f64 = 0.72;
-
 /// 把累计花费按 key 的计量单位归一（与 auth 闸的 `current_spent` 同一套换算）。
-fn spent_in_unit(total_cost: f64, limit_unit: &str) -> f64 {
+/// 已花额归一到上限单位。credits 用**上游回报的真实值**,不由 cost 反算 ——
+/// 必须与 `server::auth::current_spent` 逐字同口径,否则面板与闸门会各说各话。
+fn spent_in_unit(total_cost: f64, total_credits: f64, limit_unit: &str) -> f64 {
     if limit_unit.eq_ignore_ascii_case("credits") {
-        total_cost / CREDITS_PER_USD
+        total_credits
     } else {
         total_cost
     }
@@ -44,11 +43,16 @@ fn spent_in_unit(total_cost: f64, limit_unit: &str) -> f64 {
 ///
 /// 在途预留（并发请求临时占额）不计入：它随请求结束即释放，不是用户能看懂的稳定状态；
 /// 少算它只会让面板比闸更宽松一格，不会出现「面板说用完、实际还能发」这种反向错报。
-fn spending_exhausted(spending_limit: Option<f64>, limit_unit: &str, total_cost: f64) -> bool {
+fn spending_exhausted(
+    spending_limit: Option<f64>,
+    limit_unit: &str,
+    total_cost: f64,
+    total_credits: f64,
+) -> bool {
     let Some(limit) = spending_limit else {
         return false;
     };
-    let spent = spent_in_unit(total_cost, limit_unit);
+    let spent = spent_in_unit(total_cost, total_credits, limit_unit);
     // 取「闸上的放行条件」再取反，而不是直接写 `已花 + 预留 > 上限`：NaN 参与的比较恒为假，
     // 而闸上对非有限的上限/已花额一律保守拒绝（`try_reserve_spend` 直接 Err）。按放行条件
     // 取反，NaN 会落到「已用完」这一侧、与闸一致；直接写 `>` 则会得出「正常」，正好相反。
@@ -144,14 +148,19 @@ pub async fn login(
     };
 
     let summary = state.stats.get_summary_by_api_key(key.id).await;
-    let exhausted = spending_exhausted(key.spending_limit, &key.limit_unit, summary.total_cost);
+    let exhausted = spending_exhausted(
+        key.spending_limit,
+        &key.limit_unit,
+        summary.total_cost,
+        summary.total_credits,
+    );
     Json(LoginResponse {
         id: key.id,
         name: key.name,
         spending_limit: key.spending_limit,
         limit_unit: key.limit_unit,
         total_cost: summary.total_cost,
-        total_credits: summary.total_cost / CREDITS_PER_USD,
+        total_credits: summary.total_credits,
         expires_at: key.expires_at.map(dt_to_rfc3339),
         duration_days: key.duration_days,
         activated_at: key.activated_at.map(dt_to_rfc3339),
@@ -207,7 +216,12 @@ pub struct UsageResponse {
 }
 
 fn build_usage_response(key: ApiKey, summary: ApiKeyUsageSummary) -> UsageResponse {
-    let exhausted = spending_exhausted(key.spending_limit, &key.limit_unit, summary.total_cost);
+    let exhausted = spending_exhausted(
+        key.spending_limit,
+        &key.limit_unit,
+        summary.total_cost,
+        summary.total_credits,
+    );
     UsageResponse {
         id: key.id,
         name: key.name,
@@ -220,7 +234,7 @@ fn build_usage_response(key: ApiKey, summary: ApiKeyUsageSummary) -> UsageRespon
         total_input_tokens: summary.total_input_tokens,
         total_output_tokens: summary.total_output_tokens,
         total_cost: summary.total_cost,
-        total_credits: summary.total_cost / CREDITS_PER_USD,
+        total_credits: summary.total_credits,
         by_model: summary
             .by_model
             .into_iter()
@@ -473,7 +487,9 @@ mod tests {
         assert_eq!(v["spendingLimit"], 50.0);
         assert_eq!(v["limitUnit"], "credits");
         assert!((v["totalCost"].as_f64().unwrap() - 0.72).abs() < 1e-9);
-        assert!((v["totalCredits"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+        // credits 取上游回报的真实值(本夹具未填 credits_used → 0),**不由 cost 反算**。
+        // 旧断言 1.0 正是 0.72/0.72 的反算结果,与账单无关。
+        assert!((v["totalCredits"].as_f64().unwrap() - 0.0).abs() < 1e-9);
         // nullable 字段显式出现为 null
         assert!(v["expiresAt"].is_null());
         assert!(v["durationDays"].is_null());
@@ -831,10 +847,12 @@ mod tests {
     async fn usage_reports_exhausted_exactly_when_the_gate_rejects() {
         let stats = empty_stats("exhausted_band");
         let (state, api_keys) = make_state("exhausted_band", stats.clone());
+        // 上限须**小于一次在途预留**(EST_CREDITS_PER_REQUEST = 1.0),测试意图才成立。
+        // 原值 1.0 是配旧预留(1.389)选的;预留改成 credits 原生量后 1.0 恰好放行,前提失效。
         let k = api_keys.create(
             "band".into(),
             None,
-            Some(1.0),
+            Some(0.5),
             Some("credits".into()),
             None,
             None,

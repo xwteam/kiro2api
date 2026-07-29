@@ -4,7 +4,8 @@
 //! **USD 等值基线**——无论上游是否发 meteringEvent(真实 credits),每条用量都能给出一个
 //! 可汇总的美元度量,填充 `UsageRecord.estimated_cost` 与日报/汇总的 `total_cost`。
 //!
-//! 注意:本中转当前非流式解码 `input_tokens=0`(占位)、`output_tokens` 为字符数/4 估算,
+//! 注意:上游 meteringEvent 只回报 credits,不含 token 计量,故 USD 全为估算值
+//! (`output_tokens` = 响应字符数/4;`input_tokens` 见 [`estimate_input_tokens`],
 //! 故 estimated_cost 目前只反映 output 侧、且为估算值(input 侧待后续能取到真实 input 后补齐)。
 //! 定价表本身与真实 token 数一一对应,先把字段接通,精度随 token 计量改进而提升。
 
@@ -42,6 +43,18 @@ pub fn get_model_pricing(model: &str) -> ModelPricing {
 }
 
 /// 单次请求的估算 USD 成本 = input×单价 + output×单价(均按每百万 tokens)。
+/// 由请求内容估算输入 token:全部文本字符数 / 4,与响应侧的输出估算同一口径。
+///
+/// 上游的 meteringEvent 只回报 credits,不含 token 计量,故 USD 只能是估算值。此前输入项
+/// **硬编码为 0**,等于把成本里通常更大的那一半整个抹掉 —— 长上下文对话尤甚,USD 上限
+/// 因此系统性偏松。估算不精确,但比恒等于 0 接近真相得多。
+/// 图片等非文本块不计入(字符数无意义),故这仍是下界。
+pub fn estimate_input_tokens(system: Option<&str>, texts: &[String]) -> i32 {
+    let chars: usize = system.map(|s| s.chars().count()).unwrap_or(0)
+        + texts.iter().map(|t| t.chars().count()).sum::<usize>();
+    (chars / 4) as i32
+}
+
 pub fn calculate_cost(model: &str, input_tokens: i32, output_tokens: i32) -> f64 {
     let pricing = get_model_pricing(model);
     let input_cost = (input_tokens.max(0) as f64) * pricing.input_per_mtok / 1_000_000.0;

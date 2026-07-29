@@ -2061,9 +2061,6 @@ pub async fn global_credits(State(state): State<MessagesState>) -> Json<GlobalCr
 use crate::apikey::ApiKey;
 use crate::stats::usage::{ApiKeyUsageSummary, ModelUsageAgg};
 
-/// credits 换算系数:cost($) / 0.72 = credits(与前端 detail 页 `cost/0.72` 一致)。
-const CREDITS_PER_USD: f64 = 0.72;
-
 /// RFC3339(UTC、秒精度、Z 后缀)字符串化。
 fn dt_to_rfc3339(dt: chrono::DateTime<chrono::Utc>) -> String {
     dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -2158,7 +2155,10 @@ impl From<ApiKeyUsageSummary> for ApiKeyUsageView {
             total_input_tokens: s.total_input_tokens,
             total_output_tokens: s.total_output_tokens,
             total_cost: s.total_cost,
-            total_credits: s.total_cost / CREDITS_PER_USD,
+            // 用上游回报的真实 credits,不再由 cost 反算。
+            // 反算出来的是另一个量纲的数字,与账单无关:实测同一把 key,反算得 0.0037,
+            // 真实消耗约 1.37 —— 面板据此画成 0.00/2.00,而额度其实已用掉七成。
+            total_credits: s.total_credits,
             total_credits_saved: None,
             by_model: s.by_model.into_iter().map(ModelUsageView::from).collect(),
         }
@@ -5018,8 +5018,9 @@ mod tests {
         assert_eq!(s["totalInputTokens"], 110);
         assert_eq!(s["totalOutputTokens"], 220);
         assert!((s["totalCost"].as_f64().unwrap() - 1.08).abs() < 1e-9);
-        // totalCredits = totalCost / 0.72 = 1.5
-        assert!((s["totalCredits"].as_f64().unwrap() - 1.5).abs() < 1e-9);
+        // totalCredits 取上游回报的真实值之和,**不由 cost 反算**。
+        // 反算(1.08/0.72=1.5)是另一个量纲的数字,与账单无关。
+        assert!((s["totalCredits"].as_f64().unwrap() - 0.0).abs() < 1e-9);
         // byModel camelCase,按模型名升序
         let by = s["byModel"].as_array().unwrap();
         assert_eq!(by.len(), 2);
