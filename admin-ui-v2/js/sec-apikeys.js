@@ -964,7 +964,10 @@
       } else {
         mode = 'date'; spendingLimit = 50; limitUnit = 'usd';
         if (k.durationDays != null && k.durationDays < 1) { duration = Math.round(k.durationDays * 24 * 100) / 100; durationUnit = 'hours'; }
-        else { duration = k.durationDays != null ? k.durationDays : 1; durationUnit = 'days'; }
+        // durationDays 为 null = 永不过期,表单里对应 duration === null(「永不过期」按钮高亮)。
+        // 曾回落成 1:打开一把永不过期的 key,表单预填「1 天」、按钮不高亮,用户没察觉就保存,
+        // 这个错误显示当场变成真值 —— 永不过期的 key 被静默改成「首次使用后 1 天到期」。
+        else { duration = k.durationDays != null ? k.durationDays : null; durationUnit = 'days'; }
       }
     } else {
       mode = 'quota'; duration = 1; durationUnit = 'days'; spendingLimit = 100; limitUnit = 'usd';
@@ -1189,7 +1192,9 @@
       } else {
         payload = { name: name };
         if (mode === 'date') {
-          if (duration !== null) payload.durationDays = toDays(duration, durationUnit);
+          // 永不过期要**显式发 null**,与编辑分支同形。省略该键靠后端默认虽也得到永不过期,
+          // 但两条分支对同一语义各写各的,后端哪天改了默认值就只有新建这条会悄悄跟着变。
+          payload.durationDays = duration !== null ? toDays(duration, durationUnit) : null;
         } else {
           payload.spendingLimit = spendingLimit; payload.limitUnit = limitUnit;
         }

@@ -255,7 +255,7 @@ LOAD_BALANCING_MODE=priority
 curl http://localhost:8080/health
 
 # 输出示例：
-# {"service":"kiro2api","status":"ok","version":"0.7.6"}
+# {"service":"kiro2api","status":"ok","version":"0.7.7"}
 ```
 
 ### 准备 API Key

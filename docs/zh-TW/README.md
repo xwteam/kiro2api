@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.6-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.7-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-07-29 | v0.7.7 - 🐛 「永不過期」的密鑰仍被表單顯示成「首次使用後 1 天到期」(v0.7.6 聲稱修了但改動其實沒寫進檔案)。後端存的一直是正確的 `null`,是**表單在撒謊**:每次開啟都預填「1 天」、按鈕不高亮,一旦在這個顯示下儲存,假值就變成真值 |
 | 2026-07-29 | v0.7.6 - 🐛 **API-KEY 額度限制此前形同虛設**:credits 用量被寫成「花費USD÷0.72」的反算值,真實 credits 在同一結構裡被丟掉。實測設了 2.00 credits 上限的 key 顯示 `0.00/2.00`、真實已用約 1.37,而**准入閘讀的是同一個假數**,設了上限也攔不住任何東西。共 5 處改用真值;單次在途預留從 1.389 改為 credits 原生的 1.0。另修:USD 用量把輸入 token 硬編碼為 0;「永不過期」的密鑰被編輯表單靜默改成「首次使用後 1 天到期」 |
 | 2026-07-29 | v0.7.5 - 🐛 帳號頁「失敗」「限流」兩列張冠李戴:`failureCount` 裝的是 `strikes`(連擊數,一冷卻就清零),`throttleCount` 裝的是累計失敗數(與限流無關)。於是被上游**封禁**的帳號顯示成「限流 1、失敗 0」,把「帳號被停用需聯絡客服」錯報成「歇一會兒就好」。現在失敗=累計失敗數、限流=真實限流事件條數。另:33 個面板測試此前一次都沒在 CI 跑過,現已加入門禁 |
 | 2026-07-29 | v0.7.4 - 🐛 「重置」與「手工啟停」現在立刻落盤。v0.7.3 把封禁結論做成持久的,但重置只改活池不寫盤:點完重置帳號確實回到可用池,**下次重啟又從盤上把封禁讀回來**。封禁帳號被擋在池外後永遠等不到一次成功來清標籤,重置是唯一出口,這個出口必須持久。手工啟停同理。另修:測試不再把帶假 token 的 `credentials.json` 寫進倉庫根目錄 |
@@ -230,7 +231,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.6"}
+# {"service":"kiro2api","status":"ok","version":"0.7.7"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \
