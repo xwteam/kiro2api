@@ -99,6 +99,14 @@ pub struct Credential {
     pub label: Option<String>,
     #[serde(default)]
     pub disabled: bool,
+    /// 最近一次失败的结论,落盘那份(取值见 `pool::StatusReason::as_str`)。
+    ///
+    /// 只有**结论**落盘,strike 计数与冷却截止时刻不落——后两者是计时器,重启后从零开始
+    /// 无非是让账号早点重试一次,无害。结论不同:`banned` 会把账号挡在池外,若只活在内存里,
+    /// 每次重启/发版都会把它抹掉,账号悄悄回到可用池,直到再失败一次才重新被挡——于是
+    /// 「253 个账号有 1 个封禁,可用数却是 253」这件事会在每次重启后重现。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
 }
 
 impl Credential {
@@ -327,6 +335,7 @@ mod tests {
             weight: 0,
             label: Some("acct".into()),
             disabled: false,
+            status_reason: None,
         }
     }
 

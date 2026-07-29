@@ -2,7 +2,7 @@
 # 版本单一真源在 ./VERSION;此处 version 须与之保持一致。
 [package]
 name = "kiro2api"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2024"
 license = "MIT"
 authors = ["xwteam"]

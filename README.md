@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.2-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.3-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-07-29 | v0.7.3 - 🐛 封禁结论现在跨重启保留。v0.7.2 让封禁账号不再计入 `available`、不再被选中,但那个结论只活在内存里:每次重启/发版都会抹掉它,账号悄悄回到可用池,直到再失败一次才重新被挡——「253 个账号 1 个封禁、可用数却是 253」会在每次重启后重现,v0.7.2 只是把复现周期从「一次冷却」拉长到「一次重启」。现在结论随 `credentials.json` 落盘并在加载时还原;strike 与冷却仍不落盘(那是计时器,重启无非早重试一次) |
 | 2026-07-29 | v0.7.2 - 🐛 修复被上游封禁的账号仍被算作可用、仍会被选中:`available` 此前只看「未禁用 && 不在冷却」,不看 `statusReason`。冷却是计时器到点自动回池,而封禁是上游结论(「账号已锁定,请联系客服验证身份」)不随时间解除,于是面板挂着「封禁」、可用数却把它算在内(253 个账号 1 个封禁,可用仍显示 253),且冷却一过就重新入选、必然再失败、循环烧真实请求。现在封禁账号不被选中、不计入 `available`、`healthStatus` 报 `unhealthy`;面板「重置」会一并清掉该结论(否则封禁号再无出口) |
 | 2026-07-28 | v0.7.1 - 🐛 修复 Responses 接口无法接入 codex:工具数组里的**内置工具**(`web_search`/`local_shell`/`file_search`,照 OpenAI 规范就没有 `name`)此前会让整轮请求死在反序列化(`tools[13]: missing field \`name\``),一个内置工具废掉整个会话,且错误只报下标、看不出是哪类工具。现在内置工具可解析、被丢弃并落 WARN(`responses_builtin_tool_dropped`)。同时修掉紧随其后的第二个坑:多轮回灌的 `reasoning`/`local_shell_call` 等条目此前判错,会导致**第一轮能通、第二轮必炸**,现改为整条跳过;函数工具也允许省略 `parameters` |
 | 2026-07-28 | v0.7.0 - 令牌刷新失败此前被完全吞掉:日志只有「刷新中」紧接「跨账号重试」,中间**为什么失败**整个消失。线上真实事故:上游对整批账号回 `access_denied`,面板上只表现为「账号全过期了」,不手工 curl 上游根本分不清是账号被处置了还是中转坏了。现在失败即记录上游状态码与响应体,并写进 `statusReason`,新增「续期被拒」一档——与「过期了刷一下就好」严格分开,因为它刷多少次都没用。账号页另加「全选本页」与「批量禁用」 |
@@ -268,7 +269,7 @@ docker compose logs -f
 ```bash
 # 健康检查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.2"}
+# {"service":"kiro2api","status":"ok","version":"0.7.3"}
 
 # 查看可用模型
 curl http://localhost:8080/v1/models \

@@ -757,6 +757,7 @@ mod tests {
             weight: 1,
             label: None,
             disabled: false,
+            status_reason: None,
         }
     }
 

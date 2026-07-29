@@ -606,7 +606,7 @@ curl http://localhost:8080/api/admin/credentials \
 
 `statusReason` records **why** the last failure happened — `none` / `banned` (upstream suspended the account) / `quota` / `token_expired` / `throttled` / `refresh_denied`.
 
-> **`banned` genuinely keeps the account out of the pool**; every other reason affects presentation only. A cooldown is a timer and lapses on its own; a ban is a verdict from upstream ("we've locked your account, contact support to verify your identity") and no amount of waiting lifts it. Releasing on the timer alone means the account is picked again the moment the cooldown expires, fails again, cools down again — burning real requests in a loop — while `available` still counts it as usable: the panel says "banned" and the count says everything is fine, two numbers that contradict each other. Banned accounts are therefore not selected, not counted in `available`, and report `healthStatus: unhealthy`. They do not self-heal (the success that would clear the label can never happen), so the **only way back is the panel's Reset** (`POST /api/admin/credentials/{id}/reset`, which clears the verdict too). Every other reason still clears on the account's next success.
+> **`banned` genuinely keeps the account out of the pool**; every other reason affects presentation only. A cooldown is a timer and lapses on its own; a ban is a verdict from upstream ("we've locked your account, contact support to verify your identity") and no amount of waiting lifts it. Releasing on the timer alone means the account is picked again the moment the cooldown expires, fails again, cools down again — burning real requests in a loop — while `available` still counts it as usable: the panel says "banned" and the count says everything is fine, two numbers that contradict each other. Banned accounts are therefore not selected, not counted in `available`, and report `healthStatus: unhealthy`. They do not self-heal (the success that would clear the label can never happen), so the **only way back is the panel's Reset** (`POST /api/admin/credentials/{id}/reset`, which clears the verdict too). Every other reason still clears on the account's next success. The verdict is persisted with `credentials.json` (the `statusReason` key) and restored on load — held in memory alone, every deploy would wipe it and quietly return the account to the pool. **Strikes and the cooldown deadline are still not persisted**: those are timers, and starting them over merely retries the account a little sooner. A verdict is different — it decides whether the account is in the pool at all.
 
 > [!NOTE]
 > Every field shown above always serializes. Two further fields, `email` and `nickname`, appear only when the account actually carries them. `expiresAt` and `lastUsedAt` are always present but hold `null` when the underlying timestamp is unset.
@@ -1167,7 +1167,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1383,7 +1383,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.7.2"
+  "version": "0.7.3"
 }
 ```
 

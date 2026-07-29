@@ -156,7 +156,37 @@ pub enum StatusReason {
     RefreshDenied,
 }
 
+impl Entry {
+    /// 设置结论,并同步到落盘那份。
+    ///
+    /// 两者必须一起改,理由与 `disabled`/`cred.disabled` 完全相同:只改内存,重启即丢
+    /// (封禁账号会悄悄回到可用池);只改落盘,本轮判定不生效。
+    fn set_status_reason(&mut self, r: StatusReason) {
+        self.status_reason = r;
+        self.cred.status_reason = match r {
+            StatusReason::None => None,
+            other => Some(other.as_str().to_string()),
+        };
+    }
+}
+
 impl StatusReason {
+    /// 从落盘的字符串还原;认不出的一律当 `None`。
+    ///
+    /// 与 [`as_str`](Self::as_str) 严格互逆:封禁结论要跨重启活下来,就必须能从盘上读回来。
+    /// 认不出时回落 `None`(而非报错),是为了让旧版写下的、或将来新增而本版还不认识的取值
+    /// 只丢一个标签,不至于让整份 credentials.json 加载失败、全池打不开。
+    pub fn from_wire(s: &str) -> Self {
+        match s {
+            "banned" => StatusReason::Banned,
+            "quota" => StatusReason::QuotaExhausted,
+            "token_expired" => StatusReason::TokenExpired,
+            "throttled" => StatusReason::Throttled,
+            "refresh_denied" => StatusReason::RefreshDenied,
+            _ => StatusReason::None,
+        }
+    }
+
     /// 出站线格式用的稳定短名(前端按它筛选)。
     pub fn as_str(self) -> &'static str {
         match self {
@@ -405,6 +435,9 @@ impl Pool {
             .into_iter()
             .map(|c| Entry {
                 disabled: c.disabled,
+                // 结论从盘上还原。strike 与冷却**故意不还原**:那两个是计时器,重启后从零
+                // 开始无非让账号早重试一次;结论不还原则会让封禁账号在每次重启后悄悄回池。
+                status_reason: StatusReason::from_wire(c.status_reason.as_deref().unwrap_or("")),
                 cooldown_until: 0,
                 strikes: 0,
                 unconfirmed_refresh: false,
@@ -413,7 +446,6 @@ impl Pool {
                 successes: 0,
                 failures: 0,
                 last_used_unix: 0,
-                status_reason: StatusReason::None,
                 cred: c,
             })
             .collect();
@@ -796,7 +828,7 @@ impl Pool {
             e.cooldown_until = 0;
             // 结论也要清。封禁账号被 `is_active` 挡在池外、永远轮不到成功来清标签,
             // 「重置」是它唯一的出口;只清计时器不清结论,这个按钮对封禁号就是个空操作。
-            e.status_reason = StatusReason::None;
+            e.set_status_reason(StatusReason::None);
             true
         } else {
             false
@@ -840,7 +872,7 @@ impl Pool {
             e.successes += 1;
             // 一次成功即说明上次那个原因(封禁/限流/过期…)已经过去,标签必须跟着清,
             // 否则面板会把一个已经恢复的账号一直挂在"封禁"那一档。
-            e.status_reason = StatusReason::None;
+            e.set_status_reason(StatusReason::None);
         }
     }
 
@@ -876,7 +908,7 @@ impl Pool {
         if let Some(e) = self.find(id) {
             e.failures += 1;
             if reason != StatusReason::None {
-                e.status_reason = reason;
+                e.set_status_reason(reason);
             }
             // 上一次换新令牌的尝试刚因传输层错误未成行 → 这次 AuthInvalid 背后并没有"用新令牌
             // 重试过"的确证(403 的失效措辞对被服务端轮换掉的 access_token 同样成立,那类账号
@@ -976,6 +1008,7 @@ mod tests {
             weight,
             label: None,
             disabled: false,
+            status_reason: None,
         }
     }
 
@@ -1968,5 +2001,41 @@ mod tests {
         assert_eq!(p.stats(0)[0].status_reason, "none", "重置须清掉封禁结论");
         assert_eq!(p.active_count(0), 1, "重置后账号回到可用池");
         assert!(p.select(0).is_some());
+    }
+
+    /// 封禁结论必须跨重启活下来。只活在内存里的话,每次重启/发版都会把它抹掉,
+    /// 账号悄悄回到可用池,直到再失败一次才重新被挡——「253 个账号 1 个封禁、
+    /// 可用数却是 253」这件事就会在每次重启后重现。
+    #[test]
+    fn banned_verdict_survives_a_restart() {
+        let mut p = Pool::new(vec![cred("a", 1), cred("b", 1)], LbMode::Priority);
+        p.report_failure_with_reason("a", FailureKind::AuthAmbiguous, StatusReason::Banned, 0);
+
+        // 模拟落盘 → 重启 → 从盘上重新加载
+        let persisted = p.snapshot_credentials();
+        let reloaded = Pool::new(persisted, LbMode::Priority);
+
+        assert_eq!(
+            reloaded.stats(0)[0].status_reason,
+            "banned",
+            "结论没落盘,重启后封禁账号会悄悄回池"
+        );
+        assert_eq!(
+            reloaded.active_count(10_000_000),
+            1,
+            "重启后封禁号仍不计入可用"
+        );
+    }
+
+    /// 反过来:重置清掉的结论也要落盘,否则重启后封禁标签又冒出来。
+    #[test]
+    fn reset_is_also_persisted() {
+        let mut p = Pool::new(vec![cred("a", 1)], LbMode::Priority);
+        p.report_failure_with_reason("a", FailureKind::AuthAmbiguous, StatusReason::Banned, 0);
+        p.reset_failures("a");
+
+        let reloaded = Pool::new(p.snapshot_credentials(), LbMode::Priority);
+        assert_eq!(reloaded.stats(0)[0].status_reason, "none");
+        assert_eq!(reloaded.active_count(0), 1);
     }
 }

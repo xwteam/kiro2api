@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.2-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.3-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | Date | Update |
 |------|--------|
+| 2026-07-29 | v0.7.3 - 🐛 The ban verdict now survives a restart. v0.7.2 stopped counting banned accounts as available and stopped selecting them, but the verdict lived in memory alone: every restart wiped it, the account quietly returned to the pool, and stayed there until it failed once more — so "253 accounts, one banned, 253 available" recurred after every deploy. v0.7.2 only stretched the recurrence from one cooldown to one restart. The verdict is now persisted with `credentials.json` and restored on load; strikes and cooldowns still are not, because those are timers and restarting one merely retries the account sooner |
 | 2026-07-29 | v0.7.2 - 🐛 Fixed accounts suspended upstream still counting as available and still being selected. `available` looked only at "not disabled && not in cooldown", never at `statusReason`. A cooldown is a timer and lapses on its own; a ban is a verdict from upstream ("we've locked your account, contact support") that waiting does not lift — so the panel showed "banned" while the count said all 253 of 253 were usable, and the moment the cooldown expired the account was picked again, failed again, and burned real requests in a loop. Banned accounts are now not selected, not counted in `available`, and report `healthStatus: unhealthy`; the panel's Reset clears the verdict too, since otherwise a banned account has no way back |
 | 2026-07-28 | v0.7.1 - 🐛 Fixed codex being unable to connect over Responses. Tool definitions required `name`, but per the OpenAI spec a tools array also carries **built-ins** (`web_search`, `local_shell`, `file_search`) that have no `name` at all, so a single built-in killed the whole turn at deserialization (`tools[13]: missing field \`name\``) — and the error named only an index, never the kind of tool. Built-ins now parse, are dropped, and leave a WARN (`responses_builtin_tool_dropped`). Also fixed the failure waiting right behind it: unknown `input` item types (`reasoning`, `local_shell_call`) were hard errors, so multi-turn replays failed on **turn two, not turn one**; they are now skipped. Function tools may also omit `parameters` |
 | 2026-07-28 | v0.7.0 - Token refresh failures were swallowed: the log showed "refreshing" then "retrying on another account", with the reason missing entirely. A real incident had upstream answering `access_denied` for a whole batch of accounts, which surfaced only as "everything expired" — indistinguishable from the relay itself being broken without manually curling upstream. Failures now log the upstream status and body, and land in `statusReason` as a new `refresh_denied` bucket, kept strictly apart from a merely expired token because no amount of retrying fixes it. The accounts page also gains Select-page and Disable-selected |
@@ -268,7 +269,7 @@ docker compose logs -f
 ```bash
 # Health check
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.2"}
+# {"service":"kiro2api","status":"ok","version":"0.7.3"}
 
 # View available models
 curl http://localhost:8080/v1/models \

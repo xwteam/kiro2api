@@ -2586,6 +2586,7 @@ pub async fn add_credential(
         weight,
         label: None,
         disabled: false,
+        status_reason: None,
     };
 
     match add_credential_to_pool_and_persist(&state, cred).await {
@@ -2974,6 +2975,7 @@ pub async fn import_credentials_batch(
             weight,
             label: None,
             disabled: false,
+            status_reason: None,
         };
 
         // 4) 入池落盘(逐项韧性:某条落盘失败仅该条判失败,继续下条)。
@@ -3076,6 +3078,7 @@ fn minted_to_credential(m: MintedCredential, now: u64) -> Credential {
         weight: 1,
         label: None,
         disabled: false,
+        status_reason: None,
     }
 }
 
@@ -3547,6 +3550,7 @@ mod tests {
             weight: 1,
             label: None,
             disabled: false,
+            status_reason: None,
         }
     }
 
