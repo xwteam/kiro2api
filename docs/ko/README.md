@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.7-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.8-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 날짜 | 업데이트 내용 |
 |------|----------|
+| 2026-07-29 | v0.7.8 - 🐛 1.00 credits 한도에서 0.08만 쓰고도 402로 거부되었습니다(v0.7.6 회귀). 요청당 예약이 1.0 credits였고 v0.7.6 이후 「사용액」이 실제 값이 되면서 첫 요청부터 `0.08 + 1.0 > 1.00`이 성립했습니다. 화면에는 90%가 남았다고 표시되지만 한 건도 보낼 수 없었습니다. 예약값을 실측 기반으로 변경:credits 0.25(실측 약 0.137/회), USD 0.05(실측 약 \$0.0003/회). 한도 대비 비율로 예약을 제한하는 방안은 테스트가 기각했습니다 —— `SpendCache`의 건전성은 est >= 1회 실제 비용에 의존하므로 줄이면 초과가 새어 나갑니다 |
 | 2026-07-29 | v0.7.7 - 🐛 「무기한」 키가 여전히 「최초 사용 후 1일 만료」로 표시되었습니다(v0.7.6에서 고쳤다고 했으나 변경이 실제로 파일에 반영되지 않았습니다). 백엔드는 항상 올바른 `null`을 저장하고 있었고, **폼 표시가 거짓말을 하고 있었습니다**. 열 때마다 「1일」이 미리 채워지고 「무기한」 버튼도 꺼져 있었으며, 그 상태에서 저장하면 거짓이 참이 되었습니다 |
 | 2026-07-29 | v0.7.6 - 🐛 **API 키 사용 한도가 실제로는 아무것도 막지 못했습니다.** credits 사용량이 「USD 비용 ÷ 0.72」의 역산값이었고, 업스트림이 보고한 실제 credits는 같은 집계 안에서 버려졌습니다. 2.00 credits 한도를 건 키가 `0.00 / 2.00`으로 표시되는 동안 실제로는 약 1.37이 소비되었고, **승인 게이트도 같은 가짜 값을 읽고 있어** 한도가 전혀 작동하지 않으면서 화면에서는 드러나지 않았습니다. 표시·게이트·사용자 화면 총 5곳을 실제 값으로 변경했고, credits의 요청당 예약도 1.389(역산 시대의 산물)에서 credits 고유의 1.0으로 바꿨습니다. 그 외: USD 사용량이 입력 토큰을 0으로 고정해 비용의 더 큰 절반을 누락하던 문제, 「무기한」 키가 편집 폼에서 「최초 사용 후 1일 만료」로 조용히 바뀌던 문제도 수정 |
 | 2026-07-29 | v0.7.5 - 🐛 계정 페이지의 「실패」와 「제한」 열이 뒤바뀌어 있었습니다. `failureCount`는 `strikes`(연속 실패 수, 성공이나 쿨다운으로 0이 됨)를, `throttleCount`는 누적 `failures`(제한과 무관)를 담고 있어 업스트림에 **정지된** 계정이 「제한 1, 실패 0」으로 표시되었고, 「계정이 잠겼으니 지원팀에 문의」를 「잠시 기다리면 됨」으로 잘못 전달했습니다. 이제 실패=누적 실패 수, 제한=실제 제한 이벤트 수(계정마다 훑지 않고 한 번의 순회로 집계). 또한 33개의 `admin-ui-v2/` 패널 테스트가 **CI에서 한 번도 실행된 적이 없었으며**, 이제 게이트에 추가되었습니다 |
@@ -228,7 +229,7 @@ docker compose logs -f
 ```bash
 # 헬스 체크
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.7"}
+# {"service":"kiro2api","status":"ok","version":"0.7.8"}
 
 # 프로토콜 고정 모델 목록 조회
 curl http://localhost:8080/v1/models \

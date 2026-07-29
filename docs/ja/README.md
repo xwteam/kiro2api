@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.7-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.8-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日付 | 更新内容 |
 |------|----------|
+| 2026-07-29 | v0.7.8 - 🐛 1.00 credits の上限に対し 0.08 しか使っていないのに 402 で拒否されていました(v0.7.6 の回帰)。1 回あたりの予約が 1.0 credits で、v0.7.6 以降「消費済み」が実測値になった結果、最初のリクエストから `0.08 + 1.0 > 1.00` が成立。画面には 9 割残っていると表示されながら 1 件も送れませんでした。予約値を実測に基づく値へ:credits 0.25(実測約 0.137/回)、USD 0.05(実測約 \$0.0003/回)。上限に対する割合で予約を頭打ちにする案はテストが否決:`SpendCache` の健全性は est >= 1 回の実費に依存し、縮めると超過が漏れます |
 | 2026-07-29 | v0.7.7 - 🐛 「無期限」キーが依然として「初回使用から 1 日で失効」と表示されていました(v0.7.6 で修正したと記載しましたが、変更が実際にはファイルへ反映されていませんでした)。バックエンドは常に正しく `null` を保存しており、**フォームの表示が嘘をついていた**状態です。開くたびに「1 日」が事前入力され「無期限」ボタンも点灯せず、その状態で保存すると嘘が真になっていました |
 | 2026-07-29 | v0.7.6 - 🐛 **API キーの上限が実質機能していませんでした。** credits 使用量が「USD コスト ÷ 0.72」の逆算値で、上流が返す実際の credits は同じ集約の中で捨てられていました。2.00 credits の上限を設けたキーが `0.00 / 2.00` と表示される一方、実際には約 1.37 消費済み。しかも**受付ゲートも同じ偽の数値を読んでいた**ため、上限は何も止めておらず、それが画面からは分かりませんでした。表示・ゲート・ユーザー画面の計 5 箇所を実測値へ。credits の 1 回あたり予約も 1.389(逆算時代の産物)から credits 本来の 1.0 へ。他:USD 使用量が入力トークンを 0 に固定しコストの大きい方の半分を落としていた件、「無期限」キーが編集画面で「初回使用から 1 日で失効」に書き換えられていた件も修正 |
 | 2026-07-29 | v0.7.5 - 🐛 アカウント画面の「失敗」「スロットル」列が入れ違っていました。`failureCount` は `strikes`(連続失敗数。成功またはクールダウンでゼロに戻る)を、`throttleCount` は累計 `failures`(スロットルとは無関係)を運んでいたため、上流に**利用停止**されたアカウントが「スロットル 1、失敗 0」と表示され、「アカウントがロックされサポート連絡が必要」を「少し待てば直る」と誤って伝えていました。現在は失敗=累計失敗数、スロットル=実際のスロットルイベント数(アカウントごとに走査せず一度の走査で取得)。また、33 件の `admin-ui-v2/` パネルテストは**これまで一度も CI で実行されていませんでした**。ゲートに追加しました |
@@ -232,7 +233,7 @@ docker compose logs -f
 ```bash
 # ヘルスチェック
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.7"}
+# {"service":"kiro2api","status":"ok","version":"0.7.8"}
 
 # 利用可能なモデルを表示
 curl http://localhost:8080/v1/models \

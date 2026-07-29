@@ -918,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "kiro2api"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "anyhow",
  "async-stream",

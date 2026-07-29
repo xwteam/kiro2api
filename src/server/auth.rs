@@ -20,7 +20,11 @@ use crate::stats::StatsManager;
 /// 预留只在请求在途期间临时占额、完成即释放(RAII),不参与持久记账。
 /// 取值口径:一次大请求的量级上限的保守估计;偏大只会让接近上限时更早 402(更保守),
 /// 不会漏放导致无界超支。credits 单位下按 CREDITS_PER_USD_DIVISOR 同步换算。
-const EST_COST_PER_REQUEST_USD: f64 = 1.0;
+/// 取值依据:单次请求实测成本约 $0.0003(输出千余 token 量级),取 $0.05 留约两个数量级
+/// 余量以覆盖长上下文大请求。**必须 >= 单次真实花费**,这是 SpendCache 复用快照不漏放的
+/// 前提(见 `spent_for_admission`);同时不能过大 —— 上限本身若小于一次预留,这把 key 从
+/// 签发起就发不出任何请求。旧值 1.0 USD 是后者的反例(实测成本的三千多倍)。
+const EST_COST_PER_REQUEST_USD: f64 = 0.05;
 
 /// credits 单位下的单次在途预留(credits 原生,不由 USD 除算)。
 ///
@@ -30,7 +34,13 @@ const EST_COST_PER_REQUEST_USD: f64 = 1.0;
 /// 一个 2 credits 的上限会在真实只用掉 0.6 时就开始 402,用户看着还剩七成却发不出请求。
 /// 取 1.0:Kiro 自身的名义口径(一次请求 ≈ 1 credit),仍比实测保守约 7 倍,
 /// 偏大只会更早 402(保守方向),不会漏放。
-const EST_CREDITS_PER_REQUEST: f64 = 1.0;
+/// 取值依据:单次请求实测约 0.137 credits,取 0.25 留约一倍余量。
+///
+/// 旧值 1.0 是 credits 由 cost 反算时代的产物,当时"已花"也是反算的极小值,两个错配的量纲
+/// 凑在一起看不出问题。改用真实 credits 后,1.0 的预留会让一个 1 credit 的上限从第一发起
+/// 就 `0.08 + 1.0 > 1.00` → 402:面板显示 0.08/1.00 还剩九成,请求却一个都发不出去(实际踩过)。
+/// 与 USD 同理,此值**必须 >= 单次真实花费**(SpendCache 正确性前提),又不能吃掉整个上限。
+const EST_CREDITS_PER_REQUEST: f64 = 0.25;
 
 /// 鉴权闸解析出的 store-key id,经请求扩展下传给 relay 做用量归属。
 /// `None` = 全局 key / 开放模式(无 store-key 归属,relay 记 id=0)。
@@ -1773,7 +1783,10 @@ mod tests {
         let k = store.create(
             "u1".into(),
             None,
-            Some(3.0),
+            // 上限取 3 倍单次预留,且**用同一个乘法表达式**写出来:字面量 0.15 与
+            // `3.0 * 0.05` 在浮点下并非同一个数,写死字面量会让"快照上界恰好够到上限"
+            // 这一拍错位、重扫时机随常量取值漂移。
+            Some(3.0 * EST_COST_PER_REQUEST_USD),
             Some("usd".into()),
             None,
             None,
@@ -1802,17 +1815,29 @@ mod tests {
             .unwrap()
         };
 
-        // 前三次:真实花费每次 0.9 USD(不超过单次名义预估 est=1.0,满足快照复用的前提)。
+        // 前三次:真实花费每次 0.9 倍 est(不超过单次名义预估,满足快照复用的前提)。
+        // 全部按 est 的倍数表达,常量改值时比例自动跟随,不必回来重算夹具。
         for i in 0..3 {
             let resp = send(app.clone(), k.key.clone()).await;
             assert_eq!(resp.status(), StatusCode::OK, "第 {i} 次请求应放行");
             let _ = body_text(resp).await;
             stats
                 .usage
-                .record_usage_with_api_key(1, k.id, "m".into(), 10, 20, 0.9, None, None, None, 1000)
+                .record_usage_with_api_key(
+                    1,
+                    k.id,
+                    "m".into(),
+                    10,
+                    20,
+                    0.04,
+                    None,
+                    None,
+                    None,
+                    1000,
+                )
                 .await;
         }
-        // 此刻真实已花 2.7 USD:第 4 次的上界够到上限 → 重算 → 2.7 + 1.0 > 3.0 → 402。
+        // 此刻真实已花 2.7 倍 est:第 4 次的快照上界(4×est)越过上限 → 重算 → 2.7+1 > 3.5 → 402。
         let resp = send(app.clone(), k.key.clone()).await;
         assert_eq!(
             resp.status(),
@@ -2089,7 +2114,7 @@ mod tests {
         // 拿到 Response 但 body 尚未消费:预留必须仍占额(finding #3 的核心断言)。
         assert_eq!(
             store_probe.reserved_amount(key_id),
-            1.0,
+            EST_COST_PER_REQUEST_USD,
             "body 未消费前预留必须仍被持有"
         );
 

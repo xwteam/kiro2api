@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.7-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.8-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | Date | Update |
 |------|--------|
+| 2026-07-29 | v0.7.8 - 🐛 A key was refused with 402 after spending only 0.08 of its 1.00-credit limit — a regression from v0.7.6. The per-request in-flight reservation was 1.0 credits, and once v0.7.6 made "spent" a real number, `0.08 + 1.0 > 1.00` held from the very first request: the panel showed 90% remaining while nothing could be sent. Reservations are now grounded in measurement: 0.25 credits (~0.137 observed per request) and $0.05 (~$0.0003 observed, two orders of headroom for long-context requests). Capping the reservation as a fraction of the limit was tried and rejected by the tests: `SpendCache` only reuses a snapshot soundly while est >= a single request's real cost, and shrinking est lets overspend slip through |
 | 2026-07-29 | v0.7.7 - 🐛 A never-expiring key was still shown as "expires 1 day after first use" — v0.7.6 claimed this fix but the edit never reached the file. The backend had always stored the correct `null`; the **form was lying**: it pre-filled "1 day" with the never-expire chip unlit every time the key was opened, and saving from that state made the lie true. Noted for the record: the v0.7.6 attempt used `str.replace()`, which skips silently when the pattern does not match, while the script printed "done" unconditionally — that message was not evidence |
 | 2026-07-29 | v0.7.6 - 🐛 **API key spending limits were not limiting anything.** Credits usage was back-computed as `cost in USD / 0.72` while the real credits reported upstream sat in the same aggregate, discarded. A key with a 2.00-credit limit read `0.00 / 2.00` while roughly 1.37 had actually been spent — and **the admission gate read the same fabricated number**, so the limit never bound, invisibly. Display, gate and user panel (five sites) now use the real value; the per-request in-flight reservation for credits moves from 1.389 (an artefact of the back-computation) to a credits-native 1.0. Also fixed: USD usage hard-coded input tokens to 0, dropping the larger half of the cost; and a never-expiring key was silently rewritten to "expires 1 day after first use" by the edit form |
 | 2026-07-29 | v0.7.5 - 🐛 The accounts page had its Failures and Throttles columns crossed: `failureCount` carried `strikes` (the consecutive-failure counter, reset to zero by a success or a cooldown) and `throttleCount` carried lifetime `failures`, which has nothing to do with throttling. An account **suspended upstream** therefore read "Throttles 1, Failures 0" — both numbers lying, and the pair reporting "account locked, contact support" as "it just needs a minute". Failures is now the lifetime failure count (matching the log it opens) and Throttles the real count of throttle events, taken in a single pass rather than rescanning the log per account. Also: the 33 `admin-ui-v2/` panel tests had **never once run in CI**; they are now gated |
@@ -273,7 +274,7 @@ docker compose logs -f
 ```bash
 # Health check
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.7"}
+# {"service":"kiro2api","status":"ok","version":"0.7.8"}
 
 # View available models
 curl http://localhost:8080/v1/models \

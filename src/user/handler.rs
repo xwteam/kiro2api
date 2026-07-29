@@ -847,12 +847,12 @@ mod tests {
     async fn usage_reports_exhausted_exactly_when_the_gate_rejects() {
         let stats = empty_stats("exhausted_band");
         let (state, api_keys) = make_state("exhausted_band", stats.clone());
-        // 上限须**小于一次在途预留**(EST_CREDITS_PER_REQUEST = 1.0),测试意图才成立。
-        // 原值 1.0 是配旧预留(1.389)选的;预留改成 credits 原生量后 1.0 恰好放行,前提失效。
+        // 上限须**小于一次在途预留**(EST_CREDITS_PER_REQUEST = 0.25),测试意图才成立:
+        // 这把 key 连一次请求都买不起,闸必拒,面板就必须同步报 exhausted。
         let k = api_keys.create(
             "band".into(),
             None,
-            Some(0.5),
+            Some(0.2),
             Some("credits".into()),
             None,
             None,

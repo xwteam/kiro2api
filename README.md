@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.7-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.8-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-07-29 | v0.7.8 - 🐛 额度只用了 0.08 就被 402 拦死(v0.7.6 回归):单次在途预留取 1.0 credits,而 v0.7.6 后「已花」终于是真值,于是 1 credit 的上限从第一发起就 `0.08 + 1.0 > 1.00`——面板显示还剩九成,请求一个都发不出去。预留改为贴近实测:credits 0.25(实测 ~0.137/次)、USD 0.05(实测 ~$0.0003/次)。中途试过「按上限比例封顶预留」被测试否掉:`SpendCache` 复用快照的前提是 est ≥ 单次真实花费,砍小就漏放超支 |
 | 2026-07-29 | v0.7.7 - 🐛 「永不过期」的密钥仍被表单显示成「首次使用后 1 天到期」(v0.7.6 声称修了但改动其实没写进文件)。后端存的一直是正确的 `null`,是**表单在撒谎**:每次打开都预填「1 天」、按钮不高亮,一旦在这个显示下保存,假值就变成真值。附带记下 v0.7.6 失手的原因:`str.replace()` 没匹配上时静默跳过,而脚本无条件打印了「已改」——那句话不是证据 |
 | 2026-07-29 | v0.7.6 - 🐛 **API-KEY 额度限制此前形同虚设**:credits 用量被写成「花费USD÷0.72」的反算值,而上游回报的真实 credits 就在同一结构里被丢掉。实测一把设了 2.00 credits 上限的 key 显示 `0.00/2.00`、真实已用约 1.37(七成)——而**准入闸读的是同一个假数**,所以设了上限也拦不住任何东西,且面板上看不出来。展示/准入闸/用户面板共 5 处改用真值;credits 的单次在途预留同步从 1.389(反算产物)改为 credits 原生的 1.0。另修:USD 用量把**输入 token 硬编码为 0**、少算了成本里通常更大的一半(现按 count_tokens 口径估算);「永不过期」的密钥被编辑表单静默改成「首次使用后 1 天到期」 |
 | 2026-07-29 | v0.7.5 - 🐛 账号页「失败」「限流」两列张冠李戴:`failureCount` 装的是 `strikes`(连击数,一冷却就清零),`throttleCount` 装的是累计失败数(与限流无关)。于是被上游**封禁**的账号显示成「限流 1、失败 0」——两个数都在说假话,还把「账号被停用需联系客服」错报成「歇一会儿就好」。现在失败=累计失败数、限流=真实限流事件条数(一次遍历得出,不逐账号扫日志)。另:`admin-ui-v2/` 的 33 个面板测试**此前一次都没在 CI 跑过**,现已加入门禁 |
@@ -273,7 +274,7 @@ docker compose logs -f
 ```bash
 # 健康检查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.7"}
+# {"service":"kiro2api","status":"ok","version":"0.7.8"}
 
 # 查看可用模型
 curl http://localhost:8080/v1/models \
