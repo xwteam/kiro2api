@@ -604,14 +604,16 @@ curl http://localhost:8080/api/admin/credentials \
 }
 ```
 
-`statusReason` records **why** the last failure happened — `none` / `banned` (upstream suspended the account) / `quota` / `token_expired` / `throttled` / `refresh_denied` — and is orthogonal to `healthStatus`, which answers whether the account is selectable. It is derived from the raw upstream response body, affects presentation only (never selection, cooldown length or the disable decision), and clears on the account's next success.
+`statusReason` records **why** the last failure happened — `none` / `banned` (upstream suspended the account) / `quota` / `token_expired` / `throttled` / `refresh_denied`.
+
+> **`banned` genuinely keeps the account out of the pool**; every other reason affects presentation only. A cooldown is a timer and lapses on its own; a ban is a verdict from upstream ("we've locked your account, contact support to verify your identity") and no amount of waiting lifts it. Releasing on the timer alone means the account is picked again the moment the cooldown expires, fails again, cools down again — burning real requests in a loop — while `available` still counts it as usable: the panel says "banned" and the count says everything is fine, two numbers that contradict each other. Banned accounts are therefore not selected, not counted in `available`, and report `healthStatus: unhealthy`. They do not self-heal (the success that would clear the label can never happen), so the **only way back is the panel's Reset** (`POST /api/admin/credentials/{id}/reset`, which clears the verdict too). Every other reason still clears on the account's next success.
 
 > [!NOTE]
 > Every field shown above always serializes. Two further fields, `email` and `nickname`, appear only when the account actually carries them. `expiresAt` and `lastUsedAt` are always present but hold `null` when the underlying timestamp is unset.
 >
 > The pool picks an account per request, so there is no persistent "current" account: `currentId` is **always** `-1` and `isCurrent` is **always** `false`. Both fields are reserved for a possible sticky-selection mode — do not branch on them. `hasProxy` is the same kind of placeholder: it is hard-coded `false` for every account (the credential model carries no proxy field at all), so it never reports a per-account setting either.
 >
-> `priority` is not a separate value: it is echoed straight from `weight`, so the two are always equal. `healthStatus` is one of `disabled` | `unhealthy` (in cooldown) | `warning` (has failure strikes) | `healthy`.
+> `priority` is not a separate value: it is echoed straight from `weight`, so the two are always equal. `healthStatus` is one of `disabled` | `unhealthy` (in cooldown, or banned upstream) | `warning` (has failure strikes) | `healthy`.
 
 ### POST /api/admin/credentials
 
@@ -1165,7 +1167,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1381,7 +1383,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.7.1"
+  "version": "0.7.2"
 }
 ```
 

@@ -764,7 +764,10 @@
     actions.appendChild(iconBtn('fileText', 'acc.viewUsage', null, function () { showUsage(acc); }));
     actions.appendChild(iconBtn('pencil', 'common.edit', null, function () { openAddEditForm(acc); }));
     var resetBtn = iconBtn('refreshCw', 'acc.reset', null, function () { resetStrikes(acc); });
-    if (!(Number(acc.failureCount) > 0)) resetBtn.disabled = true; // the reference panel disables reset at 0 failures
+    // 有 strike 要清、或挂着一个"重置"才能清掉的结论(封禁),按钮就得能点。
+    // 只看 failureCount 会把封禁账号的按钮永久变灰:封禁号被挡在池外、strike 恒为 0,
+    // 而重置是它唯一的出口——出口点不动,账号就再也回不来了。
+    if (!hasResettableState(acc)) resetBtn.disabled = true;
     actions.appendChild(resetBtn);
     var delBtn = iconBtn('trash', acc.disabled ? 'common.delete' : 'acc.deleteNeedDisable', 'is-danger', function () { deleteAccount(acc); });
     if (!acc.disabled) delBtn.disabled = true; // the reference panel requires disable-before-delete
@@ -1159,9 +1162,15 @@
     step();
   }
 
+  // 账号身上是否有"重置"能清掉的东西:strike 计数,或一个不会自愈的结论。
+  // 封禁账号 strike 恒为 0(它根本不被选中,累积不了 strike),但结论必须靠重置来清。
+  function hasResettableState(a) {
+    return Number(a.failureCount) > 0 || a.statusReason === 'banned';
+  }
+
   // 恢复异常 — reset strikes on every selected account that has failures
   function batchReset(btn) {
-    var targets = selectedAccounts().filter(function (a) { return Number(a.failureCount) > 0; });
+    var targets = selectedAccounts().filter(hasResettableState);
     if (!targets.length) { api.toast(t('acc.noFailures'), 'info'); return; }
     if (btn) btn.disabled = true;
     var ok = 0, fail = 0;

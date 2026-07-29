@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.2-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 날짜 | 업데이트 내용 |
 |------|----------|
+| 2026-07-29 | v0.7.2 - 🐛 업스트림이 정지한 계정이 여전히 「사용 가능」으로 집계되고 선택되던 문제 수정. `available`은 「비활성 아님 && 쿨다운 아님」만 보고 `statusReason`은 보지 않았습니다. 쿨다운은 타이머라 저절로 풀리지만 정지는 업스트림의 결론(「계정을 잠갔습니다. 지원팀에 문의하세요」)이라 기다려도 해제되지 않습니다. 그 결과 패널은 「정지」로 표시하는데 카운트는 253개 전부 사용 가능이라 했고, 쿨다운이 끝날 때마다 다시 선택되어 다시 실패하며 실제 요청을 소모했습니다. 이제 선택되지 않고 `available`에도 포함되지 않으며 `healthStatus`는 `unhealthy`를 반환합니다. 패널의 「초기화」가 이 결론도 함께 지웁니다 |
 | 2026-07-28 | v0.7.1 - 🐛 codex 가 Responses 로 접속하지 못하던 문제 수정. 도구 정의에서 `name` 을 필수로 두었으나, OpenAI 규격상 도구 배열에는 `name` 자체가 없는 **내장 도구**(`web_search`/`local_shell`/`file_search`)도 섞여 있어 내장 도구 하나로 역직렬화 단계에서 턴 전체가 실패했습니다(`tools[13]: missing field \`name\``). 게다가 오류는 인덱스만 알려 줄 뿐 어떤 종류의 도구인지는 알 수 없었습니다. 이제 내장 도구는 파싱되고 폐기되며 WARN(`responses_builtin_tool_dropped`)을 남깁니다. 바로 뒤에 숨어 있던 두 번째 결함도 수정: 알 수 없는 `input` 항목 유형(`reasoning`/`local_shell_call`)이 하드 오류여서 멀티턴에서 **첫 턴은 되고 둘째 턴에서 반드시 터졌습니다**. 이제 건너뜁니다. 함수 도구는 `parameters` 생략 가능 |
 | 2026-07-28 | v0.7.0 - 토큰 갱신 실패가 완전히 삼켜지고 있었습니다. 로그에는 「갱신 중」 직후 「다른 계정으로 재시도」만 찍히고 **왜 실패했는지**가 통째로 빠져 있었습니다. 실제 장애에서 업스트림이 계정 전체에 `access_denied`를 반환했지만 화면에는 「전부 만료됨」으로만 보여, 수동으로 업스트림에 curl하지 않으면 릴레이 자체 고장과 구분할 수 없었습니다. 이제 실패 시 업스트림 상태 코드와 본문을 기록하고 `statusReason`에 새 구간 `refresh_denied`로 반영합니다. 아무리 재시도해도 해결되지 않으므로 단순 만료와 엄격히 구분합니다. 계정 페이지에는 「이 페이지 전체 선택」과 「일괄 비활성화」도 추가 |
 | 2026-07-28 | v0.6.0 - 계정 목록이 30초마다 조용히 자동 새로 고침되며 신선도 라벨이 붙습니다. 기존에는 페이지를 연 시점에서 멈춰 있어, 계정이 정지되거나 쿨다운에서 복귀하거나 만료되어도 수동으로 새로 고치기 전까지 화면이 그대로였습니다. 오래된 배지를 보고 판단하는 것은 배지가 없는 것보다 나쁩니다 — 「정지됨 (0)」 같은 숫자는 결론처럼 보이지만 10분 전 값일 수 있습니다. 다시 가져오는 것은 저렴한 목록 엔드포인트뿐이며, 잔액 팬아웃을 타이머로 재실행하지는 않습니다. 조용한 새로 고침은 페이지·필터·선택·스크롤 위치를 유지하고, 툴바에 숫자가 몇 초 전 것인지 표시합니다 |
@@ -222,7 +223,7 @@ docker compose logs -f
 ```bash
 # 헬스 체크
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.1"}
+# {"service":"kiro2api","status":"ok","version":"0.7.2"}
 
 # 프로토콜 고정 모델 목록 조회
 curl http://localhost:8080/v1/models \

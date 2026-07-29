@@ -657,7 +657,9 @@ curl http://localhost:8080/api/admin/credentials \
 > [!NOTE]
 > 账号池是**每次请求**现选账号，并不存在一个持久的"当前账号"：`currentId` 恒为 `-1`、每行的 `isCurrent` 恒为 `false`，两个字段是给未来的粘性选择模式预留的。请勿依赖它们做判断。
 
-`healthStatus` 为 `healthy` / `warning`(有失败计数但仍会被选中)/ `unhealthy`(在冷却窗口内,到期自动恢复)/ `disabled`(已关闭,不会自动恢复)。`statusReason` 记录**最近一次失败的原因**——`none` / `banned`(被上游停用)/ `quota` / `token_expired` / `throttled` / `refresh_denied`——与 `healthStatus` 正交:后者答「能不能被选中」,本字段答「为什么不能」。它由上游原始响应体判定,**只影响展示**(不改变选号纪律、冷却时长与禁用判定),账号成功一次即清空。
+`healthStatus` 为 `healthy` / `warning`(有失败计数但仍会被选中)/ `unhealthy`(在冷却窗口内、或已被上游封禁)/ `disabled`(已关闭)。`statusReason` 记录**最近一次失败的原因**——`none` / `banned`(被上游停用)/ `quota` / `token_expired` / `throttled` / `refresh_denied`——答「为什么不能用」。
+
+> **`banned` 会真正把账号挡在池外**,其余原因只影响展示。冷却是计时器,到点自动回池;封禁是上游给的结论(原话为「账号已锁定,请联系客服验证身份」),不随时间解除。若只按计时器放行,冷却一过账号就重新入选、再失败、再冷却,循环烧真实请求,而 `available` 还把它算作可用——面板一边挂着「封禁」、计数一边说没事,两个数字互相矛盾。因此封禁账号不被选中、不计入 `available`、`healthStatus` 报 `unhealthy`。它不会自愈(永远等不到那次成功来清标签),**唯一出口是面板的「重置」**(`POST /api/admin/credentials/{id}/reset`,会一并清掉该结论)。其余原因仍在账号下次成功时自动清空。
 
 ### POST /api/admin/credentials
 
@@ -1186,7 +1188,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1374,7 +1376,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.7.1"
+  "version": "0.7.2"
 }
 ```
 

@@ -443,8 +443,17 @@ impl Pool {
         self.mode = mode;
     }
 
+    /// 可用 = 未禁用 && 不在冷却 && 上一次的结论不是"被上游封禁"。
+    ///
+    /// 前两项是**计时器**,一到点账号就回池;而封禁是个**结论**——上游原话是"账号已锁定,
+    /// 请联系客服验证身份",不会因为等了五分钟或半小时就解除。只看计时器的后果是:冷却一过
+    /// 账号重新入选、再失败、再冷却,循环烧真实请求,而面板同时挂着"封禁"标签、可用数却把它
+    /// 算在内——两个数字互相矛盾,运维无从判断哪个可信。
+    ///
+    /// 封禁账号因此不再被选中,也不计入可用数;它不会自己恢复,出口是面板的「重置」
+    /// ([`reset_failures`](Self::reset_failures),会一并清掉该结论)。
     fn is_active(e: &Entry, now_unix: u64) -> bool {
-        !e.disabled && e.cooldown_until <= now_unix
+        !e.disabled && e.cooldown_until <= now_unix && e.status_reason != StatusReason::Banned
     }
 
     /// 窗口内计数:近 RPM_WINDOW_SECS 秒(即 now_unix 起回溯的滑动窗口)内
@@ -785,6 +794,9 @@ impl Pool {
         if let Some(e) = self.find(id) {
             e.strikes = 0;
             e.cooldown_until = 0;
+            // 结论也要清。封禁账号被 `is_active` 挡在池外、永远轮不到成功来清标签,
+            // 「重置」是它唯一的出口;只清计时器不清结论,这个按钮对封禁号就是个空操作。
+            e.status_reason = StatusReason::None;
             true
         } else {
             false
@@ -1918,5 +1930,43 @@ mod tests {
         assert!(!serialized.contains("SEKRET-CS"));
         assert!(!serialized.contains("accessToken"));
         assert!(!serialized.contains("refreshToken"));
+    }
+
+    /// 封禁不是计时器能解除的:上游原话是「账号已锁定,请联系客服验证身份」。
+    /// 此前 `is_active` 只看 disabled+冷却,冷却一过封禁号就回到可用池——面板挂着
+    /// 「封禁」标签、`available` 却把它算在内,两个数字互相矛盾。
+    #[test]
+    fn banned_account_is_neither_active_nor_counted_nor_selected() {
+        let mut p = Pool::new(vec![cred("a", 1), cred("b", 1)], LbMode::Priority);
+        assert_eq!(p.active_count(0), 2);
+
+        p.report_failure_with_reason("a", FailureKind::AuthAmbiguous, StatusReason::Banned, 0);
+
+        // 时间推到任何冷却都早已过期之后
+        let long_after = 10_000_000;
+        assert_eq!(
+            p.active_count(long_after),
+            1,
+            "封禁号不得计入可用数,哪怕冷却已过"
+        );
+        for _ in 0..10 {
+            let picked = p.select(long_after).expect("另一个健康号仍可选");
+            assert_eq!(picked.id, "b", "封禁号不得被选中");
+        }
+    }
+
+    /// 封禁号被挡在池外后永远轮不到一次成功来清标签,「重置」是它唯一的出口。
+    /// 只清计时器不清结论的话,这个按钮对封禁号就是空操作。
+    #[test]
+    fn reset_clears_the_banned_verdict_so_the_account_can_come_back() {
+        let mut p = Pool::new(vec![cred("a", 1)], LbMode::Priority);
+        p.report_failure_with_reason("a", FailureKind::AuthAmbiguous, StatusReason::Banned, 0);
+        assert_eq!(p.active_count(10_000_000), 0);
+
+        assert!(p.reset_failures("a"));
+
+        assert_eq!(p.stats(0)[0].status_reason, "none", "重置须清掉封禁结论");
+        assert_eq!(p.active_count(0), 1, "重置后账号回到可用池");
+        assert!(p.select(0).is_some());
     }
 }

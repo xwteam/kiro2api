@@ -625,12 +625,14 @@ curl http://localhost:8080/api/admin/credentials \
 }
 ```
 
-`statusReason`은 **마지막 실패 사유**를 기록합니다(`none` / `banned` = 업스트림이 계정을 정지 / `quota` / `token_expired` / `throttled` / `refresh_denied`). 「선택 가능한지」를 답하는 `healthStatus`와는 직교하는 정보입니다. 업스트림 원본 응답 본문에서 판정되며 **표시에만 영향**을 줍니다(계정 선택 규칙·쿨다운 시간·비활성화 판정에는 관여하지 않음). 다음 성공 시 초기화됩니다.
+`statusReason`은 **마지막 실패 사유**를 기록합니다(`none` / `banned` = 업스트림이 계정을 정지 / `quota` / `token_expired` / `throttled` / `refresh_denied`).
+
+> **`banned`는 계정을 실제로 풀에서 제외합니다.** 나머지 사유는 표시에만 영향을 줍니다. 쿨다운은 타이머라 시간이 지나면 스스로 풀리지만, 정지는 업스트림이 내린 결론(원문: 「계정을 잠갔습니다. 신원 확인을 위해 지원팀에 문의하세요」)이며 기다린다고 해제되지 않습니다. 타이머만 보고 복귀시키면 쿨다운이 끝나는 순간 다시 선택되고, 다시 실패하고, 다시 쿨다운 — 실제 요청을 계속 소모하면서도 `available`은 여전히 사용 가능으로 셉니다. 패널은 「정지」라고 표시하는데 카운트는 문제없다고 말하는, 서로 모순되는 두 숫자입니다. 따라서 정지된 계정은 선택되지 않고 `available`에도 포함되지 않으며 `healthStatus`는 `unhealthy`를 반환합니다. 스스로 회복하지 않습니다(라벨을 지울 성공이 영영 오지 않으므로). **유일한 복귀 수단은 패널의 「초기화」**입니다(`POST /api/admin/credentials/{id}/reset`, 이 결론도 함께 지웁니다). 나머지 사유는 종전대로 다음 성공 시 초기화됩니다.
 
 > [!NOTE]
 > - 풀은 요청마다 계정을 고르므로 "현재 계정"이라는 지속 상태가 존재하지 않습니다. `currentId`는 **항상 `-1`**, `isCurrent`는 **항상 `false`**입니다(장래의 고정 선택 모드를 위한 예약 필드) — 이 두 값으로 분기하지 마십시오.
 > - `priority`는 별도 값이 아니라 풀 가중치(`weight`)를 그대로 반영하므로 언제나 `weight`와 같습니다.
-> - `healthStatus`가 가질 수 있는 값은 `disabled` | `unhealthy`(쿨다운 중) | `warning`(실패 누적) | `healthy` 넷뿐입니다.
+> - `healthStatus`가 가질 수 있는 값은 `disabled` | `unhealthy`(쿨다운 중 또는 업스트림 정지) | `warning`(실패 누적) | `healthy` 넷뿐입니다.
 
 ### POST /api/admin/credentials
 
@@ -1428,7 +1430,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.7.1"}
+{"service":"kiro2api","status":"ok","version":"0.7.2"}
 ```
 
 ### GET /v1/ping

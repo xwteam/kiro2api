@@ -41,11 +41,15 @@ fn unix_to_rfc3339(secs: u64) -> Option<String> {
         .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
-/// 健康度分级(展示用):禁用 > 冷却(unhealthy)> 有失败 strike(warning)> 健康。
+/// 健康度分级(展示用):禁用 > 封禁 > 冷却(unhealthy)> 有失败 strike(warning)> 健康。
+///
+/// 封禁必须排在冷却之前、且不能落到 `healthy`:冷却是计时器,过期即回池,而封禁是上游给的
+/// 结论,不随时间解除。此前只看计时器,冷却一过封禁号就报 `healthy`,于是面板一边挂着
+/// 「封禁」标签、可用数一边把它算进去——同一个账号两个互相打架的说法。
 fn health_status(a: &AccountStat) -> &'static str {
     if a.disabled {
         "disabled"
-    } else if a.in_cooldown {
+    } else if a.status_reason == "banned" || a.in_cooldown {
         "unhealthy"
     } else if a.strikes > 0 {
         "warning"

@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.2-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日付 | 更新内容 |
 |------|----------|
+| 2026-07-29 | v0.7.2 - 🐛 上流に利用停止されたアカウントが「利用可能」と数えられ、選択もされ続けていた問題を修正。`available` は「無効でない && クールダウン中でない」しか見ておらず `statusReason` を参照していませんでした。クールダウンはタイマーで自然に明けますが、利用停止は上流の判断(「アカウントをロックしました。サポートへご連絡ください」)であり待っても解除されません。その結果パネルは「利用停止」と表示しながらカウントは全 253 件が使用可能と表示し、クールダウンが明けるたびに再選択・再失敗を繰り返して実リクエストを消費していました。現在は選択されず、`available` にも数えられず、`healthStatus` は `unhealthy` を返します。パネルの「リセット」はこの判断も併せてクリアします(でなければ復帰手段がありません) |
 | 2026-07-28 | v0.7.1 - 🐛 codex が Responses 経由で接続できない問題を修正。ツール定義で `name` を必須にしていましたが、OpenAI 仕様ではツール配列に `name` を持たない**組み込みツール**(`web_search`/`local_shell`/`file_search`)も含まれるため、組み込みツール一つでデシリアライズ時にターン全体が失敗していました(`tools[13]: missing field \`name\``)。しかもエラーは添字のみで、どの種類のツールかは分かりません。組み込みツールは解析可能となり、破棄したうえで WARN(`responses_builtin_tool_dropped`)を残します。直後に控えていた二つ目の不具合も修正:未知の `input` 項目型(`reasoning`/`local_shell_call`)がエラー扱いだったため、マルチターンでは**一巡目は通り二巡目で必ず落ちる**状態でした。現在はスキップします。関数ツールは `parameters` を省略可能に |
 | 2026-07-28 | v0.7.0 - トークン更新の失敗が完全に握り潰されていました。ログには「更新中」の直後に「別アカウントで再試行」とだけ出て、**なぜ失敗したか**が丸ごと欠けていました。実際の障害では上流がアカウント一括に対し `access_denied` を返し、画面上は「全部期限切れ」としか見えず、手動で上流に curl しない限りリレー自体の故障と区別できませんでした。現在は上流のステータスと本文を記録し、`statusReason` に新区分 `refresh_denied` として反映します。何度再試行しても直らないため、単なる期限切れとは厳密に区別します。アカウント画面には「このページを全選択」と「一括無効化」も追加 |
 | 2026-07-28 | v0.6.0 - アカウント一覧が 30 秒ごとに自動更新され、鮮度ラベルが付きました。従来はページを開いた時点で固定され、アカウントの利用停止・クールダウンからの復帰・期限切れが起きても、手動更新するまで画面は変わりませんでした。古いバッジを見て判断するのはバッジがないより悪く、「利用停止 (0)」のような数字は結論に見えて実は 10 分前のものかもしれません。再取得するのは安価な一覧エンドポイントだけで、残高のファンアウトをタイマーで再実行することは決してありません。静かな更新はページ・絞り込み・選択・スクロール位置を保ち、ツールバーには数字が何秒前のものかを表示します |
@@ -226,7 +227,7 @@ docker compose logs -f
 ```bash
 # ヘルスチェック
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.1"}
+# {"service":"kiro2api","status":"ok","version":"0.7.2"}
 
 # 利用可能なモデルを表示
 curl http://localhost:8080/v1/models \

@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.2-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-07-29 | v0.7.2 - 🐛 修復被上游封禁的帳號仍被算作可用、仍會被選中:`available` 此前只看「未停用 && 不在冷卻」,不看 `statusReason`。冷卻是計時器到點自動回池,而封禁是上游結論(「帳號已鎖定,請聯絡客服驗證身分」)不隨時間解除,於是面板掛著「封禁」、可用數卻把它算在內,且冷卻一過就重新入選、必然再失敗、循環燒真實請求。現在封禁帳號不被選中、不計入 `available`、`healthStatus` 報 `unhealthy`;面板「重置」會一併清掉該結論 |
 | 2026-07-28 | v0.7.1 - 🐛 修復 Responses 介面無法接入 codex:工具陣列裡的**內建工具**(`web_search`/`local_shell`/`file_search`,照 OpenAI 規範就沒有 `name`)此前會讓整輪請求死在反序列化(`tools[13]: missing field \`name\``),一個內建工具廢掉整個工作階段,且錯誤只報索引、看不出是哪類工具。現在內建工具可解析、被丟棄並落 WARN(`responses_builtin_tool_dropped`)。同時修掉緊隨其後的第二個坑:多輪回灌的 `reasoning`/`local_shell_call` 等項目此前判錯,會導致**第一輪能通、第二輪必炸**,現改為整條跳過;函式工具也允許省略 `parameters` |
 | 2026-07-28 | v0.7.0 - 權杖刷新失敗此前被完全吞掉:日誌只有「刷新中」緊接「跨帳號重試」,中間**為什麼失敗**整個消失。線上真實事故:上游對整批帳號回 `access_denied`,面板上只表現為「帳號全過期了」。現在失敗即記錄上游狀態碼與回應體,並寫進 `statusReason`,新增「續期被拒」一檔——與「過期了刷一下就好」嚴格分開。帳號頁另加「全選本頁」與「批次停用」 |
 | 2026-07-28 | v0.6.0 - 帳號列表每 30 秒靜默自動重新整理,並顯示新鮮度。此前頁面開啟即凍結:帳號被封、冷卻結束恢復、權杖過期,螢幕上都不會變,除非手動重新整理。照著一屏過時徽章做判斷比沒有徽章更糟——「封禁帳號 (0)」看著像結論,其實可能是十分鐘前的。只重拉便宜的列表介面,**絕不**按定時重跑餘額扇出。靜默重新整理保留頁碼、篩選、選取態與捲動位置;工具列顯示數字是幾秒前的 |
@@ -225,7 +226,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.1"}
+# {"service":"kiro2api","status":"ok","version":"0.7.2"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \
