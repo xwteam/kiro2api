@@ -1067,12 +1067,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "kiro2api_persist_test_{}_{}.json",
-            std::process::id(),
-            now_nanos()
-        ));
+        let path = crate::test_tmp::file("kiro_persist_test", "credentials.json");
         let p = path.to_str().unwrap().to_string();
         let _ = std::fs::remove_file(&p);
 
@@ -1346,13 +1341,5 @@ mod tests {
             pool.lock().await.snapshot_credentials()[0].refresh_token,
             "fresh-rt"
         );
-    }
-
-    /// 单调纳秒,给测试临时文件名去重。
-    fn now_nanos() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
     }
 }

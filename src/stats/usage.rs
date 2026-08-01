@@ -1387,9 +1387,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_now_persists_records_and_daily_across_reload() {
-        let name = format!("kiro2api_usage_flushnow_{}.json", std::process::id());
-        let path = std::env::temp_dir().join(name);
-        let _ = std::fs::remove_file(&path);
+        let path = crate::test_tmp::stable_dir("usage_flushnow").join("usage_records.json");
         {
             let t = UsageTracker::load(path.clone());
             t.record_usage(3, "m".into(), 10, 20, 0.25, None, None, None, 1000)
@@ -1426,9 +1424,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_tracker_does_not_clobber_persisted_file() {
-        let path =
-            std::env::temp_dir().join(format!("kiro2api_usage_drop_{}.json", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = crate::test_tmp::stable_dir("usage_drop").join("usage_records.json");
         let t = UsageTracker::load(path.clone());
         t.record_usage(1, "m".into(), 1, 1, 1.0, None, None, None, 1000)
             .await;
@@ -1513,10 +1509,7 @@ mod tests {
 
     /// 建一个本测试专用的空目录(同名残留先清掉)。
     fn test_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kiro2api_usage_{tag}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::test_tmp::stable_dir(&format!("usage_{tag}"))
     }
 
     /// 目录下的损坏备份文件列表(`*.corrupt.*`)。

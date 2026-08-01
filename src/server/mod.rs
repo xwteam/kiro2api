@@ -1091,9 +1091,7 @@ mod tests {
     /// 仍能在开放面板里调 PUT /config/auth-keys 设好管理员密钥,当场收口(见 auth.rs 同名回归测试)。
     #[tokio::test]
     async fn admin_stats_open_when_only_store_keys_exist() {
-        let dir =
-            std::env::temp_dir().join(format!("kiro2api_srv_adminguard_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_tmp::stable_dir("srv_adminguard");
         let creds = dir.join("credentials.json").to_string_lossy().into_owned();
         let store_path = crate::apikey::api_keys_path_from(&creds);
         let _ = std::fs::remove_file(&store_path);
@@ -1309,16 +1307,7 @@ mod tests {
 
     /// 每个测试独占的临时目录(pid + 纳秒,互不串扰)。
     fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "kiro2api_srv_{tag}_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::test_tmp::dir(&format!("srv_{tag}"))
     }
 
     /// 目录下的损坏备份文件列表(`*.corrupt.*`)。

@@ -1259,27 +1259,13 @@ mod tests {
     use chrono::Utc;
 
     fn tmp_store_path(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "kiro2api_authtest_{}_{}.json",
-            tag,
-            std::process::id()
-        ))
+        crate::test_tmp::stable_file(&format!("authtest_{tag}"), "store.json")
     }
 
     /// 每个用例独占的统计目录:`temp_dir()` 是全局共享的,用量断言不能被别的用例
     /// 落在同一份 usage_records.json 里的记录串扰。
     fn tmp_stats_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "kiro2api_authstats_{}_{}_{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        dir
+        crate::test_tmp::dir(&format!("authstats_{tag}"))
     }
 
     /// 回显解析出的 ApiKeyId 扩展(None → "none",Some(id) → id 字符串)。

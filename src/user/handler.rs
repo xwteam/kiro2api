@@ -372,28 +372,11 @@ mod tests {
     use tower::ServiceExt;
 
     fn unique_tmp(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "kiro2api_user_{}_{}_{}.json",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ))
+        crate::test_tmp::file(&format!("user_{tag}"), "store.json")
     }
 
     fn empty_stats(tag: &str) -> Arc<StatsManager> {
-        let dir = std::env::temp_dir().join(format!(
-            "kiro2api_user_stats_{}_{}_{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = crate::test_tmp::dir(&format!("user_stats_{tag}"));
         StatsManager::load_from_dir(&dir)
     }
 

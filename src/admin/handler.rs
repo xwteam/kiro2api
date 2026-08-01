@@ -3626,29 +3626,13 @@ mod tests {
 
     /// 建一个指向唯一临时目录的空 StatsManager(每测试隔离,避免共享落盘文件串扰)。
     fn empty_stats(tag: &str) -> Arc<StatsManager> {
-        let dir = std::env::temp_dir().join(format!(
-            "kiro2api_admin_test_{}_{}_{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = crate::test_tmp::dir(&format!("admin_{tag}"));
         StatsManager::load_from_dir(&dir)
     }
 
     /// 唯一临时 credentials.json 路径的 Config(每测试隔离持久化落盘)。
     fn cfg_with_temp_creds() -> Config {
-        let path = std::env::temp_dir().join(format!(
-            "kiro2api_p3_creds_{}_{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::test_tmp::file("admin_creds", "credentials.json");
         Config {
             credentials_path: path.to_string_lossy().into_owned(),
             ..Config::default()
@@ -5108,15 +5092,7 @@ mod tests {
 
     /// 唯一临时 config.json 路径(每测试隔离)。
     fn tmp_config_path(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "kiro2api_p5cfg_{}_{}_{}.json",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+        crate::test_tmp::file(&format!("admin_p5cfg_{tag}"), "config.json")
     }
 
     /// 构造带指定 runtime_cfg 的 admin router:runtime_cfg 的 config_path 指向 `cfg_path`,
@@ -5876,17 +5852,7 @@ mod tests {
 
     /// 唯一临时目录(每测试隔离)。
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "kiro2api_admin_{}_{}_{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::test_tmp::dir(&format!("admin_{tag}"))
     }
 
     /// 生产同款接线的 state:统计、API-KEY 存储、余额缓存、credentials.json 全落在同一个

@@ -23,3 +23,7 @@ pub mod server;
 pub mod stats;
 pub mod user;
 pub mod webui;
+
+// 测试用临时目录的统一出口。只在测试期编译,不进产物。
+#[cfg(test)]
+pub mod test_tmp;

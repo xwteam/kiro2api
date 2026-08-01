@@ -946,11 +946,7 @@ mod tests {
     }
 
     fn tmp_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "kiro2api_apikey_{}_{}.json",
-            tag,
-            std::process::id()
-        ))
+        crate::test_tmp::stable_file(&format!("apikey_{tag}"), "api_keys.json")
     }
 
     #[test]
@@ -1441,18 +1437,7 @@ mod tests {
 
     /// 每个测试独享的空目录(备份档要按 `.corrupt.*` 枚举,不能和别的用例共用目录)。
     fn unique_temp_dir(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "kiro2api_apikey_{}_{}_{}",
-            tag,
-            std::process::id(),
-            nanos
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::test_tmp::dir(&format!("apikey_{tag}"))
     }
 
     /// 目录下的损坏备份文件列表(`*.corrupt.*`)。
