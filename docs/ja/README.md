@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.12-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.13-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日付 | 更新内容 |
 |------|----------|
+| 2026-08-03 | v0.7.13 - 🐛 **codex の 502:中継自身が不正なリクエストを生成していました。** 上流はメッセージに `toolUse` が含まれる場合 `toolConfig` を必須としますが、Responses の組み込みツール(`web_search`・`local_shell`)は変換時に正当に破棄されます(v0.7.1)。そのためクライアントがあるターンで組み込みツールだけを送ると `tools` が空になり、履歴のツール呼び出しだけが残ります。再現:ツール履歴+組み込みのみ → 502、同じ履歴に関数ツール 1 つ → 200。現在は送信前に会話履歴のツール名を最小仕様で補完します(クライアント宣言分を優先、重複なし)。また `TOOL_CONFIG_MISSING` を確定的リクエストエラーに分類(従来は一時的エラー扱いで、30 分に 26 件・25 アカウントに波及) |
 | 2026-08-03 | v0.7.12 - 🐛 **一つの長すぎるリクエストがアカウントプール全体を傷つけ、最終的に 503 に至っていました。** 上流は長さ上限を超えたリクエストに `400 CONTENT_LENGTH_EXCEEDS_THRESHOLD` を返しますが、確定的なリクエストエラーとして認識していたのは `INVALID_MODEL_ID` だけで、このコードは「一時的エラー」に落ちていました。その結果、どのアカウントでも成功し得ないリクエストが**アカウントを跨いで再試行され、触れた全アカウントに失敗と strike を記録**していました。実測では一日の午後で 253 の健全なアカウントが 149 の負傷・26 のクールダウンとなり、以後 `503 no available upstream account` を返し始めました。現在は `InvalidRequest` として扱い、再試行もクールダウンも strike もありません。クライアントも内容のない `502` ではなく、コンテキスト超過であること・**この誤りは自然回復しないこと**・コンテキストを削るか会話を新規に始める必要があることを示す `400` を受け取ります |
 | 2026-08-01 | v0.7.11 - 🐛 テストスイートが一時ディレクトリを `/tmp` に撒いたまま一切回収していませんでした。125 箇所が各自 `temp_dir().join(...)` でパスを組み立て、ガードも後片付けもなく、プロセス終了と同時に孤児になります。ディスク満杯の調査時には `/tmp` 直下に **9582 個**が積み上がっており、しかもわずか 4 日分でした(systemd-tmpfiles の老化は 30 日で追いつきません)。問題は容量(合計 52M)ではなく雑然さで、一万件をかき分ける羽目になるのはディスク調査の最中です。現在はプロセスごとの単一ルート `/tmp/kiro2api-tests/<pid>/` に集約し、各テストプロセスが起動時に **pid がもう `/proc` に無い**古いルートを回収します。**テスト基盤のみの変更で、実行時の挙動は変わりません** |
 | 2026-07-29 | v0.7.10 - 🐛 リリース後もパネルが古いバージョン・古い挙動を表示していました(バックエンドは 0.7.9 なのに更新チェックは 0.7.6)。静的アセットに**キャッシュヘッダが一切ありません**でした(`Cache-Control`・`ETag`・`Last-Modified` すべて無し)。HTTP ではこの場合ブラウザがヒューリスティックキャッシュを適用し保持期間を自分で決めてよいため、古い JS が使われ続けます。サーバ側は全エンドポイントが 0.7.9 を返しており、誤っていたのはブラウザ内の複製だけ —— 診断が最も難しい種類の不具合です。現在は `Cache-Control: no-cache` と内容 SHA-256 による強い `ETag` を付与し、`If-None-Match` → `304` に対応します |
@@ -237,7 +238,7 @@ docker compose logs -f
 ```bash
 # ヘルスチェック
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.12"}
+# {"service":"kiro2api","status":"ok","version":"0.7.13"}
 
 # 利用可能なモデルを表示
 curl http://localhost:8080/v1/models \

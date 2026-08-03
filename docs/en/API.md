@@ -219,6 +219,18 @@ curl -X POST http://localhost:8080/openai/v1/chat/completions \
 
 Tool calls are returned in `choices[0].message.tool_calls` with `finish_reason:"tool_calls"`. Send the tool result back with a `role:"tool"` message. Tool calls are passed through **verbatim** — no simulation.
 
+### Tool specs backfilled from history
+
+Upstream requires that `toolConfig` be present whenever a message carries `toolUse` or `toolResult` content blocks; without it the whole request is rejected with `TOOL_CONFIG_MISSING`.
+
+Tools can legitimately be dropped before the request reaches the data plane, however. The Responses built-ins (`web_search`, `local_shell`, `file_search`) are executed by OpenAI's own service and this relay's hub has no equivalent, so they are discarded during conversion. If a client sends **only** built-ins on some turn, `tools` becomes an empty array while the tool calls in the conversation history remain.
+
+The request then carries tool calls with no tool definitions — a malformed request **this service produced itself**, not a fault of the caller.
+
+**Current behaviour:** before sending upstream, every tool name appearing in the conversation history is collected, and any not declared in the current `tools` gets a minimal spec (empty object schema). These are tools the model itself already called; backfilling them only makes the request self-consistent, and without it the whole turn fails outright. Tools the client **did** declare take precedence: a matching name is neither overwritten nor duplicated.
+
+When there are no tools and no tool calls in the history, behaviour is unchanged: no `toolConfig` is sent and the task type stays `vibe`.
+
 ### POST /openai/v1/responses
 
 OpenAI Responses API. Added for clients that require the newer Responses protocol instead of Chat Completions (e.g. **Codex CLI**, which dropped Chat Completions support in Feb 2026 — pointing Codex CLI at kiro2api needs this endpoint). Supports text, streaming, and function/tool calling.
@@ -1169,7 +1181,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.7.12",
+  "version": "0.7.13",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1385,7 +1397,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.7.12"
+  "version": "0.7.13"
 }
 ```
 
@@ -1418,7 +1430,7 @@ The error body shape varies by protocol:
 | Code | Meaning | Description |
 |------|---------|-------------|
 | 200 | OK | Request succeeded |
-| 400 | Bad Request | On the relay endpoints, three causes: a body they cannot deserialize (they answer `400`, never `422`); a model name matching nothing in the internal map — rejected by the gateway itself, message `无法识别的模型名: <name>`; or a mapped model the account's tier cannot serve — refused upstream (reason `INVALID_MODEL_ID`) and reported as `Invalid model '<name>': not available for the current account. …`. Two admin endpoints add their own: `POST /api/admin/restart` without `?confirm=true`, and `GET /api/admin/usage/summary` with an unrecognized `range` or `hours=0`; and a request body exceeding the upstream length limit — upstream reason `CONTENT_LENGTH_EXCEEDS_THRESHOLD`, answered with an "Input is too long…" message that also states the error will not recover on its own (each turn resends the whole conversation, so the next is larger still) and that the context must be trimmed or the conversation restarted. **This cause likewise is not retried and does not damage accounts** — before v0.7.12 it was misclassified as transient, retried across accounts, and charged a failure to every account it touched |
+| 400 | Bad Request | On the relay endpoints, three causes: a body they cannot deserialize (they answer `400`, never `422`); a model name matching nothing in the internal map — rejected by the gateway itself, message `无法识别的模型名: <name>`; or a mapped model the account's tier cannot serve — refused upstream (reason `INVALID_MODEL_ID`) and reported as `Invalid model '<name>': not available for the current account. …`. Two admin endpoints add their own: `POST /api/admin/restart` without `?confirm=true`, and `GET /api/admin/usage/summary` with an unrecognized `range` or `hours=0`; and a request body exceeding the upstream length limit — upstream reason `CONTENT_LENGTH_EXCEEDS_THRESHOLD`, answered with an "Input is too long…" message that also states the error will not recover on its own (each turn resends the whole conversation, so the next is larger still) and that the context must be trimmed or the conversation restarted. **This cause likewise is not retried and does not damage accounts** — before v0.7.12 it was misclassified as transient, retried across accounts, and charged a failure to every account it touched; and a message carrying tool calls without any tool definitions — upstream reason `TOOL_CONFIG_MISSING`. This should not normally occur: the relay backfills a minimal spec for every tool named in the conversation history before sending (see "Tool specs backfilled from history"). The cause is kept as a backstop and likewise is not retried and does not damage accounts |
 | 401 | Unauthorized | Missing or invalid API Key (when `apiKey` is configured); also a disabled or expired store key |
 | 402 | Payment Required | A store-managed key has reached its spending limit (`{"type":"error","error":{"type":"billing_error",…}}`) |
 | 404 | Not Found | Admin endpoints only: unknown account / API-KEY / login-session id |

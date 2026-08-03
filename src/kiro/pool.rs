@@ -129,6 +129,10 @@ pub fn classify_with_body(status: u16, body: &str) -> FailureKind {
 /// 目前两种:
 /// - `INVALID_MODEL_ID` —— 该模型对当前账号档位不可用(FREE 档请求 opus/GPT 即命中)。
 /// - `CONTENT_LENGTH_EXCEEDS_THRESHOLD` —— 请求体超过上游长度上限。
+/// - `TOOL_CONFIG_MISSING` —— 消息里有 `toolUse`/`toolResult` 块却没有工具定义。
+///   正常情况下中枢不该造出这种请求(见 `convert::tool_specs_with_history_fallback`),
+///   留这一条是兜底:万一仍然发生,也必须**当场以 400 告知**,而不是当成瞬时错误
+///   跨账号重试一遍、把整池账号打伤。
 ///
 /// 第二种此前没被认出来,落进 `Transient`(瞬时错误、值得重试),后果实测很重:
 /// 一个超长请求会被跨账号重试一遍,**每换一个账号就给它记一次失败、攒一次 strike**,
@@ -137,17 +141,22 @@ pub fn classify_with_body(status: u16, body: &str) -> FailureKind {
 /// 客户端那头看到的则是 502 `upstream request failed` —— 完全看不出是上下文超长。
 pub fn body_signals_invalid_request(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
-    lower.contains("invalid_model_id") || lower.contains("content_length_exceeds_threshold")
+    lower.contains("invalid_model_id")
+        || lower.contains("content_length_exceeds_threshold")
+        || lower.contains("tool_config_missing")
 }
 
 /// 确定性请求错误回给客户端的说明。**必须按 reason 码分别给话**:同一档 `InvalidRequest`
 /// 现在含义不止一种,笼统套一句"模型不可用"会把"上下文超长"讲成完全无关的另一回事,
 /// 使用者照着去换模型,换多少次都没用。
 pub fn invalid_request_message(body: &str, model: &str) -> String {
-    if body
-        .to_ascii_lowercase()
-        .contains("content_length_exceeds_threshold")
-    {
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("tool_config_missing") {
+        return "Tool configuration missing: the conversation contains tool calls but the \
+                request declared no tools. Resend the tool definitions along with the history."
+            .to_string();
+    }
+    if lower.contains("content_length_exceeds_threshold") {
         // 讲清"为什么"和"怎么办":这个错误不会自愈 —— 客户端每轮重发完整历史,
         // 下一轮只会更长,该会话从此必然失败,唯一出路是缩短上下文或新开会话。
         "Input is too long: the request exceeds the upstream context limit. \
@@ -2114,5 +2123,23 @@ mod tests {
         let m2 = invalid_request_message(bad_model, "claude-opus-4.6");
         assert!(m2.contains("claude-opus-4.6"), "须点名是哪个模型: {m2}");
         assert!(!m2.contains("too long"));
+    }
+
+    /// `TOOL_CONFIG_MISSING` 是兜底档:正常情况下中枢不该造出这种请求(转换层会从历史补齐
+    /// 工具规格),但万一仍然发生,必须当场以 400 告知,而**不是**当成瞬时错误跨账号重试
+    /// 一遍——线上实测那样会在半小时里波及 25 个账号。
+    #[test]
+    fn missing_tool_config_is_a_request_error_not_an_account_failure() {
+        let body = r#"{"message":"Bedrock error message: The toolConfig field must be defined when using toolUse and toolResult content blocks.","reason":"TOOL_CONFIG_MISSING"}"#;
+        assert_eq!(classify_with_body(400, body), FailureKind::InvalidRequest);
+        assert!(body_signals_invalid_request(body));
+
+        let m = invalid_request_message(body, "claude-sonnet-4.5");
+        assert!(
+            m.contains("Tool configuration missing"),
+            "须点明是工具定义缺失: {m}"
+        );
+        assert!(!m.contains("too long"), "不得串成上下文超长: {m}");
+        assert!(!m.contains("Invalid model"), "不得串成模型不可用: {m}");
     }
 }

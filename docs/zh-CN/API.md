@@ -99,7 +99,7 @@ cat data/config.json | grep apiKey
 
 | 状态码 | 说明 |
 |--------|------|
-| 400 | 三类不同成因、都不重试也不误伤账号：①**模型名在本网关本地映射不上**——体为 `无法识别的模型名: <你传的名字>`，类型 `invalid_request_error`，**不含** `INVALID_MODEL_ID` 字样；②**上游确定性拒绝该模型**（账号档位无权），上游 reason 码即 `INVALID_MODEL_ID`，原样转出。另外，四种协议的对话端点在请求体解析失败时也回 `400`（已改写成各自 SDK 认得的错误形状）；③**请求体超过上游长度上限**——上游 reason 码 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`,体为「Input is too long…」并说明该错误不会自愈(客户端每轮重发完整历史,下一轮只会更长),需缩短上下文或新开会话。**此类同样不重试、不误伤账号**(v0.7.12 前它被误判为瞬时错误,会被跨账号重试一遍并给每个账号记一次失败) |
+| 400 | 四类不同成因、都不重试也不误伤账号：①**模型名在本网关本地映射不上**——体为 `无法识别的模型名: <你传的名字>`，类型 `invalid_request_error`，**不含** `INVALID_MODEL_ID` 字样；②**上游确定性拒绝该模型**（账号档位无权），上游 reason 码即 `INVALID_MODEL_ID`，原样转出。另外，四种协议的对话端点在请求体解析失败时也回 `400`（已改写成各自 SDK 认得的错误形状）；③**请求体超过上游长度上限**——上游 reason 码 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`,体为「Input is too long…」并说明该错误不会自愈(客户端每轮重发完整历史,下一轮只会更长),需缩短上下文或新开会话。**此类同样不重试、不误伤账号**(v0.7.12 前它被误判为瞬时错误,会被跨账号重试一遍并给每个账号记一次失败)；④**消息里有工具调用却没有工具定义**——上游 reason 码 `TOOL_CONFIG_MISSING`。正常情况下不该出现:中枢会从对话历史里把调用过的工具名补成最小规格再发出(见下「工具规格的历史补全」),这一档是兜底,同样不重试、不误伤账号 |
 | 401 | 认证失败，API Key 无效或缺失（已配置 `apiKey` 时）；管理端创建的 API-KEY 被停用 / 过期同样是 `401`。协议路由与 `/api/admin/*` 的 `401` 体恒为 Anthropic 形状的 `authentication_error`（见上方例外说明）；`/api/user/*` 的 `401` 则是 `{"error":"…"}` |
 | 402 | 该 API-KEY 的**消费额度已达或超上限**（体恒为 Anthropic 形状的 `billing_error`，见上方例外说明）。仅对管理端创建、且设了 `spendingLimit` 的 key 生效；用全局 `apiKey` 调用不会命中 |
 | 404 | 管理端点的 `{id}` 不存在：账号回 `{"error":"account not found","id":…}`，API-KEY 回 `{"error":"api key not found","id":…}`，登录会话回 `{"success":false,"error":"login session not found or expired"}` |
@@ -314,6 +314,18 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 > [!TIP]
 > 工具调用在四种协议间**真透传**（Anthropic `tool_use` / OpenAI `tool_calls` / Gemini `functionCall`），不做模拟。
+
+### 工具规格的历史补全
+
+上游硬性要求:只要消息里出现 `toolUse` / `toolResult` 内容块,`toolConfig` 就**必须存在**,否则整个请求被拒(`TOOL_CONFIG_MISSING`)。
+
+但工具**可能在到达数据面之前就被合法地丢掉**:Responses 协议里的内置工具(`web_search` / `local_shell` / `file_search`)由 OpenAI 服务端自己执行、本服务的中枢没有等价物,故转换时丢弃。若客户端某一轮**只带了内置工具**,`tools` 就会成为空数组 —— 而对话历史里的工具调用还在。
+
+于是请求变成「有工具调用、没有工具定义」,这是**本服务自己造出的畸形请求**,不是调用方的错。
+
+**现在的行为:** 发往上游前,从对话历史里收集所有出现过的工具名,凡是当前 `tools` 里没有声明的,补一份最小规格(空对象 schema)。补的是模型自己调用过的工具,补上只是让请求自洽;不补则整轮对话彻底失败。客户端**显式声明**的工具优先,同名不会被覆盖也不会重复。
+
+没有工具、历史里也没有工具调用时,行为不变:不发 `toolConfig`,任务类型为 `vibe`。
 
 ### POST /v1/responses
 
@@ -1190,7 +1202,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.7.12",
+  "version": "0.7.13",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1378,7 +1390,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.7.12"
+  "version": "0.7.13"
 }
 ```
 

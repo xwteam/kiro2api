@@ -195,6 +195,18 @@ data: [DONE]
 
 首幀帶 `delta.role`，末幀帶 `finish_reason`，以 `data: [DONE]` 收尾。
 
+### 工具規格的歷史補全
+
+上游硬性要求:只要訊息裡出現 `toolUse` / `toolResult` 內容區塊,`toolConfig` 就**必須存在**,否則整個請求被拒(`TOOL_CONFIG_MISSING`)。
+
+但工具**可能在到達資料面之前就被合法地丟掉**:Responses 協議裡的內建工具(`web_search` / `local_shell` / `file_search`)由 OpenAI 服務端自己執行、本服務的中樞沒有等價物,故轉換時丟棄。若客戶端某一輪**只帶了內建工具**,`tools` 就會成為空陣列 —— 而對話歷史裡的工具呼叫還在。
+
+於是請求變成「有工具呼叫、沒有工具定義」,這是**本服務自己造出的畸形請求**,不是呼叫方的錯。
+
+**現在的行為:** 發往上游前,從對話歷史裡收集所有出現過的工具名,凡是當前 `tools` 裡沒有宣告的,補一份最小規格(空物件 schema)。補的是模型自己呼叫過的工具,補上只是讓請求自洽;不補則整輪對話徹底失敗。客戶端**顯式宣告**的工具優先,同名不會被覆蓋也不會重複。
+
+沒有工具、歷史裡也沒有工具呼叫時,行為不變:不發 `toolConfig`,任務類型為 `vibe`。
+
 ### POST /responses
 
 OpenAI Responses API。為需要新版 Responses 協議（而非 Chat Completions）的客戶端提供支援——例如 **Codex CLI**，它在 2026 年 2 月起砍掉了對 Chat Completions 的支援，要把 Codex CLI 接到 kiro2api 就得靠這個介面。支援文字對話、流式輸出、工具（函數）呼叫。
@@ -1189,7 +1201,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.7.12"}
+{"service":"kiro2api","status":"ok","version":"0.7.13"}
 ```
 
 ### GET /v1/ping
@@ -1211,7 +1223,7 @@ curl http://localhost:8080/v1/ping
 | 狀態碼 | 說明 |
 |--------|------|
 | 200 | 成功 |
-| 400 | 參數錯誤；模型名在本地未對映到內部模型（訊息為「無法識別的模型名: …」，**不帶** `INVALID_MODEL_ID`）；或上游判定該模型對當前帳號檔位不可用（上游 reason 為 `INVALID_MODEL_ID`，回給客戶端的訊息以 `Invalid model '<m>': not available for the current account.` 開頭）；③**請求體超過上游長度上限**——上游 reason 碼 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`,訊息為「Input is too long…」並說明該錯誤不會自癒(客戶端每輪重發完整歷史,下一輪只會更長),需縮短上下文或新開工作階段。**此類同樣不重試、不誤傷帳號**(v0.7.12 前被誤判為瞬時錯誤,會跨帳號重試並給每個帳號記一次失敗) |
+| 400 | 參數錯誤；模型名在本地未對映到內部模型（訊息為「無法識別的模型名: …」，**不帶** `INVALID_MODEL_ID`）；或上游判定該模型對當前帳號檔位不可用（上游 reason 為 `INVALID_MODEL_ID`，回給客戶端的訊息以 `Invalid model '<m>': not available for the current account.` 開頭）；③**請求體超過上游長度上限**——上游 reason 碼 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`,訊息為「Input is too long…」並說明該錯誤不會自癒(客戶端每輪重發完整歷史,下一輪只會更長),需縮短上下文或新開工作階段。**此類同樣不重試、不誤傷帳號**(v0.7.12 前被誤判為瞬時錯誤,會跨帳號重試並給每個帳號記一次失敗)；④**訊息裡有工具呼叫卻沒有工具定義**——上游 reason 碼 `TOOL_CONFIG_MISSING`。正常情況下不該出現:中樞會從對話歷史把呼叫過的工具名補成最小規格再發出,這一檔是兜底,同樣不重試、不誤傷帳號 |
 | 401 | 未認證（驗證閘已收口時：金鑰缺失、無效、已停用或已過期。協議閘的收口條件是設了 `apiKey` **或**已建立任何一條 API-KEY） |
 | 402 | API-KEY 消費已達上限，體為 `{"type":"error","error":{"type":"billing_error","message":"api key spending limit exceeded"}}`。判定含在途預留（USD 單位 `1.0`／credits 單位約 `1.39`），故**剩餘額度不足一次預留時就開始拒**，並非真的花到滿 |
 | 403 | 禁止 |

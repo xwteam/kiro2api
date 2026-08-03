@@ -139,6 +139,56 @@ fn non_empty_content(text: String) -> String {
     }
 }
 
+/// 从整段对话历史里收集出现过的工具名(按首次出现顺序,去重)。
+///
+/// 上游硬性要求:只要消息里出现 `toolUse`/`toolResult` 内容块,`toolConfig` 就必须存在
+/// (`TOOL_CONFIG_MISSING`)。而工具**可能在到达这里之前就被合法地丢掉了** —— Responses
+/// 协议里的内置工具(`web_search` / `local_shell` …)由 OpenAI 服务端自己执行、中枢没有
+/// 等价物,故转换时丢弃;若客户端这一轮**只带了内置工具**,`tools` 就成了空数组。
+///
+/// 于是请求变成「有工具调用、没有工具定义」—— 一个我们自己造出来的畸形请求,上游必拒。
+/// 实测就是 codex 的 502:带工具历史 + 仅内置工具 → 502,同样历史带一个函数工具 → 200。
+fn tool_names_in_history(messages: &[InMsg]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for m in messages {
+        if let ContentIn::Blocks(blocks) = &m.content {
+            for b in blocks {
+                if let Block::ToolUse { name, .. } = b
+                    && seen.insert(name.clone())
+                {
+                    out.push(name.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 为历史里出现过、但当前 `tools` 里没有的工具补一份最小规格。
+///
+/// 补的是**模型自己调用过**的工具,补上定义只是让请求自洽;不补则整个请求被上游拒掉、
+/// 那一轮对话彻底失败。schema 给空对象:我们无从知道原始定义(客户端这轮没送),
+/// 而上游只要求 `toolConfig` 存在且形状合法,不校验它与历史调用的参数是否吻合。
+fn tool_specs_with_history_fallback(tools: &[ToolDef], messages: &[InMsg]) -> Vec<ToolSpec> {
+    let mut specs = map_tools(tools);
+    let declared: std::collections::HashSet<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    for name in tool_names_in_history(messages) {
+        if !declared.contains(name.as_str()) {
+            specs.push(ToolSpec {
+                tool_specification: ToolSpecInner {
+                    name,
+                    description: None,
+                    input_schema: InputSchemaJson {
+                        json: serde_json::json!({"type": "object", "properties": {}}),
+                    },
+                },
+            });
+        }
+    }
+    specs
+}
+
 /// 把请求里的 Anthropic `ToolDef` 列表映射成 Kiro `ToolSpec` 列表(照契约 §2)。
 fn map_tools(tools: &[ToolDef]) -> Vec<ToolSpec> {
     tools
@@ -456,7 +506,12 @@ pub fn anthropic_to_kiro(
         })
         .collect::<Result<Vec<_>, ConvertError>>()?;
 
-    let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+    // 工具规格:声明的工具 + 历史里出现过却没被声明的(补最小规格)。
+    // 只看 `req.tools` 是不够的 —— 历史带工具调用而 tools 为空时,上游会以
+    // `TOOL_CONFIG_MISSING` 拒掉整个请求(见 `tool_specs_with_history_fallback`)。
+    let declared_tools: &[ToolDef] = req.tools.as_deref().unwrap_or(&[]);
+    let tool_specs = tool_specs_with_history_fallback(declared_tools, &req.messages);
+    let has_tools = !tool_specs.is_empty();
     let agent_task_type = if has_tools { "spectask" } else { "vibe" }.to_string();
 
     // 预填时末条消息已归入 history,当前轮只有续写指令,不带工具结果/图片。
@@ -477,11 +532,7 @@ pub fn anthropic_to_kiro(
                     model_id,
                     origin: "AI_EDITOR".to_string(),
                     user_input_message_context: UserInputMessageContext {
-                        tools: if has_tools {
-                            Some(map_tools(req.tools.as_ref().unwrap()))
-                        } else {
-                            None
-                        },
+                        tools: if has_tools { Some(tool_specs) } else { None },
                         tool_results: if current_tool_results.is_empty() {
                             None
                         } else {
@@ -2237,5 +2288,126 @@ mod tests {
 
         let resp = kiro_events_to_anthropic(&frames, "claude-sonnet-4.5");
         assert!(matches!(&resp.content[0], OutBlock::Text { text } if text.is_empty()));
+    }
+
+    /// 上游硬性要求:消息里出现 `toolUse`/`toolResult` 就必须有 `toolConfig`,否则整个请求
+    /// 被拒(`TOOL_CONFIG_MISSING`)。而工具可能在到达这里前就被合法丢弃 —— Responses 的
+    /// 内置工具(`web_search`/`local_shell`)中枢无等价物,客户端若这轮只带内置工具,
+    /// `tools` 就成了空数组,于是我们自己造出「有工具调用、没有工具定义」的畸形请求。
+    /// 线上实测正是 codex 的 502。
+    #[test]
+    fn history_tool_calls_force_a_tool_config_even_when_tools_were_dropped() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".into(),
+            system: None,
+            messages: vec![
+                InMsg {
+                    role: "assistant".into(),
+                    content: ContentIn::Blocks(vec![Block::ToolUse {
+                        id: "c1".into(),
+                        name: "shell".into(),
+                        input: serde_json::json!({"cmd": "ls"}),
+                    }]),
+                },
+                InMsg {
+                    role: "user".into(),
+                    content: ContentIn::Text("thanks".into()),
+                },
+            ],
+            max_tokens: Some(32),
+            stream: Some(false),
+            // 内置工具已在协议层被丢掉 → 空数组
+            tools: Some(vec![]),
+            tool_choice: None,
+        };
+        let out = anthropic_to_kiro(&req, None).expect("应转换成功");
+        let ctx = &out
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context;
+        let specs = ctx
+            .tools
+            .as_ref()
+            .expect("历史有工具调用时 toolConfig 不得缺席");
+        assert!(
+            specs.iter().any(|s| s.tool_specification.name == "shell"),
+            "补出的规格里必须有历史调用过的 shell"
+        );
+        assert_eq!(
+            out.conversation_state.agent_task_type, "spectask",
+            "有工具规格时任务类型须为 spectask"
+        );
+    }
+
+    /// 客户端**显式声明**的工具不得被历史补全覆盖或重复:同名只留声明的那份。
+    #[test]
+    fn declared_tools_are_not_duplicated_by_history_fallback() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".into(),
+            system: None,
+            messages: vec![InMsg {
+                role: "assistant".into(),
+                content: ContentIn::Blocks(vec![Block::ToolUse {
+                    id: "c1".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({}),
+                }]),
+            }],
+            max_tokens: Some(32),
+            stream: Some(false),
+            tools: Some(vec![ToolDef {
+                name: "shell".into(),
+                description: Some("real one".into()),
+                input_schema: serde_json::json!({"type": "object"}),
+            }]),
+            tool_choice: None,
+        };
+        let out = anthropic_to_kiro(&req, None).expect("应转换成功");
+        let specs = out
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools
+            .as_ref()
+            .unwrap();
+        let shells: Vec<_> = specs
+            .iter()
+            .filter(|s| s.tool_specification.name == "shell")
+            .collect();
+        assert_eq!(shells.len(), 1, "同名工具不得重复");
+        assert_eq!(
+            shells[0].tool_specification.description.as_deref(),
+            Some("real one"),
+            "须保留客户端声明的那份,而不是补出来的空壳"
+        );
+    }
+
+    /// 没有工具、历史也没有工具调用 → 照旧不发 toolConfig、任务类型 vibe。
+    #[test]
+    fn plain_chat_still_sends_no_tool_config() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".into(),
+            system: None,
+            messages: vec![InMsg {
+                role: "user".into(),
+                content: ContentIn::Text("hi".into()),
+            }],
+            max_tokens: Some(32),
+            stream: Some(false),
+            tools: None,
+            tool_choice: None,
+        };
+        let out = anthropic_to_kiro(&req, None).expect("应转换成功");
+        assert!(
+            out.conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tools
+                .is_none()
+        );
+        assert_eq!(out.conversation_state.agent_task_type, "vibe");
     }
 }

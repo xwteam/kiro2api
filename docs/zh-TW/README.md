@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.12-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.13-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-08-03 | v0.7.13 - 🐛 **codex 的 502:中轉自己造出了畸形請求**。上游要求訊息裡有 `toolUse` 時 `toolConfig` 必須存在,而內建工具在轉換時被合法丟棄(v0.7.1),客戶端某輪只帶內建工具時 `tools` 成了空陣列、歷史裡的工具呼叫卻還在。現在發往上游前會**從對話歷史把呼叫過的工具名補成最小規格**。另:`TOOL_CONFIG_MISSING` 歸入確定性請求錯誤(此前落在瞬時錯誤,半小時 26 次波及 25 個帳號) |
 | 2026-08-03 | v0.7.12 - 🐛 **一個超長請求能把整個帳號池打傷、最終 503**。上游對超長請求回 `400 CONTENT_LENGTH_EXCEEDS_THRESHOLD`,而確定性請求錯誤此前只認 `INVALID_MODEL_ID`,這個碼落進「瞬時錯誤」→ 換任何帳號都不可能成功的請求被跨帳號重試一遍,每換一個就記一次失敗。實測一個下午把 253 個健康帳號打成 149 帶傷、26 冷卻。現歸入 `InvalidRequest`(不重試/不冷卻/不累計 strike);客戶端也不再收到無資訊的 `502`,改回 `400` 並明說是上下文超限且不會自癒 |
 | 2026-08-01 | v0.7.11 - 🐛 測試套件把暫存目錄漏在 `/tmp` 裡、從不回收:125 處測試各自拼路徑(`temp_dir().join(...)`),沒有 guard 也沒有收尾,行程一結束就成孤兒。一次磁碟爆滿排查中,`/tmp` **頂層堆著 9582 個**這樣的殘留,而它們只累積了 4 天;systemd-tmpfiles 對 `/tmp` 的老化是 30 天,遠追不上。代價不在體積(合計僅 52M)而在污染——頂層近萬條目錄項,恰恰在排查磁碟問題時最礙事。現全部收進單一 per-process 根目錄 `/tmp/kiro2api-tests/<pid>/`,每個測試行程啟動時回收 **pid 已不在 `/proc`** 的舊根,下一輪自動清掉上一輪。**只改測試基礎設施,執行期行為完全不變** |
 | 2026-07-29 | v0.7.10 - 🐛 發版後面板仍顯示舊版本/舊行為(後端已 0.7.9,面板「檢查更新」卻顯示 0.7.6):靜態資源**一個快取標頭都不發**,瀏覽器因此可**啟發式快取**、自行決定存多久。服務端三個介面當時全回 0.7.9,錯的只是瀏覽器手裡那份副本。現加 `Cache-Control: no-cache` + 內容 SHA-256 強 `ETag`,支援 `If-None-Match` → `304` |
@@ -236,7 +237,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.12"}
+# {"service":"kiro2api","status":"ok","version":"0.7.13"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \

@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.12-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.13-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-08-03 | v0.7.13 - 🐛 **codex 的 502:中转自己造出了畸形请求**。上游要求消息里有 `toolUse` 时 `toolConfig` 必须存在,而内置工具(`web_search`/`local_shell`)在转换时被合法丢弃(v0.7.1),客户端某轮只带内置工具时 `tools` 就成了空数组、历史里的工具调用却还在 → 「有工具调用、没有工具定义」。复现:带工具历史+仅内置工具 → 502,同样历史带一个函数工具 → 200。现在发往上游前会**从对话历史把调用过的工具名补成最小规格**,客户端显式声明的优先、同名不重复。另:`TOOL_CONFIG_MISSING` 归入确定性请求错误(此前落在瞬时错误,半小时 26 次波及 25 个账号) |
 | 2026-08-03 | v0.7.12 - 🐛 **一个超长请求能把整个账号池打伤、最终 503**。上游对超长请求回 `400 CONTENT_LENGTH_EXCEEDS_THRESHOLD`,而确定性请求错误此前只认 `INVALID_MODEL_ID`,这个码落进了「瞬时错误」→ 一个换任何账号都不可能成功的请求被**跨账号重试一遍,每换一个就给它记一次失败**。实测一个下午把 253 个健康账号打成 149 带伤、26 冷却,随后开始回 `503 no available upstream account`。现归入 `InvalidRequest`(不重试/不冷却/不累计 strike)。同时客户端不再收到毫无信息的 `502 upstream request failed`,改回 `400` 并明说是上下文超限、**该错误不会自愈**(每轮重发完整历史,下一轮只会更长)、需缩短上下文或新开会话 |
 | 2026-08-01 | v0.7.11 - 🐛 测试套件把临时目录漏在 `/tmp` 里、从不回收:125 处测试各自拼路径(`temp_dir().join(...)`),没有 guard 也没有收尾,进程一退出就成孤儿。一次磁盘打满排查中,`/tmp` **顶层堆着 9582 个**这样的残留,而它们只积累了 4 天;systemd-tmpfiles 对 `/tmp` 的老化是 30 天,远追不上。代价不在体积(合计仅 52M)而在污染——顶层近万条目录项,恰恰在排查磁盘问题时最碍事。现全部收进单一 per-process 根目录 `/tmp/kiro2api-tests/<pid>/`,每个测试进程启动时回收 **pid 已不在 `/proc`** 的旧根,下一轮自动清掉上一轮。**只改测试基础设施,运行时行为完全不变** |
 | 2026-07-29 | v0.7.10 - 🐛 发版后面板仍显示旧版本/旧行为(后端已 0.7.9,面板「检查更新」却显示 0.7.6):静态资源**一个缓存头都不发**,HTTP 下浏览器因此可**启发式缓存**、自行决定存多久。这类问题最难查——服务端三个接口(`/health`、`server-info`、`check-update`)当时全返回 0.7.9,错的只是浏览器手里那份副本;此前几次「改了却像没生效」大概率也有这个原因。现加 `Cache-Control: no-cache` + 内容 SHA-256 强 `ETag`,支持 `If-None-Match` → `304`:不陈旧,也不必每次全量重传 |
@@ -278,7 +279,7 @@ docker compose logs -f
 ```bash
 # 健康检查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.12"}
+# {"service":"kiro2api","status":"ok","version":"0.7.13"}
 
 # 查看可用模型
 curl http://localhost:8080/v1/models \
