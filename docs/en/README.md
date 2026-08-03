@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.11-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.12-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | Date | Update |
 |------|--------|
+| 2026-08-03 | v0.7.12 - 🐛 **A single oversized request could damage the whole account pool and end in 503.** Upstream answers `400 CONTENT_LENGTH_EXCEEDS_THRESHOLD` for requests past its length limit, but only `INVALID_MODEL_ID` was recognised as a deterministic request error, so this code fell into *transient* — meaning a request that cannot succeed on any account was **retried across accounts, charging a failure and a strike to every one it touched**. Measured in production: one afternoon turned 253 healthy accounts into 149 damaged and 26 in cooldown, after which the relay began answering `503 no available upstream account`. It is now an `InvalidRequest`: no retry, no cooldown, no strike. Clients also stop receiving a contentless `502 upstream request failed` and get a `400` that says the context limit was exceeded, that **the error will not recover on its own** (each turn resends the whole conversation, so the next is larger still), and that the context must be trimmed or the conversation restarted |
 | 2026-08-01 | v0.7.11 - 🐛 The test suite leaked scratch directories into `/tmp` and never reclaimed them: 125 call sites each built their own path via `temp_dir().join(...)` with no guard and no teardown, orphaned the moment the process exited. A disk-full investigation found **9582** of them at the top of `/tmp`, accumulated over just four days; systemd-tmpfiles ages `/tmp` at 30 days and could never keep up. The cost was not size (52M in total) but clutter — ten thousand entries to wade through, precisely when a clean `/tmp` matters most. Scratch state now lives under a single per-process root, `/tmp/kiro2api-tests/<pid>/`, and each test process sweeps roots whose **pid is no longer in `/proc`** at startup, so each run cleans up after the last. **Test infrastructure only — runtime behaviour is unchanged** |
 | 2026-07-29 | v0.7.10 - 🐛 The panel kept showing an old version and old behaviour after a release — the backend was on 0.7.9 while the panel's update check reported 0.7.6. Static assets were served with **no caching headers at all**: no `Cache-Control`, no `ETag`, no `Last-Modified`. HTTP lets a browser apply heuristic caching in that case and decide the lifetime itself, so users kept an old copy of the JS. This is a hard failure to diagnose: every server endpoint answered correctly (`/health`, `server-info` and `check-update` all reported 0.7.9) and only the copy in the browser was wrong — earlier reports of a fix "not taking effect" likely share this cause. Assets now carry `Cache-Control: no-cache` plus a strong content-SHA-256 `ETag`, with `If-None-Match` → `304`: never stale, and unchanged files are not retransmitted |
 | 2026-07-29 | v0.7.9 - 🐛 "Available accounts" counted every unhealthy account too — banned, quota-exhausted, token-expired, renewal-denied. The stat card recomputed it client-side as `!a.disabled`, and none of those states is *disabled*: they all keep `disabled: false`. The same page showed "banned 6" beside "available 253". It now counts only the healthy bucket. The backend's `available` is deliberately **not** used: that number answers "which accounts will the relay attempt right now", and quota-exhausted or expired accounts belong there once their cooldown lapses — they genuinely should be retried, since quota resets and tokens refresh. The two questions are not the same. The dashboard's available/total card moves to the same rule, so one relay no longer reports two different "available" figures on two pages |
@@ -277,7 +278,7 @@ docker compose logs -f
 ```bash
 # Health check
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.11"}
+# {"service":"kiro2api","status":"ok","version":"0.7.12"}
 
 # View available models
 curl http://localhost:8080/v1/models \

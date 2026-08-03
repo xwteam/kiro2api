@@ -1169,7 +1169,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.7.11",
+  "version": "0.7.12",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1385,7 +1385,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.7.11"
+  "version": "0.7.12"
 }
 ```
 
@@ -1418,7 +1418,7 @@ The error body shape varies by protocol:
 | Code | Meaning | Description |
 |------|---------|-------------|
 | 200 | OK | Request succeeded |
-| 400 | Bad Request | On the relay endpoints, three causes: a body they cannot deserialize (they answer `400`, never `422`); a model name matching nothing in the internal map — rejected by the gateway itself, message `无法识别的模型名: <name>`; or a mapped model the account's tier cannot serve — refused upstream (reason `INVALID_MODEL_ID`) and reported as `Invalid model '<name>': not available for the current account. …`. Two admin endpoints add their own: `POST /api/admin/restart` without `?confirm=true`, and `GET /api/admin/usage/summary` with an unrecognized `range` or `hours=0` |
+| 400 | Bad Request | On the relay endpoints, three causes: a body they cannot deserialize (they answer `400`, never `422`); a model name matching nothing in the internal map — rejected by the gateway itself, message `无法识别的模型名: <name>`; or a mapped model the account's tier cannot serve — refused upstream (reason `INVALID_MODEL_ID`) and reported as `Invalid model '<name>': not available for the current account. …`. Two admin endpoints add their own: `POST /api/admin/restart` without `?confirm=true`, and `GET /api/admin/usage/summary` with an unrecognized `range` or `hours=0`; and a request body exceeding the upstream length limit — upstream reason `CONTENT_LENGTH_EXCEEDS_THRESHOLD`, answered with an "Input is too long…" message that also states the error will not recover on its own (each turn resends the whole conversation, so the next is larger still) and that the context must be trimmed or the conversation restarted. **This cause likewise is not retried and does not damage accounts** — before v0.7.12 it was misclassified as transient, retried across accounts, and charged a failure to every account it touched |
 | 401 | Unauthorized | Missing or invalid API Key (when `apiKey` is configured); also a disabled or expired store key |
 | 402 | Payment Required | A store-managed key has reached its spending limit (`{"type":"error","error":{"type":"billing_error",…}}`) |
 | 404 | Not Found | Admin endpoints only: unknown account / API-KEY / login-session id |

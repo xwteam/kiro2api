@@ -1432,7 +1432,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.7.11"}
+{"service":"kiro2api","status":"ok","version":"0.7.12"}
 ```
 
 ### GET /v1/ping
@@ -1455,7 +1455,7 @@ curl http://localhost:8080/v1/ping
 
 | 코드 | 설명 |
 |------|------|
-| 400 | 파라미터 오류. 성격이 다른 셋이 같은 코드로 옵니다: ①**모델명이 중계의 로컬 매핑에 걸리지 않음** — `message`는 `无法识别的模型名: <보낸 이름>`; ②**업스트림이 그 모델을 확정적으로 거부**(계정 구독 등급에 권한 없음) — `message`는 `Invalid model '<보낸 이름>': not available for the current account. …`이며 재시도도 계정 교체도 하지 않습니다; ③본문 파싱 실패, `previous_response_id` 지정(`previous_response_id is not supported`) 등 형식 오류. **어느 경우에도 응답 본문에 문자열 `INVALID_MODEL_ID`는 실리지 않습니다** — 그것은 중계가 ②를 판정하려고 업스트림 응답에서 찾는 내부 reason 코드일 뿐이며, 이 문서에서 `INVALID_MODEL_ID`라고 쓴 곳은 모두 ②의 상황을 가리키는 약칭입니다 |
+| 400 | 파라미터 오류. 성격이 다른 셋이 같은 코드로 옵니다: ①**모델명이 중계의 로컬 매핑에 걸리지 않음** — `message`는 `无法识别的模型名: <보낸 이름>`; ②**업스트림이 그 모델을 확정적으로 거부**(계정 구독 등급에 권한 없음) — `message`는 `Invalid model '<보낸 이름>': not available for the current account. …`이며 재시도도 계정 교체도 하지 않습니다; ③본문 파싱 실패, `previous_response_id` 지정(`previous_response_id is not supported`) 등 형식 오류. **어느 경우에도 응답 본문에 문자열 `INVALID_MODEL_ID`는 실리지 않습니다** — 그것은 중계가 ②를 판정하려고 업스트림 응답에서 찾는 내부 reason 코드일 뿐이며, 이 문서에서 `INVALID_MODEL_ID`라고 쓴 곳은 모두 ②의 상황을 가리키는 약칭입니다; ③**요청 본문이 업스트림 길이 상한을 초과** —— 업스트림 reason 코드는 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`. 「Input is too long…」과 함께, 이 오류가 스스로 회복되지 않으며(클라이언트가 매 턴 전체 대화를 다시 보내므로 다음 턴은 더 길어짐) 컨텍스트를 줄이거나 대화를 새로 시작해야 함을 알립니다. **이 유형 역시 재시도하지 않으며 계정을 손상시키지 않습니다**(v0.7.12 이전에는 일시적 오류로 오분류되어 계정을 넘나들며 재시도하고 거친 모든 계정에 실패를 기록했습니다) |
 | 401 | 미인증 (API Key 누락 또는 무효, `apiKey`가 설정된 경우) |
 | 402 | 지출 한도 초과 (`{"type":"error","error":{"type":"billing_error",…}}`. 판정은 요청 진입 시점에 1건당 예상 비용(USD 1.0 ≈ 1.39 크레딧)을 예약해 두고 내리므로, 잔여 한도가 그보다 작아지면 한도를 다 쓰기 전에도 거부됩니다) |
 | 403 | 금지 (권한 부족) |

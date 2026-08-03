@@ -1163,7 +1163,7 @@ curl -X PUT http://localhost:8080/api/admin/config/auth-keys \
 ```json
 {
   "masterApiKey": "sk-マスターキーの平文",
-  "version": "0.7.11",
+  "version": "0.7.12",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1391,7 +1391,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.7.11"
+  "version": "0.7.12"
 }
 ```
 
@@ -1419,7 +1419,7 @@ API エラーは以下のコードで返されます。
 
 | コード | 説明 | 対応 |
 |--------|------|------|
-| 400 | パラメータエラー / 中継が解決できないモデル名 / 上流がアカウント階層で提供しないモデル（`INVALID_MODEL_ID`）。管理エンドポイント固有では `POST /api/admin/restart` に `?confirm=true` が無い場合と、`GET /api/admin/usage/summary` に未知の `range` または `hours=0` を渡した場合 | リクエストパラメータとモデル名を確認 |
+| 400 | パラメータエラー / 中継が解決できないモデル名 / 上流がアカウント階層で提供しないモデル（`INVALID_MODEL_ID`）。管理エンドポイント固有では `POST /api/admin/restart` に `?confirm=true` が無い場合と、`GET /api/admin/usage/summary` に未知の `range` または `hours=0` を渡した場合 | リクエストパラメータとモデル名を確認。③**リクエストボディが上流の長さ上限を超過**——上流の reason コードは `CONTENT_LENGTH_EXCEEDS_THRESHOLD`。「Input is too long…」に加え、この誤りは自然回復しないこと(クライアントは毎ターン全履歴を再送するため次はさらに長くなる)と、コンテキストを削るか会話を新規に始める必要があることを示します。**この種別も再試行せず、アカウントを傷つけません**(v0.7.12 以前は一時的エラーと誤判定し、アカウントを跨いで再試行して触れた全アカウントに失敗を記録していました) |
 | 401 | 未認証（key がない、誤った key、無効化/期限切れのストア key） | API Key を確認 |
 | 402 | ストア管理の API-KEY が消費上限に到達（本体は `{"type":"error","error":{"type":"billing_error","message":"…"}}`）。判定には在途分の予約（USD 単位で `1.0`、`credits` 単位で約 `1.39`）が含まれるため、**残りが 1 回分の見積を下回った時点で**上限を使い切る前に拒否が始まります | key の上限を引き上げるか、使用量をリセット |
 | 403 | 禁止 | 権限がない |

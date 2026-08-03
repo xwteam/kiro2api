@@ -186,7 +186,7 @@ pub(crate) fn relay_error_to_openai(e: RelayError) -> Response {
             "overloaded_error",
         ),
         // 上游确定性拒绝(INVALID_MODEL_ID:该模型对当前档位不可用)→ 400 + 清晰的不可用说明。
-        RelayError::InvalidModel(msg) => (msg.clone(), "invalid_request_error"),
+        RelayError::InvalidRequest(msg) => (msg.clone(), "invalid_request_error"),
         // 其余(上游失败,以及中枢 `RelayError` 后续新增的变体)只报粗粒度文案,错误类型由
         // 状态码派生 —— 状态码是客户端 SDK 唯一据以决定重试的信号,不能因新增变体退化成 502。
         _ => (

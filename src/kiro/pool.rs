@@ -123,11 +123,43 @@ pub fn classify_with_body(status: u16, body: &str) -> FailureKind {
     }
 }
 
-/// 响应体是否为**确定性请求错误**(换账号重试也无用):当前只认上游对不支持的模型返回的
-/// `INVALID_MODEL_ID`(FREE 档账号请求 opus/GPT 等即命中)。刻意只匹配机器稳定的 reason 码,
+/// 响应体是否为**确定性请求错误**(换账号重试也无用)。刻意只匹配机器稳定的 reason 码,
 /// 不泛化到任意 400,避免把可重试的瞬时错误误判为永久。
+///
+/// 目前两种:
+/// - `INVALID_MODEL_ID` —— 该模型对当前账号档位不可用(FREE 档请求 opus/GPT 即命中)。
+/// - `CONTENT_LENGTH_EXCEEDS_THRESHOLD` —— 请求体超过上游长度上限。
+///
+/// 第二种此前没被认出来,落进 `Transient`(瞬时错误、值得重试),后果实测很重:
+/// 一个超长请求会被跨账号重试一遍,**每换一个账号就给它记一次失败、攒一次 strike**,
+/// 而换账号根本不可能成功(问题在请求本身)。线上一个下午就把 253 个健康账号打成
+/// 149 个带伤、26 个进冷却,可用池缩水后开始回 503「no available upstream account」。
+/// 客户端那头看到的则是 502 `upstream request failed` —— 完全看不出是上下文超长。
 pub fn body_signals_invalid_request(body: &str) -> bool {
-    body.to_ascii_lowercase().contains("invalid_model_id")
+    let lower = body.to_ascii_lowercase();
+    lower.contains("invalid_model_id") || lower.contains("content_length_exceeds_threshold")
+}
+
+/// 确定性请求错误回给客户端的说明。**必须按 reason 码分别给话**:同一档 `InvalidRequest`
+/// 现在含义不止一种,笼统套一句"模型不可用"会把"上下文超长"讲成完全无关的另一回事,
+/// 使用者照着去换模型,换多少次都没用。
+pub fn invalid_request_message(body: &str, model: &str) -> String {
+    if body
+        .to_ascii_lowercase()
+        .contains("content_length_exceeds_threshold")
+    {
+        // 讲清"为什么"和"怎么办":这个错误不会自愈 —— 客户端每轮重发完整历史,
+        // 下一轮只会更长,该会话从此必然失败,唯一出路是缩短上下文或新开会话。
+        "Input is too long: the request exceeds the upstream context limit. \
+         This will not recover on its own -- each turn resends the whole conversation, \
+         so the next one is larger still. Start a new conversation or trim the context."
+            .to_string()
+    } else {
+        format!(
+            "Invalid model '{model}': not available for the current account. \
+             Please select a different model to continue."
+        )
+    }
 }
 
 /// 账号最近一次失败的**具体原因**,用于把笼统的"异常"拆成运维真正关心的几档。
@@ -2037,5 +2069,50 @@ mod tests {
         let reloaded = Pool::new(p.snapshot_credentials(), LbMode::Priority);
         assert_eq!(reloaded.stats(0)[0].status_reason, "none");
         assert_eq!(reloaded.active_count(0), 1);
+    }
+
+    /// 上游对超长请求回 `400 CONTENT_LENGTH_EXCEEDS_THRESHOLD`。这是**请求本身**的问题,
+    /// 换任何账号都同样失败,故必须判成 `InvalidRequest`(不重试/不冷却/不累计 strike)。
+    ///
+    /// 此前只认 `INVALID_MODEL_ID`,这个码落进了 `Transient`,于是一个超长请求被跨账号重试
+    /// 一遍、**每换一个账号就记一次失败**。线上实测:一个下午把 253 个健康账号打成 149 个
+    /// 带伤、26 个进冷却,可用池缩水后开始回 503「no available upstream account」。
+    #[test]
+    fn oversized_request_is_a_request_error_not_an_account_failure() {
+        let body =
+            r#"{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#;
+        assert_eq!(classify_with_body(400, body), FailureKind::InvalidRequest);
+        assert!(body_signals_invalid_request(body));
+    }
+
+    /// `InvalidRequest` 落到池里必须什么都不做:不禁用、不冷却、不攒 strike。
+    /// 这是"一个坏请求不会打伤整池账号"的最后一道保障。
+    #[test]
+    fn invalid_request_leaves_the_account_untouched() {
+        let mut p = Pool::new(vec![cred("a", 1)], LbMode::Priority);
+        for _ in 0..10 {
+            p.report_failure_with_reason("a", FailureKind::InvalidRequest, StatusReason::None, 0);
+        }
+        let st = &p.stats(0)[0];
+        assert_eq!(st.strikes, 0, "确定性请求错误不得累计 strike");
+        assert!(!st.disabled, "不得禁用");
+        assert!(!st.in_cooldown, "不得进冷却");
+        assert_eq!(p.active_count(0), 1, "账号必须仍然可用");
+    }
+
+    /// 两种 `InvalidRequest` 的文案必须分开:笼统套一句"模型不可用"会把"上下文超长"
+    /// 讲成完全无关的另一回事,使用者照着去换模型,换多少次都没用。
+    #[test]
+    fn message_names_the_actual_reason() {
+        let too_long =
+            r#"{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#;
+        let m = invalid_request_message(too_long, "claude-sonnet-4.5");
+        assert!(m.contains("too long"), "须点明是长度问题: {m}");
+        assert!(!m.contains("Invalid model"), "不得误报成模型不可用: {m}");
+
+        let bad_model = r#"{"reason":"INVALID_MODEL_ID"}"#;
+        let m2 = invalid_request_message(bad_model, "claude-opus-4.6");
+        assert!(m2.contains("claude-opus-4.6"), "须点名是哪个模型: {m2}");
+        assert!(!m2.contains("too long"));
     }
 }

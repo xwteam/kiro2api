@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.11-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.12-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日付 | 更新内容 |
 |------|----------|
+| 2026-08-03 | v0.7.12 - 🐛 **一つの長すぎるリクエストがアカウントプール全体を傷つけ、最終的に 503 に至っていました。** 上流は長さ上限を超えたリクエストに `400 CONTENT_LENGTH_EXCEEDS_THRESHOLD` を返しますが、確定的なリクエストエラーとして認識していたのは `INVALID_MODEL_ID` だけで、このコードは「一時的エラー」に落ちていました。その結果、どのアカウントでも成功し得ないリクエストが**アカウントを跨いで再試行され、触れた全アカウントに失敗と strike を記録**していました。実測では一日の午後で 253 の健全なアカウントが 149 の負傷・26 のクールダウンとなり、以後 `503 no available upstream account` を返し始めました。現在は `InvalidRequest` として扱い、再試行もクールダウンも strike もありません。クライアントも内容のない `502` ではなく、コンテキスト超過であること・**この誤りは自然回復しないこと**・コンテキストを削るか会話を新規に始める必要があることを示す `400` を受け取ります |
 | 2026-08-01 | v0.7.11 - 🐛 テストスイートが一時ディレクトリを `/tmp` に撒いたまま一切回収していませんでした。125 箇所が各自 `temp_dir().join(...)` でパスを組み立て、ガードも後片付けもなく、プロセス終了と同時に孤児になります。ディスク満杯の調査時には `/tmp` 直下に **9582 個**が積み上がっており、しかもわずか 4 日分でした(systemd-tmpfiles の老化は 30 日で追いつきません)。問題は容量(合計 52M)ではなく雑然さで、一万件をかき分ける羽目になるのはディスク調査の最中です。現在はプロセスごとの単一ルート `/tmp/kiro2api-tests/<pid>/` に集約し、各テストプロセスが起動時に **pid がもう `/proc` に無い**古いルートを回収します。**テスト基盤のみの変更で、実行時の挙動は変わりません** |
 | 2026-07-29 | v0.7.10 - 🐛 リリース後もパネルが古いバージョン・古い挙動を表示していました(バックエンドは 0.7.9 なのに更新チェックは 0.7.6)。静的アセットに**キャッシュヘッダが一切ありません**でした(`Cache-Control`・`ETag`・`Last-Modified` すべて無し)。HTTP ではこの場合ブラウザがヒューリスティックキャッシュを適用し保持期間を自分で決めてよいため、古い JS が使われ続けます。サーバ側は全エンドポイントが 0.7.9 を返しており、誤っていたのはブラウザ内の複製だけ —— 診断が最も難しい種類の不具合です。現在は `Cache-Control: no-cache` と内容 SHA-256 による強い `ETag` を付与し、`If-None-Match` → `304` に対応します |
 | 2026-07-29 | v0.7.9 - 🐛 「利用可能」が不健全なアカウント(利用停止/クォータ枯渇/トークン期限切れ/更新拒否)まで数えていました。統計カードがクライアント側で `!a.disabled` として再計算しており、これらはいずれも「無効化」ではなく `disabled` は false のままだからです。現在は健全な区分のみを数えます。バックエンドの `available` は**意図的に使いません**:あれは「中継が今どのアカウントを試すか」に答える数で、クォータ枯渇や期限切れのアカウントもクールダウン明けには含まれます(実際に再試行されるべきです)。ダッシュボードも同じ基準に揃え、1 台の中継が 2 つの画面で異なる「利用可能」を表示しないようにしました |
@@ -236,7 +237,7 @@ docker compose logs -f
 ```bash
 # ヘルスチェック
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.11"}
+# {"service":"kiro2api","status":"ok","version":"0.7.12"}
 
 # 利用可能なモデルを表示
 curl http://localhost:8080/v1/models \

@@ -99,7 +99,7 @@ cat data/config.json | grep apiKey
 
 | 状态码 | 说明 |
 |--------|------|
-| 400 | 两类不同成因、都不重试也不误伤账号：①**模型名在本网关本地映射不上**——体为 `无法识别的模型名: <你传的名字>`，类型 `invalid_request_error`，**不含** `INVALID_MODEL_ID` 字样；②**上游确定性拒绝该模型**（账号档位无权），上游 reason 码即 `INVALID_MODEL_ID`，原样转出。另外，四种协议的对话端点在请求体解析失败时也回 `400`（已改写成各自 SDK 认得的错误形状） |
+| 400 | 三类不同成因、都不重试也不误伤账号：①**模型名在本网关本地映射不上**——体为 `无法识别的模型名: <你传的名字>`，类型 `invalid_request_error`，**不含** `INVALID_MODEL_ID` 字样；②**上游确定性拒绝该模型**（账号档位无权），上游 reason 码即 `INVALID_MODEL_ID`，原样转出。另外，四种协议的对话端点在请求体解析失败时也回 `400`（已改写成各自 SDK 认得的错误形状）；③**请求体超过上游长度上限**——上游 reason 码 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`,体为「Input is too long…」并说明该错误不会自愈(客户端每轮重发完整历史,下一轮只会更长),需缩短上下文或新开会话。**此类同样不重试、不误伤账号**(v0.7.12 前它被误判为瞬时错误,会被跨账号重试一遍并给每个账号记一次失败) |
 | 401 | 认证失败，API Key 无效或缺失（已配置 `apiKey` 时）；管理端创建的 API-KEY 被停用 / 过期同样是 `401`。协议路由与 `/api/admin/*` 的 `401` 体恒为 Anthropic 形状的 `authentication_error`（见上方例外说明）；`/api/user/*` 的 `401` 则是 `{"error":"…"}` |
 | 402 | 该 API-KEY 的**消费额度已达或超上限**（体恒为 Anthropic 形状的 `billing_error`，见上方例外说明）。仅对管理端创建、且设了 `spendingLimit` 的 key 生效；用全局 `apiKey` 调用不会命中 |
 | 404 | 管理端点的 `{id}` 不存在：账号回 `{"error":"account not found","id":…}`，API-KEY 回 `{"error":"api key not found","id":…}`，登录会话回 `{"success":false,"error":"login session not found or expired"}` |
@@ -1190,7 +1190,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.7.11",
+  "version": "0.7.12",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1378,7 +1378,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.7.11"
+  "version": "0.7.12"
 }
 ```
 

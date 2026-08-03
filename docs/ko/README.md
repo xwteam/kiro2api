@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.11-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.12-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 날짜 | 업데이트 내용 |
 |------|----------|
+| 2026-08-03 | v0.7.12 - 🐛 **하나의 과대 요청이 계정 풀 전체를 손상시키고 결국 503으로 이어졌습니다.** 업스트림은 길이 상한을 넘는 요청에 `400 CONTENT_LENGTH_EXCEEDS_THRESHOLD`를 반환하지만, 결정적 요청 오류로 인식하던 것은 `INVALID_MODEL_ID` 뿐이어서 이 코드는 「일시적 오류」로 분류되었습니다. 그 결과 어떤 계정으로도 성공할 수 없는 요청이 **계정을 넘나들며 재시도되어 거친 모든 계정에 실패와 strike를 기록**했습니다. 실측: 하루 오후에 253개의 건강한 계정이 149개 손상·26개 쿨다운이 되었고 이후 `503 no available upstream account`를 반환하기 시작했습니다. 이제 `InvalidRequest`로 처리되어 재시도·쿨다운·strike가 없습니다. 클라이언트도 내용 없는 `502` 대신, 컨텍스트 초과이며 **스스로 회복되지 않고** 컨텍스트를 줄이거나 대화를 새로 시작해야 함을 알리는 `400`을 받습니다 |
 | 2026-08-01 | v0.7.11 - 🐛 테스트 스위트가 임시 디렉터리를 `/tmp`에 흩뿌린 뒤 전혀 회수하지 않았습니다. 125곳이 각자 `temp_dir().join(...)`으로 경로를 만들고 가드도 정리도 없어, 프로세스가 끝나는 순간 고아가 됩니다. 디스크 가득 참을 조사하던 중 `/tmp` 최상위에 **9582개**가 쌓여 있었고 그것도 단 4일치였습니다(systemd-tmpfiles의 정리 주기는 30일로 따라가지 못합니다). 문제는 용량(총 52M)이 아니라 어지러움이며, 하필 디스크 문제를 조사할 때 만 건을 헤쳐야 합니다. 이제 프로세스별 단일 루트 `/tmp/kiro2api-tests/<pid>/` 아래로 모으고, 각 테스트 프로세스가 시작 시 **pid가 `/proc`에 없는** 오래된 루트를 회수합니다. **테스트 인프라만 변경되었고 런타임 동작은 그대로입니다** |
 | 2026-07-29 | v0.7.10 - 🐛 릴리스 후에도 패널이 옛 버전·옛 동작을 표시했습니다(백엔드는 0.7.9인데 업데이트 확인은 0.7.6). 정적 자산에 **캐시 헤더가 전혀 없었습니다**(`Cache-Control`·`ETag`·`Last-Modified` 모두 없음). HTTP는 이 경우 브라우저가 휴리스틱 캐싱으로 보관 기간을 스스로 정하도록 허용하므로 오래된 JS가 계속 쓰입니다. 서버 측은 모든 엔드포인트가 0.7.9를 반환했고 틀린 것은 브라우저의 사본뿐이었습니다 —— 진단하기 가장 어려운 유형입니다. 이제 `Cache-Control: no-cache`와 내용 SHA-256 기반 강한 `ETag`를 보내고 `If-None-Match` → `304`를 지원합니다 |
 | 2026-07-29 | v0.7.9 - 🐛 「사용 가능」이 건강하지 않은 계정(정지/할당량 소진/토큰 만료/갱신 거부)까지 세고 있었습니다. 통계 카드가 클라이언트에서 `!a.disabled`로 재계산했는데, 이들 중 어느 것도 「비활성화」가 아니며 `disabled`는 false로 유지되기 때문입니다. 이제 건강 구간만 셉니다. 백엔드의 `available`은 **의도적으로 쓰지 않습니다**: 그 숫자는 「중계가 지금 어떤 계정을 시도할지」에 답하며, 할당량 소진·만료 계정도 쿨다운이 끝나면 포함됩니다(실제로 재시도되어야 합니다). 대시보드도 같은 기준으로 맞춰 한 중계가 두 화면에서 서로 다른 「사용 가능」을 보이지 않게 했습니다 |
@@ -232,7 +233,7 @@ docker compose logs -f
 ```bash
 # 헬스 체크
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.11"}
+# {"service":"kiro2api","status":"ok","version":"0.7.12"}
 
 # 프로토콜 고정 모델 목록 조회
 curl http://localhost:8080/v1/models \

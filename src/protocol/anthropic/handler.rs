@@ -227,7 +227,9 @@ pub enum RelayError {
     Upstream(String),
     /// 确定性请求错误:上游明确拒绝该请求(如 `INVALID_MODEL_ID` —— 所请求的模型对当前
     /// 账号档位不可用)→ 400,携带对客户端可见的说明(换账号重试无用,故不重试)。
-    InvalidModel(String),
+    /// 确定性请求错误(换账号重试无用):模型对当前档位不可用、或请求体超上游长度上限。
+    /// 曾名 `InvalidModel` —— 在它开始承载"上下文超长"之后,那个名字本身就是个假陈述。
+    InvalidRequest(String),
 }
 
 impl RelayError {
@@ -236,7 +238,7 @@ impl RelayError {
             RelayError::Convert(_) => StatusCode::BAD_REQUEST,
             RelayError::NoAccount => StatusCode::SERVICE_UNAVAILABLE,
             RelayError::Upstream(_) => StatusCode::BAD_GATEWAY,
-            RelayError::InvalidModel(_) => StatusCode::BAD_REQUEST,
+            RelayError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
         }
     }
     /// 对外错误类型串(不泄露内部细节/令牌)。
@@ -245,7 +247,7 @@ impl RelayError {
             RelayError::Convert(_) => "invalid_request_error",
             RelayError::NoAccount => "overloaded_error",
             RelayError::Upstream(_) => "api_error",
-            RelayError::InvalidModel(_) => "invalid_request_error",
+            RelayError::InvalidRequest(_) => "invalid_request_error",
         }
     }
     /// 对外错误消息(粗粒度,不含令牌/内部堆栈)。
@@ -255,7 +257,7 @@ impl RelayError {
             RelayError::NoAccount => "no available upstream account".to_string(),
             RelayError::Upstream(_) => "upstream request failed".to_string(),
             // 清晰的不可用说明(确定性、可安全外露):把"该模型不可用、请换一个"透传给客户端。
-            RelayError::InvalidModel(msg) => msg.clone(),
+            RelayError::InvalidRequest(msg) => msg.clone(),
         }
     }
 }
@@ -441,7 +443,9 @@ pub(crate) async fn select_and_call_with_retry(
             // 请求级致命错误:任何账号上都会同样失败,不重试。
             // - Convert:请求无法转换(含未映射模型);
             // - InvalidModel:上游确定性拒绝(INVALID_MODEL_ID:该模型对当前档位不可用)。
-            Err((e @ (RelayError::Convert(_) | RelayError::InvalidModel(_)), _)) => return Err(e),
+            Err((e @ (RelayError::Convert(_) | RelayError::InvalidRequest(_)), _)) => {
+                return Err(e);
+            }
             // 池级:已无可选账号(可能是所有健康账号都被本请求试过了)。
             // 首个尝试就 NoAccount → 池确实空/全不可用,返回 NoAccount;
             // 非首个尝试 NoAccount → 说明前面的账号已试尽,返回上一次真实的账号级错误。
@@ -614,12 +618,11 @@ pub(crate) async fn select_and_call_once(
     //      **非账号故障** —— 换任何同档账号都会同样失败。故此处**不反馈池**(不冷却/不禁用/
     //      不累计 strike)、**不落账号级失败日志**,直接返回 [`RelayError::InvalidModel`],
     //      由 [`select_and_call_with_retry`] 当作致命错误**不重试**、以 400 把清晰的不可用说明回客户端。
-    if let Err((FailureKind::InvalidRequest, _, _)) = &outcome {
-        let msg = format!(
-            "Invalid model '{}': not available for the current account. Please select a different model to continue.",
-            req.model
-        );
-        return Err((RelayError::InvalidModel(msg), Some(tried_id)));
+    if let Err((FailureKind::InvalidRequest, _, body)) = &outcome {
+        // 文案按 reason 码分别给:这一档现在含义不止一种(模型不可用 / 上下文超长),
+        // 笼统套一句会把后者讲成前者,使用者照着去换模型,换多少次都没用。
+        let msg = crate::kiro::pool::invalid_request_message(body, &req.model);
+        return Err((RelayError::InvalidRequest(msg), Some(tried_id)));
     }
 
     // 6) 依最终结果反馈池(短暂持锁)。分类失败随后在池锁释放外落统计。

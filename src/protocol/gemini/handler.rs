@@ -199,7 +199,7 @@ fn relay_error_to_gemini(e: RelayError) -> Response {
         RelayError::NoAccount => ("no available upstream account".to_string(), "UNAVAILABLE"),
         RelayError::Upstream(_) => ("upstream request failed".to_string(), "INTERNAL"),
         // 上游确定性拒绝(INVALID_MODEL_ID:该模型对当前档位不可用)→ 400 INVALID_ARGUMENT + 清晰的不可用说明。
-        RelayError::InvalidModel(msg) => (msg.clone(), "INVALID_ARGUMENT"),
+        RelayError::InvalidRequest(msg) => (msg.clone(), "INVALID_ARGUMENT"),
     };
     let body = serde_json::json!({
         "error": { "code": status.as_u16(), "message": message, "status": grpc_status },

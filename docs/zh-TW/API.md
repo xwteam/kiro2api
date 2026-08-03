@@ -1189,7 +1189,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.7.11"}
+{"service":"kiro2api","status":"ok","version":"0.7.12"}
 ```
 
 ### GET /v1/ping
@@ -1211,7 +1211,7 @@ curl http://localhost:8080/v1/ping
 | 狀態碼 | 說明 |
 |--------|------|
 | 200 | 成功 |
-| 400 | 參數錯誤；模型名在本地未對映到內部模型（訊息為「無法識別的模型名: …」，**不帶** `INVALID_MODEL_ID`）；或上游判定該模型對當前帳號檔位不可用（上游 reason 為 `INVALID_MODEL_ID`，回給客戶端的訊息以 `Invalid model '<m>': not available for the current account.` 開頭） |
+| 400 | 參數錯誤；模型名在本地未對映到內部模型（訊息為「無法識別的模型名: …」，**不帶** `INVALID_MODEL_ID`）；或上游判定該模型對當前帳號檔位不可用（上游 reason 為 `INVALID_MODEL_ID`，回給客戶端的訊息以 `Invalid model '<m>': not available for the current account.` 開頭）；③**請求體超過上游長度上限**——上游 reason 碼 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`,訊息為「Input is too long…」並說明該錯誤不會自癒(客戶端每輪重發完整歷史,下一輪只會更長),需縮短上下文或新開工作階段。**此類同樣不重試、不誤傷帳號**(v0.7.12 前被誤判為瞬時錯誤,會跨帳號重試並給每個帳號記一次失敗) |
 | 401 | 未認證（驗證閘已收口時：金鑰缺失、無效、已停用或已過期。協議閘的收口條件是設了 `apiKey` **或**已建立任何一條 API-KEY） |
 | 402 | API-KEY 消費已達上限，體為 `{"type":"error","error":{"type":"billing_error","message":"api key spending limit exceeded"}}`。判定含在途預留（USD 單位 `1.0`／credits 單位約 `1.39`），故**剩餘額度不足一次預留時就開始拒**，並非真的花到滿 |
 | 403 | 禁止 |
