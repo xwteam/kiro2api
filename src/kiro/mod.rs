@@ -4,6 +4,7 @@ pub mod credential;
 pub mod endpoint;
 pub mod ensure_fresh;
 pub mod eventstream;
+pub mod keepalive;
 pub mod login;
 pub mod machine_id;
 pub mod pool;

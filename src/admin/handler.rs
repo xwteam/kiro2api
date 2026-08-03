@@ -2033,7 +2033,6 @@ pub struct GlobalCreditsResponse {
 /// `BalanceCache` 条目,累加 `remaining`;缓存 miss/过期的账号跳过(不实拉)。
 /// 返回 `{globalCredits, cachedCount, totalCount, oldestCacheUnix}`。
 pub async fn global_credits(State(state): State<MessagesState>) -> Json<GlobalCreditsResponse> {
-    let now = now_unix();
     let ids: Vec<String> = {
         let pool = state.pool.lock().await;
         pool.snapshot_credentials()
@@ -2043,10 +2042,14 @@ pub async fn global_credits(State(state): State<MessagesState>) -> Json<GlobalCr
     };
     let total_count = ids.len() as u32;
 
-    let fresh = state.balance.get_fresh_for_ids(&ids, now).await;
-    let cached_count = fresh.len() as u32;
-    let global_credits: f64 = fresh.iter().map(|(_, s)| s.remaining).sum();
-    let oldest_cache_unix = fresh.iter().map(|(_, s)| s.fetched_at_unix).min();
+    // 展示取**全部**缓存条目,不按 TTL 过滤:TTL 决定"要不要重查上游",不该决定
+    // "要不要显示"。此前按新鲜度过滤,导致超过 5 分钟没打开账号页首页就一片空白,
+    // 用户只能点刷新 —— 那次刷新正是这份缓存本该避免的上游调用。
+    // 年龄由 `oldestCacheUnix` 带给前端,由界面说清数据有多旧。
+    let cached = state.balance.get_any_for_ids(&ids).await;
+    let cached_count = cached.len() as u32;
+    let global_credits: f64 = cached.iter().map(|(_, s)| s.remaining).sum();
+    let oldest_cache_unix = cached.iter().map(|(_, s)| s.fetched_at_unix).min();
 
     Json(GlobalCreditsResponse {
         global_credits,

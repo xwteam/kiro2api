@@ -1003,7 +1003,7 @@ curl http://localhost:8080/api/admin/credentials/12345/balance \
 
 ### GET /api/admin/credits/global
 
-全局剩余积分聚合，**只读上面那份共享余额缓存、零上游调用**：遍历池内全部账号 id，只累加**仍新鲜**（同一份 5 分钟 TTL 缓存）的快照的 `remaining`；缓存 miss / 过期的账号直接跳过，本端点**不会**替它们去打上游。因此 `cachedCount < totalCount` 时 `globalCredits` 是**部分和**，要补全得先由账号页 / 仪表盘去查各账号余额把缓存填热。
+全局剩余积分聚合，**只读上面那份共享余额缓存、零上游调用**：遍历池内全部账号 id，累加缓存里**全部**快照的 `remaining`——**不按 TTL 过滤**。TTL(5 分钟)回答的是「要不要去上游重查」，不该决定「要不要显示」：此前只累加仍新鲜的条目，于是超过 5 分钟没打开过账号页，首页全局积分就一片空白，盘上明明有全部账号的余额，却逼用户点一次刷新——而那次刷新正是这份缓存本该避免的上游调用。缓存 miss 的账号仍直接跳过，本端点**不会**替它们去打上游。`oldestCacheUnix` 是参与合计的快照里最早的抓取时刻(Unix 秒)，界面据此说明「数据来自多久以前」。因此 `cachedCount < totalCount` 时 `globalCredits` 是**部分和**，要补全得先由账号页 / 仪表盘去查各账号余额把缓存填热。
 
 **请求**：
 ```bash
@@ -1202,7 +1202,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.7.13",
+  "version": "0.7.14",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1390,7 +1390,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.7.13"
+  "version": "0.7.14"
 }
 ```
 

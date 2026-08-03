@@ -190,7 +190,7 @@ curl http://localhost:8080/health
 
 Expected response:
 ```json
-{"service":"kiro2api","status":"ok","version":"0.7.13"}
+{"service":"kiro2api","status":"ok","version":"0.7.14"}
 ```
 
 ### List Available Models

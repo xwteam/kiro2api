@@ -933,7 +933,7 @@ curl http://localhost:8080/api/admin/credentials/12345/balance \
 
 Aggregate remaining credits across the pool. **Read-only over the shared balance cache — it never calls upstream.**
 
-For every account in the pool it reads that account's still-fresh (5-minute TTL) balance snapshot and sums `remaining`; accounts whose entry is missing or stale are skipped silently, not fetched. So `cachedCount` < `totalCount` simply means the rest have not been warmed yet — warm them via `GET /api/admin/credentials/{id}/balance` (or by opening the accounts page). Takes no parameters and always returns `200`.
+For every account in the pool it reads that account's cached balance snapshot and sums `remaining` — **without filtering on TTL**. The 5-minute TTL answers "should we re-query upstream", not "should we display": summing only still-fresh entries meant that after five minutes without opening the accounts page the global-credits card went blank, even though every account's balance was sitting on disk, forcing a manual refresh — precisely the upstream call this cache exists to avoid. Accounts with no cached entry at all are still skipped silently and are never fetched here. `oldestCacheUnix` is the earliest fetch time among the snapshots that were summed, so the UI can state how old the figure is. So `cachedCount` < `totalCount` simply means the rest have not been warmed yet — warm them via `GET /api/admin/credentials/{id}/balance` (or by opening the accounts page). Takes no parameters.
 
 **Request:**
 ```bash
@@ -1181,7 +1181,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.7.13",
+  "version": "0.7.14",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1397,7 +1397,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.7.13"
+  "version": "0.7.14"
 }
 ```
 

@@ -950,7 +950,7 @@ curl "http://localhost:8080/api/admin/usage/summary?range=24h" \
 
 ### GET /api/admin/credits/global
 
-全池剩餘積分合計。**純讀共享餘額快取、零上游請求**——快取 miss 或已過期（TTL 5 分鐘）的帳號直接跳過，不會為了湊數去打上游。
+全池剩餘積分合計。**純讀共享餘額快取、零上游請求**——累加快取裡**全部**快照，**不按 TTL 過濾**。TTL(5 分鐘)回答的是「要不要去上游重查」，不該決定「要不要顯示」：此前只累加仍新鮮的條目，於是超過 5 分鐘沒打開過帳號頁，首頁全域積分就一片空白，逼使用者點一次刷新——而那次刷新正是這份快取本該避免的上游呼叫。快取 miss 的帳號仍直接跳過，不會為了湊數去打上游。`oldestCacheUnix` 為參與合計的快照中最早的抓取時刻，介面據此說明資料有多舊。
 
 **請求：**
 ```bash
@@ -1201,7 +1201,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.7.13"}
+{"service":"kiro2api","status":"ok","version":"0.7.14"}
 ```
 
 ### GET /v1/ping

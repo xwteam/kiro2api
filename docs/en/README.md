@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.13-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.14-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | Date | Update |
 |------|--------|
+| 2026-08-03 | v0.7.14 - 🐛 The global-credits card was usually blank until you pressed refresh. The aggregate summed only **still-fresh** entries (5-minute TTL), so five minutes without opening the accounts page left the homepage empty — every account's balance was on disk, hidden for being "stale", forcing a manual refresh that was **exactly the upstream call this cache exists to avoid**. `is_fresh` answers "should we re-query", not "should we display"; the display path now reads every cached entry and reports the figure's age. ✨ Added **proactive token renewal for active accounts**: an account used within 24h has its token renewed in the background 10 minutes before expiry, so requests no longer wait on a refresh. **Deliberately limited to active accounts** — renewing the whole pool on a timer would give 253 accounts a permanent background heartbeat (253 upstream calls an hour, around the clock, with no user behind them), and this project has already had 24 accounts suspended by upstream as a "security precaution" |
 | 2026-08-03 | v0.7.13 - 🐛 **codex's 502: the relay was producing malformed requests itself.** Upstream requires `toolConfig` whenever a message carries `toolUse`, and the Responses built-ins (`web_search`, `local_shell`) are legitimately discarded during conversion (v0.7.1) — so when a client sends only built-ins on some turn, `tools` becomes empty while the tool calls in the history remain: tool calls with no tool definitions. Reproduced: tool history plus built-ins only → 502; the same history with one function tool → 200. Every tool name appearing in the conversation history is now backfilled with a minimal spec before sending, with client-declared tools taking precedence and no duplicates. Also: `TOOL_CONFIG_MISSING` is now a deterministic request error — it had been landing in *transient*, and 26 occurrences in half an hour touched 25 accounts |
 | 2026-08-03 | v0.7.12 - 🐛 **A single oversized request could damage the whole account pool and end in 503.** Upstream answers `400 CONTENT_LENGTH_EXCEEDS_THRESHOLD` for requests past its length limit, but only `INVALID_MODEL_ID` was recognised as a deterministic request error, so this code fell into *transient* — meaning a request that cannot succeed on any account was **retried across accounts, charging a failure and a strike to every one it touched**. Measured in production: one afternoon turned 253 healthy accounts into 149 damaged and 26 in cooldown, after which the relay began answering `503 no available upstream account`. It is now an `InvalidRequest`: no retry, no cooldown, no strike. Clients also stop receiving a contentless `502 upstream request failed` and get a `400` that says the context limit was exceeded, that **the error will not recover on its own** (each turn resends the whole conversation, so the next is larger still), and that the context must be trimmed or the conversation restarted |
 | 2026-08-01 | v0.7.11 - 🐛 The test suite leaked scratch directories into `/tmp` and never reclaimed them: 125 call sites each built their own path via `temp_dir().join(...)` with no guard and no teardown, orphaned the moment the process exited. A disk-full investigation found **9582** of them at the top of `/tmp`, accumulated over just four days; systemd-tmpfiles ages `/tmp` at 30 days and could never keep up. The cost was not size (52M in total) but clutter — ten thousand entries to wade through, precisely when a clean `/tmp` matters most. Scratch state now lives under a single per-process root, `/tmp/kiro2api-tests/<pid>/`, and each test process sweeps roots whose **pid is no longer in `/proc`** at startup, so each run cleans up after the last. **Test infrastructure only — runtime behaviour is unchanged** |
@@ -279,7 +280,7 @@ docker compose logs -f
 ```bash
 # Health check
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.13"}
+# {"service":"kiro2api","status":"ok","version":"0.7.14"}
 
 # View available models
 curl http://localhost:8080/v1/models \

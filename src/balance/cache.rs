@@ -178,6 +178,22 @@ impl BalanceCache {
             .and_then(|s| s.subscription_title.clone())
     }
 
+    /// 对给定 id 列表读取缓存快照,**不按 TTL 过滤**(只读、绝不触发上游)。
+    ///
+    /// `is_fresh` 回答的是「要不要去上游重查」,不是「要不要显示」。全局积分卡此前用
+    /// [`get_fresh_for_ids`],于是**只要超过 5 分钟没打开过账号页,首页就是空白** ——
+    /// 盘上明明有 253 个账号的余额,却因为"不新鲜"整个不显示,逼用户点一次刷新,
+    /// 反而**制造了一次本可避免的上游调用**,与这份缓存存在的理由正好相反。
+    ///
+    /// 陈旧值配上年龄照样有用(余额不会分钟级剧变),故展示走这个方法,并由调用方把
+    /// `fetched_at_unix` 的最小值一并回出去,让界面能说清"这数据来自多久以前"。
+    pub async fn get_any_for_ids(&self, ids: &[String]) -> Vec<(String, BalanceSnapshot)> {
+        let map = self.inner.read().await;
+        ids.iter()
+            .filter_map(|id| map.get(id).map(|s| (id.clone(), s.clone())))
+            .collect()
+    }
+
     /// 对给定 id 列表读取仍新鲜的缓存快照(只读、绝不触发上游)。
     /// 返回 `(id, snapshot)` 对,过期/缺失的 id 直接跳过——供全局积分聚合按池内
     /// 凭据集合读缓存求和用。TTL 判定用调用方传入的 `now_unix`(模块内不读系统时钟)。
@@ -382,5 +398,41 @@ mod tests {
         assert_eq!(cache2.len().await, 1);
         assert!(cache2.get_fresh("7", 1100).await.is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 展示用读取**不得**按 TTL 过滤。`is_fresh` 回答的是「要不要去上游重查」,
+    /// 不是「要不要显示」。全局积分卡曾用只取新鲜条目的读法,于是超过 5 分钟没打开过
+    /// 账号页,首页就一片空白 —— 盘上明明有全部账号的余额,却因"不新鲜"整个不显示,
+    /// 逼用户点一次刷新,而那次刷新正是这份缓存本该避免的上游调用。
+    #[tokio::test]
+    async fn display_read_returns_stale_entries_too() {
+        let dir = crate::test_tmp::dir("balance-stale");
+        let c = BalanceCache::load_from_dir(&dir);
+        let snap = BalanceSnapshot {
+            subscription_title: Some("KIRO FREE".into()),
+            current_usage: 1.0,
+            usage_limit: 50.0,
+            remaining: 49.0,
+            usage_percentage: 2.0,
+            next_reset_at: None,
+            fetched_at_unix: 1_000,
+        };
+        c.put(String::from("7"), snap.clone()).await;
+
+        let ids = vec!["7".to_string()];
+        // 远超 TTL 之后
+        let long_after = 1_000 + BALANCE_TTL_SECS * 100;
+
+        assert!(
+            c.get_fresh_for_ids(&ids, long_after).await.is_empty(),
+            "新鲜度判定本身不变:超过 TTL 就不算新鲜"
+        );
+        let any = c.get_any_for_ids(&ids).await;
+        assert_eq!(any.len(), 1, "展示用读取必须仍能取到陈旧条目");
+        assert_eq!(any[0].1.remaining, 49.0);
+        assert_eq!(
+            any[0].1.fetched_at_unix, 1_000,
+            "抓取时刻要原样带出,界面据此说明数据有多旧"
+        );
     }
 }

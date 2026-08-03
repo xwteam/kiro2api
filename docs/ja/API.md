@@ -1039,7 +1039,7 @@ curl http://localhost:8080/api/admin/credits/global \
 }
 ```
 
-**共有の残高キャッシュを読むだけで、上流は一切叩きません**。まだ新鮮な（TTL 5 分）キャッシュを持つアカウントだけを合計するため、`cachedCount`（合計に参加した件数）が `totalCount`（プール内の総アカウント数）より少ないのが通常です。キャッシュが無い／期限切れのアカウントは**素通し**され、この呼び出しでは補充されません（補充はアカウント画面の残高取得や `GET /api/admin/credentials/{id}/balance` の役目です）。`oldestCacheUnix` は合計に使ったキャッシュのうち最も古い取得時刻（Unix 秒）で、「◯分前時点」の表示に使えます。1 件も命中しなかった場合は `globalCredits: 0`、`cachedCount: 0`、`oldestCacheUnix: null` です。
+**共有の残高キャッシュを読むだけで、上流は一切叩きません**。キャッシュにある**すべて**のスナップショットを合計します（**TTL では絞り込みません**）。TTL（5 分）は「上流に問い合わせ直すべきか」に答えるものであり、「表示すべきか」を決めるものではありません。新鮮なものだけを合計していた頃は、アカウント画面を 5 分開かないだけでグローバル残高が空欄になり、全アカウントの残高がディスク上にあるにもかかわらず手動更新を強いていました——それはこのキャッシュが避けるためにある上流呼び出しそのものです。キャッシュが無いアカウントは従来どおり素通しされ、ここでは補充されません。`oldestCacheUnix` は合計に使ったキャッシュのうち最も古い取得時刻（Unix 秒）で、「◯分前時点」の表示に使えます。1 件も無い場合は `globalCredits: 0`、`cachedCount: 0`、`oldestCacheUnix: null` です。
 
 ### GET /api/admin/config
 
@@ -1175,7 +1175,7 @@ curl -X PUT http://localhost:8080/api/admin/config/auth-keys \
 ```json
 {
   "masterApiKey": "sk-マスターキーの平文",
-  "version": "0.7.13",
+  "version": "0.7.14",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1403,7 +1403,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.7.13"
+  "version": "0.7.14"
 }
 ```
 

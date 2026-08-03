@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.13-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.7.14-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 날짜 | 업데이트 내용 |
 |------|----------|
+| 2026-08-03 | v0.7.14 - 🐛 홈의 「전체 잔여 적립금」이 대개 비어 있고 새로고침해야 나오던 문제 수정. 집계가 **아직 신선한**(TTL 5분) 항목만 합산해, 계정 페이지를 5분만 열지 않아도 홈이 비었습니다 —— 모든 계정 잔액이 디스크에 있는데 「오래됨」을 이유로 표시되지 않아 수동 새로고침을 강요했고, 그 새로고침이야말로 이 캐시가 피하려던 업스트림 호출입니다. `is_fresh`는 「다시 조회할지」에 답하지 「표시할지」를 정하지 않습니다. 이제 모든 항목을 읽고 데이터의 나이도 함께 알립니다. ✨ **활성 계정 토큰 선제 갱신** 추가: 24시간 내 사용된 계정은 만료 10분 전에 백그라운드로 갱신됩니다. **의도적으로 활성 계정만** —— 풀 전체를 타이머로 갱신하면 253개 계정에 끊이지 않는 하트비트(시간당 253회, 사용자 없이)가 생기며, 본 프로젝트는 이미 24개 계정이 security precaution으로 정지되었습니다 |
 | 2026-08-03 | v0.7.13 - 🐛 **codex의 502: 중계가 스스로 잘못된 요청을 만들고 있었습니다.** 업스트림은 메시지에 `toolUse`가 있으면 `toolConfig`를 요구하는데, Responses 내장 도구(`web_search`·`local_shell`)는 변환 시 정당하게 폐기됩니다(v0.7.1). 따라서 클라이언트가 어떤 턴에서 내장 도구만 보내면 `tools`는 비고 이력의 도구 호출만 남습니다. 재현: 도구 이력+내장 도구만 → 502, 같은 이력에 함수 도구 하나 → 200. 이제 전송 전에 대화 이력의 도구 이름을 최소 사양으로 보완합니다(클라이언트 선언 우선, 중복 없음). 또한 `TOOL_CONFIG_MISSING`을 결정적 요청 오류로 분류(이전에는 일시적 오류로 분류되어 30분간 26건이 25개 계정에 영향) |
 | 2026-08-03 | v0.7.12 - 🐛 **하나의 과대 요청이 계정 풀 전체를 손상시키고 결국 503으로 이어졌습니다.** 업스트림은 길이 상한을 넘는 요청에 `400 CONTENT_LENGTH_EXCEEDS_THRESHOLD`를 반환하지만, 결정적 요청 오류로 인식하던 것은 `INVALID_MODEL_ID` 뿐이어서 이 코드는 「일시적 오류」로 분류되었습니다. 그 결과 어떤 계정으로도 성공할 수 없는 요청이 **계정을 넘나들며 재시도되어 거친 모든 계정에 실패와 strike를 기록**했습니다. 실측: 하루 오후에 253개의 건강한 계정이 149개 손상·26개 쿨다운이 되었고 이후 `503 no available upstream account`를 반환하기 시작했습니다. 이제 `InvalidRequest`로 처리되어 재시도·쿨다운·strike가 없습니다. 클라이언트도 내용 없는 `502` 대신, 컨텍스트 초과이며 **스스로 회복되지 않고** 컨텍스트를 줄이거나 대화를 새로 시작해야 함을 알리는 `400`을 받습니다 |
 | 2026-08-01 | v0.7.11 - 🐛 테스트 스위트가 임시 디렉터리를 `/tmp`에 흩뿌린 뒤 전혀 회수하지 않았습니다. 125곳이 각자 `temp_dir().join(...)`으로 경로를 만들고 가드도 정리도 없어, 프로세스가 끝나는 순간 고아가 됩니다. 디스크 가득 참을 조사하던 중 `/tmp` 최상위에 **9582개**가 쌓여 있었고 그것도 단 4일치였습니다(systemd-tmpfiles의 정리 주기는 30일로 따라가지 못합니다). 문제는 용량(총 52M)이 아니라 어지러움이며, 하필 디스크 문제를 조사할 때 만 건을 헤쳐야 합니다. 이제 프로세스별 단일 루트 `/tmp/kiro2api-tests/<pid>/` 아래로 모으고, 각 테스트 프로세스가 시작 시 **pid가 `/proc`에 없는** 오래된 루트를 회수합니다. **테스트 인프라만 변경되었고 런타임 동작은 그대로입니다** |
@@ -234,7 +235,7 @@ docker compose logs -f
 ```bash
 # 헬스 체크
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.13"}
+# {"service":"kiro2api","status":"ok","version":"0.7.14"}
 
 # 프로토콜 고정 모델 목록 조회
 curl http://localhost:8080/v1/models \

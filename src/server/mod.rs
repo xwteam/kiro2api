@@ -220,6 +220,15 @@ pub fn build_router_with_persist_handles(
         refresh_ctx: crate::kiro::ensure_fresh::RefreshCtx::new(cfg.credentials_path.clone()),
     };
 
+    // 活跃账号的令牌提前续期。只对近期真被选中过的账号生效 —— 全池定时续期会给每个账号
+    // 造出一条永不停歇的后台心跳,而本项目的账号已被上游以 security precaution 封过。
+    // 详见 `kiro::keepalive` 模块头。
+    crate::kiro::keepalive::spawn(
+        messages_state.pool.clone(),
+        messages_state.control_client.clone(),
+        messages_state.refresh_ctx.clone(),
+    );
+
     // 三条协议路由(/v1/messages、OpenAI 兼容、Gemini 兼容)共用同一 MessagesState,
     // 先 merge 成一组再统一 .layer() 鉴权闸——axum 的 .layer() 只作用于其之前
     // 已注册到该 Router 的路由,故必须在合并进顶层 Router 之前单独 layer,
