@@ -16,6 +16,18 @@ pub struct MessagesRequest {
     pub tools: Option<Vec<ToolDef>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// Anthropic 规范的 `metadata`。我们只用其中的 `user_id`:真实客户端(Claude Code)
+    /// 会把会话标识塞在这里,据它可以让**同一次会话的多个请求共用一个 `conversationId`**。
+    /// 此前完全不解析该字段,于是每个请求都是一段全新的"对话",与真实客户端形态不符。
+    #[serde(default)]
+    pub metadata: Option<RequestMetadata>,
+}
+
+/// `metadata` 对象。除 `user_id` 外的键由 serde 忽略。
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct RequestMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 }
 
 /// `system` 字段:裸字符串**或**内容块数组。Anthropic 规范二者都允许——真实客户端

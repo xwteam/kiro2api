@@ -566,7 +566,8 @@ pub(crate) async fn select_and_call_once(
             &cred_id,
             // #7:令牌刷新走**控制面**硬超时客户端(connect + 整请求 timeout),而非数据面流式
             // 客户端(无整请求超时)。避免上游刷新挂死拖垮 relay 热路径;与 balance/models 同设计。
-            &state.control_client,
+            // 出口按该账号自己的代理取,与它的数据面一致。
+            &crate::http::unary_for(&cred),
             now_unix,
             REFRESH_MARGIN_SECS,
             Some(&state.refresh_ctx),
@@ -626,7 +627,8 @@ pub(crate) async fn select_and_call_once(
                 &state.pool,
                 &cred.id,
                 // #7:403 后的强制换新令牌同样走控制面硬超时客户端,防上游刷新挂死拖垮 relay。
-                &state.control_client,
+                // 出口同该账号的数据面。
+                &crate::http::unary_for(&cred),
                 now_unix,
                 // 本次数据面请求实际用的 bearer(provider 用的就是它),即"失败令牌":
                 // 池内当前值若已不是它,说明别人刚换过,直接复用、不再多刷一轮。
@@ -751,7 +753,7 @@ async fn call_data_plane(
                 origin: "AI_EDITOR",
                 target: None,
             };
-            match provider::call(&state.client, &ep, cred, imp, body).await {
+            match provider::call(&crate::http::streaming_for(cred), &ep, cred, imp, body).await {
                 Ok(r) => Ok(r),
                 Err(e) => {
                     // provider::call 在非 2xx 时读体后返回 `UpstreamHttp{status, body}`
@@ -768,7 +770,9 @@ async fn call_data_plane(
             }
         }
         None => provider::call_with_fallback_no_report(
-            &state.client,
+            // 按该账号自己的代理取客户端。数据面与下面的刷新/余额必须同一出口,
+            // 否则等于主动告诉上游这两条流量属于同一个中转。
+            &crate::http::streaming_for(cred),
             &effective_region(cred),
             "auto",
             true,
@@ -1783,6 +1787,9 @@ mod tests {
 
     fn cred() -> Credential {
         Credential {
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
             id: "a".into(),
             access_token: "AT".into(),
             refresh_token: "rt".into(),

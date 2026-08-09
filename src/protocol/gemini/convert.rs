@@ -253,6 +253,7 @@ pub fn gemini_to_hub(
         .and_then(|g| g.max_output_tokens);
 
     Ok(MessagesRequest {
+        metadata: None,
         model,
         system: system.map(SystemPrompt::Text),
         messages,

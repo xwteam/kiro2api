@@ -189,6 +189,20 @@ pub async fn fetch_available_models_fresh(
     now_unix: u64,
     ctx: Option<&crate::kiro::ensure_fresh::RefreshCtx>,
 ) -> Result<AvailableModelsResponse, ModelsError> {
+    // 出口按该账号自己的代理取:它的数据面走哪个出口,余额/模型清单就得走哪个。
+    // 只有配了代理才覆盖调用方传入的客户端,没配时行为与此前完全一致。
+    let per_cred = {
+        let g = pool.lock().await;
+        g.snapshot_credentials()
+            .into_iter()
+            .find(|c| c.id == cred_id)
+    }
+    .filter(|c| {
+        c.effective_proxy(crate::kiro::provider::config_proxy_url().as_deref())
+            .is_some()
+    })
+    .map(|c| crate::http::unary_for(&c));
+    let client = per_cred.as_ref().unwrap_or(client);
     let cred = crate::kiro::ensure_fresh::ensure_fresh(pool, cred_id, client, now_unix, 300, ctx)
         .await
         .map_err(|_| ModelsError::Http)?;
@@ -233,6 +247,9 @@ mod tests {
 
     fn cred() -> Credential {
         Credential {
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
             id: "7".into(),
             access_token: "AT".into(),
             refresh_token: "rt".into(),

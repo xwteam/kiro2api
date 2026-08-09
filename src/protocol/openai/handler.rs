@@ -682,6 +682,9 @@ mod tests {
 
     fn cred() -> Credential {
         Credential {
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
             id: "a".into(),
             access_token: "AT".into(),
             refresh_token: "rt".into(),

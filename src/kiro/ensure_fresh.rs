@@ -520,6 +520,9 @@ mod tests {
 
     fn cred(id: &str, expires_at_unix: u64, region: &str) -> Credential {
         Credential {
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
             id: id.into(),
             access_token: "old-at".into(),
             refresh_token: "old-rt".into(),

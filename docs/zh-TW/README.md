@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.10.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.10.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-08-09 | v0.10.1 - 🔌 **出站代理按帳號分流 + 補齊工作階段身分欄位**。①代理三件套此前**收下即丟**、`hasProxy` 還硬編碼 false —— 面板顯示配好了、實際全程直連;現真正落庫生效,優先級 憑證級 > 全域 > 直連(`"direct"` 顯式直連),且**同一帳號的資料面/重新整理/餘額/模型清單/背景續期一律同一出口**;②`conversationId` 此前每請求新生成且不是 UUID 形狀 → 改為優先取客戶端 `metadata.user_id` 裡的 session UUID,同工作階段共用;③此前**根本不發** `agentContinuationId`,已補;④管理面新增的帳號不會凍結 machineId,現入池即凍結;⑤`isCurrent` 硬編碼 false,現報真值 |
 | 2026-08-09 | v0.10.0 - 🎯 **按行為形態對齊真實客戶端**。對照一個長期穩定的同類實作逐模組比對後,前兩版對封號的歸因被推翻:那份實作既複用連線、也不鎖 HTTP/1.1、TLS 還預設 rustls,我們賭的三件事它一件沒做。真正的差異是:①`priority` 此前**每請求換一個帳號**,上游在同一 IP 上看到幾百個 machineId 秒級交替 → 改為**黏住一個帳號直到它不可用**;②封停/額度耗盡的帳號此前冷卻 5/30 分鐘後**自動回池**,等於永不停止地去撞牆 → 改為停止使用(記憶體態,重設可復活);③**令牌重新整理請求連 User-Agent 都沒有**(實測位元組),而那是 Kiro 自家端點、每個帳號必走 → 按 axios/sso-oidc 兩種真實形態補齊;④**machineId 每重新整理一次就變**(由會輪換的 refreshToken 現算)→ 載入時凍結落盤;⑤ksk 帳號 machineId 退化成全域常數 → 按型別互斥衍生。另:429 改判瞬時限流、資料面端點三個收斂為一個、`amz-sdk-invocation-id` 改 UUID v4、標頭順序對齊、補 `claude-opus-5` 對應、SSE 加 25 秒保活 |
 | 2026-08-09 | v0.9.1 - 🔧 **上游連線鎖 HTTP/1.1 + TLS 後端改 native-tls**。v0.9.0 加了 `Connection: close` 卻沒鎖協議——它是 HTTP/1.1 的標頭、**h2 明確禁止**,而我們協商到的正是 h2,所以那個標頭當時**只是擺設**(實測鎖定後出站協議由 HTTP/2 變為 HTTP/1.1)。TLS 後端預設改 **native-tls(OpenSSL)** 以貼合真實客戶端的 ClientHello 指紋。另:machineId 增加設定級兜底 |
 | 2026-08-09 | v0.9.0 - 🔥 **整池帳號被上游成批封停:同一條 TCP 連線上輪換了多個帳號身分**。中轉走連線池(idle 90s),同一條 TCP/TLS 上依次發出不同帳號的令牌,而每個帳號在 user-agent 裡還各自聲稱是不同機器。線上 1046 個帳號燒到只剩 22 個健康,而**從未經過中轉**的帳號直查上游全部正常。現數據面帶 `Connection: close`,兩個客戶端均 `pool_max_idle_per_host(0)`;UA 的 SDK 版本對齊被觀測的真實客戶端。**診斷修正**:初版歸因於「換號太快」並做了熔斷器,經對照分析**被證偽**,熔斷器已整個回退 |
@@ -243,7 +244,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.10.0"}
+# {"service":"kiro2api","status":"ok","version":"0.10.1"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \

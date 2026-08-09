@@ -221,6 +221,7 @@ pub fn openai_to_hub(req: ChatCompletionRequest) -> MessagesRequest {
     });
 
     MessagesRequest {
+        metadata: None,
         model: req.model,
         system: system.map(SystemPrompt::Text),
         messages,

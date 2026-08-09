@@ -141,9 +141,14 @@ pub async fn refresh_at(
     };
     // Social 走 axios 形态、要声明 Accept-Encoding,故必须用开着解压的那个客户端;
     // 其余(IdC)沿用调用方传入的控制面客户端(不带该头,与真实 aws-sdk-js 一致)。
-    static AXIOS: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    // 两者都按该账号自己的代理取,出口与它的数据面一致 —— 数据面走代理而刷新走主 IP,
+    // 比不配代理更糟。
+    let axios;
     let client = match cred.auth {
-        AuthMethod::Social => AXIOS.get_or_init(crate::http::axios),
+        AuthMethod::Social => {
+            axios = crate::http::axios_for(cred);
+            &axios
+        }
         _ => client,
     };
     let resp = client
@@ -304,6 +309,9 @@ mod tests {
 
     fn cred(auth: AuthMethod) -> Credential {
         Credential {
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
             id: "a".into(),
             access_token: "old".into(),
             refresh_token: "rt".into(),

@@ -425,6 +425,13 @@ struct Entry {
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountStat {
     pub id: String,
+    /// 该账号是否配了出站代理(凭据级或经全局兜底)。此前管理接口硬编码 `false`。
+    pub has_proxy: bool,
+    /// 是否是 Priority 档当前粘住的那个账号。
+    ///
+    /// 粘滞选号之后"现在在用哪个号"是个真实存在、且运营者需要看见的状态:面板据它能一眼
+    /// 看出流量集中在谁身上。此前管理接口把这个字段硬编码成 `false` —— 它一直在骗人。
+    pub is_current: bool,
     pub requests: u64,
     pub successes: u64,
     pub failures: u64,
@@ -755,6 +762,12 @@ impl Pool {
     pub fn add_credential(&mut self, mut cred: Credential) -> (String, Option<String>) {
         let id = self.alloc_id();
         cred.id = id.clone();
+        // 新账号入池即冻结机器 ID。
+        //
+        // 启动时的那一遍冻结只覆盖**已在文件里**的凭据;从管理面加进来的账号走的是这条路,
+        // 不在这里补的话它们照旧每请求现算 —— 而派生材料 refreshToken 会被刷新轮换,
+        // 于是这些新号又回到"每刷新一次换一台机器"的老毛病上。
+        crate::kiro::credential::freeze_machine_id(&mut cred);
         let email = cred.email.clone();
         self.entries.push(Entry {
             disabled: cred.disabled,
@@ -1036,6 +1049,11 @@ impl Pool {
         self.entries
             .iter()
             .map(|e| AccountStat {
+                has_proxy: e
+                    .cred
+                    .effective_proxy(crate::kiro::provider::config_proxy_url().as_deref())
+                    .is_some(),
+                is_current: self.current.as_deref() == Some(e.cred.id.as_str()),
                 id: e.cred.id.clone(),
                 requests: e.requests,
                 successes: e.successes,
@@ -1076,6 +1094,9 @@ mod tests {
 
     fn cred(id: &str, weight: u32) -> Credential {
         Credential {
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
             id: id.into(),
             access_token: "at".into(),
             refresh_token: "rt".into(),
@@ -1372,6 +1393,40 @@ mod tests {
             "none",
             "成功一次就说明那个原因过去了,标签必须跟着清"
         );
+    }
+
+    /// 从管理面加进来的账号也必须在入池那一刻冻结机器 ID。
+    ///
+    /// 回归:启动时的那一遍冻结只覆盖已在文件里的凭据。新增路径不补的话,后加的每个号
+    /// 都回到"每刷新一次换一台机器"的老毛病上 —— 而运营者恰恰是靠管理面加号的。
+    #[test]
+    fn newly_added_credentials_get_a_frozen_machine_id() {
+        let mut p = Pool::new(vec![], LbMode::Priority);
+        let mut c = cred("ignored", 1);
+        c.machine_id = None;
+        let (id, _) = p.add_credential(c);
+        let stored = p
+            .snapshot_credentials()
+            .into_iter()
+            .find(|x| x.id == id)
+            .unwrap();
+        let mid = stored.machine_id.expect("入池即应冻结");
+        assert_eq!(mid.len(), 64);
+        assert!(mid.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    /// `is_current` 必须如实反映粘住的那个账号(此前管理接口硬编码 false)。
+    #[test]
+    fn stats_report_which_account_is_current() {
+        let mut p = Pool::new(vec![cred("a", 1), cred("b", 1)], LbMode::Priority);
+        assert!(
+            p.stats(0).iter().all(|s| !s.is_current),
+            "还没选过号时不该有 current"
+        );
+        let picked = p.select(0).unwrap().id;
+        let cur: Vec<_> = p.stats(0).into_iter().filter(|s| s.is_current).collect();
+        assert_eq!(cur.len(), 1, "有且只有一个 current");
+        assert_eq!(cur[0].id, picked);
     }
 
     #[test]

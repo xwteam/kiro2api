@@ -48,10 +48,41 @@ impl fmt::Display for ConvertError {
 impl std::error::Error for ConvertError {}
 
 /// 生成一个随机十六进制 id(16 字节 CSPRNG),用于 conversationId / 响应 id。
-fn random_hex_id() -> String {
-    let mut raw = [0u8; 16];
-    getrandom::getrandom(&mut raw).expect("CSPRNG");
-    hex::encode(raw)
+/// 定出本次请求的 `conversationId`。
+///
+/// 优先从客户端 `metadata.user_id` 里提取 session UUID —— 真实客户端(Claude Code)会把
+/// 会话标识放在那里,于是**同一次会话的多个请求共用同一个 conversationId**,这正是真实
+/// 客户端的形态。取不到才新生成一个 UUID。
+///
+/// 此前这里是 `random_hex_id()`:每请求一个新的 32 位无连字符十六进制。两处都不对——
+/// 形状不是 UUID,而且每个请求在上游看来都是一段全新的对话。
+fn conversation_id_for(req: &MessagesRequest) -> String {
+    req.metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_deref())
+        .and_then(extract_session_id)
+        .unwrap_or_else(crate::kiro::uuid_v4)
+}
+
+/// 从 `metadata.user_id` 里抠出 session UUID。
+///
+/// 两种形态都认(照真实客户端观测):
+/// - JSON 串,含 `session_id` 键;
+/// - 任意串里出现 `session_<uuid>` 片段。
+///
+/// 两条都要求那段确实是标准 UUID,否则宁可返回 None 去新生成 —— 把一段来路不明的用户
+/// 输入原样当会话标识发给上游,既可能带上隐私,也可能是个畸形值。
+fn extract_session_id(user_id: &str) -> Option<String> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(user_id)
+        && let Some(sid) = v.get("session_id").and_then(|x| x.as_str())
+        && crate::kiro::is_uuid(sid)
+    {
+        return Some(sid.to_string());
+    }
+    let pos = user_id.find("session_")?;
+    let rest = &user_id[pos + "session_".len()..];
+    let cand = rest.get(..36)?;
+    crate::kiro::is_uuid(cand).then(|| cand.to_string())
 }
 
 /// 版本号 token 匹配:同时接受点分与横杠两种分隔形式(契约 §5)。
@@ -527,9 +558,10 @@ pub fn anthropic_to_kiro(
 
     Ok(KiroRequest {
         conversation_state: ConversationState {
-            chat_trigger_type: "MANUAL".to_string(),
+            agent_continuation_id: Some(crate::kiro::uuid_v4()),
             agent_task_type,
-            conversation_id: random_hex_id(),
+            chat_trigger_type: "MANUAL".to_string(),
+            conversation_id: conversation_id_for(req),
             current_message: CurrentMessage {
                 user_input_message: UserInputMessage {
                     content: non_empty_content(last_text),
@@ -722,9 +754,11 @@ pub fn frame_text_delta(frame: &Message) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// 新的 Anthropic 消息 id(`msg_` + 随机十六进制)。
+/// 新的 Anthropic 消息 id(`msg_` + 去连字符的 UUID)。
+///
+/// 这是**回给客户端**的 id,不上 wire,故形状只需与 Anthropic 官方一致(32 位十六进制)。
 pub fn new_message_id() -> String {
-    format!("msg_{}", random_hex_id())
+    format!("msg_{}", crate::kiro::uuid_v4().replace('-', ""))
 }
 
 /// 从 `meteringEvent` 帧提取的真实计费数据(照观测的数据面契约)。
@@ -964,6 +998,7 @@ mod tests {
 
     fn base_req(messages: Vec<InMsg>) -> MessagesRequest {
         MessagesRequest {
+            metadata: None,
             model: "sonnet".to_string(),
             system: None,
             messages,
@@ -1055,6 +1090,65 @@ mod tests {
     #[test]
     fn maps_fable() {
         assert_eq!(map_model("Fable"), Some("claude-fable-5".to_string()));
+    }
+
+    /// 同一次会话的多个请求必须共用同一个 `conversationId`。
+    ///
+    /// 回归:此前每请求生成一个新的 32 位无连字符十六进制 —— 上游看到的是"这个账号每发
+    /// 一句话就开一段全新对话",与真实客户端形态不符;形状也不是 UUID。
+    #[test]
+    fn conversation_id_is_stable_within_a_session_and_is_a_uuid() {
+        let sid = "550e8400-e29b-41d4-a716-446655440000";
+        let mk = |uid: Option<&str>| {
+            let mut r = base_req(vec![msg("user", "hi")]);
+            r.metadata = uid.map(|u| crate::protocol::anthropic::types::RequestMetadata {
+                user_id: Some(u.to_string()),
+            });
+            anthropic_to_kiro(&r, None).unwrap().conversation_state
+        };
+
+        // JSON 形态的 user_id
+        let a = mk(Some(&format!(r#"{{"session_id":"{sid}"}}"#)));
+        let b = mk(Some(&format!(r#"{{"session_id":"{sid}"}}"#)));
+        assert_eq!(a.conversation_id, sid);
+        assert_eq!(a.conversation_id, b.conversation_id, "同会话必须稳定");
+
+        // `session_<uuid>` 片段形态
+        let c = mk(Some(&format!("user_abc__session_{sid}")));
+        assert_eq!(c.conversation_id, sid);
+
+        // 没有 metadata → 新生成,但必须是 UUID 形状
+        let d = mk(None);
+        assert!(
+            crate::kiro::is_uuid(&d.conversation_id),
+            "{}",
+            d.conversation_id
+        );
+        let e = mk(None);
+        assert_ne!(
+            d.conversation_id, e.conversation_id,
+            "无会话标识时应各自新生成"
+        );
+
+        // 畸形/非 UUID 的 session 值不得原样发出去
+        let f = mk(Some(r#"{"session_id":"not-a-uuid"}"#));
+        assert_ne!(f.conversation_id, "not-a-uuid");
+        assert!(crate::kiro::is_uuid(&f.conversation_id));
+    }
+
+    /// `agentContinuationId` 每请求一个新 UUID,且必须真的发出去。
+    #[test]
+    fn agent_continuation_id_is_present_and_fresh() {
+        let a = anthropic_to_kiro(&base_req(vec![msg("user", "hi")]), None)
+            .unwrap()
+            .conversation_state;
+        let b = anthropic_to_kiro(&base_req(vec![msg("user", "hi")]), None)
+            .unwrap()
+            .conversation_state;
+        let ida = a.agent_continuation_id.expect("此前根本不发这个字段");
+        let idb = b.agent_continuation_id.expect("此前根本不发这个字段");
+        assert!(crate::kiro::is_uuid(&ida), "{ida}");
+        assert_ne!(ida, idb, "每请求应各不相同");
     }
 
     #[test]
@@ -1164,6 +1258,7 @@ mod tests {
     #[test]
     fn converts_request_with_system_and_history() {
         let req = MessagesRequest {
+            metadata: None,
             model: "sonnet".to_string(),
             system: Some(SystemPrompt::Text("S".to_string())),
             messages: vec![msg("user", "a"), msg("assistant", "b"), msg("user", "c")],
@@ -1214,6 +1309,7 @@ mod tests {
     #[test]
     fn unknown_model_errors() {
         let req = MessagesRequest {
+            metadata: None,
             model: "gpt-4o".to_string(),
             system: None,
             messages: vec![msg("user", "hi")],
@@ -1231,6 +1327,7 @@ mod tests {
     #[test]
     fn empty_messages_errors() {
         let req = MessagesRequest {
+            metadata: None,
             model: "sonnet".to_string(),
             system: None,
             messages: vec![],
@@ -1248,6 +1345,7 @@ mod tests {
     #[test]
     fn passes_through_profile_arn() {
         let req = MessagesRequest {
+            metadata: None,
             model: "sonnet".to_string(),
             system: None,
             messages: vec![msg("user", "hi")],
@@ -2311,6 +2409,7 @@ mod tests {
     #[test]
     fn history_tool_calls_force_a_tool_config_even_when_tools_were_dropped() {
         let req = MessagesRequest {
+            metadata: None,
             model: "claude-sonnet-4.5".into(),
             system: None,
             messages: vec![
@@ -2357,6 +2456,7 @@ mod tests {
     #[test]
     fn declared_tools_are_not_duplicated_by_history_fallback() {
         let req = MessagesRequest {
+            metadata: None,
             model: "claude-sonnet-4.5".into(),
             system: None,
             messages: vec![InMsg {
@@ -2401,6 +2501,7 @@ mod tests {
     #[test]
     fn plain_chat_still_sends_no_tool_config() {
         let req = MessagesRequest {
+            metadata: None,
             model: "claude-sonnet-4.5".into(),
             system: None,
             messages: vec![InMsg {

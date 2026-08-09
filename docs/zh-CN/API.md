@@ -104,6 +104,15 @@ cat data/config.json | grep apiKey
 | 402 | 该 API-KEY 的**消费额度已达或超上限**（体恒为 Anthropic 形状的 `billing_error`，见上方例外说明）。仅对管理端创建、且设了 `spendingLimit` 的 key 生效；用全局 `apiKey` 调用不会命中 |
 | 404 | 管理端点的 `{id}` 不存在：账号回 `{"error":"account not found","id":…}`，API-KEY 回 `{"error":"api key not found","id":…}`，登录会话回 `{"success":false,"error":"login session not found or expired"}` |
 | 422 | 请求体反序列化失败（缺必填字段 / 类型不符），axum 默认拒收，`text/plain` 纯文本。出现在带 body 提取器的端点上：`/api/admin/*` 与 `POST /api/user/login`（四个协议对话端点与 `/v1/messages/count_tokens` 已自行接管拒收、改回各自形状的 `400`）（`/api/user/*` 的其余端点只收 query，参数类型不符是 `400` 而非 `422`） |
+
+> **代理字段自 v0.10.1 起真正生效。** 此前 `proxyUrl` / `proxyUsername` / `proxyPassword`
+> 被接口收下但**不落库**,`hasProxy` 恒为 `false` —— 面板显示配置成功,流量照旧直连。
+> 现在:优先级 **凭据级 `proxyUrl` > 全局 `proxyUrl` > 直连**;凭据级填 `"direct"`(不分
+> 大小写)表示该账号显式直连,即便全局配了也不走。支持 `http://` / `https://` / `socks5://`。
+> `hasProxy` 现在反映的是**该账号最终是否真的经代理出站**(含经全局兜底的情况)。
+>
+> 同一个账号的**数据面、令牌刷新、余额查询、模型清单、后台续期一律走同一个出口**。
+> 代理地址无法解析时会记 `error` 日志并退回直连(不静默吞掉)。
 | 429 | **只来自上游限流**，且只在上游于 HTTP 200 事件流中途下发 `Throttling*` 异常帧时原样映射。本地的 `MAX_RPM_PER_CREDENTIAL` **不会**产生 `429`：超过该上限只是让这个账号本轮选不中，全部账号都选不中才落到 `503`（见下行）。上游在 HTTP 层直接回的 `429` 也**不**原样透出——自 v0.10.0 起它被判为**瞬时限流**(退避后重试,不惩罚账号;此前被误判为配额耗尽并让账号吃长冷却),重试用尽后以 `502` 收尾。据自己设的 RPM 上限去监控 `429` 是等不到的 |
 | 502 | 上游 Kiro 失败（含跨账号重试用尽后的最后一个账号级错误）。**每个上游请求都带 `Connection: close`、且客户端不复用连接**:本中转每个请求携带**不同账号**的令牌,user-agent 里的 machineId 也随账号变化,复用连接会让同一条 TCP/TLS 上依次出现几十个不同身份 —— 真实客户端不可能如此,而这是账号共享最直接的证据。瞬态失败(网络抖动/5xx/限流)换账号前指数退避 200ms→2s + 抖动;账号级失败(令牌失效/额度耗尽)不退避,换个账号立刻可成上游连接锁 **HTTP/1.1**(真实客户端不主动升 h2;且 `Connection: close` 是 1.1 的头,h2 明确禁止它,不锁就只是摆设),TLS 后端默认 **native-tls(OpenSSL)** 以贴合真实客户端的 ClientHello 指纹 —— 该指纹在任何 HTTP 内容发出**之前**就暴露。 |
 | 503 | 无可用账号（全部冷却 / 禁用 / **超本地 RPM 上限**），或日志端点未启用（`logCapacity=0`） |
@@ -1230,7 +1239,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1418,7 +1427,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.10.0"
+  "version": "0.10.1"
 }
 ```
 

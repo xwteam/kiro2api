@@ -32,6 +32,8 @@ pub struct ImpersonationDefaults {
     pub system_version: String,
     pub node_version: String,
     pub machine_id: Option<String>,
+    /// 全局出站代理(凭据级未设时的兜底)。
+    pub proxy_url: Option<String>,
 }
 
 static IMP_DEFAULTS: std::sync::OnceLock<ImpersonationDefaults> = std::sync::OnceLock::new();
@@ -43,7 +45,18 @@ pub fn init_impersonation_defaults(cfg: &crate::config::Config) {
         system_version: cfg.system_version.clone(),
         node_version: cfg.node_version.clone(),
         machine_id: cfg.machine_id.clone(),
+        proxy_url: cfg.proxy_url.clone(),
     });
+}
+
+/// 进程级配置里的全局 machineId(未初始化时取 `Config::default`)。
+pub fn config_machine_id() -> Option<String> {
+    imp_defaults().machine_id
+}
+
+/// 进程级配置里的全局出站代理。
+pub fn config_proxy_url() -> Option<String> {
+    imp_defaults().proxy_url
 }
 
 fn imp_defaults() -> ImpersonationDefaults {
@@ -54,6 +67,7 @@ fn imp_defaults() -> ImpersonationDefaults {
             system_version: d.system_version,
             node_version: d.node_version,
             machine_id: d.machine_id,
+            proxy_url: d.proxy_url,
         }
     })
 }
@@ -146,19 +160,7 @@ pub(crate) async fn read_body_capped(mut resp: reqwest::Response) -> String {
 /// 零成本、100% 命中的判别器 —— 每一个请求都带着它。这里手工按 RFC 4122 置好 version
 /// 与 variant 位并加连字符,不引第三方依赖。
 pub fn new_invocation_id() -> String {
-    let mut b = [0u8; 16];
-    getrandom::getrandom(&mut b).expect("CSPRNG");
-    b[6] = (b[6] & 0x0f) | 0x40; // version = 4
-    b[8] = (b[8] & 0x3f) | 0x80; // variant = RFC 4122
-    let h = hex::encode(b);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &h[0..8],
-        &h[8..12],
-        &h[12..16],
-        &h[16..20],
-        &h[20..32]
-    )
+    crate::kiro::uuid_v4()
 }
 
 /// 从 `https://host/path` 里取出 host(不含端口以外的任何修饰)。
@@ -533,6 +535,9 @@ mod tests {
 
     fn cred() -> Credential {
         Credential {
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
             id: "a".into(),
             access_token: "AT".into(),
             refresh_token: "rt".into(),

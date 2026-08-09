@@ -123,6 +123,19 @@ pub struct Credential {
     /// 「253 个账号有 1 个封禁,可用数却是 253」这件事会在每次重启后重现。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_reason: Option<String>,
+    /// 该账号出站走的代理(`http://` / `https://` / `socks5://`)。
+    ///
+    /// 优先级:**凭据级 > 全局 `proxyUrl` > 直连**。特殊值 `"direct"`(不分大小写)表示
+    /// 这个账号**显式不走代理**,即便全局配了也不走。
+    ///
+    /// 为什么按账号分:数据面已经做到"一条连接一个账号",但整池仍从同一个出口 IP 发出。
+    /// 真实用户是一人一机一 IP,几十个账号共用一个 IP 是这条链上最后一处对不上的地方。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
 }
 
 #[cfg(test)]
@@ -145,10 +158,37 @@ pub(crate) fn tests_support_cred() -> Credential {
         label: None,
         disabled: false,
         status_reason: None,
+        proxy_url: None,
+        proxy_username: None,
+        proxy_password: None,
     }
 }
 
+/// 凭据级 `proxyUrl` 的特殊值:显式直连。
+pub const PROXY_DIRECT: &str = "direct";
+
 impl Credential {
+    /// 定出该账号实际使用的代理:**凭据级 > 全局 > 直连**;`"direct"` 显式直连。
+    ///
+    /// 返回的三元组直接用于构造客户端缓存的键,故这里把用户名/密码一并带出 —— 同一个
+    /// 代理地址配不同凭证要算作不同出口。
+    pub fn effective_proxy(
+        &self,
+        global: Option<&str>,
+    ) -> Option<(String, Option<String>, Option<String>)> {
+        match self.proxy_url.as_deref() {
+            Some(u) if u.eq_ignore_ascii_case(PROXY_DIRECT) => None,
+            Some(u) if !u.is_empty() => Some((
+                u.to_string(),
+                self.proxy_username.clone(),
+                self.proxy_password.clone(),
+            )),
+            _ => global
+                .filter(|g| !g.is_empty() && !g.eq_ignore_ascii_case(PROXY_DIRECT))
+                .map(|g| (g.to_string(), None, None)),
+        }
+    }
+
     /// 是否为 API Key 凭据:带 `kiroApiKey`,或 `authMethod` 显式声明。
     ///
     /// 两个条件取并集是刻意的:导入时只填 key 不填 authMethod 是最自然的用法,
@@ -273,6 +313,13 @@ fn sweep_stale_tmp(path: &str) {
 ///
 /// 派生材料都缺(ksk 为空、refreshToken 也为空)时用按凭据 id 的稳定兜底,
 /// 绝不落到"空串派生"那个所有部署都一样的常量上。
+/// 给**单条**凭据补冻结机器 ID(已有则不动)。配置级 machineId 的抑制规则同
+/// [`freeze_machine_ids`],取值从进程级默认值读(新增账号的路径拿不到 `Config`)。
+pub fn freeze_machine_id(cred: &mut Credential) -> bool {
+    let cfg_mid = crate::kiro::provider::config_machine_id();
+    freeze_machine_ids(std::slice::from_mut(cred), cfg_mid.as_deref()) == 1
+}
+
 pub fn freeze_machine_ids(creds: &mut [Credential], config_machine_id: Option<&str>) -> usize {
     if config_machine_id
         .and_then(crate::kiro::machine_id::normalize)
@@ -417,6 +464,41 @@ pub async fn persist_pool_credentials_serialized(
 
 #[cfg(test)]
 mod tests {
+    /// 代理优先级:凭据级 > 全局 > 直连;`"direct"` 显式直连。
+    #[test]
+    fn effective_proxy_precedence() {
+        let mut c = super::tests_support_cred();
+        // 都没配 → 直连
+        assert_eq!(c.effective_proxy(None), None);
+        // 只有全局 → 用全局
+        assert_eq!(
+            c.effective_proxy(Some("http://g:1")),
+            Some(("http://g:1".into(), None, None))
+        );
+        // 凭据级压过全局
+        c.proxy_url = Some("socks5://c:2".into());
+        assert_eq!(
+            c.effective_proxy(Some("http://g:1")),
+            Some(("socks5://c:2".into(), None, None))
+        );
+        // 带凭证
+        c.proxy_username = Some("u".into());
+        c.proxy_password = Some("p".into());
+        assert_eq!(
+            c.effective_proxy(None),
+            Some(("socks5://c:2".into(), Some("u".into()), Some("p".into())))
+        );
+        // "direct" 显式直连,压过全局
+        c.proxy_url = Some("DIRECT".into());
+        assert_eq!(c.effective_proxy(Some("http://g:1")), None);
+        // 空串当没配
+        c.proxy_url = Some(String::new());
+        assert_eq!(
+            c.effective_proxy(Some("http://g:1")),
+            Some(("http://g:1".into(), None, None))
+        );
+    }
+
     /// 机器 ID 一次冻结之后,**refreshToken 轮换也不再改变它**。
     ///
     /// 回归:此前 machineId 每次请求现算 `sha256("KotlinNativeAPI/" + 当前 refreshToken)`,
@@ -484,6 +566,9 @@ mod tests {
 
     fn sample() -> Credential {
         Credential {
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
             id: "a1".into(),
             access_token: "at".into(),
             refresh_token: "rt".into(),

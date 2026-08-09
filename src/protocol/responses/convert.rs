@@ -166,6 +166,7 @@ pub fn responses_to_hub(req: ResponsesRequest) -> Result<MessagesRequest, Respon
     });
 
     Ok(MessagesRequest {
+        metadata: None,
         model: req.model,
         system: req.instructions.map(SystemPrompt::Text),
         messages,

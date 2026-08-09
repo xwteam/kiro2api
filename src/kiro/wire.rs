@@ -14,10 +14,16 @@ pub struct KiroRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationState {
-    pub chat_trigger_type: String,
+    /// 本轮代理续跑标识。真实客户端每个请求发一个新的 UUID;此前我们**根本不发这个字段**。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_continuation_id: Option<String>,
     pub agent_task_type: String,
-    pub conversation_id: String,
+    pub chat_trigger_type: String,
     pub current_message: CurrentMessage,
+    /// 会话标识。**同一次会话内应当保持不变**,故优先取客户端 `metadata.user_id` 里的
+    /// session UUID;取不到才新生成。此前是每请求一个新的 32 位无连字符十六进制 ——
+    /// 既不是 UUID 形状,也让每个请求看起来都是一段全新对话。
+    pub conversation_id: String,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub history: Vec<HistoryItem>,
 }
@@ -146,6 +152,7 @@ mod tests {
     fn sample() -> KiroRequest {
         KiroRequest {
             conversation_state: ConversationState {
+                agent_continuation_id: None,
                 chat_trigger_type: "MANUAL".to_string(),
                 agent_task_type: "vibe".to_string(),
                 conversation_id: "conv-1".to_string(),

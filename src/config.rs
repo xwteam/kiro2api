@@ -30,6 +30,9 @@ pub struct Config {
     /// 此前只有凭据级覆盖,缺配置级兜底。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
+    /// 全局出站代理。凭据级 `proxyUrl` 未设时用它;凭据级填 `"direct"` 可单独退回直连。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
     /// 每凭据每分钟最大请求数;0 = 无限(默认,兼容既有行为)。
     pub max_rpm_per_credential: u32,
     /// 负载均衡模式:"priority"(默认,等权轮询)或 "balanced"(按权重轮询)。
@@ -69,6 +72,7 @@ impl Default for Config {
             system_version: "win32#10.0.22631".into(),
             node_version: "22.22.0".into(),
             machine_id: None,
+            proxy_url: None,
             max_rpm_per_credential: 0,
             load_balancing_mode: "priority".into(),
             trusted_proxy_hops: 1,

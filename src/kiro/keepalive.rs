@@ -70,9 +70,21 @@ pub fn spawn(pool: Arc<Mutex<Pool>>, client: reqwest::Client, ctx: RefreshCtx) {
             let now = now_unix();
             let due = due_for_refresh(&pool, now).await;
             for id in due {
+                // 出口按该账号自己的代理取:后台续期与它的数据面必须同一出口,
+                // 否则这条"无人使用却按时发生"的流量会从另一个 IP 冒出来,更扎眼。
+                let per_cred = {
+                    let g = pool.lock().await;
+                    g.snapshot_credentials().into_iter().find(|c| c.id == id)
+                }
+                .filter(|c| {
+                    c.effective_proxy(crate::kiro::provider::config_proxy_url().as_deref())
+                        .is_some()
+                })
+                .map(|c| crate::http::unary_for(&c));
+                let cl = per_cred.as_ref().unwrap_or(&client);
                 // 失败由 ensure_fresh 内部反馈池;这里只记录,不重复处置。
                 if let Err(e) =
-                    ensure_fresh(&pool, &id, &client, now, REFRESH_MARGIN_SECS, Some(&ctx)).await
+                    ensure_fresh(&pool, &id, cl, now, REFRESH_MARGIN_SECS, Some(&ctx)).await
                 {
                     tracing::debug!(
                         event = "keepalive_refresh_failed",
@@ -121,6 +133,9 @@ mod tests {
 
     fn cred(id: &str, expires_at: u64) -> Credential {
         Credential {
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
             id: id.into(),
             access_token: "AT".into(),
             refresh_token: "RT".into(),

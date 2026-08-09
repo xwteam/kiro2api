@@ -118,7 +118,7 @@ fn account_to_item(a: &AccountStat, throttles: u64) -> CredentialStatusItem {
         weight: a.weight,
         disabled: a.disabled,
         failure_count: a.failures as u32,
-        is_current: false,
+        is_current: a.is_current,
         expires_at: unix_to_rfc3339(a.expires_at_unix),
         auth_method: Some(a.auth_method.clone()),
         has_profile_arn: a.has_profile_arn,
@@ -126,7 +126,7 @@ fn account_to_item(a: &AccountStat, throttles: u64) -> CredentialStatusItem {
         nickname: a.nickname.clone(),
         success_count: a.successes,
         last_used_at: unix_to_rfc3339(a.last_used_unix),
-        has_proxy: false,
+        has_proxy: a.has_proxy,
         health_status: health_status(a),
         status_reason: a.status_reason,
         throttle_count: throttles,
@@ -2403,7 +2403,7 @@ use crate::kiro::credential::{AuthMethod, Credential};
 use crate::kiro::pool::CredentialUpdate;
 
 /// `POST /api/admin/credentials` 请求体,对齐前端 `AddCredentialRequest`(camelCase)。
-/// proxy* 字段被前端契约声明但凭据模型当前不落 proxy(状态里 `hasProxy` 恒 false),
+/// proxy* 字段自 v0.10.1 起**真正落库并生效**(此前是"收到即丢",`hasProxy` 恒 false),
 /// 故接收但不持久化——保持契约兼容、不新增存储面。
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -2459,7 +2459,7 @@ pub struct AddCredentialResponse {
 }
 
 /// `PUT /api/admin/credentials/{id}` 请求体,对齐前端 `UpdateCredentialRequest`。
-/// 字段缺省=不改;proxy* 同 Add 说明(接收不落)。
+/// 字段缺省=不改;proxy* 同 Add 说明(现已落库生效)。
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateCredentialRequest {
@@ -2631,6 +2631,11 @@ pub async fn add_credential(
         label: None,
         disabled: false,
         status_reason: None,
+        // 代理三件套**真正落库**。此前这里是"收下即丢",而状态里 `hasProxy` 还硬编码
+        // `false` —— 用户在面板上填了代理、界面显示保存成功,实际全程直连。
+        proxy_url: req.proxy_url.filter(|s| !s.is_empty()),
+        proxy_username: req.proxy_username.filter(|s| !s.is_empty()),
+        proxy_password: req.proxy_password.filter(|s| !s.is_empty()),
     };
 
     match add_credential_to_pool_and_persist(&state, cred).await {
@@ -3027,6 +3032,9 @@ pub async fn import_credentials_batch(
             disabled: false,
             status_reason: None,
             kiro_api_key: None,
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
         };
 
         // 4) 入池落盘(逐项韧性:某条落盘失败仅该条判失败,继续下条)。
@@ -3131,6 +3139,9 @@ fn minted_to_credential(m: MintedCredential, now: u64) -> Credential {
         label: None,
         disabled: false,
         status_reason: None,
+        proxy_url: None,
+        proxy_username: None,
+        proxy_password: None,
     }
 }
 
@@ -3604,6 +3615,9 @@ mod tests {
             label: None,
             disabled: false,
             status_reason: None,
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
         }
     }
 
