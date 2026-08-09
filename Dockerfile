@@ -22,13 +22,18 @@ FROM --platform=$BUILDPLATFORM rust:1-slim AS builder
 ARG TARGETARCH
 WORKDIR /build
 # 目标架构的交叉 gcc + libc 头(供 ring 的 C/asm 交叉编译与链接)。
+# perl + make:vendored OpenSSL(native-tls 后端)自带一套 Perl 写的 ./Configure,
+# rust:1-slim 里两样都没有,缺了会在 `./Configure line 15` 处直接失败。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      pkg-config gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+      pkg-config gcc-aarch64-linux-gnu libc6-dev-arm64-cross perl make \
     && rm -rf /var/lib/apt/lists/*
 RUN rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 # arm64 目标的链接器与 C 编译器指向交叉工具链(amd64 目标用镜像自带的原生 gcc)。
+# AR 也要指向交叉工具链:OpenSSL 交叉编译时要打静态库,用宿主 ar 会产出 x86 归档、
+# 链接阶段才报错(错误信息与真实原因相距很远)。
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # build.rs 在编译期捕获 rustc 版本注入 KIRO_RUST_VERSION,必须在 cargo build 前拷入
