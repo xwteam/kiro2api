@@ -4641,7 +4641,12 @@ mod tests {
     async fn usage_summary_range_and_hours_and_invalid() {
         let stats = empty_stats("usage_summary");
         let now = now_unix() as i64;
-        // 三条:近窗内 2 条(now-1h、now-2h),第三条 now-40h(超出 24h 窗口)。
+        // 三条:近窗内 2 条(59 分钟前、2 小时前),第三条 now-40h(超出 24h 窗口)。
+        //
+        // 第一条**故意不放在整 1 小时的边界上**。查询侧会自己重新取一次 now,只要这个测试
+        // 从建数据到发请求之间跨过了 1 秒,放在 `now-3600` 的那条就会掉出 `hours=1` 的窗口
+        // —— 于是测试在 CI 上间歇性变红,而被测代码完全正常。留 60 秒余量。
+        // (边界闭区间本身该在能注入时钟的那一层单测,不该靠这条走 HTTP 的用例赌时序。)
         stats
             .usage
             .record_usage_full(
@@ -4656,7 +4661,7 @@ mod tests {
                 None,
                 None,
                 Some(100),
-                now - 3600,
+                now - 3540,
             )
             .await;
         stats
@@ -4716,7 +4721,7 @@ mod tests {
         assert_eq!(v["successfulRequests"], 2);
         assert_eq!(v["failedRequests"], 0);
 
-        // hours=1:只含 now-3600 那一条(闭区间边界包含)。
+        // hours=1:只含 59 分钟前那一条。
         let (st2, v2) = get(&app, "/api/admin/usage/summary?hours=1").await;
         assert_eq!(st2, HttpStatusCode::OK);
         assert_eq!(v2["range"], "1h");
