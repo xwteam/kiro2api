@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.10.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.10.2-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | Date | Update |
 |------|--------|
+| 2026-08-09 | v0.10.2 - 🩹 **Fix: a runtime stop was being written to disk, so "a restart revives it" was hollow.** v0.10.0 made quota-exhausted and repeatedly-rejected accounts stop being used, explicitly in memory only — but `snapshot_credentials()` overwrote `cred.disabled` with the runtime flag when persisting, so one quota exhaustion or two 401/403s wrote the account off **permanently** in `credentials.json`, unrecoverable by restart — worse than the behaviour it replaced (one production account was lost this way). Persistence now takes only the durable verdict; the two paths that should persist (operator disable, body-confirmed invalidation) already set `cred.disabled` themselves. **If your `credentials.json` has a `"disabled": true` you never set, flip it back to false to recover the account** |
 | 2026-08-09 | v0.10.1 - 🔌 **Per-account outbound proxy, plus the session identity fields that were missing.** ① The three proxy fields were **accepted and then dropped**, and `hasProxy` was hardcoded to `false` — the panel said it was configured while every request went out direct. They are now persisted and effective, with precedence credential > global > direct (`"direct"` forces a direct connection), and **one account's data plane, token refresh, balance, model list and background renewal all share a single exit** (a data plane behind a proxy while refresh comes from the main IP is worse than no proxy at all). ② `conversationId` was regenerated per request and was not UUID-shaped → it now prefers the session UUID carried in the client's `metadata.user_id`, so one session shares one id. ③ `agentContinuationId` **was never sent**; it is now. ④ Credentials added through the panel never got a frozen machineId (v0.10.0 only covered those already in the file) → now frozen the moment they enter the pool. ⑤ `isCurrent` was hardcoded `false`; it now reports the truth |
 | 2026-08-09 | v0.10.0 - 🎯 **Aligned behavioural shape with the real client.** A module-by-module comparison against a long-stable peer implementation overturned the previous two releases' diagnosis: that implementation reuses connections, does not pin HTTP/1.1, and defaults to rustls — none of the three things we had bet on. The real differences: ① `priority` used to **rotate accounts on every request**, so one exit IP showed hundreds of machineIds interleaving by the second → now it **sticks to one account until that account becomes unusable**; ② suspended / quota-exhausted accounts used to **return to the pool** after a 5- or 30-minute cooldown, i.e. hammered a wall forever → now they stop being used (in-memory only; a reset revives them); ③ **token refresh requests carried no User-Agent at all** (measured on the wire), on Kiro's own endpoint, on a path every account must take → now filled in per the two real shapes (axios and sso-oidc); ④ **machineId changed on every refresh** (derived from the rotating refreshToken) → now frozen and persisted at load; ⑤ ksk accounts collapsed to one global constant machineId → now derived per credential type. Also: 429 reclassified as transient throttling, three data-plane endpoints collapsed to one, `amz-sdk-invocation-id` is now a UUID v4, header order aligned, `claude-opus-5` mapping added, and SSE gained a 25-second keep-alive |
 | 2026-08-09 | v0.9.1 - 🔧 **Upstream connections pinned to HTTP/1.1, TLS backend switched to native-tls.** v0.9.0 added `Connection: close` without pinning the protocol — but that is an HTTP/1.1 header which h2 forbids outright, and ALPN was negotiating h2, so the header was **purely decorative** (measured: pinning changes the outbound protocol from HTTP/2 to HTTP/1.1). The TLS backend now defaults to **native-tls (OpenSSL)**: the real client is Electron/Node and handshakes through OpenSSL, whose ClientHello differs sharply from rustls — and **the fingerprint is exposed before any HTTP content is sent**. Also: machineId gains a config-level fallback (credential > config > derived) |
@@ -286,7 +287,7 @@ docker compose logs -f
 ```bash
 # Health check
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.10.1"}
+# {"service":"kiro2api","status":"ok","version":"0.10.2"}
 
 # View available models
 curl http://localhost:8080/v1/models \

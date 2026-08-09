@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.10.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.10.2-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 날짜 | 업데이트 내용 |
 |------|----------|
+| 2026-08-09 | v0.10.2 - 🩹 **수정: 런타임 사용 중단이 디스크에 기록되어 「재시작하면 복구된다」가 빈말이었습니다.** v0.10.0은 메모리 상태만 바꾼다고 명시했지만, 영속화 시 `snapshot_credentials()`가 런타임 `disabled`로 `cred.disabled`를 덮어써서 한도 소진 1회 또는 401/403 2회로 `credentials.json`에 **영구히** 기록됐고 재시작으로도 돌아오지 않았습니다 — 바꾸기 전 동작보다 나쁩니다(운영 중 계정 하나를 이렇게 잃었습니다). 이제 영속적인 결론만 기록합니다. **직접 중지한 적 없는 `"disabled": true`가 있다면 false로 되돌리면 복구됩니다** |
 | 2026-08-09 | v0.10.1 - 🔌 **계정별 아웃바운드 프록시와 누락됐던 세션 식별 필드 보완.** ① 프록시 3개 필드는 **받고 나서 버려졌고**, `hasProxy`도 `false`로 하드코딩돼 있었습니다 — 패널은 설정됐다고 표시하지만 실제로는 전부 직접 연결. 이제 실제로 저장되어 동작하며 우선순위는 자격증명 > 전역 > 직결(`"direct"`는 명시적 직결)이고, **한 계정의 데이터 플레인/토큰 갱신/잔량 조회/모델 목록/백그라운드 갱신이 모두 같은 출구**를 사용합니다(데이터 플레인만 프록시를 타고 갱신은 메인 IP에서 나가는 것은 프록시가 없느니만 못합니다). ② `conversationId`가 요청마다 새로 생성되고 UUID 형태도 아니었습니다 → 클라이언트 `metadata.user_id`의 세션 UUID를 우선 사용해 같은 세션이 공유합니다. ③ `agentContinuationId`는 **아예 보내지 않았습니다**. ④ 패널로 추가한 계정은 machineId가 고정되지 않았습니다 → 풀 진입 시점에 고정. ⑤ `isCurrent` 하드코딩 `false`를 실제 값으로 |
 | 2026-08-09 | v0.10.0 - 🎯 **동작 형태를 실제 클라이언트에 맞췄습니다.** 오랫동안 안정적으로 운영되는 동종 구현과 모듈 단위로 비교한 결과, 앞선 두 릴리스의 정지 원인 진단이 뒤집혔습니다: 그 구현은 연결을 재사용하고, HTTP/1.1로 고정하지 않으며, TLS 기본값도 rustls입니다 — 우리가 걸었던 세 가지를 하나도 하지 않습니다. 실제 차이는: ① `priority`가 **요청마다 계정을 교체**해, 같은 출구 IP에서 수백 개의 machineId가 초 단위로 번갈아 나타났습니다 → **한 계정을 쓸 수 없게 될 때까지 고정**하도록 변경; ② 정지/한도 소진 계정이 5분·30분 쿨다운 후 **풀로 복귀**해 벽을 계속 들이받았습니다 → 사용 중단(메모리 상태, 초기화하면 복구); ③ **토큰 갱신 요청에 User-Agent조차 없었습니다**(바이트 실측). 그것도 Kiro 자체 엔드포인트이며 모든 계정이 반드시 지나는 경로입니다 → axios와 sso-oidc 두 가지 실제 형태로 보완; ④ **machineId가 갱신할 때마다 바뀜**(교체되는 refreshToken에서 매번 계산) → 로드 시 고정해 디스크에 기록; ⑤ ksk 계정의 machineId가 전역 상수로 퇴화 → 자격 증명 유형별로 파생. 그 밖에 429를 일시적 스로틀링으로 재분류, 데이터 플레인 엔드포인트를 3개에서 1개로 축소, `amz-sdk-invocation-id`를 UUID v4로, 헤더 순서 정렬, `claude-opus-5` 매핑 추가, SSE에 25초 keep-alive 추가 |
 | 2026-08-09 | v0.9.1 - 🔧 **업스트림 연결을 HTTP/1.1로 고정하고 TLS 백엔드를 native-tls로 변경**. v0.9.0은 `Connection: close`를 추가했지만 프로토콜을 고정하지 않았습니다 —— 이는 HTTP/1.1 헤더이며 h2에서는 금지되어 있고 ALPN은 h2를 선택하고 있었으므로 당시 그 헤더는 **장식일 뿐이었습니다**(실측: 고정 후 송신 프로토콜이 HTTP/2에서 HTTP/1.1로 변경). TLS 백엔드는 기본값이 **native-tls(OpenSSL)**입니다: 실제 클라이언트는 Electron/Node로 OpenSSL을 통해 핸드셰이크하며 그 ClientHello는 rustls와 크게 다릅니다. 지문은 HTTP 내용이 전송되기 **전에** 노출됩니다. 또한 machineId에 설정 수준 폴백 추가 |
@@ -241,7 +242,7 @@ docker compose logs -f
 ```bash
 # 헬스 체크
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.10.1"}
+# {"service":"kiro2api","status":"ok","version":"0.10.2"}
 
 # 프로토콜 고정 모델 목록 조회
 curl http://localhost:8080/v1/models \

@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.10.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.10.2-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日付 | 更新内容 |
 |------|----------|
+| 2026-08-09 | v0.10.2 - 🩹 **修正:実行時の使用停止がディスクへ書き込まれ、「再起動で復活」が空文になっていました。** v0.10.0 はメモリ上のみと明言していましたが、永続化時に `snapshot_credentials()` が実行時の `disabled` で `cred.disabled` を上書きしていたため、枠切れ 1 回または 401/403 が 2 回で `credentials.json` に**恒久的に**書き込まれ、再起動でも戻りませんでした —— 置き換える前の挙動より悪い状態です(本番でアカウントが 1 つ失われました)。現在は永続的な判断のみを書き出します。**手動で停止した覚えのない `"disabled": true` があれば、false に戻すと復活します** |
 | 2026-08-09 | v0.10.1 - 🔌 **アカウント単位のアウトバウンドプロキシと、欠けていたセッション識別フィールドの補完。** ① プロキシ 3 項目は**受け取って捨てられ**、`hasProxy` も `false` 固定でした —— 画面上は設定済みでも実際は全て直接接続。現在は保存され有効に機能します(優先度は 資格情報 > グローバル > 直結、`"direct"` で明示的に直結)。かつ**同一アカウントのデータプレーン/トークン更新/残量照会/モデル一覧/バックグラウンド更新はすべて同じ出口**を使います(データプレーンだけプロキシ経由で更新が主 IP から出るのは、プロキシ無しより悪い)。② `conversationId` はリクエストごとに再生成され UUID 形状でもありませんでした → クライアントの `metadata.user_id` にあるセッション UUID を優先し、同一セッションで共有します。③ `agentContinuationId` は**そもそも送っていませんでした**。④ 管理画面から追加したアカウントは machineId が凍結されていませんでした → プール投入時点で凍結。⑤ `isCurrent` の `false` 固定を実値に |
 | 2026-08-09 | v0.10.0 - 🎯 **挙動の形を実クライアントに合わせました。** 長期安定している同種実装とモジュール単位で比較した結果、前 2 版の BAN 原因の推定は覆りました:その実装は接続を再利用し、HTTP/1.1 に固定せず、TLS も既定が rustls です — こちらが賭けた 3 点をどれも行っていません。実際の差分:① `priority` は**リクエストごとに アカウントを切り替え**ており、同一の出口 IP 上で数百の machineId が秒単位で交互に現れていました → **1 つのアカウントが使えなくなるまで固定**する方式へ;② 停止/枠を使い切ったアカウントが 5 分・30 分のクールダウン後に**プールへ復帰**し、壁に当たり続けていました → 使用停止(メモリ上のみ、リセットで復活);③ **トークン更新リクエストに User-Agent すら無い**状態でした(実測)。しかも Kiro 自身のエンドポイントで、全アカウントが必ず通る経路です → axios と sso-oidc の 2 つの実形態に合わせて補完;④ **machineId が更新のたびに変化**(ローテーションする refreshToken から都度算出)→ 読み込み時に凍結して永続化;⑤ ksk アカウントの machineId が単一の定数に退化 → 資格情報の種別ごとに導出。ほかに 429 を一時的スロットリングへ再分類、データプレーンのエンドポイントを 3 つから 1 つへ集約、`amz-sdk-invocation-id` を UUID v4 化、ヘッダ順序の一致、`claude-opus-5` マッピング追加、SSE に 25 秒のキープアライブ |
 | 2026-08-09 | v0.9.1 - 🔧 **上流接続を HTTP/1.1 に固定し、TLS バックエンドを native-tls へ**。v0.9.0 は `Connection: close` を追加しましたがプロトコルを固定していませんでした —— これは HTTP/1.1 のヘッダで h2 では禁止されており、ALPN では h2 が選ばれていたため、当時この設定は**飾りにすぎませんでした**(実測:固定により送信プロトコルが HTTP/2 から HTTP/1.1 へ)。TLS バックエンドは既定で **native-tls(OpenSSL)**:実クライアントは Electron/Node で OpenSSL 経由の握手を行い、その ClientHello は rustls と大きく異なります。指紋は HTTP の内容が送られる**前**に露出します。また machineId に設定レベルのフォールバックを追加 |
@@ -245,7 +246,7 @@ docker compose logs -f
 ```bash
 # ヘルスチェック
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.10.1"}
+# {"service":"kiro2api","status":"ok","version":"0.10.2"}
 
 # 利用可能なモデルを表示
 curl http://localhost:8080/v1/models \

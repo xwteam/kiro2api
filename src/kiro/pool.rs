@@ -714,17 +714,19 @@ impl Pool {
 
     /// 当前全部凭据快照(顺序即池内顺序),供调用方落盘 credentials.json。
     ///
-    /// `disabled` 以运行时那份为准写出:落盘路径绝不能拿 `cred` 里可能陈旧的旧值,
-    /// 把刚发生的手工停用/永久禁用覆写回去。
+    /// **落盘的 `disabled` 只取 `cred` 里那份(持久结论),不取运行时那份。**
+    ///
+    /// 两者是有意分开的:运行期的"停止使用"(额度耗尽、连续鉴权失败)只置内存态
+    /// `Entry::disabled`,重启或「重置」即复活 —— 这样上游一次权限抖动不会变成永久损失。
+    /// 而真正该持久化的两条路径(管理员手工停用 [`set_disabled`](Self::set_disabled)、
+    /// 响应体确证的凭据失效 [`FailureKind::AuthInvalid`])**都会同时写 `cred.disabled`**,
+    /// 所以这里照实写出即可,不会漏。
+    ///
+    /// 曾经这里拿运行时那份覆写 `cred.disabled`,于是"只置内存态"被彻底架空:一次配额
+    /// 耗尽或两次 401/403 就把账号**永久**写死在磁盘上,重启也回不来 —— 比修复前的
+    /// 「冷却后回池」还糟。线上真的因此死掉过一个账号。
     pub fn snapshot_credentials(&self) -> Vec<Credential> {
-        self.entries
-            .iter()
-            .map(|e| {
-                let mut c = e.cred.clone();
-                c.disabled = e.disabled;
-                c
-            })
-            .collect()
+        self.entries.iter().map(|e| e.cred.clone()).collect()
     }
 
     /// 为新凭据分配数值 id:取单调递增计数器,并与"现有 id 最大值 +1"取较大者
@@ -1392,6 +1394,45 @@ mod tests {
             p.stats(0)[0].status_reason,
             "none",
             "成功一次就说明那个原因过去了,标签必须跟着清"
+        );
+    }
+
+    /// 运行期的"停止使用"**绝不能**落盘,否则"重启即复活"是句空话。
+    ///
+    /// 回归:`snapshot_credentials` 曾把运行时的 `Entry::disabled` 覆写进 `cred.disabled`,
+    /// 于是一次配额耗尽或两次 401/403 就把账号永久写死在磁盘上。线上真的死过账号。
+    #[test]
+    fn runtime_stop_does_not_leak_into_the_persisted_snapshot() {
+        let mut p = Pool::new(vec![cred("a", 1), cred("b", 1)], LbMode::Priority);
+
+        // 额度耗尽 → 运行期停用
+        p.report_failure("a", FailureKind::Quota, 100);
+        assert!(p.select(100).unwrap().id != "a", "a 本进程内不该再被选中");
+        let snap = p.snapshot_credentials();
+        let a = snap.iter().find(|c| c.id == "a").unwrap();
+        assert!(!a.disabled, "运行期停用不得落盘");
+
+        // 连续鉴权失败 → 同样只在内存
+        p.report_failure("b", FailureKind::AuthAmbiguous, 100);
+        p.report_failure("b", FailureKind::AuthAmbiguous, 100);
+        let snap = p.snapshot_credentials();
+        assert!(!snap.iter().find(|c| c.id == "b").unwrap().disabled);
+
+        // 而这两条**该**持久化的路径必须照旧落盘
+        p.set_disabled("a", true);
+        assert!(
+            p.snapshot_credentials()
+                .iter()
+                .find(|c| c.id == "a")
+                .unwrap()
+                .disabled,
+            "管理员手工停用必须落盘"
+        );
+        let mut q = Pool::new(vec![cred("c", 1)], LbMode::Priority);
+        q.report_failure("c", FailureKind::AuthInvalid, 100);
+        assert!(
+            q.snapshot_credentials()[0].disabled,
+            "响应体确证的凭据失效必须落盘"
         );
     }
 
