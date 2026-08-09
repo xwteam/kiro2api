@@ -16,6 +16,14 @@
 
 - **machineId 支持配置级兜底**。优先级由两级扩为三级:凭据自带 > 配置 `machineId` > 由 refreshToken 派生。配置级适合"一台机器、一个身份"的部署形态;不设则维持每账号各自派生(默认,与真实客户端"一账号一机器"一致)。
 
+- **构建镜像与运行镜像的 glibc 世代不一致,产出的二进制启动即崩溃**。构建阶段用的浮动标签 `rust:1-slim` 已随上游滚到 Debian trixie(glibc 2.41),运行镜像仍是 bookworm(2.36)。以前用 ring 没暴露,本版换 vendored OpenSSL 后,它的 C 代码会用到 glibc 2.38 才加入的 `strlcpy`/`strlcat`,于是两个架构的二进制都被打上 `GLIBC_2.38` 依赖,容器启动即 `version GLIBC_2.38 not found` 并反复重启。
+
+  这类失败**编译、镜像构建、推送全绿**,只在容器启动那一刻炸。现已把构建镜像钉到 `rust:1-slim-bookworm`,并把"两边必须同一 Debian 世代"钉成测试断言(`tests/dockerfile_libc.rs`),换任一边都会先红在测试上,而不是先红在生产上。
+
+### Changed
+
+- `stats::persist` 的刷盘测试改为轮询等待期望内容(最长 5 秒),不再等固定时长后断言。原写法在 CI 上会因调度被抢占而间歇性失败,而被测代码完全正常。
+
 ## [0.9.0] - 2026-08-09
 
 ### Fixed
