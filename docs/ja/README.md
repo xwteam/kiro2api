@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.11.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.11.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日付 | 更新内容 |
 |------|----------|
+| 2026-08-09 | v0.11.1 - 🔬 **本番での実測で判明した 2 点。** ① **ツールの説明が空だと上流がリクエスト全体を拒否**します(実測:同じツールで説明ありは 200 かつ `tool_use` が正常に返り、説明を外すと `400 Invalid tool use format / REQUEST_BODY_INVALID`)。v0.11.0 で `null` を空文字にしましたが、上流が求めるのは**非空**でした → ツール名でフォールバック。② `REQUEST_BODY_INVALID` を再試行可能として扱っていました。これは決定的な誤りでどのアカウントでも同じく失敗するため、不正な 1 リクエストが複数アカウントの再試行枠を消費し(実測で 4 件)、最後に要領を得ない 502 を返していました → 再試行なし・アカウント無罰のクラスに変更し、ツール仕様を指す 400 を返します |
 | 2026-08-09 | v0.11.0 - 🧰 **「上流にリクエストを拒否させる」種類の不具合をまとめて修正。** ① サーバー側組み込みツール(web_search 等)は `input_schema` を持たないのに同フィールドが必須だったため、公式の書き方を使うだけで当方の層で 400。② ツールの `description` が **null** として送られることがあった(実クライアントは常に文字列)。③ `input_schema` を素通ししていたため `properties: null` のような形で**リクエスト全体**が拒否された → 形だけを整える正規化を追加(意味は変更しません)。④ 長すぎるツール名を短縮せず(上流の上限は 63)、復元もできなかった → 決定的に短縮し、`短縮名→元名` を出口まで持ち回して復元。⑤ `:message-type == "error"` のフレームを完全に無視しており、上流のエラーが 200＋空メッセージになっていた。⑥ 管理画面の存在しないアセットが 404 ではなく 200＋HTML を返していた。ほかに `POST /api/admin/credentials/{id}/refresh` を追加 |
 | 2026-08-09 | v0.10.2 - 🩹 **修正:実行時の使用停止がディスクへ書き込まれ、「再起動で復活」が空文になっていました。** v0.10.0 はメモリ上のみと明言していましたが、永続化時に `snapshot_credentials()` が実行時の `disabled` で `cred.disabled` を上書きしていたため、枠切れ 1 回または 401/403 が 2 回で `credentials.json` に**恒久的に**書き込まれ、再起動でも戻りませんでした —— 置き換える前の挙動より悪い状態です(本番でアカウントが 1 つ失われました)。現在は永続的な判断のみを書き出します。**手動で停止した覚えのない `"disabled": true` があれば、false に戻すと復活します** |
 | 2026-08-09 | v0.10.1 - 🔌 **アカウント単位のアウトバウンドプロキシと、欠けていたセッション識別フィールドの補完。** ① プロキシ 3 項目は**受け取って捨てられ**、`hasProxy` も `false` 固定でした —— 画面上は設定済みでも実際は全て直接接続。現在は保存され有効に機能します(優先度は 資格情報 > グローバル > 直結、`"direct"` で明示的に直結)。かつ**同一アカウントのデータプレーン/トークン更新/残量照会/モデル一覧/バックグラウンド更新はすべて同じ出口**を使います(データプレーンだけプロキシ経由で更新が主 IP から出るのは、プロキシ無しより悪い)。② `conversationId` はリクエストごとに再生成され UUID 形状でもありませんでした → クライアントの `metadata.user_id` にあるセッション UUID を優先し、同一セッションで共有します。③ `agentContinuationId` は**そもそも送っていませんでした**。④ 管理画面から追加したアカウントは machineId が凍結されていませんでした → プール投入時点で凍結。⑤ `isCurrent` の `false` 固定を実値に |
@@ -247,7 +248,7 @@ docker compose logs -f
 ```bash
 # ヘルスチェック
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.11.0"}
+# {"service":"kiro2api","status":"ok","version":"0.11.1"}
 
 # 利用可能なモデルを表示
 curl http://localhost:8080/v1/models \

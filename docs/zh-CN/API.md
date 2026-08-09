@@ -107,6 +107,7 @@ cat data/config.json | grep apiKey
 
 
 > **v0.11.0 起的工具契约变更(与客户端直接相关):**
+> **v0.11.1 补充:工具 `description` 上行时保证非空** —— 上游对空描述回 `400 Invalid tool use format / REQUEST_BODY_INVALID`,拒的是**整条请求**。你没给描述时本服务用工具名兜底。另:该 reason 现归为**确定性**错误,直接回 `400`(不再跨账号重试后回 502)。
 > - `tools[].type` 被接收:Anthropic **服务端内置工具**(`web_search_20250305` 等)没有
 >   `input_schema`,此前该字段必填,导致整条请求在本服务这层就被 400。现已容缺。
 > - `tools[].input_schema` 会被**规范化**成上游一定收得下的形状(补 `type`/`properties`/
@@ -1252,7 +1253,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1440,7 +1441,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.11.0"
+  "version": "0.11.1"
 }
 ```
 

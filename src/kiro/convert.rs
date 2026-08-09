@@ -216,8 +216,8 @@ fn tool_specs_with_history_fallback(
         if !declared.contains(name.as_str()) {
             specs.push(ToolSpec {
                 tool_specification: ToolSpecInner {
+                    description: name.clone(),
                     name: map_tool_name(&name, map),
-                    description: String::new(),
                     input_schema: InputSchemaJson {
                         json: normalize_json_schema(&serde_json::Value::Null),
                     },
@@ -314,7 +314,16 @@ fn map_tools(
     tools
         .iter()
         .map(|t| {
+            // 描述**不能是空串**:上游对空描述回 `Invalid tool use format` /
+            // `REQUEST_BODY_INVALID`,拒掉的是整条请求(线上实测:同一个工具带描述 200、
+            // 去掉描述 400)。客户端没给时用工具名兜底 —— 非空、且是此处能给出的最有信息量
+            // 的值,不会误导模型。
             let desc = t.description.clone().unwrap_or_default();
+            let desc = if desc.trim().is_empty() {
+                t.name.clone()
+            } else {
+                desc
+            };
             let desc = match desc.char_indices().nth(TOOL_DESC_MAX_CHARS) {
                 Some((i, _)) => desc[..i].to_string(),
                 None => desc,
@@ -1230,7 +1239,7 @@ mod tests {
     /// 回归:此前是 `Option<String>`,客户端没给描述时序列化成 `"description": null`,
     /// 而真实客户端在这个位置永远是字符串(没有就是空串)。
     #[test]
-    fn tool_description_is_never_null() {
+    fn tool_description_is_never_null_nor_empty() {
         let mut map = std::collections::HashMap::new();
         let specs = map_tools(
             &[ToolDef {
@@ -1241,13 +1250,28 @@ mod tests {
             }],
             &mut map,
         );
-        assert_eq!(specs[0].tool_specification.description, "");
+        // 既不是 null,**也不能是空串**:上游对空描述回 `Invalid tool use format` /
+        // `REQUEST_BODY_INVALID`,拒的是整条请求(线上实测:同一个工具带描述 200、
+        // 去掉描述 400)。客户端没给时用工具名兜底。
+        assert_eq!(specs[0].tool_specification.description, "t");
         let v = serde_json::to_value(&specs[0]).unwrap();
-        assert_eq!(v["toolSpecification"]["description"], "");
         assert!(
             !v["toolSpecification"]["description"].is_null(),
             "绝不能是 null"
         );
+        assert_ne!(v["toolSpecification"]["description"], "", "绝不能是空串");
+
+        // 只有空白的描述同样按"没给"处理
+        let specs = map_tools(
+            &[ToolDef {
+                tool_type: None,
+                name: "u".into(),
+                description: Some("   ".into()),
+                input_schema: serde_json::json!({}),
+            }],
+            &mut std::collections::HashMap::new(),
+        );
+        assert_eq!(specs[0].tool_specification.description, "u");
     }
 
     /// 客户端给的 schema 千奇百怪,规范化后必须一定是上游收得下的形状。

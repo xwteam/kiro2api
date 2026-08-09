@@ -646,6 +646,7 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 > **v0.11.0의 도구 계약 변경:** `tools[].type`를 받습니다(서버 측 내장 도구는 `input_schema`가
+> **v0.11.1: 도구 `description`은 전송 시 항상 비어 있지 않습니다.** 업스트림은 빈 설명에 `400 Invalid tool use format / REQUEST_BODY_INVALID`로 응답하며 **요청 전체**를 거부합니다. 설명이 없으면 도구 이름으로 대체합니다. 이 reason은 **결정적** 오류로 분류되어 곧바로 `400`을 반환합니다.
 > 없는데 해당 필드가 필수여서 요청 전체가 400이었습니다). `input_schema`는 업스트림이 확실히
 > 받아들이는 형태로 **정규화**됩니다(형태만, 의미는 변경 없음). `name`이 **63**자를 넘으면
 > 축약해 전송하고 응답에서는 선언한 이름으로 복원합니다. `description`은 항상 문자열입니다.
@@ -1487,7 +1488,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.11.0"}
+{"service":"kiro2api","status":"ok","version":"0.11.1"}
 ```
 
 ### GET /v1/ping

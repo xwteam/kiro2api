@@ -149,6 +149,10 @@ pub fn body_signals_invalid_request(body: &str) -> bool {
     lower.contains("invalid_model_id")
         || lower.contains("content_length_exceeds_threshold")
         || lower.contains("tool_config_missing")
+        // 上游对请求体本身不合法(工具规格形状不对等)回这个 reason。它是**确定性**的:
+        // 换任何账号都会同样失败。此前落在可重试档,于是一条畸形请求会连烧几个账号的
+        // 重试配额,最后还回一个语焉不详的 502 —— 而真正该做的是立刻回 400 说清哪里不对。
+        || lower.contains("request_body_invalid")
 }
 
 /// 确定性请求错误回给客户端的说明。**必须按 reason 码分别给话**:同一档 `InvalidRequest`
@@ -156,6 +160,13 @@ pub fn body_signals_invalid_request(body: &str) -> bool {
 /// 使用者照着去换模型,换多少次都没用。
 pub fn invalid_request_message(body: &str, model: &str) -> String {
     let lower = body.to_ascii_lowercase();
+    if lower.contains("request_body_invalid") {
+        return "Invalid request body: the upstream rejected the request shape, most often a \
+                malformed tool specification (an empty tool description, or an input_schema \
+                that is not a JSON Schema object). Retrying will not help -- fix the tools \
+                in the request."
+            .to_string();
+    }
     if lower.contains("tool_config_missing") {
         return "Tool configuration missing: the conversation contains tool calls but the \
                 request declared no tools. Resend the tool definitions along with the history."
@@ -1395,6 +1406,34 @@ mod tests {
             "none",
             "成功一次就说明那个原因过去了,标签必须跟着清"
         );
+    }
+
+    /// `REQUEST_BODY_INVALID` 是**确定性**请求错误:不重试、不罚账号,直接把话说清。
+    ///
+    /// 回归:此前它落在可重试档,于是一条畸形请求(最常见是空的工具描述)会连烧几个账号的
+    /// 重试配额,最后还回一个语焉不详的 502 —— 线上实测一次打了 4 个账号。
+    #[test]
+    fn request_body_invalid_is_deterministic_not_retryable() {
+        let body = r#"{"message":"Invalid tool use format.","reason":"REQUEST_BODY_INVALID"}"#;
+        assert!(body_signals_invalid_request(body));
+        assert_eq!(
+            classify_with_body(400, body),
+            FailureKind::InvalidRequest,
+            "必须落在不重试、不罚账号的那一档"
+        );
+        // 回给客户端的话要点出真实原因,而不是笼统一句"上游错误"
+        let msg = invalid_request_message(body, "claude-sonnet-4.5");
+        assert!(msg.contains("tool"), "应指向工具规格: {msg}");
+        assert!(
+            msg.to_lowercase().contains("retry"),
+            "应说明重试无用: {msg}"
+        );
+
+        // 这一档不得冷却、不得禁用、不得累计 strike
+        let mut p = Pool::new(vec![cred("a", 1)], LbMode::Priority);
+        p.report_failure("a", FailureKind::InvalidRequest, 100);
+        assert!(p.select(100).is_some(), "账号不该因请求畸形而被罚");
+        assert_eq!(p.stats(100)[0].strikes, 0);
     }
 
     /// 运行期的"停止使用"**绝不能**落盘,否则"重启即复活"是句空话。

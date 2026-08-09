@@ -599,6 +599,7 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 > **v0.11.0 起的工具契約變更:** `tools[].type` 被接收(服務端內建工具沒有 `input_schema`,
+> **v0.11.1 補充:工具 `description` 上行時保證非空** —— 上游對空描述回 `400 Invalid tool use format / REQUEST_BODY_INVALID`,拒的是**整條請求**。未給描述時本服務用工具名兜底。該 reason 現歸為**確定性**錯誤,直接回 `400`。
 > 此前必填會導致整條請求 400);`input_schema` 會被規範化成上游收得下的形狀(只補形狀不改
 > 語義);`name` 超過 **63** 字元會被縮短並在回應中還原成原名;`description` 上行恆為字串。
 > 另新增 `POST /api/admin/credentials/{id}/refresh`(強制換發新權杖)。
@@ -1238,7 +1239,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.11.0"}
+{"service":"kiro2api","status":"ok","version":"0.11.1"}
 ```
 
 ### GET /v1/ping

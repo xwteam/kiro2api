@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.11.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.11.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | Date | Update |
 |------|--------|
+| 2026-08-09 | v0.11.1 - 🔬 **Two things production testing turned up.** ① **An empty tool description makes upstream reject the whole request** — measured: the same tool with a description returns 200 and a proper `tool_use`; drop the description and it is `400 {"message":"Invalid tool use format.","reason":"REQUEST_BODY_INVALID"}`. v0.11.0 changed `null` to an empty string, but upstream wants a **non-empty** one — the tool name is now used as a fallback. ② `REQUEST_BODY_INVALID` was treated as retryable. It is deterministic — every account fails the same way — so one malformed request burned several accounts' retry budget (four in one measured run) and still returned an unhelpful 502. It is now in the no-retry, no-penalty class and returns a 400 that points at the tool specification |
 | 2026-08-09 | v0.11.0 - 🧰 **Fixes for the class of bugs that made upstream reject the request.** ① Anthropic's **server-side tools** (`web_search` and friends) carry no `input_schema`, yet that field was mandatory — so using the officially supported shape got the request rejected at our own layer with a 400. ② A tool's `description` could serialize to **null**; the real client always sends a string there. ③ `input_schema` was passed through verbatim, so a shape like `properties: null` had upstream reject the **entire request** — schemas are now normalized (shape only, semantics untouched). ④ Over-long tool names were neither shortened (upstream caps at 63) nor mappable back — they are now shortened deterministically and the short→original map is carried to both exits, so the client never sees a tool it did not declare. ⑤ Frames with `:message-type == "error"` were ignored entirely, turning an upstream error into a 200 with an empty message. ⑥ Missing panel assets returned 200 + HTML instead of 404 — **which made "curl the file to check what's deployed" lie to you**. Also adds `POST /api/admin/credentials/{id}/refresh` |
 | 2026-08-09 | v0.10.2 - 🩹 **Fix: a runtime stop was being written to disk, so "a restart revives it" was hollow.** v0.10.0 made quota-exhausted and repeatedly-rejected accounts stop being used, explicitly in memory only — but `snapshot_credentials()` overwrote `cred.disabled` with the runtime flag when persisting, so one quota exhaustion or two 401/403s wrote the account off **permanently** in `credentials.json`, unrecoverable by restart — worse than the behaviour it replaced (one production account was lost this way). Persistence now takes only the durable verdict; the two paths that should persist (operator disable, body-confirmed invalidation) already set `cred.disabled` themselves. **If your `credentials.json` has a `"disabled": true` you never set, flip it back to false to recover the account** |
 | 2026-08-09 | v0.10.1 - 🔌 **Per-account outbound proxy, plus the session identity fields that were missing.** ① The three proxy fields were **accepted and then dropped**, and `hasProxy` was hardcoded to `false` — the panel said it was configured while every request went out direct. They are now persisted and effective, with precedence credential > global > direct (`"direct"` forces a direct connection), and **one account's data plane, token refresh, balance, model list and background renewal all share a single exit** (a data plane behind a proxy while refresh comes from the main IP is worse than no proxy at all). ② `conversationId` was regenerated per request and was not UUID-shaped → it now prefers the session UUID carried in the client's `metadata.user_id`, so one session shares one id. ③ `agentContinuationId` **was never sent**; it is now. ④ Credentials added through the panel never got a frozen machineId (v0.10.0 only covered those already in the file) → now frozen the moment they enter the pool. ⑤ `isCurrent` was hardcoded `false`; it now reports the truth |
@@ -288,7 +289,7 @@ docker compose logs -f
 ```bash
 # Health check
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.11.0"}
+# {"service":"kiro2api","status":"ok","version":"0.11.1"}
 
 # View available models
 curl http://localhost:8080/v1/models \

@@ -677,6 +677,7 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 > **v0.11.0 でのツール契約の変更:** `tools[].type` を受け付けます(サーバー側組み込みツールは
+> **v0.11.1:ツールの `description` は送信時に必ず非空になります。** 上流は空の説明に対し `400 Invalid tool use format / REQUEST_BODY_INVALID` を返し、**リクエスト全体**を拒否します。説明が無い場合はツール名で補います。この reason は**決定的**な誤りとして分類され、そのまま `400` を返します。
 > `input_schema` を持たず、同フィールドが必須だったため整リクエストが 400 になっていました)。
 > `input_schema` は上流が確実に受け取れる形へ**正規化**します(形のみ、意味は変更しません)。
 > `name` が **63** 文字を超える場合は短縮して送り、レスポンスでは宣言どおりの名前へ復元します。
@@ -1219,7 +1220,7 @@ curl -X PUT http://localhost:8080/api/admin/config/auth-keys \
 ```json
 {
   "masterApiKey": "sk-マスターキーの平文",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1447,7 +1448,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.11.0"
+  "version": "0.11.1"
 }
 ```
 

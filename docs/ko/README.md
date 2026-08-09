@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.11.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.11.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 날짜 | 업데이트 내용 |
 |------|----------|
+| 2026-08-09 | v0.11.1 - 🔬 **운영 환경 실측으로 드러난 두 가지.** ① **도구 설명이 비어 있으면 업스트림이 요청 전체를 거부**합니다(실측: 같은 도구에 설명이 있으면 200과 정상 `tool_use`, 설명을 빼면 `400 Invalid tool use format / REQUEST_BODY_INVALID`). v0.11.0에서 `null`을 빈 문자열로 바꿨지만 업스트림이 원하는 것은 **비어 있지 않은** 값이었습니다 → 도구 이름으로 대체. ② `REQUEST_BODY_INVALID`를 재시도 가능으로 처리했습니다. 이는 결정적이어서 어떤 계정으로도 똑같이 실패하는데, 잘못된 요청 하나가 여러 계정의 재시도 예산을 소모하고(실측 4개) 결국 모호한 502를 반환했습니다 → 재시도 없음·계정 무벌점 등급으로 옮기고 도구 명세를 지목하는 400을 반환합니다 |
 | 2026-08-09 | v0.11.0 - 🧰 **「업스트림이 요청을 거부하게 만드는」 부류의 버그 수정.** ① 서버 측 내장 도구(web_search 등)는 `input_schema`가 없는데 해당 필드가 필수여서, 공식 표기를 쓰기만 해도 우리 계층에서 400. ② 도구 `description`이 **null**로 직렬화될 수 있었습니다(실제 클라이언트는 항상 문자열). ③ `input_schema`를 그대로 전달해 `properties: null` 같은 형태에서 **요청 전체**가 거부됐습니다 → 형태만 정규화(의미는 변경하지 않음). ④ 너무 긴 도구 이름을 줄이지 않았고(업스트림 상한 63) 복원도 불가능했습니다 → 결정적으로 축약하고 `축약명→원본명`을 출구까지 전달해 복원. ⑤ `:message-type == "error"` 프레임을 완전히 무시해 업스트림 오류가 200+빈 메시지가 됐습니다. ⑥ 패널의 없는 자산이 404가 아니라 200+HTML을 반환했습니다. 그 외 `POST /api/admin/credentials/{id}/refresh` 추가 |
 | 2026-08-09 | v0.10.2 - 🩹 **수정: 런타임 사용 중단이 디스크에 기록되어 「재시작하면 복구된다」가 빈말이었습니다.** v0.10.0은 메모리 상태만 바꾼다고 명시했지만, 영속화 시 `snapshot_credentials()`가 런타임 `disabled`로 `cred.disabled`를 덮어써서 한도 소진 1회 또는 401/403 2회로 `credentials.json`에 **영구히** 기록됐고 재시작으로도 돌아오지 않았습니다 — 바꾸기 전 동작보다 나쁩니다(운영 중 계정 하나를 이렇게 잃었습니다). 이제 영속적인 결론만 기록합니다. **직접 중지한 적 없는 `"disabled": true`가 있다면 false로 되돌리면 복구됩니다** |
 | 2026-08-09 | v0.10.1 - 🔌 **계정별 아웃바운드 프록시와 누락됐던 세션 식별 필드 보완.** ① 프록시 3개 필드는 **받고 나서 버려졌고**, `hasProxy`도 `false`로 하드코딩돼 있었습니다 — 패널은 설정됐다고 표시하지만 실제로는 전부 직접 연결. 이제 실제로 저장되어 동작하며 우선순위는 자격증명 > 전역 > 직결(`"direct"`는 명시적 직결)이고, **한 계정의 데이터 플레인/토큰 갱신/잔량 조회/모델 목록/백그라운드 갱신이 모두 같은 출구**를 사용합니다(데이터 플레인만 프록시를 타고 갱신은 메인 IP에서 나가는 것은 프록시가 없느니만 못합니다). ② `conversationId`가 요청마다 새로 생성되고 UUID 형태도 아니었습니다 → 클라이언트 `metadata.user_id`의 세션 UUID를 우선 사용해 같은 세션이 공유합니다. ③ `agentContinuationId`는 **아예 보내지 않았습니다**. ④ 패널로 추가한 계정은 machineId가 고정되지 않았습니다 → 풀 진입 시점에 고정. ⑤ `isCurrent` 하드코딩 `false`를 실제 값으로 |
@@ -243,7 +244,7 @@ docker compose logs -f
 ```bash
 # 헬스 체크
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.11.0"}
+# {"service":"kiro2api","status":"ok","version":"0.11.1"}
 
 # 프로토콜 고정 모델 목록 조회
 curl http://localhost:8080/v1/models \

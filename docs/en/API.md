@@ -625,6 +625,7 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 > **Tool contract changes in v0.11.0** (these affect clients directly):
+> **v0.11.1: a tool's `description` is guaranteed non-empty on the wire.** Upstream answers an empty description with `400 Invalid tool use format / REQUEST_BODY_INVALID` and rejects the **entire request**; when you omit one, this service falls back to the tool name. That reason is now classified as **deterministic** and returned as a `400` directly, instead of being retried across accounts and surfacing as a 502.
 > - `tools[].type` is now accepted. Anthropic's **server-side tools** (`web_search_20250305`
 >   and friends) carry no `input_schema`, and that field used to be mandatory — so the request
 >   was rejected with a 400 by this service before it ever reached upstream.
@@ -1241,7 +1242,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1457,7 +1458,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.11.0"
+  "version": "0.11.1"
 }
 ```
 
