@@ -69,7 +69,9 @@ pub struct ToolSpec {
 #[serde(rename_all = "camelCase")]
 pub struct ToolSpecInner {
     pub name: String,
-    pub description: Option<String>,
+    /// **恒为字符串,绝不为 null。** 此前是 `Option<String>`,客户端没给描述时会序列化成
+    /// `"description": null` —— 而真实客户端在这个位置永远是个字符串(没有就是空串)。
+    pub description: String,
     pub input_schema: InputSchemaJson,
 }
 
@@ -246,7 +248,7 @@ mod tests {
             tools: Some(vec![ToolSpec {
                 tool_specification: ToolSpecInner {
                     name: "get_weather".to_string(),
-                    description: Some("d".to_string()),
+                    description: "d".to_string(),
                     input_schema: InputSchemaJson {
                         json: serde_json::json!({"type": "object"}),
                     },

@@ -597,6 +597,11 @@ curl http://localhost:8080/api/admin/credentials \
 > **`banned` 會真正把帳號擋在池外**,其餘原因只影響展示。冷卻是計時器,到點自動回池;封禁是上游給的結論(原話為「帳號已鎖定,請聯絡客服驗證身分」),不隨時間解除。若只按計時器放行,冷卻一過帳號就重新入選、再失敗、再冷卻,循環燒真實請求,而 `available` 還把它算作可用——面板一邊掛著「封禁」、計數一邊說沒事,兩個數字互相矛盾。因此封禁帳號不被選中、不計入 `available`、`healthStatus` 報 `unhealthy`。它不會自癒(永遠等不到那次成功來清標籤),**唯一出口是面板的「重置」**(`POST /api/admin/credentials/{id}/reset`,會一併清掉該結論)。其餘原因仍在帳號下次成功時自動清空。該結論隨 `credentials.json` 落盤(`statusReason` 鍵)、重啟後還原——只活在記憶體裡的話,每次發版都會把它抹掉、帳號悄悄回池。**strike 計數與冷卻截止時刻仍不落盤**:那兩個是計時器,重啟從零開始無非早重試一次;結論不同,它決定帳號能不能進池。
 
 
+
+> **v0.11.0 起的工具契約變更:** `tools[].type` 被接收(服務端內建工具沒有 `input_schema`,
+> 此前必填會導致整條請求 400);`input_schema` 會被規範化成上游收得下的形狀(只補形狀不改
+> 語義);`name` 超過 **63** 字元會被縮短並在回應中還原成原名;`description` 上行恆為字串。
+> 另新增 `POST /api/admin/credentials/{id}/refresh`(強制換發新權杖)。
 > **代理欄位自 v0.10.1 起真正生效。** 此前 `proxyUrl` / `proxyUsername` / `proxyPassword`
 > 被介面收下但**不落庫**,`hasProxy` 恆為 `false`。現在:優先級 **憑證級 > 全域 > 直連**;
 > 憑證級填 `"direct"` 表示該帳號顯式直連。支援 `http://` / `https://` / `socks5://`。
@@ -1233,7 +1238,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.10.2"}
+{"service":"kiro2api","status":"ok","version":"0.11.0"}
 ```
 
 ### GET /v1/ping

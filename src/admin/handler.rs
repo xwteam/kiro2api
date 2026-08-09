@@ -2804,6 +2804,66 @@ pub async fn reset_credential_failure(
     .into_response()
 }
 
+/// `POST /api/admin/credentials/{id}/refresh` —— 立刻强制换发一枚新令牌。
+///
+/// 用途:回答"这个账号的 refreshToken 还活着吗"。此前只能等它自然过期,或发一次真实请求
+/// 去撞 —— 而后者会把一个可能已经失效的账号推到数据面上。`force_refresh` 早就写好了,
+/// 只是从来没接过路由。
+///
+/// 出口按该账号自己的代理取,与它的数据面一致。
+pub async fn refresh_credential_token(
+    State(state): State<MessagesState>,
+    Path(id): Path<String>,
+) -> Response {
+    let snapshot = {
+        let pool = state.pool.lock().await;
+        pool.snapshot_credentials().into_iter().find(|c| c.id == id)
+    };
+    let Some(cred) = snapshot else {
+        return not_found(&id);
+    };
+    // API Key 凭据没有可换的东西(ksk 本身就是数据面 bearer),明确说清而不是去打一个
+    // 注定失败的端点。
+    if cred.is_api_key() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(SuccessResponse {
+                success: false,
+                message: "API Key 凭据不刷新:ksk 本身就是数据面令牌".into(),
+            }),
+        )
+            .into_response();
+    }
+    let now = now_unix();
+    // 传当前 access_token 作双检基线:池内若已被别人换过,直接复用而不再轮换一次
+    //(轮换会作废他人正在用的令牌)。
+    let r = crate::kiro::ensure_fresh::force_refresh(
+        &state.pool,
+        &id,
+        &crate::http::unary_for(&cred),
+        now,
+        &cred.access_token,
+        Some(&state.refresh_ctx),
+    )
+    .await;
+    match r {
+        Ok(c) => Json(serde_json::json!({
+            "success": true,
+            "message": "token refreshed",
+            "expiresAt": unix_to_rfc3339(c.expires_at_unix),
+        }))
+        .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(SuccessResponse {
+                success: false,
+                message: format!("刷新失败: {e:?}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 // ============ 批量 / KAM 导入(server-side,与前端 batch/KAM 弹窗契约同形) ============
 //
 // 前端 batch-import / KAM-import 弹窗当前在浏览器逐条解析并调 `POST /credentials`,

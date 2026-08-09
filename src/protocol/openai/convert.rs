@@ -213,6 +213,7 @@ pub fn openai_to_hub(req: ChatCompletionRequest) -> MessagesRequest {
         tools
             .into_iter()
             .map(|t| ToolDef {
+                tool_type: None,
                 name: t.function.name,
                 description: t.function.description,
                 input_schema: t.function.parameters,

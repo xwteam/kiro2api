@@ -227,6 +227,7 @@ pub fn gemini_to_hub(
             .into_iter()
             .flat_map(|t| t.function_declarations)
             .map(|fd| ToolDef {
+                tool_type: None,
                 name: fd.name,
                 description: fd.description,
                 input_schema: fd.parameters,

@@ -105,6 +105,19 @@ cat data/config.json | grep apiKey
 | 404 | 管理端点的 `{id}` 不存在：账号回 `{"error":"account not found","id":…}`，API-KEY 回 `{"error":"api key not found","id":…}`，登录会话回 `{"success":false,"error":"login session not found or expired"}` |
 | 422 | 请求体反序列化失败（缺必填字段 / 类型不符），axum 默认拒收，`text/plain` 纯文本。出现在带 body 提取器的端点上：`/api/admin/*` 与 `POST /api/user/login`（四个协议对话端点与 `/v1/messages/count_tokens` 已自行接管拒收、改回各自形状的 `400`）（`/api/user/*` 的其余端点只收 query，参数类型不符是 `400` 而非 `422`） |
 
+
+> **v0.11.0 起的工具契约变更(与客户端直接相关):**
+> - `tools[].type` 被接收:Anthropic **服务端内置工具**(`web_search_20250305` 等)没有
+>   `input_schema`,此前该字段必填,导致整条请求在本服务这层就被 400。现已容缺。
+> - `tools[].input_schema` 会被**规范化**成上游一定收得下的形状(补 `type`/`properties`/
+>   `required`/`additionalProperties`)。**只补形状,不改语义** —— 本来合法的字段原样保留。
+> - `tools[].name` 超过 **63** 字符会被缩短为 `前缀_8位sha256`,并在响应里**还原**成你声明的
+>   原名。流式与非流式两条路都还原,故客户端侧无感。
+> - 工具 `description` 上行时恒为字符串(缺省为空串),不再出现 `null`;超过 10000 字符按
+>   字符边界截断。
+>
+> 另新增 `POST /api/admin/credentials/{id}/refresh`:立刻强制换发新令牌,用来判断该账号的
+> refreshToken 是否还有效。API Key(ksk)凭据返回 400(它没有可换的东西)。
 > **代理字段自 v0.10.1 起真正生效。** 此前 `proxyUrl` / `proxyUsername` / `proxyPassword`
 > 被接口收下但**不落库**,`hasProxy` 恒为 `false` —— 面板显示配置成功,流量照旧直连。
 > 现在:优先级 **凭据级 `proxyUrl` > 全局 `proxyUrl` > 直连**;凭据级填 `"direct"`(不分
@@ -1239,7 +1252,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.10.2",
+  "version": "0.11.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1427,7 +1440,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.10.2"
+  "version": "0.11.0"
 }
 ```
 

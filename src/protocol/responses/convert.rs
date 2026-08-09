@@ -143,6 +143,7 @@ pub fn responses_to_hub(req: ResponsesRequest) -> Result<MessagesRequest, Respon
             .into_iter()
             .filter_map(|t: ResponsesTool| match t.name {
                 Some(name) => Some(ToolDef {
+                    tool_type: None,
                     name,
                     description: t.description,
                     // 无 `parameters` 的函数工具照中枢规范补空对象:中枢要求 input_schema 是

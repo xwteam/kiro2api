@@ -22,8 +22,8 @@ use tokio::sync::Mutex;
 use crate::apikey::ApiKeyStore;
 use crate::config::Config;
 use crate::kiro::convert::{
-    ConvertError, StreamException, Truncation, anthropic_to_kiro, exception_status,
-    extract_exception, kiro_events_to_anthropic,
+    ConvertError, StreamException, Truncation, exception_status, extract_exception,
+    kiro_events_to_anthropic,
 };
 use crate::kiro::endpoint::Endpoint;
 use crate::kiro::eventstream::decoder::StreamDecoder;
@@ -351,6 +351,28 @@ pub(crate) struct CallOutcome {
     pub resp: reqwest::Response,
     /// 选中凭据的数值 id(`Credential.id` 解析为 u32;非数值/缺失回落 0)。
     pub credential_id: u32,
+    /// `短名 → 原名`。超长工具名上行前被缩短,上游回来的 `tool_use` 用的是短名;
+    /// 出口处必须还原,否则客户端收到一个它没声明过的工具名。名字都没超长时为空表。
+    pub tool_name_map: std::collections::HashMap<String, String>,
+}
+
+/// 把响应里被缩短过的工具名还原成客户端原本声明的名字。
+///
+/// 表为空(没有任何工具名超长)时直接返回,不遍历。
+fn restore_tool_names(
+    out: &mut crate::protocol::anthropic::types::MessagesResponse,
+    map: &std::collections::HashMap<String, String>,
+) {
+    if map.is_empty() {
+        return;
+    }
+    for b in out.content.iter_mut() {
+        if let crate::protocol::anthropic::types::OutBlock::ToolUse { name, .. } = b
+            && let Some(orig) = map.get(name.as_str())
+        {
+            *name = orig.clone();
+        }
+    }
 }
 
 /// 把 `Credential.id`(内部 String,磁盘上多为整数)解析为统计层用的 u32;非数值回落 0。
@@ -584,8 +606,12 @@ pub(crate) async fn select_and_call_once(
     let credential_id = credential_id_num(&cred.id);
 
     // 3) 转换请求体(未映射模型/空消息 → 400)。Convert 为请求级致命错误,不触发跨账号重试。
-    let kiro_req = anthropic_to_kiro(req, cred.profile_arn.as_deref())
+    let converted = crate::kiro::convert::anthropic_to_kiro_full(req, cred.profile_arn.as_deref())
         .map_err(|e| (RelayError::Convert(e), Some(tried_id.clone())))?;
+    let kiro_req = converted.request;
+    // 超长工具名在上行时被缩短了,上游回来的 tool_use 用的就是短名。这张表要一路带到出口,
+    // 否则客户端会收到一个**它自己没声明过**的工具名,那一轮工具调用直接作废。
+    let tool_name_map = converted.tool_name_map;
     let body = serde_json::to_vec(&kiro_req).map_err(|e| {
         (
             RelayError::Upstream(format!("encode: {e}")),
@@ -704,6 +730,7 @@ pub(crate) async fn select_and_call_once(
         CallOutcome {
             resp,
             credential_id,
+            tool_name_map,
         },
         tried_id,
     ))
@@ -863,6 +890,7 @@ pub async fn relay_core_outcome(
     let CallOutcome {
         resp,
         credential_id,
+        tool_name_map,
     } = select_and_call_with_retry(state, &req, now_unix, bound.as_ref()).await?;
 
     // 端到端延迟(选账号+跨账号重试+调上游,至上游响应就绪):既用于 INFO 日志,也随用量记录落库
@@ -906,7 +934,10 @@ pub async fn relay_core_outcome(
         return Ok(CoreOutcome::Exception { status, e });
     }
 
-    let out = kiro_events_to_anthropic(&frames, &req.model);
+    let mut out = kiro_events_to_anthropic(&frames, &req.model);
+    // 工具名还原:上行时超长名被缩短,上游回来的就是短名。不还原的话客户端收到一个
+    // 它自己没声明过的工具名,那一轮工具调用直接作废。名字没超长时该表为空,零开销。
+    restore_tool_names(&mut out, &tool_name_map);
 
     // meteringEvent(若上游发了)带真实积分消耗与缓存 token;无则 credits=None、回退字符估算。
     let metering = crate::kiro::convert::extract_metering(&frames);
@@ -1090,6 +1121,7 @@ pub async fn relay_stream_attributed(
     let CallOutcome {
         mut resp,
         credential_id,
+        tool_name_map,
     } = select_and_call_with_retry(state, &req, now_unix, bound.as_ref()).await?;
     let model = req.model.clone();
 
@@ -1189,7 +1221,12 @@ pub async fn relay_stream_attributed(
                                         text_index = None; // 允许后续文本重开新块
                                     }
                                 }
-                                let name = v["name"].as_str().unwrap_or("");
+                                let raw_name = v["name"].as_str().unwrap_or("");
+                                // 还原成客户端认识的原名(见 CallOutcome::tool_name_map)。
+                                let name = tool_name_map
+                                    .get(raw_name)
+                                    .map(String::as_str)
+                                    .unwrap_or(raw_name);
                                 let idx = next_index;
                                 next_index += 1;
                                 tool_index.insert(id.to_string(), idx);

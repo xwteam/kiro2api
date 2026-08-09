@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.10.2-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.11.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-08-09 | v0.11.0 - 🧰 **修「会让请求被上游拒」的一类**。①Anthropic **服务端内置工具**(web_search 等)没有 `input_schema`,而该字段此前是必填 → 客户端一用官方写法,请求就在我们这层 400;②工具 `description` 会序列化成 **null**(真实客户端恒为字符串);③`input_schema` 原样透传,`properties: null` 这类形状不合法会被上游拒掉**整条请求** → 现统一规范化(只补形状不改语义);④超长工具名不缩短(上游上限 63)、缩短后也无法还原 → 现确定性缩短并把 `短名→原名` 带到出口,流式/非流式都还原,否则客户端收到自己没声明过的工具;⑤`:message-type == "error"` 的框架级错误帧被整个忽略 → 上游报错却还原成 200+空消息;⑥面板缺失资源返回 200+HTML 而非 404 —— **这条会让「用 curl 核对产物是否上线」本身骗人**。另:新增 `POST /api/admin/credentials/{id}/refresh` 强制换发令牌 |
 | 2026-08-09 | v0.10.2 - 🩹 **修:运行期停用被写进磁盘,「重启即复活」形同虚设**。v0.10.0 把额度耗尽/连续鉴权失败改为停止使用并声明只置内存态,但落盘时 `snapshot_credentials()` 拿运行时 `disabled` 覆写了 `cred.disabled` —— 一次配额耗尽或两次 401/403 就把账号**永久**写死在 credentials.json 里,重启也回不来,比修复前更糟(线上真的死过一个号)。现落盘只取持久结论;管理员手工停用与响应体确证的失效本就同时写 `cred.disabled`,不会漏。**若你的 credentials.json 里有你没手工停过的 `"disabled": true`,改回 false 即可恢复** |
 | 2026-08-09 | v0.10.1 - 🔌 **出站代理按账号分流 + 补齐会话身份字段**。①代理三件套此前**收下即丢**、`hasProxy` 还硬编码 false —— 面板显示配好了、实际全程直连;现真正落库生效,优先级 凭据级 > 全局 > 直连(`"direct"` 显式直连),且**同一账号的数据面/刷新/余额/模型清单/后台续期一律同一出口**(数据面走代理而刷新从主 IP 出比不配更糟);②`conversationId` 此前每请求新生成且不是 UUID 形状 → 改为优先取客户端 `metadata.user_id` 里的 session UUID,同会话共用;③此前**根本不发** `agentContinuationId`,已补;④管理面新增的账号不会冻结 machineId(v0.10.0 只覆盖启动时文件里已有的),现入池即冻结;⑤`isCurrent` 硬编码 false,现报真值 |
 | 2026-08-09 | v0.10.0 - 🎯 **按行为形态对齐真实客户端**。对照一个长期稳定的同类实现逐模块比对后,前两版对封号的归因被推翻:那份实现既复用连接、也不锁 HTTP/1.1、TLS 还默认 rustls,我们赌的三件事它一件没做。真正的差异是:①`priority` 此前**每请求换一个账号**,上游在同一 IP 上看到几百个 machineId 秒级交替 → 改为**粘住一个账号直到它不可用**;②封停/额度耗尽的账号此前冷却 5/30 分钟后**自动回池**,等于永不停止地去撞墙 → 改为停止使用(内存态,重置可复活);③**令牌刷新请求连 User-Agent 都没有**(实测字节),而那是 Kiro 自家端点、每个账号必走 → 按 axios/sso-oidc 两种真实形态补齐;④**machineId 每刷新一次就变**(由会轮换的 refreshToken 现算)→ 载入时冻结落盘;⑤ksk 账号 machineId 退化成全局常量 → 按类型互斥派生。另:429 改判瞬时限流、数据面端点三个收敛为一个、`amz-sdk-invocation-id` 改 UUID v4、头顺序对齐、补 `claude-opus-5` 映射、SSE 加 25 秒保活 |
@@ -270,7 +271,7 @@ kiro2api 内置令牌自愈机制：token 到期**自动内存刷新**（单飞�
 ```bash
 # 健康检查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.10.2"}
+# {"service":"kiro2api","status":"ok","version":"0.11.0"}
 
 # 查看协议侧模型清单（固定短清单，不代表账号档位真的授权）
 curl http://localhost:8080/v1/models \

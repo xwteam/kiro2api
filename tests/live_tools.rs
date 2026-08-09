@@ -84,6 +84,7 @@ async fn live_tools_get_weather_round_trip() {
         max_tokens: Some(64),
         stream: Some(false),
         tools: Some(vec![ToolDef {
+            tool_type: None,
             name: "get_weather".to_string(),
             description: Some("Get the current weather for a city.".to_string()),
             input_schema: serde_json::json!({

@@ -67,12 +67,27 @@ fn serve<A: RustEmbed>(path: &str, inm: Option<&str>) -> Response {
             let mime = mime_guess::from_path(candidate).first_or_octet_stream();
             serve_asset(f, mime.as_ref(), inm)
         }
-        // SPA 回退:非静态路径回 index.html
+        // SPA 回退**只对路由生效**,资源路径找不到就老实 404。
+        //
+        // 此前是无条件回退:`assets/index-abc123.js` 这种明明是资源、明明不存在的路径,
+        // 也会拿到 `200` + 一整篇 HTML。两个坏处:
+        // 1. 浏览器把 HTML 当 JS 解析,报的是 `Unexpected token '<'`,而不是一眼可见的 404;
+        // 2. **用 curl 核对某个构建产物是否上线时,不存在的文件也返回 200 —— 校验本身在骗人。**
+        //
+        // 判据用"文件名是否带扩展名":带扩展名的当资源(404),不带的当前端路由(回 index)。
+        None if is_asset_path(candidate) => StatusCode::NOT_FOUND.into_response(),
         None => match A::get("index.html") {
             Some(f) => serve_asset(f, "text/html", inm),
             None => StatusCode::NOT_FOUND.into_response(),
         },
     }
+}
+
+/// 路径是否指向一个静态资源(而非前端路由):取最后一段,含 `.` 即认为带扩展名。
+fn is_asset_path(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|last| last.contains('.'))
 }
 
 /// 从请求头取 `If-None-Match`(非 UTF-8 视为未提供)。
@@ -128,6 +143,53 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    /// 不存在的**资源**必须 404,不能回 200 + index.html。
+    ///
+    /// 回归:SPA 回退此前是无条件的,于是 `js/does-not-exist.js` 也拿到 `200` + 一整篇 HTML。
+    /// 浏览器把 HTML 当 JS 解析,报的是 `Unexpected token '<'`;更坏的是,**用 curl 核对
+    /// 某个构建产物是否上线时,不存在的文件也返回 200 —— 校验本身在骗人。**
+    #[tokio::test]
+    async fn missing_assets_404_while_routes_still_fall_back_to_index() {
+        // 带扩展名 → 资源 → 404
+        for p in [
+            "/admin/js/does-not-exist.js",
+            "/admin/assets/index-deadbeef.css",
+        ] {
+            let resp = admin_router()
+                .oneshot(Request::builder().uri(p).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{p} 应 404");
+        }
+        // 不带扩展名 → 前端路由 → 回 index.html
+        let resp = admin_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/some/spa/route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "前端路由仍应回 index");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("<"),
+            "回退内容应是 HTML"
+        );
+    }
+
+    #[test]
+    fn is_asset_path_only_matches_names_with_an_extension() {
+        assert!(is_asset_path("js/app.js"));
+        assert!(is_asset_path("assets/index-abc.css"));
+        assert!(is_asset_path("favicon.ico"));
+        assert!(!is_asset_path("dashboard"));
+        assert!(!is_asset_path("some/spa/route"));
+        // 目录名里有点、文件名没有 → 仍算路由
+        assert!(!is_asset_path("v1.0/settings"));
+    }
 
     /// 面板资源必须带缓存协商头。一个头都不发时,HTTP 允许浏览器**启发式缓存**——
     /// 自己决定存多久——发版后用户看到的仍是旧面板。实际发生过:后端已是 0.7.9,

@@ -304,6 +304,7 @@ pub async fn chat_completions_stream(
     let crate::protocol::anthropic::handler::CallOutcome {
         mut resp,
         credential_id,
+        tool_name_map: _,
     } = select_and_call_with_retry(&state, &hub_req, now_unix, bound.as_ref()).await?;
     // 统计层用量句柄(Arc,移入哨兵);记账经 Drop 哨兵在流**任意方式结束**时都落一条(#8/#9/#15)。
     let usage_handle = state.stats.usage.clone();

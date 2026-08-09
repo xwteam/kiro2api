@@ -65,9 +65,18 @@ impl SystemPrompt {
 /// 工具定义(照 Anthropic 公开规范)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDef {
+    /// 工具类型。Anthropic 的**服务端内置工具**(如 `web_search_20250305`)靠它标识,
+    /// 那类工具**没有** `input_schema`。此前该字段是必填,于是客户端一带内置工具,
+    /// 整条请求就在我们这层 400 掉 —— 而客户端只是用了官方支持的写法。
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub tool_type: Option<String>,
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// 缺省即空对象:内置工具没有这个字段,普通工具缺了也不该让整条请求失败
+    ///(规范化那一步会把它补成合法的空 schema)。
+    #[serde(default)]
     pub input_schema: serde_json::Value,
 }
 

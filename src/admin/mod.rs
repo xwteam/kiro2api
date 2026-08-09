@@ -50,6 +50,12 @@ pub fn admin_api_router(state: MessagesState) -> Router {
             "/api/admin/credentials/{id}/reset",
             post(handler::reset_credential_failure),
         )
+        // 强制换发新令牌:回答"这个账号的 refreshToken 还活着吗",
+        // 不必等它自然过期、也不必拿一个可能已失效的账号去撞数据面。
+        .route(
+            "/api/admin/credentials/{id}/refresh",
+            post(handler::refresh_credential_token),
+        )
         // ---- Phase 3 交互式登录流(/api/admin/login/*)----
         .route(
             "/api/admin/login/builderid/start",

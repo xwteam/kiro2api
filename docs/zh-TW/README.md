@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.10.2-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.11.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-08-09 | v0.11.0 - 🧰 **修「會讓請求被上游拒」的一類**。①服務端內建工具(web_search 等)沒有 `input_schema`,而該欄位此前是必填 → 客戶端一用官方寫法,請求就在我們這層 400;②工具 `description` 會序列化成 **null**;③`input_schema` 原樣透傳,形狀不合法會被上游拒掉**整條請求** → 現統一規範化;④超長工具名不縮短(上游上限 63)、縮短後也無法還原 → 現確定性縮短並把 `短名→原名` 帶到出口;⑤`:message-type == "error"` 的框架級錯誤幀被整個忽略 → 上游報錯卻還原成 200+空訊息;⑥面板缺失資源返回 200+HTML 而非 404。另:新增 `POST /api/admin/credentials/{id}/refresh` |
 | 2026-08-09 | v0.10.2 - 🩹 **修:執行期停用被寫進磁碟,「重啟即復活」形同虛設**。v0.10.0 宣告只置記憶體態,但落盤時 `snapshot_credentials()` 拿執行時 `disabled` 覆寫了 `cred.disabled` —— 一次額度耗盡或兩次 401/403 就把帳號**永久**寫死在 credentials.json 裡,比修復前更糟。現落盤只取持久結論。**若你的 credentials.json 裡有你沒手工停過的 `"disabled": true`,改回 false 即可恢復** |
 | 2026-08-09 | v0.10.1 - 🔌 **出站代理按帳號分流 + 補齊工作階段身分欄位**。①代理三件套此前**收下即丟**、`hasProxy` 還硬編碼 false —— 面板顯示配好了、實際全程直連;現真正落庫生效,優先級 憑證級 > 全域 > 直連(`"direct"` 顯式直連),且**同一帳號的資料面/重新整理/餘額/模型清單/背景續期一律同一出口**;②`conversationId` 此前每請求新生成且不是 UUID 形狀 → 改為優先取客戶端 `metadata.user_id` 裡的 session UUID,同工作階段共用;③此前**根本不發** `agentContinuationId`,已補;④管理面新增的帳號不會凍結 machineId,現入池即凍結;⑤`isCurrent` 硬編碼 false,現報真值 |
 | 2026-08-09 | v0.10.0 - 🎯 **按行為形態對齊真實客戶端**。對照一個長期穩定的同類實作逐模組比對後,前兩版對封號的歸因被推翻:那份實作既複用連線、也不鎖 HTTP/1.1、TLS 還預設 rustls,我們賭的三件事它一件沒做。真正的差異是:①`priority` 此前**每請求換一個帳號**,上游在同一 IP 上看到幾百個 machineId 秒級交替 → 改為**黏住一個帳號直到它不可用**;②封停/額度耗盡的帳號此前冷卻 5/30 分鐘後**自動回池**,等於永不停止地去撞牆 → 改為停止使用(記憶體態,重設可復活);③**令牌重新整理請求連 User-Agent 都沒有**(實測位元組),而那是 Kiro 自家端點、每個帳號必走 → 按 axios/sso-oidc 兩種真實形態補齊;④**machineId 每重新整理一次就變**(由會輪換的 refreshToken 現算)→ 載入時凍結落盤;⑤ksk 帳號 machineId 退化成全域常數 → 按型別互斥衍生。另:429 改判瞬時限流、資料面端點三個收斂為一個、`amz-sdk-invocation-id` 改 UUID v4、標頭順序對齊、補 `claude-opus-5` 對應、SSE 加 25 秒保活 |
@@ -245,7 +246,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.10.2"}
+# {"service":"kiro2api","status":"ok","version":"0.11.0"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \

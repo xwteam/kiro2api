@@ -205,17 +205,21 @@ fn tool_names_in_history(messages: &[InMsg]) -> Vec<String> {
 /// 补的是**模型自己调用过**的工具,补上定义只是让请求自洽;不补则整个请求被上游拒掉、
 /// 那一轮对话彻底失败。schema 给空对象:我们无从知道原始定义(客户端这轮没送),
 /// 而上游只要求 `toolConfig` 存在且形状合法,不校验它与历史调用的参数是否吻合。
-fn tool_specs_with_history_fallback(tools: &[ToolDef], messages: &[InMsg]) -> Vec<ToolSpec> {
-    let mut specs = map_tools(tools);
+fn tool_specs_with_history_fallback(
+    tools: &[ToolDef],
+    messages: &[InMsg],
+    map: &mut std::collections::HashMap<String, String>,
+) -> Vec<ToolSpec> {
+    let mut specs = map_tools(tools, map);
     let declared: std::collections::HashSet<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     for name in tool_names_in_history(messages) {
         if !declared.contains(name.as_str()) {
             specs.push(ToolSpec {
                 tool_specification: ToolSpecInner {
-                    name,
-                    description: None,
+                    name: map_tool_name(&name, map),
+                    description: String::new(),
                     input_schema: InputSchemaJson {
-                        json: serde_json::json!({"type": "object", "properties": {}}),
+                        json: normalize_json_schema(&serde_json::Value::Null),
                     },
                 },
             });
@@ -224,18 +228,106 @@ fn tool_specs_with_history_fallback(tools: &[ToolDef], messages: &[InMsg]) -> Ve
     specs
 }
 
+/// 工具名长度上限(照观测的上游约束)。
+const TOOL_NAME_MAX_LEN: usize = 63;
+
+/// 工具描述长度上限。超长描述会把请求体撑大,且上游有自己的上限;这里先行安全截断。
+const TOOL_DESC_MAX_CHARS: usize = 10_000;
+
+/// 超长工具名 → 确定性短名:`前缀 + "_" + 8 位 sha256`,总长恰好 63。
+///
+/// 必须**确定性**:同一个工具名在每次请求里都要缩成同一个短名,否则模型在多轮之间看到的
+/// 工具会变来变去。按字符边界截前缀,避免把多字节字符切一半。
+fn shorten_tool_name(name: &str) -> String {
+    use sha2::Digest;
+    let hash = hex::encode(sha2::Sha256::digest(name.as_bytes()));
+    let prefix_max = TOOL_NAME_MAX_LEN - 1 - 8;
+    let prefix = match name.char_indices().nth(prefix_max) {
+        Some((idx, _)) => &name[..idx],
+        None => name,
+    };
+    format!("{}_{}", prefix, &hash[..8])
+}
+
+/// 需要缩短就缩短,并把 `短名 → 原名` 记进映射(供把上游回来的 tool_use 名字还原)。
+fn map_tool_name(name: &str, map: &mut std::collections::HashMap<String, String>) -> String {
+    if name.len() <= TOOL_NAME_MAX_LEN {
+        return name.to_string();
+    }
+    let short = shorten_tool_name(name);
+    map.insert(short.clone(), name.to_string());
+    short
+}
+
+/// 把工具的 JSON Schema 规范成上游一定收得下的形状。
+///
+/// 客户端给的 schema 千奇百怪:`type` 缺失或不是字符串、`properties` 是 null、
+/// `required` 是 null 或混进了非字符串、`additionalProperties` 给了个数字……
+/// 原样透传的话上游直接拒掉**整条请求**,而客户端那边只看到一个语焉不详的 400。
+/// 这里只补形状、不改语义:已经合法的字段一律原样保留。
+fn normalize_json_schema(schema: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let Some(obj) = schema.as_object() else {
+        return serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": true
+        });
+    };
+    let mut obj = obj.clone();
+    if !obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+    {
+        obj.insert("type".into(), Value::String("object".into()));
+    }
+    if !matches!(obj.get("properties"), Some(Value::Object(_))) {
+        obj.insert("properties".into(), Value::Object(Map::new()));
+    }
+    let required = match obj.remove("required") {
+        Some(Value::Array(arr)) => Value::Array(
+            arr.into_iter()
+                .filter_map(|v| v.as_str().map(|s| Value::String(s.to_string())))
+                .collect(),
+        ),
+        _ => Value::Array(Vec::new()),
+    };
+    obj.insert("required".into(), required);
+    if !matches!(
+        obj.get("additionalProperties"),
+        Some(Value::Bool(_)) | Some(Value::Object(_))
+    ) {
+        obj.insert("additionalProperties".into(), Value::Bool(true));
+    }
+    Value::Object(obj)
+}
+
 /// 把请求里的 Anthropic `ToolDef` 列表映射成 Kiro `ToolSpec` 列表(照契约 §2)。
-fn map_tools(tools: &[ToolDef]) -> Vec<ToolSpec> {
+///
+/// `map` 收集"短名 → 原名",供上游把 tool_use 回来时还原成客户端认识的名字。
+fn map_tools(
+    tools: &[ToolDef],
+    map: &mut std::collections::HashMap<String, String>,
+) -> Vec<ToolSpec> {
     tools
         .iter()
-        .map(|t| ToolSpec {
-            tool_specification: ToolSpecInner {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                input_schema: InputSchemaJson {
-                    json: t.input_schema.clone(),
+        .map(|t| {
+            let desc = t.description.clone().unwrap_or_default();
+            let desc = match desc.char_indices().nth(TOOL_DESC_MAX_CHARS) {
+                Some((i, _)) => desc[..i].to_string(),
+                None => desc,
+            };
+            ToolSpec {
+                tool_specification: ToolSpecInner {
+                    name: map_tool_name(&t.name, map),
+                    description: desc,
+                    input_schema: InputSchemaJson {
+                        json: normalize_json_schema(&t.input_schema),
+                    },
                 },
-            },
+            }
         })
         .collect()
 }
@@ -454,9 +546,42 @@ const PREFILL_CONTINUATION: &str = "Continue.";
 ///   `toolResults` / `toolUses` / `images`。
 /// - `max_tokens` / `tool_choice`:Kiro 数据面 wire(见 `kiro::wire`)没有任何对应字段,
 ///   故意不转发;上游只在自己命中预算时用 `ContentLengthExceededException` 帧回报截断。
+/// 一次转换的产物:上行请求体 + 工具名还原表。
+///
+/// 之所以要把表带出来:超长工具名在发给上游前会被缩短,上游回来的 `tool_use` 用的就是
+/// 短名。不还原的话,客户端收到一个**它自己没声明过**的工具名,那一轮工具调用直接作废。
+#[derive(Debug, Clone)]
+pub struct Converted {
+    pub request: KiroRequest,
+    /// `短名 → 原名`。工具名都没超长时为空。
+    pub tool_name_map: std::collections::HashMap<String, String>,
+}
+
+/// 同 [`anthropic_to_kiro`],但一并返回工具名还原表。
+pub fn anthropic_to_kiro_full(
+    req: &MessagesRequest,
+    profile_arn: Option<&str>,
+) -> Result<Converted, ConvertError> {
+    let mut tool_name_map = std::collections::HashMap::new();
+    let request = anthropic_to_kiro_inner(req, profile_arn, &mut tool_name_map)?;
+    Ok(Converted {
+        request,
+        tool_name_map,
+    })
+}
+
+/// 只要请求体、不关心工具名还原表时用它(测试与不涉工具的路径)。
 pub fn anthropic_to_kiro(
     req: &MessagesRequest,
     profile_arn: Option<&str>,
+) -> Result<KiroRequest, ConvertError> {
+    anthropic_to_kiro_full(req, profile_arn).map(|c| c.request)
+}
+
+fn anthropic_to_kiro_inner(
+    req: &MessagesRequest,
+    profile_arn: Option<&str>,
+    tool_name_map: &mut std::collections::HashMap<String, String>,
 ) -> Result<KiroRequest, ConvertError> {
     let model_id =
         map_model(&req.model).ok_or_else(|| ConvertError::UnknownModel(req.model.clone()))?;
@@ -545,7 +670,7 @@ pub fn anthropic_to_kiro(
     // 只看 `req.tools` 是不够的 —— 历史带工具调用而 tools 为空时,上游会以
     // `TOOL_CONFIG_MISSING` 拒掉整个请求(见 `tool_specs_with_history_fallback`)。
     let declared_tools: &[ToolDef] = req.tools.as_deref().unwrap_or(&[]);
-    let tool_specs = tool_specs_with_history_fallback(declared_tools, &req.messages);
+    let tool_specs = tool_specs_with_history_fallback(declared_tools, &req.messages, tool_name_map);
     let has_tools = !tool_specs.is_empty();
     let agent_task_type = if has_tools { "spectask" } else { "vibe" }.to_string();
 
@@ -694,13 +819,21 @@ fn exception_message(payload: &[u8]) -> String {
 /// `ContentLengthExceededException` 与 contextUsage 判出的窗口耗尽)都在这里放行,
 /// 由既有 Truncation 路径处理。payload 非法 JSON 不影响判定(仅消息取空串)。
 pub fn frame_exception(frame: &Message) -> Option<StreamException> {
-    if header_str(frame, ":message-type") != Some("exception") {
+    // `exception` 与 `error` 两类都要认。
+    //
+    // event-stream 协议里 `:message-type` 除了 `event` / `exception`,还有 `error` ——
+    // 那是**框架级**错误(类型在 `:error-code` 头里),与业务异常走的不是同一个头。
+    // 此前只认 `exception`,于是一个 error 帧会被整个流循环忽略,还原出"没有任何内容"
+    // 的成功响应:上游明明报了错,客户端却拿到 200 + 空消息,完全无从判断发生了什么。
+    let mt = header_str(frame, ":message-type");
+    if mt != Some("exception") && mt != Some("error") {
         return None;
     }
     if frame_truncation(frame).is_some() {
         return None;
     }
     let kind = header_str(frame, ":exception-type")
+        .or_else(|| header_str(frame, ":error-code"))
         .map(|s| s.to_string())
         .or_else(|| {
             let v: serde_json::Value = serde_json::from_slice(&frame.payload).ok()?;
@@ -1092,6 +1225,149 @@ mod tests {
         assert_eq!(map_model("Fable"), Some("claude-fable-5".to_string()));
     }
 
+    /// `description` 恒为字符串,**绝不为 null**。
+    ///
+    /// 回归:此前是 `Option<String>`,客户端没给描述时序列化成 `"description": null`,
+    /// 而真实客户端在这个位置永远是字符串(没有就是空串)。
+    #[test]
+    fn tool_description_is_never_null() {
+        let mut map = std::collections::HashMap::new();
+        let specs = map_tools(
+            &[ToolDef {
+                tool_type: None,
+                name: "t".into(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            &mut map,
+        );
+        assert_eq!(specs[0].tool_specification.description, "");
+        let v = serde_json::to_value(&specs[0]).unwrap();
+        assert_eq!(v["toolSpecification"]["description"], "");
+        assert!(
+            !v["toolSpecification"]["description"].is_null(),
+            "绝不能是 null"
+        );
+    }
+
+    /// 客户端给的 schema 千奇百怪,规范化后必须一定是上游收得下的形状。
+    ///
+    /// 回归:此前原样透传,`properties: null` / `required: null` 这类会让上游拒掉**整条请求**,
+    /// 而客户端只看到一个语焉不详的 400。
+    #[test]
+    fn input_schema_is_normalized_into_a_shape_upstream_accepts() {
+        // 完全不是对象 → 给一份合法空 schema
+        let v = normalize_json_schema(&serde_json::json!("garbage"));
+        assert_eq!(v["type"], "object");
+        assert!(v["properties"].is_object());
+        assert!(v["required"].is_array());
+
+        // 各字段类型都不对 → 逐项补形状
+        let v = normalize_json_schema(&serde_json::json!({
+            "type": 123, "properties": null, "required": null, "additionalProperties": 7
+        }));
+        assert_eq!(v["type"], "object");
+        assert!(v["properties"].is_object());
+        assert_eq!(v["required"], serde_json::json!([]));
+        assert_eq!(v["additionalProperties"], true);
+
+        // required 里混了非字符串 → 只留字符串
+        let v = normalize_json_schema(&serde_json::json!({"required": ["a", 1, null, "b"]}));
+        assert_eq!(v["required"], serde_json::json!(["a", "b"]));
+
+        // 本来就合法 → 原样保留,不擅自改语义
+        let ok = serde_json::json!({
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "required": ["x"],
+            "additionalProperties": false
+        });
+        assert_eq!(normalize_json_schema(&ok), ok);
+    }
+
+    /// 服务端内置工具(web_search 等)没有 `input_schema`,不得让整条请求失败。
+    ///
+    /// 回归:`input_schema` 曾是必填字段,客户端一带官方内置工具,请求就在我们这层 400。
+    #[test]
+    fn server_side_tools_without_a_schema_do_not_fail_the_request() {
+        let req: MessagesRequest = serde_json::from_str(
+            r#"{"model":"sonnet","max_tokens":16,
+                "messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"web_search_20250305","name":"web_search"}]}"#,
+        )
+        .expect("带内置工具的请求必须能解析");
+        let kiro = anthropic_to_kiro(&req, None).expect("不得因缺 input_schema 而失败");
+        let specs = kiro
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools
+            .expect("应带上工具");
+        let s = &specs[0].tool_specification;
+        assert_eq!(s.name, "web_search");
+        assert_eq!(s.input_schema.json["type"], "object");
+    }
+
+    /// 超长工具名缩短到 63,且**确定性**;短名 → 原名的映射要带出来。
+    #[test]
+    fn overlong_tool_names_are_shortened_deterministically_and_mapped_back() {
+        let long = "x".repeat(120);
+        let req = {
+            let mut r = base_req(vec![msg("user", "hi")]);
+            r.tools = Some(vec![ToolDef {
+                tool_type: None,
+                name: long.clone(),
+                description: Some("d".into()),
+                input_schema: serde_json::json!({"type": "object"}),
+            }]);
+            r
+        };
+        let a = anthropic_to_kiro_full(&req, None).unwrap();
+        let b = anthropic_to_kiro_full(&req, None).unwrap();
+        let short = a
+            .request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools
+            .as_ref()
+            .unwrap()[0]
+            .tool_specification
+            .name
+            .clone();
+        assert_eq!(short.len(), TOOL_NAME_MAX_LEN, "必须恰好压到上限");
+        assert_ne!(short, long);
+        // 确定性:同名每次缩成同一个,否则模型在多轮之间看到的工具会变来变去
+        let short_b = b
+            .request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools
+            .as_ref()
+            .unwrap()[0]
+            .tool_specification
+            .name
+            .clone();
+        assert_eq!(short, short_b);
+        // 映射能还原回原名
+        assert_eq!(a.tool_name_map.get(&short), Some(&long));
+
+        // 没超长的名字不进映射,也不改名
+        let mut r2 = base_req(vec![msg("user", "hi")]);
+        r2.tools = Some(vec![ToolDef {
+            tool_type: None,
+            name: "short_name".into(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        }]);
+        let c = anthropic_to_kiro_full(&r2, None).unwrap();
+        assert!(c.tool_name_map.is_empty());
+    }
+
     /// 同一次会话的多个请求必须共用同一个 `conversationId`。
     ///
     /// 回归:此前每请求生成一个新的 32 位无连字符十六进制 —— 上游看到的是"这个账号每发
@@ -1364,6 +1640,7 @@ mod tests {
     fn tools_present_sets_spectask_and_maps_tool_spec() {
         let mut req = base_req(vec![msg("user", "hi")]);
         req.tools = Some(vec![ToolDef {
+            tool_type: None,
             name: "get_weather".to_string(),
             description: Some("gets weather".to_string()),
             input_schema: serde_json::json!({"type": "object"}),
@@ -2283,6 +2560,38 @@ mod tests {
 
     // --- 200 事件流内的非截断 exception 帧(错误契约) ---
 
+    /// `:message-type == "error"` 的**框架级**错误帧必须被报出来。
+    ///
+    /// 回归:此前只认 `exception`,error 帧被整个流循环忽略,于是还原出"没有任何内容"的
+    /// 成功响应 —— 上游明明报了错,客户端拿到的是 200 + 空消息,完全无从判断出了什么事。
+    #[test]
+    fn error_typed_frames_are_reported_not_silently_dropped() {
+        let f = Message {
+            headers: vec![
+                Header {
+                    name: ":message-type".to_string(),
+                    value: HeaderValue::Str("error".to_string()),
+                },
+                Header {
+                    name: ":error-code".to_string(),
+                    value: HeaderValue::Str("InternalServerError".to_string()),
+                },
+            ],
+            payload: br#"{"message":"boom"}"#.to_vec(),
+        };
+        let e = frame_exception(&f).expect("error 帧不得被吞掉");
+        assert_eq!(e.kind, "InternalServerError");
+        assert_eq!(e.message, "boom");
+        assert_eq!(exception_status(&e.kind), 502);
+
+        // 混在正常帧里也要被 extract_exception 捞出来
+        let frames = vec![
+            event_frame("assistantResponseEvent", r#"{"content":"hi"}"#),
+            f,
+        ];
+        assert!(extract_exception(&frames).is_some());
+    }
+
     #[test]
     fn frame_exception_detects_throttling_with_message() {
         let f = exception_frame_with("ThrottlingException", r#"{"message":"Too many requests"}"#);
@@ -2470,6 +2779,7 @@ mod tests {
             max_tokens: Some(32),
             stream: Some(false),
             tools: Some(vec![ToolDef {
+                tool_type: None,
                 name: "shell".into(),
                 description: Some("real one".into()),
                 input_schema: serde_json::json!({"type": "object"}),
@@ -2491,8 +2801,7 @@ mod tests {
             .collect();
         assert_eq!(shells.len(), 1, "同名工具不得重复");
         assert_eq!(
-            shells[0].tool_specification.description.as_deref(),
-            Some("real one"),
+            shells[0].tool_specification.description, "real one",
             "须保留客户端声明的那份,而不是补出来的空壳"
         );
     }
