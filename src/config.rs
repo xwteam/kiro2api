@@ -23,6 +23,13 @@ pub struct Config {
     pub system_version: String,
     /// 伪装 UA 里的 `md/nodejs#{node_version}`(契约 §3)。
     pub node_version: String,
+    /// 全局 machineId 覆盖(可选)。优先级:凭据自带 > 本配置 > 由 refresh_token 派生。
+    ///
+    /// 有此项时整池共用同一个 machineId —— 适合"一台机器、一个身份"的部署形态;
+    /// 不设则每个账号派生各自的 machineId(默认,与真实客户端"一账号一机器"一致)。
+    /// 此前只有凭据级覆盖,缺配置级兜底。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
     /// 每凭据每分钟最大请求数;0 = 无限(默认,兼容既有行为)。
     pub max_rpm_per_credential: u32,
     /// 负载均衡模式:"priority"(默认,等权轮询)或 "balanced"(按权重轮询)。
@@ -61,6 +68,7 @@ impl Default for Config {
             kiro_version: "0.11.107".into(),
             system_version: "win32#10.0.22631".into(),
             node_version: "22.22.0".into(),
+            machine_id: None,
             max_rpm_per_credential: 0,
             load_balancing_mode: "priority".into(),
             trusted_proxy_hops: 1,

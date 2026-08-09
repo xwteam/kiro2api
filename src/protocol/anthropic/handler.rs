@@ -334,7 +334,11 @@ fn impersonation_for(
     explicit_machine_id: Option<&str>,
 ) -> Impersonation {
     Impersonation {
-        machine_id: machine_id::resolve(explicit_machine_id, refresh_token),
+        machine_id: machine_id::resolve_with_config(
+            explicit_machine_id,
+            cfg.machine_id.as_deref(),
+            refresh_token,
+        ),
         kiro_version: cfg.kiro_version.clone(),
         agent_mode: "vibe".to_string(),
         system_version: cfg.system_version.clone(),
@@ -412,7 +416,7 @@ const MAX_CROSS_ACCOUNT_ATTEMPTS_HARD_CAP: usize = 5;
 /// 瞬态失败后的退避:指数增长 + 抖动,上限 2 秒。
 ///
 /// 只用于**瞬态**错误(网络抖动、上游 5xx/限流)。账号级失败(令牌失效、额度耗尽)不等 ——
-/// 那类失败换个账号立刻就能成,等待只是白白拖慢用户。此分工照 kiro.rs:它在 408/429/5xx
+/// 那类失败换个账号立刻就能成,等待只是白白拖慢用户。此分工照观测:真实客户端在 408/429/5xx
 /// 与发送失败上退避,在 401/403 换账号时不退避,而它打同一个上游长期稳定。
 ///
 /// 抖动是为了避免上游抖动时多个并发请求同拍重试、把故障放大成尖峰。
@@ -680,7 +684,7 @@ pub(crate) async fn select_and_call_once(
     if let Some((kind, status, body)) = failure_to_record {
         record_classified_failure(&state.stats, credential_id, kind, status, &body, now_unix).await;
         // 瞬态与账号级分开:前者值得退避后再换号(上游抖动时不放大),后者换个账号
-        // 立刻就能成、等待纯属拖慢用户。此分工照 kiro.rs —— 它在 408/429/5xx 上退避、
+        // 立刻就能成、等待纯属拖慢用户。此分工照观测 —— 真实客户端在 408/429/5xx 上退避、
         // 在 401/403 换账号时不退避,而它打同一个上游长期稳定。
         let msg = "data-plane request failed".to_string();
         return Err((

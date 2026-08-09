@@ -162,7 +162,7 @@ impl Credential {
     /// 这类凭据取不到 bearer,又因为 [`is_api_key`](Self::is_api_key) 取并集而通过了
     /// "是 API Key 凭据"的判定,于是每次被选中都在同一处失败 —— 不刷新(API Key 本就不刷)、
     /// 也没有可用的 token,只能在跨账号重试里空转。故必须在**入池那一刻**就判出来并禁用,
-    /// 而不是留给运行时反复触发。(此坑由 kiro.rs #134 的后续修复提示。)
+    /// 而不是留给运行时反复触发。(照观测补齐。)
     pub fn is_invalid_api_key_config(&self) -> bool {
         self.auth == AuthMethod::ApiKey && self.kiro_api_key.is_none()
     }

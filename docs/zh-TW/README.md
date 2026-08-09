@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.9.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.9.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,7 +61,8 @@
 
 | 日期 | 更新內容 |
 |------|----------|
-| 2026-08-09 | v0.9.0 - 🔥 **整池帳號被上游成批封停:同一條 TCP 連線上輪換了多個帳號身分**。中轉走連線池(idle 90s),同一條 TCP/TLS 上依次發出不同帳號的令牌,而每個帳號在 user-agent 裡還各自聲稱是不同機器。線上 1046 個帳號燒到只剩 22 個健康,而**從未經過中轉**的帳號直查上游全部正常。現數據面帶 `Connection: close`,兩個客戶端均 `pool_max_idle_per_host(0)`;UA 的 SDK 版本對齊 1.0.34。**診斷修正**:初版歸因於「換號太快」並做了熔斷器,經與 kiro.rs 逐行對比**被證偽**,熔斷器已整個回退 |
+| 2026-08-09 | v0.9.1 - 🔧 **上游連線鎖 HTTP/1.1 + TLS 後端改 native-tls**。v0.9.0 加了 `Connection: close` 卻沒鎖協議——它是 HTTP/1.1 的標頭、**h2 明確禁止**,而我們協商到的正是 h2,所以那個標頭當時**只是擺設**(實測鎖定後出站協議由 HTTP/2 變為 HTTP/1.1)。TLS 後端預設改 **native-tls(OpenSSL)** 以貼合真實客戶端的 ClientHello 指紋。另:machineId 增加設定級兜底 |
+| 2026-08-09 | v0.9.0 - 🔥 **整池帳號被上游成批封停:同一條 TCP 連線上輪換了多個帳號身分**。中轉走連線池(idle 90s),同一條 TCP/TLS 上依次發出不同帳號的令牌,而每個帳號在 user-agent 裡還各自聲稱是不同機器。線上 1046 個帳號燒到只剩 22 個健康,而**從未經過中轉**的帳號直查上游全部正常。現數據面帶 `Connection: close`,兩個客戶端均 `pool_max_idle_per_host(0)`;UA 的 SDK 版本對齊被觀測的真實客戶端。**診斷修正**:初版歸因於「換號太快」並做了熔斷器,經對照分析**被證偽**,熔斷器已整個回退 |
 | 2026-08-03 | v0.8.1 - 🐛 面板上沒有地方填 Kiro API Key:v0.8.0 後端與介面都做好了,卻**沒給「新增帳號」表單加輸入框**,從介面看這功能等於不存在。現在認證方式下拉多一項 **API Key (`ksk_…`)**,選中即顯示 ksk 輸入框並隱藏 refreshToken 那一欄,提交也不再要求它 |
 | 2026-08-03 | v0.8.0 - ✨ **支援用 Kiro API Key(`ksk_…`)匯入帳號**。key 本身就是資料面 bearer,不換令牌、不刷新、不過期。匯入寫 `{"kiroApiKey":"ksk_xxx","authMethod":"api_key"}`,或呼叫介面傳 `kiroApiKey`。實作按觀測對齊:帶 `tokentype: API_KEY` 標頭、machineId 用 `KiroAPIKey/` 鹽、刷新鏈路顯式短路、過期判定恆答否。另:宣告 `api_key` 卻沒給 key 的憑據**入池即停用**,且「重置」拒絕救活它 |
 | 2026-08-03 | v0.7.14 - 🐛 首頁「全域剩餘積分」經常空白、要點刷新才有:聚合只累加**仍新鮮**(5 分鐘 TTL)的快取,超過 5 分鐘沒打開帳號頁首頁就是空的——盤上明明有全部帳號餘額卻不顯示,逼你點刷新,**而那次刷新正是這份快取本該避免的上游呼叫**。現展示取全部條目並帶出資料年齡。✨ 新增**活躍帳號令牌提前續期**:近 24h 用過的帳號在到期前 10 分鐘後台續上;**刻意只續活躍帳號**——全池定時續期等於給 253 個帳號造一條永不停歇的心跳,而本專案帳號已被上游封過 24 個 |
@@ -241,7 +242,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.9.0"}
+# {"service":"kiro2api","status":"ok","version":"0.9.1"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \

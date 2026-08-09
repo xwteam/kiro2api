@@ -870,7 +870,7 @@ impl Pool {
         if let Some(e) = self.find(id) {
             // 配置自相矛盾的凭据不得被"重置"救活:重置只清 strike/冷却/结论,
             // 改不了"声明了 api_key 却没有 key"这件事,复活后立刻重新走回同一条错误路径。
-            // 出路是先把配置改对再重启,而不是反复点重置。(kiro.rs #134 后续修复同此结论。)
+            // 出路是先把配置改对再重启,而不是反复点重置。(照观测,结论同上。)
             if e.cred.is_invalid_api_key_config() {
                 return false;
             }
@@ -2158,7 +2158,7 @@ mod tests {
     ///
     /// 它取不到 bearer,又因为 `is_api_key()` 取并集而被判定为 API Key 凭据(故不刷新),
     /// 留在池里只会在跨账号重试里反复空转 —— 每次选中都在同一处失败。
-    /// (此坑由 kiro.rs #134 的后续修复提示。)
+    /// (照观测补齐。)
     #[test]
     fn a_credential_claiming_api_key_without_one_is_disabled_on_load() {
         let mut c = cred("bad", 1);

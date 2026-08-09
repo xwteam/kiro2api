@@ -2,7 +2,7 @@
 # 版本单一真源在 ./VERSION;此处 version 须与之保持一致。
 [package]
 name = "kiro2api"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 license = "MIT"
 authors = ["xwteam"]
@@ -15,6 +15,14 @@ path = "src/main.rs"
 [profile.release]
 lto = "thin"
 strip = true
+
+[features]
+# 默认走 native-tls(OpenSSL):真实 Kiro 客户端是 Electron/Node,TLS 握手用的是 OpenSSL,
+# 其 ClientHello 指纹与 rustls 截然不同。TLS 指纹在任何 HTTP 内容发出**之前**就暴露,
+# 是最标准的机器人识别手段之一 —— 故与真实客户端对齐。
+# 关掉此特性则回落 rustls(编译更快、无需 OpenSSL 工具链,但指纹对不上)。
+default = ["native-tls-backend"]
+native-tls-backend = ["reqwest/native-tls-vendored"]
 
 [dependencies]
 axum = "0.8"

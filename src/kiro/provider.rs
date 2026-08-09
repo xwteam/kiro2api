@@ -83,7 +83,7 @@ pub fn build_headers(
     // 公司网络解释,前者解释不了。
     //
     // 线上症状与此吻合:账号在**没经过中转时是活的**(直查上游余额正常),一旦被中转用过就
-    // 被以 `security precaution` 封停;而 kiro.rs 打同一个上游长期稳定,它每个请求都显式
+    // 被以 `security precaution` 封停。真实客户端每个请求都显式
     // 带 `Connection: close`。这是两边在 wire 上最实质的差异,故对齐。
     h.insert("connection", HeaderValue::from_static("close"));
     h.insert(
@@ -848,7 +848,7 @@ mod tests {
     /// 是不同的机器(user-agent 里的 machineId 各不相同)。真实客户端不可能这样,
     /// 而「同一条连接上轮换多个身份」是账号共享最直接的证据 —— 同 IP 还能用 NAT 解释,
     /// 同一条连接解释不了。线上症状吻合:账号没经过中转时是活的,用过就被 security
-    /// precaution 封停;长期稳定的 kiro.rs 每请求都带这个头。
+    /// precaution 封停;真实客户端每请求都带这个头。
     #[test]
     fn every_request_asks_the_connection_to_close() {
         let ep = Endpoint {
@@ -864,7 +864,7 @@ mod tests {
         );
     }
 
-    /// user-agent 里的 SDK 版本与 kiro.rs 对齐(它抓的是更新的真实客户端)。
+    /// user-agent 里的 SDK 版本与被观测的真实客户端对齐。
     /// 版本号本身就是指纹的一部分,长期停在旧版是可识别的差异。
     #[test]
     fn sdk_version_matches_the_observed_client() {

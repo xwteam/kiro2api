@@ -33,8 +33,21 @@ pub fn normalize(raw: &str) -> Option<String> {
 
 /// explicit 能归一则用它,否则由 refresh_token 派生。
 pub fn resolve(explicit: Option<&str>, refresh_token: &str) -> String {
+    resolve_with_config(explicit, None, refresh_token)
+}
+
+/// 三级优先:凭据自带 > 配置全局 > 由 refresh_token 派生。
+///
+/// 配置级是此前缺的一层。它的用途是让整池共用一个 machineId ——
+/// 部署在单机、希望对上游呈现"一台机器"时用得上;不设则维持每账号各自派生(默认)。
+pub fn resolve_with_config(
+    explicit: Option<&str>,
+    config_level: Option<&str>,
+    refresh_token: &str,
+) -> String {
     explicit
         .and_then(normalize)
+        .or_else(|| config_level.and_then(normalize))
         .unwrap_or_else(|| derive(refresh_token))
 }
 
@@ -70,5 +83,34 @@ mod tests {
         assert_eq!(resolve(Some(&full), "rt"), full); // explicit 合法
         assert_eq!(resolve(Some("bad"), "rt"), derive("rt")); // explicit 非法→derive
         assert_eq!(resolve(None, "rt"), derive("rt")); // 无 explicit→derive
+    }
+
+    /// 三级优先:凭据自带 > 配置全局 > 由 refresh_token 派生。
+    /// 配置级是此前缺的一层。
+    #[test]
+    fn machine_id_resolution_is_three_tiered() {
+        // machineId 必须是 32/64 位十六进制(见 `normalize`),故夹具用合法值。
+        let cred_mid = "a".repeat(64);
+        let cfg_mid = "b".repeat(64);
+        // 凭据级最优先
+        assert_eq!(
+            resolve_with_config(Some(&cred_mid), Some(&cfg_mid), "rt"),
+            cred_mid
+        );
+        // 凭据缺 → 用配置级
+        assert_eq!(resolve_with_config(None, Some(&cfg_mid), "rt"), cfg_mid);
+        // 配置级是非法值 → 不采用,回落派生(别把垃圾值当身份发出去)
+        assert_eq!(
+            resolve_with_config(None, Some("not-hex"), "rt"),
+            derive("rt")
+        );
+        // 都缺 → 派生,且与 refresh_token 绑定
+        let derived = resolve_with_config(None, None, "rt");
+        assert_eq!(derived, derive("rt"));
+        assert_ne!(
+            derived,
+            derive("other-rt"),
+            "不同 rt 必须派生出不同 machineId"
+        );
     }
 }

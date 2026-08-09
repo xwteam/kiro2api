@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.9.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.9.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,7 +58,8 @@
 
 | 날짜 | 업데이트 내용 |
 |------|----------|
-| 2026-08-09 | v0.9.0 - 🔥 **풀 전체가 업스트림에 정지되고 있었습니다: 하나의 TCP 연결이 여러 계정 신원을 실어 나르고 있었습니다.** 중계가 연결 풀(idle 90초)을 쓰다 보니 같은 TCP/TLS 세션 위에 서로 다른 계정의 토큰이 차례로 나타났고, 각 계정은 user-agent의 machineId로 서로 다른 기기라고 주장했습니다. 실제 Kiro 클라이언트는 그럴 수 없습니다(한 기기, 한 계정, 한 연결). **한 연결 위에서 신원이 바뀌는 것은 계정 공유의 가장 직접적인 증거**입니다 —— IP 공유는 NAT로 설명되지만 연결 공유는 설명되지 않습니다. 운영에서 1046개 계정이 건강한 22개로 줄어든 반면, **중계를 한 번도 거치지 않은** 계정 3개는 직접 조회에서 정상이었습니다. 이제 요청에 `Connection: close`를 붙이고 두 클라이언트 모두 `pool_max_idle_per_host(0)`, UA의 SDK 버전은 1.0.34로 정렬했습니다. **진단 정정**: 초판은 「전환이 너무 빠르다」고 결론짓고 서킷 브레이커를 넣었으나 kiro.rs와의 라인별 비교로 **반증**되어(더 빠르게 전환하고 더 많이 재시도하며 정지를 특별 취급하지 않는데도 안정적) 브레이커는 전면 철회했습니다 |
+| 2026-08-09 | v0.9.1 - 🔧 **업스트림 연결을 HTTP/1.1로 고정하고 TLS 백엔드를 native-tls로 변경**. v0.9.0은 `Connection: close`를 추가했지만 프로토콜을 고정하지 않았습니다 —— 이는 HTTP/1.1 헤더이며 h2에서는 금지되어 있고 ALPN은 h2를 선택하고 있었으므로 당시 그 헤더는 **장식일 뿐이었습니다**(실측: 고정 후 송신 프로토콜이 HTTP/2에서 HTTP/1.1로 변경). TLS 백엔드는 기본값이 **native-tls(OpenSSL)**입니다: 실제 클라이언트는 Electron/Node로 OpenSSL을 통해 핸드셰이크하며 그 ClientHello는 rustls와 크게 다릅니다. 지문은 HTTP 내용이 전송되기 **전에** 노출됩니다. 또한 machineId에 설정 수준 폴백 추가 |
+| 2026-08-09 | v0.9.0 - 🔥 **풀 전체가 업스트림에 정지되고 있었습니다: 하나의 TCP 연결이 여러 계정 신원을 실어 나르고 있었습니다.** 중계가 연결 풀(idle 90초)을 쓰다 보니 같은 TCP/TLS 세션 위에 서로 다른 계정의 토큰이 차례로 나타났고, 각 계정은 user-agent의 machineId로 서로 다른 기기라고 주장했습니다. 실제 클라이언트는 그럴 수 없습니다. 운영에서 1046개 계정이 건강한 22개로 줄어든 반면, **중계를 한 번도 거치지 않은** 계정은 직접 조회에서 정상이었습니다. 이제 요청에 `Connection: close`를 붙이고 두 클라이언트 모두 `pool_max_idle_per_host(0)`, UA의 SDK 버전은 관측된 실제 클라이언트에 맞췄습니다. **진단 정정**: 초판은 「전환이 너무 빠르다」고 결론짓고 서킷 브레이커를 넣었으나 비교 분석으로 **반증**되어 전면 철회했습니다 |
 | 2026-08-03 | v0.8.1 - 🐛 패널에 Kiro API Key를 입력할 곳이 없었습니다. v0.8.0에서 백엔드와 엔드포인트는 준비했지만 **「계정 추가」 폼에 입력란을 추가하지 않아** UI 상으로는 기능이 없는 것과 같았고 curl로만 접근할 수 있었습니다. 인증 방식 드롭다운에 **API Key (`ksk_…`)** 를 추가했고, 선택하면 키 입력란이 나타나며 **refreshToken 행은 숨겨집니다**(이 자격 증명에는 없는 항목이라, 필수처럼 보이는 빈칸을 남겨두면 입력 누락으로 오해하게 됩니다). 제출 시에도 요구하지 않습니다 |
 | 2026-08-03 | v0.8.0 - ✨ **Kiro API Key(`ksk_…`)로 계정 가져오기를 지원**합니다. 이 자격 증명은 social/idc와 근본적으로 달라 **키 자체가 데이터 플레인 bearer**이며 교환·갱신·만료가 없어 OAuth 경로를 전혀 거치지 않습니다. `{"kiroApiKey":"ksk_xxx","authMethod":"api_key"}`로 등록하거나 가져오기 엔드포인트에 `kiroApiKey`(별칭 `ksk`)를 전달합니다. 구현은 관측에 맞췄습니다: 요청에 `tokentype: API_KEY` 헤더 부여(없으면 업스트림이 OAuth 토큰으로 해석해 거부), machine id는 `KiroAPIKey/` 솔트, 갱신 경로 명시적 단락, 만료 판정은 항상 아니오 —— 그렇지 않으면 기본값 `expiresAt=0`이 「1970년에 만료」로 읽혀 풀에 들어가자마자 사망 처리됩니다. 또한 `api_key`를 선언하고 키가 없는 자격 증명은 로드 시 비활성화되며 「초기화」로도 되살아나지 않습니다 |
 | 2026-08-03 | v0.7.14 - 🐛 홈의 「전체 잔여 적립금」이 대개 비어 있고 새로고침해야 나오던 문제 수정. 집계가 **아직 신선한**(TTL 5분) 항목만 합산해, 계정 페이지를 5분만 열지 않아도 홈이 비었습니다 —— 모든 계정 잔액이 디스크에 있는데 「오래됨」을 이유로 표시되지 않아 수동 새로고침을 강요했고, 그 새로고침이야말로 이 캐시가 피하려던 업스트림 호출입니다. `is_fresh`는 「다시 조회할지」에 답하지 「표시할지」를 정하지 않습니다. 이제 모든 항목을 읽고 데이터의 나이도 함께 알립니다. ✨ **활성 계정 토큰 선제 갱신** 추가: 24시간 내 사용된 계정은 만료 10분 전에 백그라운드로 갱신됩니다. **의도적으로 활성 계정만** —— 풀 전체를 타이머로 갱신하면 253개 계정에 끊이지 않는 하트비트(시간당 253회, 사용자 없이)가 생기며, 본 프로젝트는 이미 24개 계정이 security precaution으로 정지되었습니다 |
@@ -238,7 +239,7 @@ docker compose logs -f
 ```bash
 # 헬스 체크
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.9.0"}
+# {"service":"kiro2api","status":"ok","version":"0.9.1"}
 
 # 프로토콜 고정 모델 목록 조회
 curl http://localhost:8080/v1/models \
