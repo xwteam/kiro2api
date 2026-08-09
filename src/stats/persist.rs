@@ -418,6 +418,31 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// 轮询等待磁盘内容变成 `want`,最长等 `deadline_ms`。
+    ///
+    /// 刷盘发生在后台任务里,"等固定一段时间再断言"实际是在赌调度 —— 本地机器闲着,
+    /// 200ms 绰绰有余;CI runner 上一核跑满,同样的 200ms 就不够,于是测试间歇性红,
+    /// 而被测代码完全正常。轮询把这层运气拿掉:常见情况下第一拍就返回(比原来的固定
+    /// sleep 还快),真出问题时才等满截止时间再报错。
+    ///
+    /// 注意这只适用于断言"最终会变成什么";断言"不该变"必须老老实实等满时间。
+    async fn wait_for_json(path: &std::path::Path, want: &Vec<u32>, deadline_ms: u64) {
+        let step = 20;
+        let mut waited = 0;
+        loop {
+            let got: Option<Vec<u32>> = read_json(path).unwrap();
+            if got.as_ref() == Some(want) {
+                return;
+            }
+            assert!(
+                waited < deadline_ms,
+                "等了 {deadline_ms}ms 磁盘内容仍不是 {want:?},实际 {got:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(step)).await;
+            waited += step;
+        }
+    }
+
     #[tokio::test]
     async fn flush_loop_persists_on_dirty_and_on_close() {
         let dir = std::env::temp_dir();
@@ -433,18 +458,14 @@ mod tests {
         });
 
         flag.mark_dirty();
-        // 等一拍多一点让定时器落盘
-        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
-        let got: Option<Vec<u32>> = read_json(&path).unwrap();
-        assert_eq!(got, Some(vec![10, 20]));
+        // 周期是 1s,给到 5s 才算超时 —— 留足 CI 上被抢占的余量。
+        wait_for_json(&path, &vec![10, 20], 5000).await;
 
         // 改内存 + 置脏 + drop flag(关通道)→ 应触发最后一次刷盘
         *payload.lock().unwrap() = vec![99];
         flag.mark_dirty();
         drop(flag);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let got: Option<Vec<u32>> = read_json(&path).unwrap();
-        assert_eq!(got, Some(vec![99]));
+        wait_for_json(&path, &vec![99], 5000).await;
 
         let _ = std::fs::remove_file(&path);
     }
