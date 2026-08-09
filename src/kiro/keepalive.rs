@@ -133,6 +133,7 @@ mod tests {
 
     fn cred(id: &str, expires_at: u64) -> Credential {
         Credential {
+            priority: 999,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,

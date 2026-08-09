@@ -683,6 +683,7 @@ mod tests {
 
     fn cred() -> Credential {
         Credential {
+            priority: 999,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,

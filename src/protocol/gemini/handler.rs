@@ -200,8 +200,10 @@ fn relay_error_to_gemini(e: RelayError) -> Response {
         RelayError::Upstream(_) | RelayError::UpstreamTransient(_) => {
             ("upstream request failed".to_string(), "INTERNAL")
         }
-        // 上游确定性拒绝(INVALID_MODEL_ID:该模型对当前档位不可用)→ 400 INVALID_ARGUMENT + 清晰的不可用说明。
+        // 上游确定性拒绝(工具规格畸形 / 缺工具定义 / 上下文超长)→ 400 + 清晰说明。
         RelayError::InvalidRequest(msg) => (msg.clone(), "INVALID_ARGUMENT"),
+        // 全池账号都不支持该模型(各账号档位不同)→ 400,文案见 RelayError::message。
+        RelayError::ModelUnavailable(_) => (e.message(), "INVALID_ARGUMENT"),
     };
     let body = serde_json::json!({
         "error": { "code": status.as_u16(), "message": message, "status": grpc_status },
@@ -745,6 +747,7 @@ mod tests {
 
     fn cred() -> Credential {
         Credential {
+            priority: 999,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,

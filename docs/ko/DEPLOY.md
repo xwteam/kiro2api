@@ -202,7 +202,7 @@ curl http://localhost:8080/health
 
 예상 응답:
 ```json
-{"service":"kiro2api","status":"ok","version":"0.11.1"}
+{"service":"kiro2api","status":"ok","version":"0.12.0"}
 ```
 
 ### 모델 목록 조회

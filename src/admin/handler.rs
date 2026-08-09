@@ -113,8 +113,7 @@ pub struct CredentialsStatusResponse {
 fn account_to_item(a: &AccountStat, throttles: u64) -> CredentialStatusItem {
     CredentialStatusItem {
         id: id_as_number(&a.id),
-        // 池当前不区分优先级(等权/按权重轮询),priority 以 weight 兜底展示。
-        priority: a.weight as i64,
+        priority: a.priority as i64,
         weight: a.weight,
         disabled: a.disabled,
         failure_count: a.failures as u32,
@@ -2628,6 +2627,12 @@ pub async fn add_credential(
         email: req.email.filter(|s| !s.is_empty()),
         nickname: req.nickname.filter(|s| !s.is_empty()),
         weight,
+        // 选号优先级:**导入一律 999(最低)**,显式给了就用给的。
+        // 默认不猜由谁先顶上——那是运营决策,交给运营者显式设定(面板可改)。
+        priority: req
+            .priority
+            .map(|p| p.clamp(0, u32::MAX as i64) as u32)
+            .unwrap_or(crate::kiro::credential::DEFAULT_PRIORITY),
         label: None,
         disabled: false,
         status_reason: None,
@@ -3075,6 +3080,7 @@ pub async fn import_credentials_batch(
             .unwrap_or(1);
 
         let cred = Credential {
+            priority: crate::kiro::credential::DEFAULT_PRIORITY,
             id: String::new(),
             access_token: String::new(),
             refresh_token: item.refresh_token,
@@ -3182,6 +3188,7 @@ fn minted_to_credential(m: MintedCredential, now: u64) -> Credential {
         now.saturating_add(m.expires_in_secs)
     };
     Credential {
+        priority: crate::kiro::credential::DEFAULT_PRIORITY,
         id: String::new(),
         access_token: m.access_token,
         refresh_token: m.refresh_token,
@@ -3658,6 +3665,7 @@ mod tests {
 
     fn cred(id: &str) -> Credential {
         Credential {
+            priority: 999,
             id: id.into(),
             access_token: "SEKRET-AT".into(),
             refresh_token: "SEKRET-RT".into(),
@@ -5479,7 +5487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_priority_maps_to_weight_and_persists() {
+    async fn set_priority_persists_the_priority_field() {
         let cfg = cfg_with_temp_creds();
         let path = cfg.credentials_path.clone();
         let state = state_with(vec![cred("2")], cfg);
@@ -5494,7 +5502,7 @@ mod tests {
         assert_eq!(status, HttpStatusCode::OK);
         assert_eq!(v["success"], true);
         let saved = crate::kiro::credential::load(&path).unwrap();
-        assert_eq!(saved.iter().find(|c| c.id == "2").unwrap().weight, 8);
+        assert_eq!(saved.iter().find(|c| c.id == "2").unwrap().priority, 8);
         let _ = std::fs::remove_file(&path);
         // 未知 id → 404
         let (status2, _) = send(

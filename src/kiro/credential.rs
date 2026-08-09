@@ -21,6 +21,13 @@ pub enum AuthMethod {
     ApiKey,
 }
 
+/// 优先级缺省值:所有导入的账号都是它。数字越小越优先,故 999 = 最低。
+pub const DEFAULT_PRIORITY: u32 = 999;
+
+fn default_priority() -> u32 {
+    DEFAULT_PRIORITY
+}
+
 /// region 缺省值(契约 §7:credentials.json 无 region 键时回落)。
 fn default_region() -> String {
     "us-east-1".to_string()
@@ -105,6 +112,16 @@ pub struct Credential {
     pub nickname: Option<String>,
     #[serde(default)]
     pub weight: u32,
+    /// 选号优先级:**数字越小越优先**。缺省 999。
+    ///
+    /// Priority 档换号时取**优先级最小**的可用账号(同级则按池内顺序)。这让"哪些号先用"
+    /// 成为可运营的策略:比如把付费档/大额度的号设成 100,让它优先顶上;而**所有导入进来的
+    /// 号一律 999**,需要更高就手工改 —— 默认不猜、由运营者显式决定。
+    ///
+    /// 与 `weight` 无关:后者只在 `balanced` 档按权重铺开时起作用。此前二者被混成一个字段,
+    /// 于是"设置优先级"实际改的是权重,而 Priority 档根本不看它。
+    #[serde(default = "default_priority")]
+    pub priority: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default)]
@@ -157,6 +174,7 @@ pub(crate) fn tests_support_cred() -> Credential {
         weight: 1,
         label: None,
         disabled: false,
+        priority: DEFAULT_PRIORITY,
         status_reason: None,
         proxy_url: None,
         proxy_username: None,
@@ -566,6 +584,7 @@ mod tests {
 
     fn sample() -> Credential {
         Credential {
+            priority: 999,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,

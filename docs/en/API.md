@@ -624,6 +624,18 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.12.0: selection priority and mixed-tier pools**
+> - `priority` (lower number wins) **now actually drives selection**. In the Priority mode the
+>   relay switches to the eligible account with the smallest priority. It used to be a mere alias
+>   for `weight` and never affected selection, so the "set priority" control was a no-op in the
+>   default mode. **Every imported account defaults to `999`** (lowest); raise it explicitly via
+>   `POST /api/admin/credentials/{id}/priority`.
+> - With accounts on different subscription tiers (FREE, API-key and so on), it is normal for a
+>   model to exist on only some of them: `/v1/models` returns the **union** across the pool. When
+>   a request names such a model the relay skips accounts that do not offer it, and returns `400`
+>   only when **no** account can serve it, with a message that says exactly that.
+> - "This account lacks that model" is remembered (in memory only; relearned after a restart), so
+>   later requests skip those accounts instead of rediscovering it with an upstream 400 each time.
 > **Tool contract changes in v0.11.0** (these affect clients directly):
 > **v0.11.1: a tool's `description` is guaranteed non-empty on the wire.** Upstream answers an empty description with `400 Invalid tool use format / REQUEST_BODY_INVALID` and rejects the **entire request**; when you omit one, this service falls back to the tool name. That reason is now classified as **deterministic** and returned as a `400` directly, instead of being retried across accounts and surfacing as a 502.
 > - `tools[].type` is now accepted. Anthropic's **server-side tools** (`web_search_20250305`
@@ -1242,7 +1254,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.11.1",
+  "version": "0.12.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1458,7 +1470,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.11.1"
+  "version": "0.12.0"
 }
 ```
 

@@ -598,6 +598,10 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.12.0:選號優先級與多檔位共存** —— `priority`(數字越小越優先)現在真正參與選號
+> (此前只是 `weight` 的別名);**匯入的帳號一律 999**,要更高請手工設定。池裡混著不同訂閱
+> 檔位時,`/v1/models` 回的是全池**並集**,本服務會自動跳過不支援該模型的帳號,全池都不
+> 支援才回 `400`。已知的「某帳號不支援某模型」會被記住(僅記憶體)。
 > **v0.11.0 起的工具契約變更:** `tools[].type` 被接收(服務端內建工具沒有 `input_schema`,
 > **v0.11.1 補充:工具 `description` 上行時保證非空** —— 上游對空描述回 `400 Invalid tool use format / REQUEST_BODY_INVALID`,拒的是**整條請求**。未給描述時本服務用工具名兜底。該 reason 現歸為**確定性**錯誤,直接回 `400`。
 > 此前必填會導致整條請求 400);`input_schema` 會被規範化成上游收得下的形狀(只補形狀不改
@@ -1239,7 +1243,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.11.1"}
+{"service":"kiro2api","status":"ok","version":"0.12.0"}
 ```
 
 ### GET /v1/ping

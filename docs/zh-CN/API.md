@@ -106,6 +106,16 @@ cat data/config.json | grep apiKey
 | 422 | 请求体反序列化失败（缺必填字段 / 类型不符），axum 默认拒收，`text/plain` 纯文本。出现在带 body 提取器的端点上：`/api/admin/*` 与 `POST /api/user/login`（四个协议对话端点与 `/v1/messages/count_tokens` 已自行接管拒收、改回各自形状的 `400`）（`/api/user/*` 的其余端点只收 query，参数类型不符是 `400` 而非 `422`） |
 
 
+> **v0.12.0:选号优先级与多档位共存**
+> - `priority`(数字越小越优先)**现在真正参与选号**:Priority 档换号时取优先级最小的可用账号。
+>   此前它只是 `weight` 的别名、从不参与,「设置优先级」在默认档位下是空操作。
+>   **所有导入的账号一律 `999`(最低)**,要更高请手工设置
+>   (`POST /api/admin/credentials/{id}/priority`)。
+> - 池里混着不同订阅档位(FREE / API-Key 等)时,某个模型只有部分账号支持是正常的:
+>   `/v1/models` 返回的是全池**并集**。请求这类模型时本服务会自动跳过不支持它的账号;
+>   **全池都不支持**才回 `400`,并在消息里说清原因。
+> - 已知「某账号不支持某模型」会被记住(仅内存,重启后重学),后续请求直接跳过,
+>   不再每次都花一次上游 400 去重新发现。
 > **v0.11.0 起的工具契约变更(与客户端直接相关):**
 > **v0.11.1 补充:工具 `description` 上行时保证非空** —— 上游对空描述回 `400 Invalid tool use format / REQUEST_BODY_INVALID`,拒的是**整条请求**。你没给描述时本服务用工具名兜底。另:该 reason 现归为**确定性**错误,直接回 `400`(不再跨账号重试后回 502)。
 > - `tools[].type` 被接收:Anthropic **服务端内置工具**(`web_search_20250305` 等)没有
@@ -1253,7 +1263,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.11.1",
+  "version": "0.12.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1441,7 +1451,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.11.1"
+  "version": "0.12.0"
 }
 ```
 

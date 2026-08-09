@@ -192,7 +192,7 @@ curl http://localhost:8080/health
 
 預期回應：
 ```json
-{"service":"kiro2api","status":"ok","version":"0.11.1"}
+{"service":"kiro2api","status":"ok","version":"0.12.0"}
 ```
 
 ### 列出模型清單

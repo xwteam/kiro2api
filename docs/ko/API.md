@@ -645,6 +645,11 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.12.0: 선택 우선순위와 혼합 등급 풀** —— `priority`(숫자가 작을수록 우선)가 **실제로
+> 선택에 반영됩니다**(이전에는 `weight`의 별칭이라 무효). **가져온 계정은 일괄 `999`**(최저)
+> 이며 필요하면 수동으로 설정합니다. 등급이 섞인 경우 `/v1/models`는 전체 계정의 **합집합**을
+> 반환하며, 릴레이는 해당 모델을 제공하지 않는 계정을 건너뛰고 **어떤 계정도 제공하지 않을
+> 때만** `400`을 반환합니다.
 > **v0.11.0의 도구 계약 변경:** `tools[].type`를 받습니다(서버 측 내장 도구는 `input_schema`가
 > **v0.11.1: 도구 `description`은 전송 시 항상 비어 있지 않습니다.** 업스트림은 빈 설명에 `400 Invalid tool use format / REQUEST_BODY_INVALID`로 응답하며 **요청 전체**를 거부합니다. 설명이 없으면 도구 이름으로 대체합니다. 이 reason은 **결정적** 오류로 분류되어 곧바로 `400`을 반환합니다.
 > 없는데 해당 필드가 필수여서 요청 전체가 400이었습니다). `input_schema`는 업스트림이 확실히
@@ -1488,7 +1493,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.11.1"}
+{"service":"kiro2api","status":"ok","version":"0.12.0"}
 ```
 
 ### GET /v1/ping

@@ -90,6 +90,18 @@ fn region_base(region: &str) -> String {
     format!("https://codewhisperer.{region}.amazonaws.com")
 }
 
+/// 模型清单的**备用**主机。
+///
+/// `codewhisperer.{region}` 只在部分 region 存在 —— 实测 `codewhisperer.eu-central-1`
+/// 连 DNS 都解析不了,于是非 us-east-1 的账号"刷新模型"必然失败,而且失败形态是**传输层
+/// 错误**,面板上只显示一句 `models http error`,完全看不出是主机不存在。
+///
+/// `q.{region}` 在这些 region 是存在的,故作备用:至少能拿到一个**真实的 HTTP 应答**,
+/// 把上游的原话(例如"该订阅不支持此应用")带给运营者,而不是一个语焉不详的传输失败。
+fn region_base_fallback(region: &str) -> String {
+    format!("https://q.{region}.amazonaws.com")
+}
+
 /// 由凭据 + 配置构造伪装身份(machine_id 优先显式,否则由 refresh_token 派生)。
 fn impersonation_for(cred: &Credential, cfg: &crate::config::Config) -> Impersonation {
     // 收口到唯一入口(理由同 balance::client):此前这份不认配置级 machineId。
@@ -171,9 +183,21 @@ pub async fn fetch_available_models(
     cfg: &crate::config::Config,
     cred: &Credential,
 ) -> Result<AvailableModelsResponse, ModelsError> {
-    let base = region_base(&cred.region);
     let imp = impersonation_for(cred, cfg);
-    fetch_at(client, &base, cred, &imp).await
+    match fetch_at(client, &region_base(&cred.region), cred, &imp).await {
+        // 传输层失败(最常见的是主机在该 region 根本不存在)→ 换备用主机再试一次。
+        // 只对传输失败回落:拿到了 HTTP 应答就说明主机是对的,那种失败换主机也没用。
+        Err(ModelsError::Http) => {
+            let fb = region_base_fallback(&cred.region);
+            tracing::debug!(
+                region = %cred.region,
+                fallback = %fb,
+                "模型清单主机不可达,改用备用主机"
+            );
+            fetch_at(client, &fb, cred, &imp).await
+        }
+        other => other,
+    }
 }
 
 /// 集中保鲜版:调 ListAvailableModels 前先经 [`crate::kiro::ensure_fresh`] 确保 access_token
@@ -247,6 +271,7 @@ mod tests {
 
     fn cred() -> Credential {
         Credential {
+            priority: 999,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -322,6 +347,78 @@ mod tests {
         assert_eq!(infos.len(), 2);
         assert_eq!(infos[0].id, "auto");
         assert_eq!(infos[1].id, "claude-sonnet-5");
+    }
+
+    /// ksk(API Key)凭据刷新模型清单时必须带 **ksk 本身**作 bearer,并配套 `tokentype: API_KEY`。
+    ///
+    /// 回归:此前这里直接读 `access_token`,而 ksk 的令牌在 `kiroApiKey` 里 —— 发出去的是
+    /// 空 Bearer,于是 ksk 账号"刷新模型"必然报错。用户报过这个现象。
+    #[tokio::test]
+    async fn api_key_credentials_refresh_models_with_the_ksk_itself() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("authorization", "Bearer ksk_TESTKEY"))
+            .and(header("tokentype", "API_KEY"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{ "modelId": "claude-sonnet-4.5", "modelName": "Claude Sonnet 4.5" }]
+            })))
+            .mount(&server)
+            .await;
+        let mut c = cred();
+        c.auth = AuthMethod::ApiKey;
+        c.kiro_api_key = Some("ksk_TESTKEY".into());
+        c.access_token = String::new();
+        let r = fetch_at(&reqwest::Client::new(), &server.uri(), &c, &imp())
+            .await
+            .expect("ksk 必须能刷新模型清单");
+        assert!(!r.models.is_empty());
+    }
+
+    /// 非 ksk 凭据不得带 `tokentype`。
+    #[tokio::test]
+    async fn oauth_credentials_do_not_send_tokentype_on_models() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": []
+            })))
+            .mount(&server)
+            .await;
+        let _ = fetch_at(&reqwest::Client::new(), &server.uri(), &cred(), &imp()).await;
+        let reqs = server.received_requests().await.unwrap();
+        assert!(!reqs[0].headers.contains_key("tokentype"));
+    }
+
+    /// 主主机不可达时回落备用主机。
+    ///
+    /// 回归:`codewhisperer.{region}` 只在部分 region 存在(实测 `codewhisperer.eu-central-1`
+    /// 连 DNS 都解析不了),于是非 us-east-1 的账号刷新模型必然失败,面板只显示一句
+    /// `models http error` —— 完全看不出是主机不存在。用户报过 ksk 刷新模型报错。
+    #[tokio::test]
+    async fn unreachable_primary_host_falls_back() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{ "modelId": "m1", "modelName": "M1" }]
+            })))
+            .mount(&server)
+            .await;
+        // 主主机指向一个必然连不上的端口 → 传输失败 → 回落到 mock
+        let r = match fetch_at(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1",
+            &cred(),
+            &imp(),
+        )
+        .await
+        {
+            Err(ModelsError::Http) => {
+                fetch_at(&reqwest::Client::new(), &server.uri(), &cred(), &imp()).await
+            }
+            other => other,
+        };
+        assert!(r.is_ok(), "回落后应成功");
+        assert_eq!(r.unwrap().models.len(), 1);
     }
 
     #[tokio::test]

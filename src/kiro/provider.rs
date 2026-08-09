@@ -287,7 +287,8 @@ fn signal_strength(kind: FailureKind) -> u8 {
         FailureKind::Transient => 0,
         FailureKind::AuthAmbiguous => 1,
         FailureKind::Quota => 2,
-        FailureKind::AuthInvalid | FailureKind::InvalidRequest => 3,
+        // 模型不可用与确定性请求错误同为"机器稳定信号":都不该被后续端点的传输错误盖掉。
+        FailureKind::AuthInvalid | FailureKind::InvalidRequest | FailureKind::ModelUnavailable => 3,
     }
 }
 
@@ -535,6 +536,7 @@ mod tests {
 
     fn cred() -> Credential {
         Credential {
+            priority: 999,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,

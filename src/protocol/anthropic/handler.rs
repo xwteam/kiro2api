@@ -234,6 +234,9 @@ pub enum RelayError {
     /// 确定性请求错误(换账号重试无用):模型对当前档位不可用、或请求体超上游长度上限。
     /// 曾名 `InvalidModel` —— 在它开始承载"上下文超长"之后,那个名字本身就是个假陈述。
     InvalidRequest(String),
+    /// 该模型对**当前账号**不可用。带模型名,供全池试尽后给客户端一句说得清的话。
+    /// 与 [`InvalidRequest`](Self::InvalidRequest) 不同,它会触发换账号重试。
+    ModelUnavailable(String),
 }
 
 impl RelayError {
@@ -242,7 +245,9 @@ impl RelayError {
             RelayError::Convert(_) => StatusCode::BAD_REQUEST,
             RelayError::NoAccount => StatusCode::SERVICE_UNAVAILABLE,
             RelayError::Upstream(_) | RelayError::UpstreamTransient(_) => StatusCode::BAD_GATEWAY,
-            RelayError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            RelayError::InvalidRequest(_) | RelayError::ModelUnavailable(_) => {
+                StatusCode::BAD_REQUEST
+            }
         }
     }
     /// 对外错误类型串(不泄露内部细节/令牌)。
@@ -251,11 +256,13 @@ impl RelayError {
             RelayError::Convert(_) => "invalid_request_error",
             RelayError::NoAccount => "overloaded_error",
             RelayError::Upstream(_) | RelayError::UpstreamTransient(_) => "api_error",
-            RelayError::InvalidRequest(_) => "invalid_request_error",
+            RelayError::InvalidRequest(_) | RelayError::ModelUnavailable(_) => {
+                "invalid_request_error"
+            }
         }
     }
     /// 对外错误消息(粗粒度,不含令牌/内部堆栈)。
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         match self {
             RelayError::Convert(e) => e.to_string(),
             RelayError::NoAccount => "no available upstream account".to_string(),
@@ -264,6 +271,13 @@ impl RelayError {
             }
             // 清晰的不可用说明(确定性、可安全外露):把"该模型不可用、请换一个"透传给客户端。
             RelayError::InvalidRequest(msg) => msg.clone(),
+            RelayError::ModelUnavailable(model) => format!(
+                "Model `{model}` is not available on any account in the pool. \
+                 Available models differ by subscription tier (a FREE account and an API-key \
+                 account do not offer the same set), while the model list this relay exposes is \
+                 the union across all accounts. Pick a model your accounts actually have, or \
+                 add an account whose tier includes it."
+            ),
         }
     }
 }
@@ -414,6 +428,9 @@ async fn record_classified_failure(
                 .record_failure(credential_id, "api", code, response_body, now_i64)
                 .await;
         }
+        // 模型对该账号不可用:**不记失败日志**——账号没坏,只是档位不含这个模型。
+        // 记进去会让面板上一个完全健康的账号显示成"有失败",运营者据此误判。
+        FailureKind::ModelUnavailable => {}
         FailureKind::Quota => {
             stats
                 .record_throttle(credential_id, "api", response_body, now_i64)
@@ -489,8 +506,17 @@ pub(crate) async fn select_and_call_with_retry(
 
     let mut tried_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut last_err: Option<RelayError> = None;
+    // "该模型对这个账号不可用"单独计数,**不占**账号故障的重试预算。
+    //
+    // 两者代价与含义都不同:账号故障意味着上游可能真出问题了,连试几个就该收手;而模型
+    // 不可用只是"这个账号的档位不含这个模型",一次尝试就是一个廉价的确定性 400,继续往下
+    // 找完全合理。混着 FREE 与付费档时,支持该模型的账号可能排在很后面——共用 3 次预算的
+    // 话根本轮不到它(实测:14 个账号的池只试到第 3 个就放弃,而唯一支持的账号排第 14)。
+    let mut model_skips = 0usize;
+    let max_model_skips = pool_size;
 
-    for _attempt in 0..max_attempts {
+    let mut attempt = 0usize;
+    while attempt < max_attempts + model_skips {
         match select_and_call_once(state, req, now_unix, &tried_ids, bound).await {
             // 成功:直接返回(响应体尚未开始消费)。
             Ok((outcome, _tried_id)) => return Ok(outcome),
@@ -505,6 +531,26 @@ pub(crate) async fn select_and_call_with_retry(
             // 非首个尝试 NoAccount → 说明前面的账号已试尽,返回上一次真实的账号级错误。
             Err((RelayError::NoAccount, _)) => {
                 return Err(last_err.unwrap_or(RelayError::NoAccount));
+            }
+            // 模型对该账号不可用:**换个账号再试**,而不是直接回 400。
+            //
+            // 可用模型随订阅档位变化,而我们对客户端暴露的是全池并集 —— 池里混着不同档位时,
+            // 并集里的模型落到不支持它的账号上必错。此前它被当作请求级致命错误直接返回,
+            // 于是"ksk 和 FREE 同时启用就报错、只留一种就正常"。
+            //
+            // 记下这个账号并继续;若全池试尽仍不行,循环外会把这个错误原样返回,
+            // 客户端得到的是一句说得清的 400(见 `RelayError::ModelUnavailable` 的文案)。
+            Err((e @ RelayError::ModelUnavailable(_), tried_id)) => {
+                if let Some(id) = tried_id {
+                    tried_ids.insert(id);
+                }
+                last_err = Some(e);
+                model_skips += 1;
+                if model_skips > max_model_skips {
+                    break;
+                }
+                attempt += 1;
+                continue;
             }
             // 账号级失败(Auth/Quota/Transient):记下已试账号,换下一个重试。
             Err((e @ (RelayError::Upstream(_) | RelayError::UpstreamTransient(_)), tried_id)) => {
@@ -526,9 +572,10 @@ pub(crate) async fn select_and_call_with_retry(
                 }
                 // 瞬态失败在换账号前退避(指数 + 抖动,上限 2s);账号级失败不等。
                 if transient && tried_ids.len() < max_attempts {
-                    tokio::time::sleep(transient_backoff(_attempt)).await;
+                    tokio::time::sleep(transient_backoff(attempt)).await;
                 }
                 // 还有下一轮就继续;这是最后一轮则落到循环外返回 last_err。
+                attempt += 1;
                 continue;
             }
         }
@@ -555,7 +602,8 @@ pub(crate) async fn select_and_call_once(
     // 1) 选账号(整条链路串行占锁,见 MessagesState 说明);排除本请求已试过的账号。
     let mut pool = state.pool.lock().await;
     let mut cred = pool
-        .select_with_exclude(now_unix, exclude_ids, bound)
+        // 按模型选号:跳过**已知不支持该模型**的账号,免得每次都拿一堆 FREE 号去撞 400。
+        .select_for_model(now_unix, exclude_ids, bound, Some(req.model.as_str()))
         .ok_or((RelayError::NoAccount, None))?;
 
     // 2) 即将过期 → 集中刷新并写回活池(不各自反复轮换令牌;见 kiro::ensure_fresh)。
@@ -684,10 +732,32 @@ pub(crate) async fn select_and_call_once(
     //      不累计 strike)、**不落账号级失败日志**,直接返回 [`RelayError::InvalidModel`],
     //      由 [`select_and_call_with_retry`] 当作致命错误**不重试**、以 400 把清晰的不可用说明回客户端。
     if let Err((FailureKind::InvalidRequest, _, body)) = &outcome {
-        // 文案按 reason 码分别给:这一档现在含义不止一种(模型不可用 / 上下文超长),
-        // 笼统套一句会把后者讲成前者,使用者照着去换模型,换多少次都没用。
+        // 文案按 reason 码分别给:这一档现在含义不止一种(工具规格畸形 / 缺工具定义 /
+        // 上下文超长),笼统套一句会把其中一种讲成另一种,使用者照着改,改多少次都没用。
         let msg = crate::kiro::pool::invalid_request_message(body, &req.model);
         return Err((RelayError::InvalidRequest(msg), Some(tried_id)));
+    }
+
+    // 5.6) 该模型对**这个账号**不可用(INVALID_MODEL_ID)。
+    //
+    // 这是**账号级**的,不是请求级的:可用模型随订阅档位变化(FREE 与付费档、ksk 与 OAuth
+    // 各不相同),而我们对客户端暴露的是全池模型的**并集** —— 并集里的模型落到不支持它的
+    // 账号上就必错。此前它和请求级错误共用一档、直接回 400,于是池里一混档位就报错,
+    // 只留一种账号反而正常。
+    //
+    // 故此处同样**不罚账号**(它没坏),但把它当作账号级失败交给上层:上层会把它排除出
+    // 本次请求的候选、换个账号再试;全池都不支持时才由重试循环收口成 400。
+    if let Err((FailureKind::ModelUnavailable, _, _)) = &outcome {
+        // 记下"这个账号不支持这个模型":档位是账号的稳定属性,下次直接跳过,
+        // 不必再花一次上游 400 去重新发现。
+        {
+            let mut pool = state.pool.lock().await;
+            pool.mark_model_unsupported(&tried_id, &req.model);
+        }
+        return Err((
+            RelayError::ModelUnavailable(req.model.clone()),
+            Some(tried_id),
+        ));
     }
 
     // 6) 依最终结果反馈池(短暂持锁)。分类失败随后在池锁释放外落统计。
@@ -820,6 +890,8 @@ async fn call_data_plane(
                 FailureKind::Quota => 429u16,
                 FailureKind::Transient => 0u16,
                 FailureKind::InvalidRequest => 400u16,
+                // 模型对该账号不可用:上游给的就是 400,但语义是"换个账号可能行"。
+                FailureKind::ModelUnavailable => 400u16,
             };
             (f.kind, status, f.body)
         }),
@@ -1824,6 +1896,7 @@ mod tests {
 
     fn cred() -> Credential {
         Credential {
+            priority: 999,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,

@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.11.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.12.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-08-09 | v0.12.0 - 🎚️ **不同订阅档位的账号终于能共存**(用户提供的真实 ksk 实测复现并验证)。两个半根因:①`INVALID_MODEL_ID` 被归为**请求级**错误直接回 400,而它其实是**账号级**的——可用模型由档位决定,而我们对客户端暴露的是全池**并集**,并集里的模型落到不支持它的账号上就必错 → 拆出 `ModelUnavailable`,不罚账号但换号再试;②换号预算只有 3 次,而支持该模型的号可能排第 14 → 模型不可用**不占**账号故障预算。另:记住「谁不支持哪个模型」(第 2 次同模型请求只选 1 个号,第 1 次是 14 个);**`priority` 此前只是 `weight` 的别名、从不参与选号** → 现数字越小越优先,导入一律 999,手工可调;非 us-east-1 账号刷新模型必然失败(`codewhisperer.{region}` 在该区不存在,DNS 都解析不了)→ 回落 `q.{region}` |
 | 2026-08-09 | v0.11.1 - 🔬 **线上实测挖出的两件事**。①**工具描述为空时上游拒掉整条请求**(实测:同一工具带描述 200 并正常回 tool_use,去掉描述 → `400 Invalid tool use format / REQUEST_BODY_INVALID`)。v0.11.0 把 null 改成了空串,而上游要的是**非空** → 现用工具名兜底;②`REQUEST_BODY_INVALID` 被当成可重试:它是确定性的,换账号也一样失败,此前一条畸形请求连烧几个账号的重试配额(实测一次打了 4 个号)最后回个语焉不详的 502 → 现归入不重试不罚账号那档,直接回 400 并点明多半是工具规格的问题 |
 | 2026-08-09 | v0.11.0 - 🧰 **修「会让请求被上游拒」的一类**。①Anthropic **服务端内置工具**(web_search 等)没有 `input_schema`,而该字段此前是必填 → 客户端一用官方写法,请求就在我们这层 400;②工具 `description` 会序列化成 **null**(真实客户端恒为字符串);③`input_schema` 原样透传,`properties: null` 这类形状不合法会被上游拒掉**整条请求** → 现统一规范化(只补形状不改语义);④超长工具名不缩短(上游上限 63)、缩短后也无法还原 → 现确定性缩短并把 `短名→原名` 带到出口,流式/非流式都还原,否则客户端收到自己没声明过的工具;⑤`:message-type == "error"` 的框架级错误帧被整个忽略 → 上游报错却还原成 200+空消息;⑥面板缺失资源返回 200+HTML 而非 404 —— **这条会让「用 curl 核对产物是否上线」本身骗人**。另:新增 `POST /api/admin/credentials/{id}/refresh` 强制换发令牌 |
 | 2026-08-09 | v0.10.2 - 🩹 **修:运行期停用被写进磁盘,「重启即复活」形同虚设**。v0.10.0 把额度耗尽/连续鉴权失败改为停止使用并声明只置内存态,但落盘时 `snapshot_credentials()` 拿运行时 `disabled` 覆写了 `cred.disabled` —— 一次配额耗尽或两次 401/403 就把账号**永久**写死在 credentials.json 里,重启也回不来,比修复前更糟(线上真的死过一个号)。现落盘只取持久结论;管理员手工停用与响应体确证的失效本就同时写 `cred.disabled`,不会漏。**若你的 credentials.json 里有你没手工停过的 `"disabled": true`,改回 false 即可恢复** |
@@ -272,7 +273,7 @@ kiro2api 内置令牌自愈机制：token 到期**自动内存刷新**（单飞�
 ```bash
 # 健康检查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.11.1"}
+# {"service":"kiro2api","status":"ok","version":"0.12.0"}
 
 # 查看协议侧模型清单（固定短清单，不代表账号档位真的授权）
 curl http://localhost:8080/v1/models \

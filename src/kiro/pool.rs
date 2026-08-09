@@ -51,10 +51,23 @@ pub enum FailureKind {
     /// 401/403 但无明确失效信号 → 冷却(带 strike),不永久禁用。
     AuthAmbiguous,
     Transient,
-    /// 确定性请求错误(如上游 `INVALID_MODEL_ID`:所请求的模型对当前账号档位不可用)。
-    /// **非账号故障**:换任何同档账号都会同样失败,故不冷却/不禁用/不跨账号重试,
-    /// 由上层直接以 400 把清晰的不可用说明回给客户端(见 handler `RelayError::InvalidModel`)。
+    /// 确定性**请求**错误(工具规格畸形 `REQUEST_BODY_INVALID`、缺工具定义
+    /// `TOOL_CONFIG_MISSING`、上下文超长 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`)。
+    /// **非账号故障**:换任何账号都会同样失败,故不冷却/不禁用/不跨账号重试,
+    /// 由上层直接以 400 把清晰的说明回给客户端。
     InvalidRequest,
+    /// 该模型**对这个账号**不可用(`INVALID_MODEL_ID`)。
+    ///
+    /// 与 [`InvalidRequest`](Self::InvalidRequest) 的关键区别:它是**账号级**的,不是请求级的。
+    /// 可用模型随订阅档位变化(FREE 与付费档、ksk 与 OAuth 各不相同),而我们对客户端暴露的
+    /// 是全池模型的**并集** —— 于是一个并集里的模型落到不支持它的账号上就必错。
+    ///
+    /// 此前它和请求级错误共用一档,后果是:池里混着不同档位的账号时,请求**不换号直接 400**。
+    /// 用户报的"ksk 和 FREE 账号同时启用就报错、只留一种就正常"正是这个。
+    ///
+    /// 处置:不罚账号(它没坏),但把它排除出**本次请求**的候选,换个账号再试;
+    /// 全池都不支持时才回 400。
+    ModelUnavailable,
 }
 
 /// 自设冷却时长(秒)。
@@ -116,8 +129,11 @@ pub fn classify_with_body(status: u16, body: &str) -> FailureKind {
             }
         }
         _ => {
-            if body_signals_invalid_request(body) {
-                // 确定性请求错误(如 400 INVALID_MODEL_ID):非账号故障,不重试、不冷却。
+            if body_signals_model_unavailable(body) {
+                // 该模型对**这个账号**不可用:账号没坏,但本次请求要换个账号试。
+                FailureKind::ModelUnavailable
+            } else if body_signals_invalid_request(body) {
+                // 确定性请求错误(工具规格畸形/缺工具定义/上下文超长):换谁都一样,不重试。
                 FailureKind::InvalidRequest
             } else if body_signals_quota(body) {
                 FailureKind::Quota
@@ -144,10 +160,17 @@ pub fn classify_with_body(status: u16, body: &str) -> FailureKind {
 /// 而换账号根本不可能成功(问题在请求本身)。线上一个下午就把 253 个健康账号打成
 /// 149 个带伤、26 个进冷却,可用池缩水后开始回 503「no available upstream account」。
 /// 客户端那头看到的则是 502 `upstream request failed` —— 完全看不出是上下文超长。
+/// 响应体是否表示"该模型对这个账号不可用"。
+///
+/// 与 [`body_signals_invalid_request`] 分开:可用模型随订阅档位变化,而我们对客户端暴露的
+/// 是全池的**并集** —— 这类失败换个账号就可能成功,不该像请求级错误那样直接回 400。
+pub fn body_signals_model_unavailable(body: &str) -> bool {
+    body.to_ascii_lowercase().contains("invalid_model_id")
+}
+
 pub fn body_signals_invalid_request(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
-    lower.contains("invalid_model_id")
-        || lower.contains("content_length_exceeds_threshold")
+    lower.contains("content_length_exceeds_threshold")
         || lower.contains("tool_config_missing")
         // 上游对请求体本身不合法(工具规格形状不对等)回这个 reason。它是**确定性**的:
         // 换任何账号都会同样失败。此前落在可重试档,于是一条畸形请求会连烧几个账号的
@@ -429,6 +452,15 @@ struct Entry {
     last_used_unix: u64,
     /// 最近一次失败的具体原因(仅用于展示/筛选,见 [`StatusReason`])。成功即清空。
     status_reason: StatusReason,
+    /// 已知**这个账号不支持**的模型(上游回过 `INVALID_MODEL_ID` 的那些)。
+    ///
+    /// 可用模型由订阅档位决定,是这个账号的稳定属性,不是一次抖动。记下来之后,后续请求
+    /// 直接跳过它,不必再花一次上游 400 去重新发现 —— 混着 FREE 与付费档时,不记的话
+    /// 每个 opus 请求都要把所有 FREE 账号挨个撞一遍(实测 13 次)才轮到支持它的那个。
+    ///
+    /// 只存在内存里:档位会变(升级订阅、换周期),重启后重新学一遍即可,落盘反而会把
+    /// 一个已经升级的账号长期错判。
+    unsupported_models: std::collections::HashSet<String>,
 }
 
 /// 单账号用量快照(供后续 admin 只读展示用,内部观测,无需改名)。
@@ -436,6 +468,8 @@ struct Entry {
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountStat {
     pub id: String,
+    /// 选号优先级(数字越小越优先)。
+    pub priority: u32,
     /// 该账号是否配了出站代理(凭据级或经全局兜底)。此前管理接口硬编码 `false`。
     pub has_proxy: bool,
     /// 是否是 Priority 档当前粘住的那个账号。
@@ -515,6 +549,7 @@ impl Pool {
                 strikes: 0,
                 unconfirmed_refresh: false,
                 req_times: Vec::new(),
+                unsupported_models: std::collections::HashSet::new(),
                 requests: 0,
                 successes: 0,
                 failures: 0,
@@ -637,6 +672,39 @@ impl Pool {
     /// `allowed` 为本次请求的 store-key 绑定白名单(鉴权闸从命中的那条 key 上解析,经请求
     /// 扩展下传;`None` = 不受限)。**这是绑定唯一的执行点**:成员判定一律委托
     /// [`BoundCredentialIds::allows`],不在此处另写一份 id 解析,以免两处口径漂移。
+    /// 记下"这个账号不支持这个模型"。见 [`Entry::unsupported_models`]。
+    pub fn mark_model_unsupported(&mut self, id: &str, model: &str) {
+        if let Some(e) = self.find(id) {
+            e.unsupported_models.insert(model.to_string());
+        }
+    }
+
+    /// 该账号是否已知不支持某模型。
+    fn supports_model(e: &Entry, model: Option<&str>) -> bool {
+        match model {
+            Some(m) => !e.unsupported_models.contains(m),
+            None => true,
+        }
+    }
+
+    /// 同 [`select_with_exclude`](Self::select_with_exclude),但**跳过已知不支持该模型的账号**。
+    ///
+    /// 混着不同订阅档位时,不跳的话每个 opus 请求都要把所有 FREE 账号挨个撞一遍
+    /// (实测 13 次上游 400)才轮到支持它的那个。
+    pub fn select_for_model(
+        &mut self,
+        now_unix: u64,
+        exclude_ids: &std::collections::HashSet<String>,
+        allowed: Option<&BoundCredentialIds>,
+        model: Option<&str>,
+    ) -> Option<Credential> {
+        self.select_excluding_for_model(
+            now_unix,
+            |c| exclude_ids.contains(&c.id) || allowed.is_some_and(|b| !b.allows(&c.id)),
+            model,
+        )
+    }
+
     pub fn select_with_exclude(
         &mut self,
         now_unix: u64,
@@ -655,13 +723,25 @@ impl Pool {
         now_unix: u64,
         excluded: impl Fn(&Credential) -> bool,
     ) -> Option<Credential> {
+        self.select_excluding_for_model(now_unix, excluded, None)
+    }
+
+    fn select_excluding_for_model(
+        &mut self,
+        now_unix: u64,
+        excluded: impl Fn(&Credential) -> bool,
+        model: Option<&str>,
+    ) -> Option<Credential> {
         let n = self.entries.len();
         if n == 0 {
             return None;
         }
         let max_rpm = self.max_rpm;
         let eligible = |e: &Entry| {
-            Self::is_active(e, now_unix) && Self::rpm_ok(e, now_unix, max_rpm) && !excluded(&e.cred)
+            Self::is_active(e, now_unix)
+                && Self::rpm_ok(e, now_unix, max_rpm)
+                && Self::supports_model(e, model)
+                && !excluded(&e.cred)
         };
         // 收集可用下标:disabled/cooldown/RPM 过滤之外再叠加排除集过滤
         let active: Vec<usize> = (0..n).filter(|&i| eligible(&self.entries[i])).collect();
@@ -682,9 +762,15 @@ impl Pool {
                     .filter(|&i| eligible(&self.entries[i]));
                 let idx = match sticky {
                     Some(i) => i,
-                    // 换人时取**第一个**可用账号(条目顺序即优先级顺序),而不是 cursor 的下一个:
-                    // 后者会让每次换人都往后漂,长期看又退化成轮询。
-                    None => active[0],
+                    // 换人时取**优先级最小**的可用账号(同级按池内顺序);而不是 cursor 的
+                    // 下一个 —— 后者会让每次换人都往后漂,长期看又退化成轮询。
+                    //
+                    // 优先级让"先用哪些号"成为可运营的策略:把付费档/大额度的号调小即可
+                    // 让它优先顶上,导入的号一律 999(最低),要更高得手工改。
+                    None => *active
+                        .iter()
+                        .min_by_key(|&&i| (self.entries[i].cred.priority, i))
+                        .expect("active 非空"),
                 };
                 self.current = Some(self.entries[idx].cred.id.clone());
                 idx
@@ -783,6 +869,7 @@ impl Pool {
         crate::kiro::credential::freeze_machine_id(&mut cred);
         let email = cred.email.clone();
         self.entries.push(Entry {
+            unsupported_models: std::collections::HashSet::new(),
             disabled: cred.disabled,
             cooldown_until: 0,
             strikes: 0,
@@ -898,9 +985,13 @@ impl Pool {
     }
 
     /// 设置凭据优先级(映射到负载均衡 weight;下限 1)。返回是否命中。
+    /// 设置选号优先级(数字越小越优先)。
+    ///
+    /// 此前这里改的是 `weight` —— 而 `weight` 只在 `balanced` 档起作用,Priority 档根本不看它。
+    /// 于是"设置优先级"这个按钮在默认档位下是个空操作。
     pub fn set_priority(&mut self, id: &str, priority: i64) -> bool {
         if let Some(e) = self.find(id) {
-            e.cred.weight = if priority < 1 { 1 } else { priority as u32 };
+            e.cred.priority = priority.clamp(0, u32::MAX as i64) as u32;
             true
         } else {
             false
@@ -1050,9 +1141,12 @@ impl Pool {
                         e.strikes = 0;
                     }
                 }
-                // 确定性请求错误(如 INVALID_MODEL_ID):非账号故障,不冷却、不禁用、不累计 strike。
+                // 确定性请求错误:非账号故障,不冷却、不禁用、不累计 strike。
                 // (上层其实会在反馈池前就短路,不会带此类走到这里;此 arm 仅为防御性穷尽。)
                 FailureKind::InvalidRequest => {}
+                // 模型对该账号不可用:同样**不罚账号**——它没坏,只是档位不含这个模型。
+                // 排除出本次请求候选是调用方的事(见 handler 的跨账号重试)。
+                FailureKind::ModelUnavailable => {}
             }
         }
     }
@@ -1062,6 +1156,7 @@ impl Pool {
         self.entries
             .iter()
             .map(|e| AccountStat {
+                priority: e.cred.priority,
                 has_proxy: e
                     .cred
                     .effective_proxy(crate::kiro::provider::config_proxy_url().as_deref())
@@ -1107,6 +1202,7 @@ mod tests {
 
     fn cred(id: &str, weight: u32) -> Credential {
         Credential {
+            priority: 999,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -1143,28 +1239,40 @@ mod tests {
     }
 
     #[test]
-    fn classify_with_body_flags_invalid_model_id_as_invalid_request() {
-        // 上游对不支持的模型返回的 400 INVALID_MODEL_ID → InvalidRequest(不重试/不冷却)。
+    fn invalid_model_id_is_account_level_not_request_level() {
+        // `INVALID_MODEL_ID` 说的是"**这个账号**的档位不含该模型",不是"这条请求有问题"。
+        //
+        // 回归:它此前和请求级错误共用 `InvalidRequest` 一档,而那一档在上层是**不换账号
+        // 直接回 400** 的。于是池里混着不同档位的账号时(用户的场景:ksk + FREE),
+        // 客户端看到的是全池模型的**并集**,并集里的模型一旦落到不支持它的账号上就报错 ——
+        // 现象正是"两种账号同时启用就出 API 错误,只留一种反而正常"。
         let body = r#"{"message":"Invalid model. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}"#;
-        assert_eq!(classify_with_body(400, body), FailureKind::InvalidRequest);
+        assert_eq!(classify_with_body(400, body), FailureKind::ModelUnavailable);
+        assert!(body_signals_model_unavailable(body));
         // 大小写无关。
         assert_eq!(
             classify_with_body(400, r#"{"reason":"invalid_model_id"}"#),
-            FailureKind::InvalidRequest
+            FailureKind::ModelUnavailable
         );
+        // 且**不得**被误判成请求级错误——那会让它退回"不换账号直接 400"的老路。
+        assert!(!body_signals_invalid_request(body));
+
         // 其它 400(无该 reason 码)仍保守落 Transient(可重试),不误伤。
         assert_eq!(
             classify_with_body(400, "Bad Request"),
             FailureKind::Transient
         );
         assert_eq!(classify_with_body(400, ""), FailureKind::Transient);
-        // report_failure 收到 InvalidRequest 不冷却/不禁用/不累计 strike(防御性穷尽 arm)。
-        let mut pool = Pool::new(vec![cred("c1", 1)], LbMode::Priority);
-        pool.report_failure("c1", FailureKind::InvalidRequest, 1000);
-        let e = pool.find("c1").unwrap();
-        assert!(!e.disabled, "InvalidRequest 不该禁用账号");
-        assert_eq!(e.cooldown_until, 0, "InvalidRequest 不该冷却账号");
-        assert_eq!(e.strikes, 0, "InvalidRequest 不该累计 strike");
+
+        // 两档都不罚账号:账号没坏,坏的是"这个模型配这个账号"。
+        for kind in [FailureKind::InvalidRequest, FailureKind::ModelUnavailable] {
+            let mut pool = Pool::new(vec![cred("c1", 1)], LbMode::Priority);
+            pool.report_failure("c1", kind, 1000);
+            let e = pool.find("c1").unwrap();
+            assert!(!e.disabled, "{kind:?} 不该禁用账号");
+            assert_eq!(e.cooldown_until, 0, "{kind:?} 不该冷却账号");
+            assert_eq!(e.strikes, 0, "{kind:?} 不该累计 strike");
+        }
     }
 
     #[test]
@@ -1434,6 +1542,79 @@ mod tests {
         p.report_failure("a", FailureKind::InvalidRequest, 100);
         assert!(p.select(100).is_some(), "账号不该因请求畸形而被罚");
         assert_eq!(p.stats(100)[0].strikes, 0);
+    }
+
+    /// Priority 档换号时取**优先级最小**的账号(数字越小越优先)。
+    ///
+    /// 回归:`priority` 此前只是 `weight` 的别名,而 `weight` 只在 balanced 档起作用 ——
+    /// 于是"设置优先级"这个按钮在默认档位下是个空操作,运营者无法决定先用哪些号。
+    #[test]
+    fn priority_decides_who_takes_over() {
+        // 池内顺序故意与优先级相反,确保测的是优先级而不是顺序
+        let mut a = cred("low", 1);
+        a.priority = 999;
+        let mut b = cred("high", 1);
+        b.priority = 10;
+        let mut p = Pool::new(vec![a, b], LbMode::Priority);
+        let none = std::collections::HashSet::new();
+
+        assert_eq!(
+            p.select_for_model(0, &none, None, None).unwrap().id,
+            "high",
+            "应先用优先级数字更小的那个"
+        );
+        p.report_failure("high", FailureKind::AuthInvalid, 0);
+        assert_eq!(p.select_for_model(0, &none, None, None).unwrap().id, "low");
+    }
+
+    /// 缺省优先级是 999(最低):导入的账号一律如此,要更高得手工改。
+    #[test]
+    fn imported_credentials_default_to_the_lowest_priority() {
+        let json = r#"[{"id":1,"accessToken":"a","refreshToken":"r","authMethod":"social"}]"#;
+        let creds: Vec<Credential> = serde_json::from_str(json).unwrap();
+        assert_eq!(creds[0].priority, crate::kiro::credential::DEFAULT_PRIORITY);
+        assert_eq!(crate::kiro::credential::DEFAULT_PRIORITY, 999);
+    }
+
+    /// 记下"某账号不支持某模型"后,后续选号直接跳过它。
+    ///
+    /// 动机:可用模型由订阅档位决定,是账号的稳定属性。不记的话,池里混着 FREE 与付费档时,
+    /// **每个** opus 请求都要把所有 FREE 账号挨个撞一遍才轮到支持它的那个 —— 线上实测
+    /// 一次请求白打了 13 次上游 400。
+    #[test]
+    fn accounts_known_not_to_support_a_model_are_skipped() {
+        let mut p = Pool::new(vec![cred("free", 1), cred("power", 1)], LbMode::Priority);
+        let none = std::collections::HashSet::new();
+
+        // 一开始谁都可能被选中(粘滞会先挑第一个)
+        assert_eq!(
+            p.select_for_model(0, &none, None, Some("opus")).unwrap().id,
+            "free"
+        );
+
+        // 上游说 free 不支持 opus → 记下
+        p.mark_model_unsupported("free", "opus");
+
+        // 此后 opus 请求直接跳过它
+        assert_eq!(
+            p.select_for_model(0, &none, None, Some("opus")).unwrap().id,
+            "power",
+            "已知不支持的账号必须被跳过"
+        );
+        // 但**别的模型**照旧可以用这个账号——记的是"这个模型",不是"这个账号坏了"。
+        //(粘滞此刻停在 power 上,故先把它排除掉才能看出 free 仍然可选。)
+        let mut ex = std::collections::HashSet::new();
+        ex.insert("power".to_string());
+        assert_eq!(
+            p.select_for_model(0, &ex, None, Some("sonnet")).unwrap().id,
+            "free"
+        );
+        // 不带模型时不过滤(控制面等路径)
+        assert!(p.select_for_model(0, &none, None, None).is_some());
+
+        // 全池都不支持 → 选不出来,由上层收口成一句说得清的 400
+        p.mark_model_unsupported("power", "opus");
+        assert!(p.select_for_model(0, &none, None, Some("opus")).is_none());
     }
 
     /// 运行期的"停止使用"**绝不能**落盘,否则"重启即复活"是句空话。
@@ -1978,15 +2159,21 @@ mod tests {
     }
 
     #[test]
-    fn set_priority_maps_to_weight_with_floor_one() {
-        let mut p = Pool::new(vec![cred("a", 1)], LbMode::Priority);
+    fn set_priority_writes_priority_not_weight() {
+        let mut p = Pool::new(vec![cred("a", 7)], LbMode::Priority);
         assert!(p.set_priority("a", 5));
-        assert_eq!(p.snapshot_credentials()[0].weight, 5);
-        // 低于 1 的优先级钳到 1
+        let c = &p.snapshot_credentials()[0];
+        assert_eq!(c.priority, 5, "应写 priority");
+        assert_eq!(
+            c.weight, 7,
+            "**不得**顺手改 weight —— 此前二者被混成一个字段,于是「设置优先级」\
+             实际改的是权重,而 Priority 档根本不看权重,按钮等于空操作"
+        );
+        // 0 是合法的最高优先级(不再钳到 1);负数钳到 0
         assert!(p.set_priority("a", 0));
-        assert_eq!(p.snapshot_credentials()[0].weight, 1);
+        assert_eq!(p.snapshot_credentials()[0].priority, 0);
         assert!(p.set_priority("a", -3));
-        assert_eq!(p.snapshot_credentials()[0].weight, 1);
+        assert_eq!(p.snapshot_credentials()[0].priority, 0);
         // 未知 id → false
         assert!(!p.set_priority("nope", 2));
     }

@@ -258,6 +258,7 @@ mod tests {
 
     fn cred() -> Credential {
         Credential {
+            priority: 999,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -328,6 +329,65 @@ mod tests {
         assert_eq!(r.current_usage(), 5.0);
         assert_eq!(r.remaining(), 45.0);
         assert_eq!(r.subscription_title(), Some("KIRO PRO+"));
+    }
+
+    /// ksk(API Key)凭据的余额查询必须带 **ksk 本身**作 bearer,并配套 `tokentype: API_KEY`。
+    ///
+    /// 回归:此前这里直接读 `access_token`,而 ksk 的令牌在 `kiroApiKey` 里 —— 于是发出去的是
+    /// 一个**空 Bearer**,余额查询对 ksk 账号必然 401/403,面板上永远查不出额度。
+    /// 用户报过这个现象("导入的 ksk 没有办法查余额")。
+    #[tokio::test]
+    async fn api_key_credentials_query_balance_with_the_ksk_itself() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/getUsageLimits"))
+            // 两条同时成立才算对:bearer 是 ksk 本身,且显式声明令牌类型
+            .and(header("authorization", "Bearer ksk_TESTKEY"))
+            .and(header("tokentype", "API_KEY"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "subscriptionInfo": { "subscriptionTitle": "KIRO FREE" },
+                "usageBreakdownList": [{
+                    "currentUsageWithPrecision": 1.0,
+                    "usageLimitWithPrecision": 50.0
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let mut c = cred();
+        c.auth = AuthMethod::ApiKey;
+        c.kiro_api_key = Some("ksk_TESTKEY".into());
+        c.access_token = String::new(); // ksk 凭据本就没有 access_token
+        let r = fetch_at(&reqwest::Client::new(), &server.uri(), &c, &imp())
+            .await
+            .expect("ksk 必须能查出余额");
+        assert_eq!(r.usage_limit(), 50.0);
+        assert_eq!(r.subscription_title(), Some("KIRO FREE"));
+    }
+
+    /// 非 ksk 凭据**不得**带 `tokentype`:那个头只对 API Key 成立,乱发会让上游按 ksk
+    /// 去解析一枚 OAuth 令牌。
+    #[tokio::test]
+    async fn oauth_credentials_do_not_send_tokentype() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/getUsageLimits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "subscriptionInfo": { "subscriptionTitle": "KIRO FREE" },
+                "usageBreakdownList": [{
+                    "currentUsageWithPrecision": 0.0,
+                    "usageLimitWithPrecision": 50.0
+                }]
+            })))
+            .mount(&server)
+            .await;
+        fetch_at(&reqwest::Client::new(), &server.uri(), &cred(), &imp())
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        assert!(
+            !reqs[0].headers.contains_key("tokentype"),
+            "OAuth 凭据不该带 tokentype"
+        );
     }
 
     #[tokio::test]
