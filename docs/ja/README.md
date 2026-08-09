@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.14-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.8.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日付 | 更新内容 |
 |------|----------|
+| 2026-08-03 | v0.8.0 - ✨ **Kiro API Key(`ksk_…`)でのアカウント登録に対応**。この種の資格情報は social/idc とは根本的に異なり、**キー自体がデータプレーンの bearer** です。交換も更新も期限もなく、OAuth 経路を一切通りません。`{"kiroApiKey":"ksk_xxx","authMethod":"api_key"}` として登録するか、登録エンドポイントに `kiroApiKey`(別名 `ksk`)を渡します。実装は観測に合わせています:リクエストに `tokentype: API_KEY` を付与(無いと上流は OAuth トークンとして解釈し拒否します)、machine id は `KiroAPIKey/` を塩に、更新経路は明示的に短絡、期限判定は常に否 —— そうしないと既定の `expiresAt=0` が「1970 年に期限切れ」と読まれ、プール投入と同時に死亡扱いになります。また `api_key` を宣言しながらキーが無い資格情報は読み込み時に無効化され、「リセット」でも復活しません |
 | 2026-08-03 | v0.7.14 - 🐛 ホームの「グローバル残高」がたいてい空欄で、更新を押さないと出ない問題を修正。集計が**まだ新鮮な**(TTL 5 分)エントリのみを合計していたため、アカウント画面を 5 分開かないだけでホームが空になっていました——全アカウントの残高はディスク上にあるのに「古い」という理由で表示されず、手動更新を強いる。その更新こそ、このキャッシュが避けるためにある上流呼び出しです。`is_fresh` は「再取得すべきか」に答えるものであり「表示すべきか」ではありません。現在は全エントリを読み、データの古さも併せて示します。✨ **アクティブなアカウントのトークン先行更新**を追加:24 時間以内に使われたアカウントは期限 10 分前に背後で更新されます。**意図的にアクティブ分のみ**——プール全体をタイマーで更新すると 253 アカウントに恒常的な心拍(毎時 253 回、無人)が生まれ、本プロジェクトは既に 24 アカウントを security precaution で停止されています |
 | 2026-08-03 | v0.7.13 - 🐛 **codex の 502:中継自身が不正なリクエストを生成していました。** 上流はメッセージに `toolUse` が含まれる場合 `toolConfig` を必須としますが、Responses の組み込みツール(`web_search`・`local_shell`)は変換時に正当に破棄されます(v0.7.1)。そのためクライアントがあるターンで組み込みツールだけを送ると `tools` が空になり、履歴のツール呼び出しだけが残ります。再現:ツール履歴+組み込みのみ → 502、同じ履歴に関数ツール 1 つ → 200。現在は送信前に会話履歴のツール名を最小仕様で補完します(クライアント宣言分を優先、重複なし)。また `TOOL_CONFIG_MISSING` を確定的リクエストエラーに分類(従来は一時的エラー扱いで、30 分に 26 件・25 アカウントに波及) |
 | 2026-08-03 | v0.7.12 - 🐛 **一つの長すぎるリクエストがアカウントプール全体を傷つけ、最終的に 503 に至っていました。** 上流は長さ上限を超えたリクエストに `400 CONTENT_LENGTH_EXCEEDS_THRESHOLD` を返しますが、確定的なリクエストエラーとして認識していたのは `INVALID_MODEL_ID` だけで、このコードは「一時的エラー」に落ちていました。その結果、どのアカウントでも成功し得ないリクエストが**アカウントを跨いで再試行され、触れた全アカウントに失敗と strike を記録**していました。実測では一日の午後で 253 の健全なアカウントが 149 の負傷・26 のクールダウンとなり、以後 `503 no available upstream account` を返し始めました。現在は `InvalidRequest` として扱い、再試行もクールダウンも strike もありません。クライアントも内容のない `502` ではなく、コンテキスト超過であること・**この誤りは自然回復しないこと**・コンテキストを削るか会話を新規に始める必要があることを示す `400` を受け取ります |
@@ -239,7 +240,7 @@ docker compose logs -f
 ```bash
 # ヘルスチェック
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.14"}
+# {"service":"kiro2api","status":"ok","version":"0.8.0"}
 
 # 利用可能なモデルを表示
 curl http://localhost:8080/v1/models \

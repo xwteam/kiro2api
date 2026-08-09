@@ -602,6 +602,26 @@ curl http://localhost:8080/api/admin/credentials \
 
 新增一條憑證入池並落盤。
 
+**用 Kiro API Key(`ksk_…`)匯入**是另一條路:傳 `kiroApiKey`(也認別名 `ksk`)**代替** `refreshToken`。這類憑證的 key **本身就是資料面 bearer** —— 不換取令牌、不刷新、不過期,完全不走 OAuth 鏈路,故無需 `refreshToken`/`clientId`/`clientSecret`,也不必給 `expiresAt`。
+
+```bash
+curl -X POST http://localhost:8080/api/admin/credentials \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-你的管理金鑰" \
+  -d '{"kiroApiKey": "ksk_xxx"}'
+```
+
+落盤形態(直接編輯 `credentials.json` 亦可):
+
+```json
+{"kiroApiKey": "ksk_xxx", "authMethod": "api_key"}
+```
+
+**給了 `kiroApiKey` 就按 API Key 處理,不看 `authMethod` 寫了什麼** —— 顯式宣告 `idc` 卻帶著 key 會掉進「必填 clientId/clientSecret」的校驗,把一個本來完整的憑證判成缺欄位。
+
+反過來,**宣告了 `authMethod: api_key` 卻沒給 `kiroApiKey`** 的憑證配置自相矛盾:它取不到 bearer,又被判定為 API Key 憑證(故不刷新),留在池裡只會在跨帳號重試裡反覆空轉。此類憑證**載入時即被停用**,且**「重置」拒絕救活它** —— 重置只清 strike/冷卻/結論,改不了配置本身。出路是改對配置再重啟。
+
+
 ### PUT /api/admin/credentials/{id}
 
 更新既有憑證。
@@ -1201,7 +1221,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.7.14"}
+{"service":"kiro2api","status":"ok","version":"0.8.0"}
 ```
 
 ### GET /v1/ping

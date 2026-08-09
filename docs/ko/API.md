@@ -654,6 +654,26 @@ curl http://localhost:8080/api/admin/credentials \
 
 필수 필드는 `refreshToken` 하나뿐입니다(`authMethod`가 `idc`면 `clientId` + `clientSecret`도 필요). access token과 만료 시각은 **여기서 받지 않습니다** — 첫 자동 갱신 때 채워지며, 그 밖의 알 수 없는 키는 거부되지 않고 조용히 무시됩니다.
 
+**Kiro API Key(`ksk_…`)로 가져오기**는 또 다른 경로입니다: `refreshToken` **대신** `kiroApiKey`(별칭 `ksk`)를 보냅니다. 이런 자격 증명에서는 **키 자체가 데이터 플레인 bearer**이며 교환·갱신·만료가 없고 OAuth 경로를 전혀 거치지 않으므로 `refreshToken`·`clientId`·`clientSecret`·`expiresAt` 모두 필요 없습니다.
+
+```bash
+curl -X POST http://localhost:8080/api/admin/credentials \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-관리자키" \
+  -d '{"kiroApiKey": "ksk_xxx"}'
+```
+
+디스크 형태(`credentials.json`을 직접 편집해도 됩니다):
+
+```json
+{"kiroApiKey": "ksk_xxx", "authMethod": "api_key"}
+```
+
+**`kiroApiKey`가 있으면 `authMethod`에 무엇이 적혀 있든 API Key로 처리합니다** —— `idc`를 선언하면서 키를 지닌 경우 「clientId와 clientSecret 필수」 검증에 걸려 사실은 완전한 자격 증명이 미비로 판정되기 때문입니다.
+
+반대로 `authMethod: api_key`를 선언하면서 `kiroApiKey`가 없는 자격 증명은 자기모순입니다: 제시할 bearer가 없는데도 API Key 자격 증명으로 판정되어 갱신되지 않고, 계정 간 재시도 속에서 선택될 때마다 같은 지점에서 실패합니다. 이런 자격 증명은 **로드 시 비활성화**되며 **「초기화」로도 되살아나지 않습니다** —— 초기화는 strike·쿨다운·결론만 지울 뿐 설정을 바꾸지 못하므로 되살려도 같은 실패로 되돌아갑니다. 설정을 고치고 재시작하세요.
+
+
 **요청**:
 
 ```bash
@@ -1444,7 +1464,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.7.14"}
+{"service":"kiro2api","status":"ok","version":"0.8.0"}
 ```
 
 ### GET /v1/ping

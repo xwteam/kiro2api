@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.14-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.8.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-08-03 | v0.8.0 - ✨ **支援用 Kiro API Key(`ksk_…`)匯入帳號**。key 本身就是資料面 bearer,不換令牌、不刷新、不過期。匯入寫 `{"kiroApiKey":"ksk_xxx","authMethod":"api_key"}`,或呼叫介面傳 `kiroApiKey`。實作按觀測對齊:帶 `tokentype: API_KEY` 標頭、machineId 用 `KiroAPIKey/` 鹽、刷新鏈路顯式短路、過期判定恆答否。另:宣告 `api_key` 卻沒給 key 的憑據**入池即停用**,且「重置」拒絕救活它 |
 | 2026-08-03 | v0.7.14 - 🐛 首頁「全域剩餘積分」經常空白、要點刷新才有:聚合只累加**仍新鮮**(5 分鐘 TTL)的快取,超過 5 分鐘沒打開帳號頁首頁就是空的——盤上明明有全部帳號餘額卻不顯示,逼你點刷新,**而那次刷新正是這份快取本該避免的上游呼叫**。現展示取全部條目並帶出資料年齡。✨ 新增**活躍帳號令牌提前續期**:近 24h 用過的帳號在到期前 10 分鐘後台續上;**刻意只續活躍帳號**——全池定時續期等於給 253 個帳號造一條永不停歇的心跳,而本專案帳號已被上游封過 24 個 |
 | 2026-08-03 | v0.7.13 - 🐛 **codex 的 502:中轉自己造出了畸形請求**。上游要求訊息裡有 `toolUse` 時 `toolConfig` 必須存在,而內建工具在轉換時被合法丟棄(v0.7.1),客戶端某輪只帶內建工具時 `tools` 成了空陣列、歷史裡的工具呼叫卻還在。現在發往上游前會**從對話歷史把呼叫過的工具名補成最小規格**。另:`TOOL_CONFIG_MISSING` 歸入確定性請求錯誤(此前落在瞬時錯誤,半小時 26 次波及 25 個帳號) |
 | 2026-08-03 | v0.7.12 - 🐛 **一個超長請求能把整個帳號池打傷、最終 503**。上游對超長請求回 `400 CONTENT_LENGTH_EXCEEDS_THRESHOLD`,而確定性請求錯誤此前只認 `INVALID_MODEL_ID`,這個碼落進「瞬時錯誤」→ 換任何帳號都不可能成功的請求被跨帳號重試一遍,每換一個就記一次失敗。實測一個下午把 253 個健康帳號打成 149 帶傷、26 冷卻。現歸入 `InvalidRequest`(不重試/不冷卻/不累計 strike);客戶端也不再收到無資訊的 `502`,改回 `400` 並明說是上下文超限且不會自癒 |
@@ -238,7 +239,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.14"}
+# {"service":"kiro2api","status":"ok","version":"0.8.0"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \

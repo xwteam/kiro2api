@@ -635,6 +635,26 @@ Add one credential to the pool and persist it.
 
 Only `refreshToken` is required (plus `clientId` + `clientSecret` when `authMethod` is `idc`). The access token and its expiry are **not accepted here** — they are left empty and filled in by the first automatic refresh. Unknown keys (including `accessToken` / `expiresAt`) are silently ignored, not rejected, so a request carrying them still returns `200` while those values are dropped. Other optional keys: `authMethod`, `email`, `nickname`, `profileArn`, `priority`, `weight`, `authRegion`, `apiRegion`, `machineId`.
 
+**Importing with a Kiro API Key (`ksk_…`)** is the other route: send `kiroApiKey` (alias `ksk`) **instead of** `refreshToken`. For such a credential the key **is** the data-plane bearer — nothing is exchanged, refreshed or expires, and the OAuth path is bypassed entirely, so no `refreshToken`, `clientId`, `clientSecret` or `expiresAt` is needed.
+
+```bash
+curl -X POST http://localhost:8080/api/admin/credentials \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-your-admin-key" \
+  -d '{"kiroApiKey": "ksk_xxx"}'
+```
+
+On disk (editing `credentials.json` directly works too):
+
+```json
+{"kiroApiKey": "ksk_xxx", "authMethod": "api_key"}
+```
+
+**A present `kiroApiKey` decides the auth method regardless of what `authMethod` says** — declaring `idc` while carrying a key would otherwise fall into the "clientId and clientSecret are required" check and reject a credential that is in fact complete.
+
+Conversely, a credential declaring `authMethod: api_key` **without** a `kiroApiKey` is self-contradictory: it has no bearer to offer, yet counts as an API-key credential and so is never refreshed, leaving it to spin through cross-account retries and fail at the same point every time it is selected. Such credentials are **disabled on load**, and **Reset refuses to revive them** — resetting clears strikes, cooldowns and verdicts, none of which changes the configuration, so the credential would walk straight back into the same failure. Fix the configuration and restart.
+
+
 **Request:**
 ```bash
 curl -X POST http://localhost:8080/api/admin/credentials \
@@ -1181,7 +1201,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.7.14",
+  "version": "0.8.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1397,7 +1417,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.7.14"
+  "version": "0.8.0"
 }
 ```
 

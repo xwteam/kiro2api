@@ -4,6 +4,24 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-03
+
+### Added
+
+- **支持用 Kiro API Key(`ksk_…`)导入账号**。这类凭据与 social/idc 根本不同:**key 本身就是数据面 bearer**,不换取令牌、不刷新、不过期,故完全不走 OAuth 刷新链路。
+
+  两种导入方式:
+
+  ```json
+  {"kiroApiKey": "ksk_xxx", "authMethod": "api_key"}
+  ```
+
+  或调导入接口传 `kiroApiKey`(也认 `ksk` 别名);给了 key 就按 API Key 处理,不看 `authMethod` 写了什么 —— 显式声明 idc 却带着 key 会掉进"必填 clientId/clientSecret"的校验,把一个本来完整的凭据判成缺字段。
+
+  实现按观测对齐:请求带 `tokentype: API_KEY` 头(缺了上游会按 OAuth 令牌解析这枚 key 并拒绝,且错误信息不提令牌类型,看起来像"这个 key 是坏的");machineId 用 `sha256("KiroAPIKey/" + ksk)`,与 OAuth 那条盐不可互换;`ensure_fresh` 与 `force_refresh` 对这类凭据显式短路;`is_expired`/`expires_soon` 恒答否 —— 否则缺省的 `expiresAt=0` 会被读成"1970 年就过期了",账号一进池就被判死。
+
+- **配置自相矛盾的 API Key 凭据入池即禁用**。声明了 `authMethod=api_key` 却没给 `kiroApiKey` 时,该凭据取不到 bearer,又被判定为 API Key 凭据(故不刷新),留在池里只会在跨账号重试里反复空转 —— 每次被选中都在同一处失败。现在加载阶段就判出来并禁用,且**「重置」拒绝救活它**:重置只清 strike/冷却/结论,改不了配置本身,复活后立刻重新走回同一条错误路径。出路是改对配置再重启。(此坑由 kiro.rs #134 的后续修复提示。)
+
 ## [0.7.14] - 2026-08-03
 
 ### Fixed

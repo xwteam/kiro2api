@@ -682,6 +682,26 @@ curl http://localhost:8080/api/admin/credentials \
 
 必須は `refreshToken` だけです（`authMethod` が `idc` の場合は `clientId` + `clientSecret` も必要）。access token と有効期限は**このエンドポイントでは受け付けません**——初回の自動リフレッシュ時に補完されます。未知のキーは拒否されず、黙って無視されます。
 
+**Kiro API Key(`ksk_…`)による登録**はもう一つの経路です:`refreshToken` の**代わりに** `kiroApiKey`(別名 `ksk`)を送ります。この種の資格情報では**キー自体がデータプレーンの bearer** であり、交換も更新も期限もなく OAuth 経路を一切通らないため、`refreshToken`・`clientId`・`clientSecret`・`expiresAt` はいずれも不要です。
+
+```bash
+curl -X POST http://localhost:8080/api/admin/credentials \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-管理キー" \
+  -d '{"kiroApiKey": "ksk_xxx"}'
+```
+
+ディスク上の形(`credentials.json` を直接編集しても構いません):
+
+```json
+{"kiroApiKey": "ksk_xxx", "authMethod": "api_key"}
+```
+
+**`kiroApiKey` があれば `authMethod` の記載に関わらず API Key として扱います** —— `idc` を宣言しつつキーを持つ場合、「clientId と clientSecret は必須」の検証に落ち、本来完全な資格情報が不備と判定されてしまうためです。
+
+逆に `authMethod: api_key` を宣言しながら `kiroApiKey` が無い資格情報は自己矛盾です:提示できる bearer が無いのに API Key 資格情報と判定されるため更新もされず、アカウントを跨ぐ再試行の中で毎回同じ箇所で失敗し続けます。この種の資格情報は**読み込み時に無効化**され、**「リセット」でも復活しません** —— リセットは strike・クールダウン・判定を消すだけで設定自体は変わらず、復活しても同じ失敗に戻るだけです。設定を修正して再起動してください。
+
+
 **リクエスト:**
 
 ```bash
@@ -1175,7 +1195,7 @@ curl -X PUT http://localhost:8080/api/admin/config/auth-keys \
 ```json
 {
   "masterApiKey": "sk-マスターキーの平文",
-  "version": "0.7.14",
+  "version": "0.8.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1403,7 +1423,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.7.14"
+  "version": "0.8.0"
 }
 ```
 

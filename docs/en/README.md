@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.7.14-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.8.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | Date | Update |
 |------|--------|
+| 2026-08-03 | v0.8.0 - ✨ **Accounts can now be imported with a Kiro API Key (`ksk_…`).** Such a credential is unlike social/idc: the key *is* the data-plane bearer — nothing is exchanged, refreshed or expires, so the OAuth path is bypassed entirely. Import as `{"kiroApiKey":"ksk_xxx","authMethod":"api_key"}`, or pass `kiroApiKey` (alias `ksk`) to the import endpoint; a present key decides the auth method regardless of what `authMethod` says. Implemented to match observed behaviour: requests carry `tokentype: API_KEY` (without it upstream parses the key as an OAuth token and rejects it, in a message that never mentions token type), the machine id salts with `KiroAPIKey/`, the refresh paths short-circuit explicitly, and expiry always answers no — otherwise the default `expiresAt=0` reads as "expired in 1970" and the account is declared dead the moment it enters the pool. Also: a credential claiming `api_key` without one is disabled on load, and Reset refuses to revive it — resetting cannot change the configuration, so it would only walk back into the same failure |
 | 2026-08-03 | v0.7.14 - 🐛 The global-credits card was usually blank until you pressed refresh. The aggregate summed only **still-fresh** entries (5-minute TTL), so five minutes without opening the accounts page left the homepage empty — every account's balance was on disk, hidden for being "stale", forcing a manual refresh that was **exactly the upstream call this cache exists to avoid**. `is_fresh` answers "should we re-query", not "should we display"; the display path now reads every cached entry and reports the figure's age. ✨ Added **proactive token renewal for active accounts**: an account used within 24h has its token renewed in the background 10 minutes before expiry, so requests no longer wait on a refresh. **Deliberately limited to active accounts** — renewing the whole pool on a timer would give 253 accounts a permanent background heartbeat (253 upstream calls an hour, around the clock, with no user behind them), and this project has already had 24 accounts suspended by upstream as a "security precaution" |
 | 2026-08-03 | v0.7.13 - 🐛 **codex's 502: the relay was producing malformed requests itself.** Upstream requires `toolConfig` whenever a message carries `toolUse`, and the Responses built-ins (`web_search`, `local_shell`) are legitimately discarded during conversion (v0.7.1) — so when a client sends only built-ins on some turn, `tools` becomes empty while the tool calls in the history remain: tool calls with no tool definitions. Reproduced: tool history plus built-ins only → 502; the same history with one function tool → 200. Every tool name appearing in the conversation history is now backfilled with a minimal spec before sending, with client-declared tools taking precedence and no duplicates. Also: `TOOL_CONFIG_MISSING` is now a deterministic request error — it had been landing in *transient*, and 26 occurrences in half an hour touched 25 accounts |
 | 2026-08-03 | v0.7.12 - 🐛 **A single oversized request could damage the whole account pool and end in 503.** Upstream answers `400 CONTENT_LENGTH_EXCEEDS_THRESHOLD` for requests past its length limit, but only `INVALID_MODEL_ID` was recognised as a deterministic request error, so this code fell into *transient* — meaning a request that cannot succeed on any account was **retried across accounts, charging a failure and a strike to every one it touched**. Measured in production: one afternoon turned 253 healthy accounts into 149 damaged and 26 in cooldown, after which the relay began answering `503 no available upstream account`. It is now an `InvalidRequest`: no retry, no cooldown, no strike. Clients also stop receiving a contentless `502 upstream request failed` and get a `400` that says the context limit was exceeded, that **the error will not recover on its own** (each turn resends the whole conversation, so the next is larger still), and that the context must be trimmed or the conversation restarted |
@@ -280,7 +281,7 @@ docker compose logs -f
 ```bash
 # Health check
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.7.14"}
+# {"service":"kiro2api","status":"ok","version":"0.8.0"}
 
 # View available models
 curl http://localhost:8080/v1/models \

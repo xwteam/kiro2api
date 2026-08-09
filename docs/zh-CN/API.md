@@ -681,6 +681,26 @@ curl http://localhost:8080/api/admin/credentials \
 
 **必填的只有 `refreshToken`**（`authMethod` 为 `idc` 时还需 `clientId` + `clientSecret`）。本端点**不接受** access token 与到期时间——它们由首次自动刷新时补齐；多余的键会被**静默忽略**（不报错）。可选键：`authMethod`、`email`、`nickname`、`clientId`、`clientSecret`、`profileArn`、`priority`、`weight`、`authRegion`、`apiRegion`、`machineId`、`proxyUrl`、`proxyUsername`、`proxyPassword`。
 
+**用 Kiro API Key(`ksk_…`)导入**是另一条路:传 `kiroApiKey`(也认别名 `ksk`)**代替** `refreshToken`。这类凭据的 key **本身就是数据面 bearer** —— 不换取令牌、不刷新、不过期,完全不走 OAuth 链路,故无需 `refreshToken`/`clientId`/`clientSecret`,也不必给 `expiresAt`。
+
+```bash
+curl -X POST http://localhost:8080/api/admin/credentials \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-你的管理密钥" \
+  -d '{"kiroApiKey": "ksk_xxx"}'
+```
+
+落盘形态(直接编辑 `credentials.json` 亦可):
+
+```json
+{"kiroApiKey": "ksk_xxx", "authMethod": "api_key"}
+```
+
+**给了 `kiroApiKey` 就按 API Key 处理,不看 `authMethod` 写了什么** —— 显式声明 `idc` 却带着 key 会掉进"必填 clientId/clientSecret"的校验,把一个本来完整的凭据判成缺字段。
+
+反过来,**声明了 `authMethod: api_key` 却没给 `kiroApiKey`** 的凭据配置自相矛盾:它取不到 bearer,又被判定为 API Key 凭据(故不刷新),留在池里只会在跨账号重试里反复空转。此类凭据**加载时即被禁用**,且**「重置」拒绝救活它** —— 重置只清 strike/冷却/结论,改不了配置本身,复活后立刻重新走回同一条错误路径。出路是改对配置再重启。
+
+
 **请求**：
 ```bash
 curl -X POST http://localhost:8080/api/admin/credentials \
@@ -1202,7 +1222,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.7.14",
+  "version": "0.8.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1390,7 +1410,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.7.14"
+  "version": "0.8.0"
 }
 ```
 
