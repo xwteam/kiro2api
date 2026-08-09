@@ -18,7 +18,12 @@ RUN pnpm build
 # 关键:--platform=$BUILDPLATFORM 让 builder 永远原生(amd64)运行,再用交叉工具链编 arm64,
 # 避免在 QEMU 里模拟编译整个 Rust 依赖树(那会慢 5-10 倍、单次上小时)。TLS 后端为 ring,
 # 交叉编译干净(不含 aws-lc-rs/openssl 等难移植 C 依赖)。
-FROM --platform=$BUILDPLATFORM rust:1-slim AS builder
+# **必须钉 -bookworm,且必须与下面运行镜像同代**:二进制链接时按 builder 里的 libc 头
+# 定符号版本,运行时却在运行镜像的 glibc 上跑,builder 比运行镜像新就会缺符号。裸 rust:1-slim
+# 已随上游滚到 trixie(glibc 2.41),而运行镜像是 bookworm(2.36);vendored OpenSSL 又会用到
+# glibc 2.38 才加入的 strlcpy/strlcat,于是产出的二进制启动即
+# `version GLIBC_2.38 not found` —— 两个架构都中招。换运行镜像时必须同步改这里。
+FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm AS builder
 ARG TARGETARCH
 WORKDIR /build
 # 目标架构的交叉 gcc + libc 头(供 ring 的 C/asm 交叉编译与链接)。
