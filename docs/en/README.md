@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.8.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.9.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | Date | Update |
 |------|--------|
+| 2026-08-09 | v0.9.0 - 🔥 **Whole pools were being suspended upstream: one TCP connection was carrying several account identities.** The relay used reqwest's connection pool (90s idle), so a single TCP/TLS session would emit one account's token after another — each also claiming, via the machineId in its user-agent, to be a different machine. A real Kiro client cannot do that: one machine, one account, one connection. **Rotating identities on a single connection is the most direct evidence of account sharing there is** — a shared IP can be explained by NAT, a shared connection cannot. Production went from 1046 accounts to 22 healthy ones, while three accounts that had **never passed through the relay** answered normally when queried upstream directly: the accounts do not arrive dead. Requests now carry `Connection: close` and both clients set `pool_max_idle_per_host(0)`; the user-agent SDK version is aligned to 1.0.34. Transient failures also back off exponentially (200ms–2s with jitter) before switching accounts, while account-level failures do not — following kiro.rs. **Diagnosis correction:** the first fix blamed rapid account switching and added a circuit breaker; a line-by-line comparison with kiro.rs **disproved** it (that project switches faster, retries more, and treats suspension as ordinary, yet runs stably), so the breaker was reverted entirely |
 | 2026-08-03 | v0.8.1 - 🐛 There was nowhere in the panel to enter a Kiro API Key. v0.8.0 shipped the backend and the endpoint but **never added the field to the Add Account form**, so from the UI the feature did not exist — only curl could reach it. The auth-method dropdown now offers **API Key (`ksk_…`)**; choosing it reveals the key field and **hides the refreshToken row**, since such a credential has none and leaving a required-looking box there only suggests something is missing. Submission no longer demands it either |
 | 2026-08-03 | v0.8.0 - ✨ **Accounts can now be imported with a Kiro API Key (`ksk_…`).** Such a credential is unlike social/idc: the key *is* the data-plane bearer — nothing is exchanged, refreshed or expires, so the OAuth path is bypassed entirely. Import as `{"kiroApiKey":"ksk_xxx","authMethod":"api_key"}`, or pass `kiroApiKey` (alias `ksk`) to the import endpoint; a present key decides the auth method regardless of what `authMethod` says. Implemented to match observed behaviour: requests carry `tokentype: API_KEY` (without it upstream parses the key as an OAuth token and rejects it, in a message that never mentions token type), the machine id salts with `KiroAPIKey/`, the refresh paths short-circuit explicitly, and expiry always answers no — otherwise the default `expiresAt=0` reads as "expired in 1970" and the account is declared dead the moment it enters the pool. Also: a credential claiming `api_key` without one is disabled on load, and Reset refuses to revive it — resetting cannot change the configuration, so it would only walk back into the same failure |
 | 2026-08-03 | v0.7.14 - 🐛 The global-credits card was usually blank until you pressed refresh. The aggregate summed only **still-fresh** entries (5-minute TTL), so five minutes without opening the accounts page left the homepage empty — every account's balance was on disk, hidden for being "stale", forcing a manual refresh that was **exactly the upstream call this cache exists to avoid**. `is_fresh` answers "should we re-query", not "should we display"; the display path now reads every cached entry and reports the figure's age. ✨ Added **proactive token renewal for active accounts**: an account used within 24h has its token renewed in the background 10 minutes before expiry, so requests no longer wait on a refresh. **Deliberately limited to active accounts** — renewing the whole pool on a timer would give 253 accounts a permanent background heartbeat (253 upstream calls an hour, around the clock, with no user behind them), and this project has already had 24 accounts suspended by upstream as a "security precaution" |
@@ -282,7 +283,7 @@ docker compose logs -f
 ```bash
 # Health check
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.8.1"}
+# {"service":"kiro2api","status":"ok","version":"0.9.0"}
 
 # View available models
 curl http://localhost:8080/v1/models \

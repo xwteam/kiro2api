@@ -74,6 +74,18 @@ pub fn build_headers(
         h.insert("tokentype", HeaderValue::from_static("API_KEY"));
     }
     h.insert("content-type", HeaderValue::from_static("application/json"));
+    // 每请求一条新连接,**绝不复用**。
+    //
+    // 我们本来走 reqwest 连接池(idle 90s),于是同一条 TCP/TLS 连接上会依次发出不同账号的
+    // 令牌,而每个账号还各自声称是不同的机器(user-agent 里的 machineId 各不相同)。
+    // 真实的 Kiro 客户端不可能这样 —— 一台机器、一个账号、一条连接。「同一条连接上轮换
+    // 多个身份」是账号共享/盗用最直接的证据,比「同 IP 多账号」强得多:后者还能用 NAT 或
+    // 公司网络解释,前者解释不了。
+    //
+    // 线上症状与此吻合:账号在**没经过中转时是活的**(直查上游余额正常),一旦被中转用过就
+    // 被以 `security precaution` 封停;而 kiro.rs 打同一个上游长期稳定,它每个请求都显式
+    // 带 `Connection: close`。这是两边在 wire 上最实质的差异,故对齐。
+    h.insert("connection", HeaderValue::from_static("close"));
     h.insert(
         "x-amzn-codewhisperer-optout",
         HeaderValue::from_static("true"),
@@ -88,7 +100,7 @@ pub fn build_headers(
         h.insert(
             name,
             hv(&format!(
-                "aws-sdk-js/1.0.27 KiroIDE-{}-{}",
+                "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
                 imp.kiro_version, imp.machine_id
             )),
         );
@@ -96,7 +108,7 @@ pub fn build_headers(
     h.insert(
         reqwest::header::USER_AGENT,
         hv(&format!(
-            "aws-sdk-js/1.0.27 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.27 m/E KiroIDE-{}-{}",
+            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
             imp.system_version, imp.node_version, imp.kiro_version, imp.machine_id
         )),
     );
@@ -414,7 +426,7 @@ mod tests {
         };
         let h = build_headers(&cred(), &imp(), &ep, "inv-1");
         let xamz_ua = h.get("x-amz-user-agent").unwrap().to_str().unwrap();
-        assert_eq!(xamz_ua, "aws-sdk-js/1.0.27 KiroIDE-0.0.1-mid");
+        assert_eq!(xamz_ua, "aws-sdk-js/1.0.34 KiroIDE-0.0.1-mid");
         let sdk_req = h.get("amz-sdk-request").unwrap().to_str().unwrap();
         assert_eq!(sdk_req, "attempt=1; max=3");
     }
@@ -428,9 +440,9 @@ mod tests {
         };
         let h = build_headers(&cred(), &imp(), &ep, "inv-1");
         let ua = h.get("user-agent").unwrap().to_str().unwrap();
-        assert!(ua.starts_with("aws-sdk-js/1.0.27 ua/2.1 os/win32#10.0.22631 lang/js"));
+        assert!(ua.starts_with("aws-sdk-js/1.0.34 ua/2.1 os/win32#10.0.22631 lang/js"));
         assert!(ua.contains("md/nodejs#22.22.0"));
-        assert!(ua.contains("api/codewhispererstreaming#1.0.27"));
+        assert!(ua.contains("api/codewhispererstreaming#1.0.34"));
         assert!(ua.contains("m/E KiroIDE-0.0.1-mid"));
     }
 
@@ -828,5 +840,46 @@ mod tests {
             pool.report_failure("a", f.kind, 0);
         }
         assert_eq!(pool.active_count(0), 1); // AuthAmbiguous 单次不禁用,仍可用
+    }
+
+    /// 每请求一条新连接:数据面头必须带 `Connection: close`。
+    ///
+    /// 复用连接会让同一条 TCP/TLS 上依次出现几十个不同账号的令牌,而每个账号还各自声称
+    /// 是不同的机器(user-agent 里的 machineId 各不相同)。真实客户端不可能这样,
+    /// 而「同一条连接上轮换多个身份」是账号共享最直接的证据 —— 同 IP 还能用 NAT 解释,
+    /// 同一条连接解释不了。线上症状吻合:账号没经过中转时是活的,用过就被 security
+    /// precaution 封停;长期稳定的 kiro.rs 每请求都带这个头。
+    #[test]
+    fn every_request_asks_the_connection_to_close() {
+        let ep = Endpoint {
+            url: "http://x/".into(),
+            origin: "AI_EDITOR",
+            target: None,
+        };
+        let h = build_headers(&cred(), &imp(), &ep, "inv");
+        assert_eq!(
+            h.get("connection").unwrap(),
+            "close",
+            "缺这个头连接就会被复用,整池账号暴露在同一条连接上"
+        );
+    }
+
+    /// user-agent 里的 SDK 版本与 kiro.rs 对齐(它抓的是更新的真实客户端)。
+    /// 版本号本身就是指纹的一部分,长期停在旧版是可识别的差异。
+    #[test]
+    fn sdk_version_matches_the_observed_client() {
+        let ep = Endpoint {
+            url: "http://x/".into(),
+            origin: "AI_EDITOR",
+            target: None,
+        };
+        let h = build_headers(&cred(), &imp(), &ep, "inv");
+        let ua = h.get("user-agent").unwrap().to_str().unwrap();
+        assert!(ua.contains("aws-sdk-js/1.0.34"), "UA 版本未对齐: {ua}");
+        assert!(
+            ua.contains("codewhispererstreaming#1.0.34"),
+            "API 版本未对齐: {ua}"
+        );
+        assert!(!ua.contains("1.0.27"), "仍残留旧版本号: {ua}");
     }
 }

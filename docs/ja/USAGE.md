@@ -527,7 +527,7 @@ docker compose ps
 
 ```bash
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.8.1"}
+# {"service":"kiro2api","status":"ok","version":"0.9.0"}
 ```
 
 ### 認証エラー

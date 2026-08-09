@@ -227,6 +227,10 @@ pub enum RelayError {
     Upstream(String),
     /// 确定性请求错误:上游明确拒绝该请求(如 `INVALID_MODEL_ID` —— 所请求的模型对当前
     /// 账号档位不可用)→ 400,携带对客户端可见的说明(换账号重试无用,故不重试)。
+    /// 上游**瞬态**失败(网络抖动、5xx、限流):换账号前值得退避一下,免得把上游的
+    /// 抖动放大成尖峰。与 [`Upstream`](Self::Upstream) 对外表现一致(同为 502),
+    /// 只在重试策略上区分开。
+    UpstreamTransient(String),
     /// 确定性请求错误(换账号重试无用):模型对当前档位不可用、或请求体超上游长度上限。
     /// 曾名 `InvalidModel` —— 在它开始承载"上下文超长"之后,那个名字本身就是个假陈述。
     InvalidRequest(String),
@@ -237,7 +241,7 @@ impl RelayError {
         match self {
             RelayError::Convert(_) => StatusCode::BAD_REQUEST,
             RelayError::NoAccount => StatusCode::SERVICE_UNAVAILABLE,
-            RelayError::Upstream(_) => StatusCode::BAD_GATEWAY,
+            RelayError::Upstream(_) | RelayError::UpstreamTransient(_) => StatusCode::BAD_GATEWAY,
             RelayError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
         }
     }
@@ -246,7 +250,7 @@ impl RelayError {
         match self {
             RelayError::Convert(_) => "invalid_request_error",
             RelayError::NoAccount => "overloaded_error",
-            RelayError::Upstream(_) => "api_error",
+            RelayError::Upstream(_) | RelayError::UpstreamTransient(_) => "api_error",
             RelayError::InvalidRequest(_) => "invalid_request_error",
         }
     }
@@ -255,7 +259,9 @@ impl RelayError {
         match self {
             RelayError::Convert(e) => e.to_string(),
             RelayError::NoAccount => "no available upstream account".to_string(),
-            RelayError::Upstream(_) => "upstream request failed".to_string(),
+            RelayError::Upstream(_) | RelayError::UpstreamTransient(_) => {
+                "upstream request failed".to_string()
+            }
             // 清晰的不可用说明(确定性、可安全外露):把"该模型不可用、请换一个"透传给客户端。
             RelayError::InvalidRequest(msg) => msg.clone(),
         }
@@ -403,6 +409,28 @@ const DEFAULT_MAX_CROSS_ACCOUNT_ATTEMPTS: usize = 3;
 /// 跨账号重试的硬顶(防御性):即便池很大,单请求最多也只试这么多个账号。
 const MAX_CROSS_ACCOUNT_ATTEMPTS_HARD_CAP: usize = 5;
 
+/// 瞬态失败后的退避:指数增长 + 抖动,上限 2 秒。
+///
+/// 只用于**瞬态**错误(网络抖动、上游 5xx/限流)。账号级失败(令牌失效、额度耗尽)不等 ——
+/// 那类失败换个账号立刻就能成,等待只是白白拖慢用户。此分工照 kiro.rs:它在 408/429/5xx
+/// 与发送失败上退避,在 401/403 换账号时不退避,而它打同一个上游长期稳定。
+///
+/// 抖动是为了避免上游抖动时多个并发请求同拍重试、把故障放大成尖峰。
+fn transient_backoff(attempt: usize) -> std::time::Duration {
+    const BASE_MS: u64 = 200;
+    const MAX_MS: u64 = 2_000;
+    let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
+    let backoff = exp.min(MAX_MS);
+    let mut b = [0u8; 2];
+    // 取不到随机数就不抖动:抖动是加分项,不该让请求失败。
+    let jitter = if getrandom::getrandom(&mut b).is_ok() {
+        (u16::from_le_bytes(b) as u64) % (backoff / 4).max(1)
+    } else {
+        0
+    };
+    std::time::Duration::from_millis(backoff.saturating_add(jitter))
+}
+
 /// 由池大小计算本请求的跨账号重试上限:`min(pool_size, 3)`,再叠加防御性硬顶。
 /// 空池按 1 处理(仍走一次选择以产出 `NoAccount` 的既有语义)。
 /// 有效上界取默认值与硬顶的较小者,`clamp` 的下界为 1(至少试一次)。
@@ -453,7 +481,8 @@ pub(crate) async fn select_and_call_with_retry(
                 return Err(last_err.unwrap_or(RelayError::NoAccount));
             }
             // 账号级失败(Auth/Quota/Transient):记下已试账号,换下一个重试。
-            Err((e @ RelayError::Upstream(_), tried_id)) => {
+            Err((e @ (RelayError::Upstream(_) | RelayError::UpstreamTransient(_)), tried_id)) => {
+                let transient = matches!(e, RelayError::UpstreamTransient(_));
                 if let Some(id) = tried_id {
                     tried_ids.insert(id);
                 }
@@ -468,6 +497,10 @@ pub(crate) async fn select_and_call_with_retry(
                         max_attempts = max_attempts,
                         "账号级失败,跨账号重试"
                     );
+                }
+                // 瞬态失败在换账号前退避(指数 + 抖动,上限 2s);账号级失败不等。
+                if transient && tried_ids.len() < max_attempts {
+                    tokio::time::sleep(transient_backoff(_attempt)).await;
                 }
                 // 还有下一轮就继续;这是最后一轮则落到循环外返回 last_err。
                 continue;
@@ -646,8 +679,16 @@ pub(crate) async fn select_and_call_once(
     // 分类失败落库(池锁已释放,fire-and-forget,不阻塞热路径的其它请求)。
     if let Some((kind, status, body)) = failure_to_record {
         record_classified_failure(&state.stats, credential_id, kind, status, &body, now_unix).await;
+        // 瞬态与账号级分开:前者值得退避后再换号(上游抖动时不放大),后者换个账号
+        // 立刻就能成、等待纯属拖慢用户。此分工照 kiro.rs —— 它在 408/429/5xx 上退避、
+        // 在 401/403 换账号时不退避,而它打同一个上游长期稳定。
+        let msg = "data-plane request failed".to_string();
         return Err((
-            RelayError::Upstream("data-plane request failed".to_string()),
+            if kind == FailureKind::Transient {
+                RelayError::UpstreamTransient(msg)
+            } else {
+                RelayError::Upstream(msg)
+            },
             Some(tried_id),
         ));
     }

@@ -1201,7 +1201,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1417,7 +1417,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.8.1"
+  "version": "0.9.0"
 }
 ```
 
@@ -1455,7 +1455,7 @@ The error body shape varies by protocol:
 | 402 | Payment Required | A store-managed key has reached its spending limit (`{"type":"error","error":{"type":"billing_error",…}}`) |
 | 404 | Not Found | Admin endpoints only: unknown account / API-KEY / login-session id |
 | 422 | Unprocessable Entity | Admin endpoints and `/api/user/login` only: the body does not deserialize into the expected shape (missing or wrongly typed required field). The body is axum's `text/plain` diagnostic, not any of the three JSON error shapes above. The relay endpoints (the four conversational ones plus `/v1/messages/count_tokens`) never answer `422` — they convert the same failure into a `400` carrying their protocol's error shape |
-| 502 | Bad Gateway | Upstream Kiro / CodeWhisperer failure |
+| 502 | Bad Gateway | Upstream Kiro / CodeWhisperer failure. **Every upstream request carries `Connection: close` and the clients never reuse connections.** Each request bears a *different account's* token and a machineId that varies with it, so a reused connection would present dozens of identities in sequence on one TCP/TLS session — something a real client cannot do, and the most direct evidence of account sharing there is. Transient failures (network, 5xx, throttling) back off exponentially from 200ms to 2s with jitter before switching accounts; account-level failures do not back off, since another account can succeed immediately |
 | 503 | Service Unavailable | No account available (all in cooldown / disabled / over RPM); also the log endpoints when `logCapacity` is `0` |
 
 ### Common Error Causes

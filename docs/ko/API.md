@@ -1464,7 +1464,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.8.1"}
+{"service":"kiro2api","status":"ok","version":"0.9.0"}
 ```
 
 ### GET /v1/ping
@@ -1495,7 +1495,7 @@ curl http://localhost:8080/v1/ping
 | 422 | 요청 본문 역직렬화 실패 (기본 `Json` 추출기가 그대로 거부 — 필수 필드 누락이나 타입 불일치. 예: `POST /api/admin/credentials/batch-import`를 `{"data": …}` 래퍼 없이 호출. `Json`을 직접 쓰는 `/api/admin/*`, `POST /api/user/login`에서 발생합니다. 반면 프로토콜 4종의 **대화** 엔드포인트(`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1beta/models/{m}:generateContent`)와 `POST /v1/messages/count_tokens`는 같은 상황을 각 프로토콜 형태의 `400` 본문으로 변환해 돌려줍니다) |
 | 429 | 업스트림 Kiro의 스로틀링(`ThrottlingException` 계열 예외를 변환한 결과). `MAX_RPM_PER_CREDENTIAL` 초과는 이 코드가 되지 않습니다 — 해당 계정이 선택 대상에서 빠져 다른 계정으로 넘어가고, 전부 빠졌을 때만 `503`입니다 |
 | 500 | 서버 오류 (내부 오류) |
-| 502 | 업스트림 Kiro 실패 |
+| 502 | 업스트림 Kiro 실패. **모든 업스트림 요청에 `Connection: close`를 붙이고 클라이언트는 연결을 재사용하지 않습니다.** 각 요청은 *서로 다른 계정*의 토큰을 싣고 user-agent의 machineId도 계정마다 달라, 연결을 재사용하면 하나의 TCP/TLS 위에 수십 개의 신원이 차례로 나타납니다 —— 실제 클라이언트로는 불가능하며 계정 공유의 가장 직접적인 증거입니다. 일시적 실패(네트워크/5xx/스로틀링)는 계정 전환 전 200ms→2s 지수 백오프+지터, 계정 수준 실패는 대기하지 않습니다 |
 | 503 | 서비스 사용 불가 (사용 가능한 계정 없음 — 전체 쿨다운/비활성화/RPM 초과, 또는 `logCapacity=0`인데 로그 엔드포인트 호출) |
 
 ## 에러 응답 형식

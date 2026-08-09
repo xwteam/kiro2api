@@ -105,7 +105,7 @@ cat data/config.json | grep apiKey
 | 404 | 管理端点的 `{id}` 不存在：账号回 `{"error":"account not found","id":…}`，API-KEY 回 `{"error":"api key not found","id":…}`，登录会话回 `{"success":false,"error":"login session not found or expired"}` |
 | 422 | 请求体反序列化失败（缺必填字段 / 类型不符），axum 默认拒收，`text/plain` 纯文本。出现在带 body 提取器的端点上：`/api/admin/*` 与 `POST /api/user/login`（四个协议对话端点与 `/v1/messages/count_tokens` 已自行接管拒收、改回各自形状的 `400`）（`/api/user/*` 的其余端点只收 query，参数类型不符是 `400` 而非 `422`） |
 | 429 | **只来自上游限流**，且只在上游于 HTTP 200 事件流中途下发 `Throttling*` 异常帧时原样映射。本地的 `MAX_RPM_PER_CREDENTIAL` **不会**产生 `429`：超过该上限只是让这个账号本轮选不中，全部账号都选不中才落到 `503`（见下行）。上游在 HTTP 层直接回的 `429` 也**不**原样透出——那会被归为配额失败、冷却该账号并换号重试，用尽后以 `502` 收尾。据自己设的 RPM 上限去监控 `429` 是等不到的 |
-| 502 | 上游 Kiro 失败（含跨账号重试用尽后的最后一个账号级错误） |
+| 502 | 上游 Kiro 失败（含跨账号重试用尽后的最后一个账号级错误）。**每个上游请求都带 `Connection: close`、且客户端不复用连接**:本中转每个请求携带**不同账号**的令牌,user-agent 里的 machineId 也随账号变化,复用连接会让同一条 TCP/TLS 上依次出现几十个不同身份 —— 真实客户端不可能如此,而这是账号共享最直接的证据。瞬态失败(网络抖动/5xx/限流)换账号前指数退避 200ms→2s + 抖动;账号级失败(令牌失效/额度耗尽)不退避,换个账号立刻可成 |
 | 503 | 无可用账号（全部冷却 / 禁用 / **超本地 RPM 上限**），或日志端点未启用（`logCapacity=0`） |
 
 ## 模型名映射
@@ -1222,7 +1222,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1410,7 +1410,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.8.1"
+  "version": "0.9.0"
 }
 ```
 

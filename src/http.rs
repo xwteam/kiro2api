@@ -31,6 +31,20 @@ const UNARY_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// 空闲连接在池中的存活上限,避免复用早已被上游/中间设备静默关闭的死连接。
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// 每主机保留的空闲连接数:**0 = 不复用连接**。
+///
+/// 本中转的每个请求都携带**不同账号**的令牌,user-agent 里的 machineId 也随账号变化。
+/// 若复用连接,同一条 TCP/TLS 上就会依次出现几十个不同身份 —— 真实的 Kiro 客户端不可能
+/// 这样(一台机器、一个账号、一条连接),而「同一条连接上轮换多个身份」是账号共享最直接
+/// 的证据,比「同 IP 多账号」强得多:后者还能用 NAT 解释,前者解释不了。
+///
+/// 线上症状与此吻合:账号**没经过中转时是活的**(直查上游余额正常),被中转用过就以
+/// `security precaution` 封停;而长期稳定的 kiro.rs 每个请求都显式带 `Connection: close`。
+///
+/// 代价是每次请求多一次 TLS 握手。这个代价是值得的 —— 复用省下的那点延迟,换来的是把
+/// 整池账号暴露在同一条连接上。
+const POOL_MAX_IDLE_PER_HOST: usize = 0;
+
 /// 构造中转数据面(流式)客户端。
 ///
 /// 有 `connect_timeout` + `read_timeout`,**无**整请求超时——见模块文档。
@@ -41,6 +55,7 @@ pub fn streaming() -> reqwest::Client {
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(STREAM_READ_TIMEOUT)
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -52,7 +67,9 @@ pub fn unary() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(UNARY_TOTAL_TIMEOUT)
-        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        // 控制面同样不复用:令牌刷新与余额查询一样是**逐账号**的,复用会把多个账号的
+        // 刷新请求串在同一条连接上,与数据面同一个问题。
+        .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -70,5 +87,23 @@ mod tests {
     #[test]
     fn unary_client_builds() {
         let _ = unary();
+    }
+
+    /// 连接复用上限必须是 0 —— 数据面与控制面都不复用。
+    ///
+    /// 复用会让同一条 TCP/TLS 上依次出现几十个不同账号的令牌,而每个账号还各自声称是
+    /// 不同的机器(user-agent 里的 machineId 各不相同)。真实客户端不可能这样,而
+    /// 「同一条连接上轮换多个身份」是账号共享最直接的证据:同 IP 还能用 NAT 解释,
+    /// 同一条连接解释不了。线上症状吻合 —— 账号没经过中转时是活的(直查余额正常),
+    /// 被中转用过就以 `security precaution` 封停;长期稳定的 kiro.rs 每请求都
+    /// 显式带 `Connection: close`。
+    ///
+    /// 真正会再次出错的场景是有人为省一次 TLS 握手把复用加回来,故把 0 钉死在测试里。
+    #[test]
+    fn connections_are_never_reused() {
+        assert_eq!(
+            POOL_MAX_IDLE_PER_HOST, 0,
+            "复用连接会把整池账号串在同一条连接上暴露给上游"
+        );
     }
 }

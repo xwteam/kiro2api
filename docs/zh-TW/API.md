@@ -722,7 +722,7 @@ curl -X POST http://localhost:8080/api/admin/credentials/12345/models/refresh \
 |--------|------|--------|
 | 200 | 拉取成功 | `{"success":true,"id":"…","count":N}` |
 | 404 | 池中沒有這個 id | `{"error":"account not found","id":"…"}` |
-| 502 | 上游拉取失敗 | `{"success":false,"id":"…","error":"models upstream HTTP 403: …"}` |
+| 502 | 上游拉取失敗 | `{"success":false,"id":"…","error":"models upstream HTTP 403: …"}`。**每個上游請求都帶 `Connection: close`、且客戶端不複用連線**:本中轉每個請求攜帶**不同帳號**的令牌,user-agent 裡的 machineId 也隨帳號變化,複用連線會讓同一條 TCP/TLS 上依次出現數十個不同身分 —— 真實客戶端不可能如此。瞬態失敗換帳號前指數退避 200ms→2s + 抖動;帳號級失敗不退避 |
 
 > **注意：** 本端點**不跳過已停用的帳號**——`disabled: true` 的帳號一樣會被實拉（只有下面的批次版本才會跳過停用帳號）。`502` 的 `error` 直接透出上游的狀態碼與短說明（如 `HTTP 403: Your User ID ... suspended`），便於面板顯示真因；同一條真因另會以 WARN 進日誌緩衝。回應**絕不含**任何 token。
 
@@ -1221,7 +1221,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.8.1"}
+{"service":"kiro2api","status":"ok","version":"0.9.0"}
 ```
 
 ### GET /v1/ping

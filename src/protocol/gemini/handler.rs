@@ -197,7 +197,9 @@ fn relay_error_to_gemini(e: RelayError) -> Response {
     let (message, grpc_status) = match &e {
         RelayError::Convert(err) => (err.to_string(), "INVALID_ARGUMENT"),
         RelayError::NoAccount => ("no available upstream account".to_string(), "UNAVAILABLE"),
-        RelayError::Upstream(_) => ("upstream request failed".to_string(), "INTERNAL"),
+        RelayError::Upstream(_) | RelayError::UpstreamTransient(_) => {
+            ("upstream request failed".to_string(), "INTERNAL")
+        }
         // 上游确定性拒绝(INVALID_MODEL_ID:该模型对当前档位不可用)→ 400 INVALID_ARGUMENT + 清晰的不可用说明。
         RelayError::InvalidRequest(msg) => (msg.clone(), "INVALID_ARGUMENT"),
     };
