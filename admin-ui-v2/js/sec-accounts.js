@@ -1708,7 +1708,7 @@
     var authG = el('div', 'form-group');
     authG.appendChild(elI18n('label', 'form-label', 'accForm.authMethod'));
     var authSel = el('select', 'form-control'); authSel.id = 'accAuth';
-    [['social', 'add.methodSocial'], ['idc', 'add.methodIdc']].forEach(function (o) {
+    [['social', 'add.methodSocial'], ['idc', 'add.methodIdc'], ['api_key', 'add.methodApiKey']].forEach(function (o) {
       var opt = elI18n('option', null, o[1]); opt.value = o[0]; authSel.appendChild(opt);
     });
     authSel.value = 'social';
@@ -1726,6 +1726,12 @@
     form.appendChild(regionG);
 
     // idc-only client fields
+      // API Key 专用输入框:ksk 本身就是凭据,选中它时 refreshToken 不再必填也不再显示。
+      var kskBox = el('div'); kskBox.id = 'kskBox';
+      kskBox.appendChild(formField('accForm.kiroApiKey', 'accKiroApiKey', 'password', '',
+        { reqStar: true, phKey: 'add.kiroApiKeyPh', hintKey: 'add.kiroApiKeyHint' }));
+      form.appendChild(kskBox);
+
     var idcBox = el('div'); idcBox.id = 'idcBox';
     idcBox.appendChild(formField('accForm.clientId', 'accClientId', 'text', '', { reqStar: true, phKey: 'add.clientIdPh' }));
     idcBox.appendChild(formField('accForm.clientSecret', 'accClientSecret', 'password', '', { reqStar: true, phKey: 'add.clientSecretPh' }));
@@ -1753,7 +1759,17 @@
     proxyG.appendChild(elI18n('div', 'form-hint', 'add.proxyHint'));
     form.appendChild(proxyG);
 
-    function syncIdc() { idcBox.style.display = authSel.value === 'idc' ? '' : 'none'; }
+    function syncIdc() {
+      var isApiKey = authSel.value === 'api_key';
+      idcBox.style.display = authSel.value === 'idc' ? '' : 'none';
+      kskBox.style.display = isApiKey ? '' : 'none';
+      // API Key 凭据没有 refreshToken 可填 —— 留着这个必填框只会让人以为漏了东西。
+      var tokRow = document.getElementById('accToken');
+      if (tokRow && tokRow.closest) {
+        var g = tokRow.closest('.form-group');
+        if (g) g.style.display = isApiKey ? 'none' : '';
+      }
+    }
     authSel.addEventListener('change', syncIdc); syncIdc();
 
     var footer = el('div', 'modal-footer');
@@ -1765,11 +1781,16 @@
     cancel.addEventListener('click', function () { m.close(); });
     save.addEventListener('click', function () {
       var isIdc = authSel.value === 'idc';
+        var isApiKey = authSel.value === 'api_key';
+        var ksk = fval('accKiroApiKey');
+        if (isApiKey && !ksk) { api.toast(t('add.needApiKey'), 'error'); return; }
       var token = fval('accToken');
-      if (!token) { api.toast(t('add.needToken'), 'error'); return; }
+      // API Key 凭据没有 refreshToken —— 这道必填校验在它之前,不放行就永远填不进来。
+      if (authSel.value !== 'api_key' && !token) { api.toast(t('add.needToken'), 'error'); return; }
       if (isIdc && (!fval('accClientId') || !fval('accClientSecret'))) { api.toast(t('add.needClientCreds'), 'error'); return; }
       var payload = {
-        refreshToken: token,
+          // API Key 凭据不发 refreshToken:后端对这类凭据不要求它,发个空串反而多余。
+          refreshToken: isApiKey ? undefined : token,
         authMethod: authSel.value,
         email: fval('accEmail') || undefined,
         authRegion: fval('accAuthRegion') || undefined,
@@ -1785,6 +1806,7 @@
         payload.clientId = fval('accClientId') || undefined;
         payload.clientSecret = fval('accClientSecret') || undefined;
       }
+        if (isApiKey) payload.kiroApiKey = ksk;
       save.disabled = true;
       api.post('/credentials', payload)
         .then(function () { api.toast(t('acc.saved'), 'success'); m.close(); loadAccounts(); })

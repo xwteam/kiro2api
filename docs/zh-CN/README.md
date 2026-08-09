@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.8.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.8.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-08-03 | v0.8.1 - 🐛 面板上没有地方填 Kiro API Key:v0.8.0 后端与接口都做好了,却**没给「新增账号」表单加输入框**——从界面看这功能等于不存在,只能去敲 curl。现在认证方式下拉多一项 **API Key (`ksk_…`)**,选中即显示 ksk 输入框并隐藏 refreshToken 那一栏(这类凭据本就没有它,留着必填框只会让人以为漏填),提交也不再要求它 |
 | 2026-08-03 | v0.8.0 - ✨ **支持用 Kiro API Key(`ksk_…`)导入账号**。这类凭据 key 本身就是数据面 bearer,不换令牌、不刷新、不过期,完全不走 OAuth 链路。导入写 `{"kiroApiKey":"ksk_xxx","authMethod":"api_key"}`,或调接口传 `kiroApiKey`(认 `ksk` 别名);给了 key 就按 API Key 处理,不看 authMethod 写了什么。实现按观测对齐:带 `tokentype: API_KEY` 头、machineId 用 `KiroAPIKey/` 盐、刷新链路显式短路、过期判定恒答否(否则缺省 `expiresAt=0` 会让账号一进池就被判死)。另:声明 `api_key` 却没给 key 的凭据**入池即禁用**,且「重置」拒绝救活它——重置改不了配置,复活后只会重新走回同一条错误路径 |
 | 2026-08-03 | v0.7.14 - 🐛 首页「全局剩余积分」经常空白、要点刷新才有:聚合只累加**仍新鲜**(5 分钟 TTL)的缓存,于是超过 5 分钟没打开账号页首页就是空的——盘上明明有全部账号余额,却因「不新鲜」整个不显示,逼你点刷新,**而那次刷新正是这份缓存本该避免的上游调用**。`is_fresh` 该答「要不要重查」而非「要不要显示」,现展示取全部条目、并带出数据年龄。✨ 新增**活跃账号令牌提前续期**:近 24h 用过的账号在到期前 10 分钟后台续上,请求不必等刷新;**刻意只续活跃账号**——全池定时续期等于给 253 个账号造一条永不停歇的心跳(每小时 253 次上游调用、无人使用),而本项目账号已被上游以 `security precaution` 封过 24 个 |
 | 2026-08-03 | v0.7.13 - 🐛 **codex 的 502:中转自己造出了畸形请求**。上游要求消息里有 `toolUse` 时 `toolConfig` 必须存在,而内置工具(`web_search`/`local_shell`)在转换时被合法丢弃(v0.7.1),客户端某轮只带内置工具时 `tools` 就成了空数组、历史里的工具调用却还在 → 「有工具调用、没有工具定义」。复现:带工具历史+仅内置工具 → 502,同样历史带一个函数工具 → 200。现在发往上游前会**从对话历史把调用过的工具名补成最小规格**,客户端显式声明的优先、同名不重复。另:`TOOL_CONFIG_MISSING` 归入确定性请求错误(此前落在瞬时错误,半小时 26 次波及 25 个账号) |
@@ -264,7 +265,7 @@ kiro2api 内置令牌自愈机制：token 到期**自动内存刷新**（单飞�
 ```bash
 # 健康检查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.8.0"}
+# {"service":"kiro2api","status":"ok","version":"0.8.1"}
 
 # 查看协议侧模型清单（固定短清单，不代表账号档位真的授权）
 curl http://localhost:8080/v1/models \

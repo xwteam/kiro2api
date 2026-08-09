@@ -250,6 +250,11 @@ window.I18N = {
   // ---- Add-account dialog (POST /credentials) ----
   'add.submit':           { 'zh-CN': '添加', 'zh-TW': '新增', 'en': 'Add', 'ja': '追加', 'ko': '추가' },
   'add.methodSocial':     { 'zh-CN': 'Social', 'zh-TW': 'Social', 'en': 'Social', 'ja': 'Social', 'ko': 'Social' },
+  'add.methodApiKey':    { 'zh-CN': 'API Key (ksk_…)', 'zh-TW': 'API Key (ksk_…)', 'en': 'API Key (ksk_…)', 'ja': 'API Key (ksk_…)', 'ko': 'API Key (ksk_…)' },
+  'accForm.kiroApiKey':  { 'zh-CN': 'Kiro API Key', 'zh-TW': 'Kiro API Key', 'en': 'Kiro API Key', 'ja': 'Kiro API Key', 'ko': 'Kiro API Key' },
+  'add.kiroApiKeyPh':    { 'zh-CN': 'ksk_ 开头的密钥', 'zh-TW': 'ksk_ 開頭的金鑰', 'en': 'key beginning with ksk_', 'ja': 'ksk_ で始まるキー', 'ko': 'ksk_ 로 시작하는 키' },
+  'add.kiroApiKeyHint':  { 'zh-CN': 'Key 本身就是凭据,无需 refreshToken —— 不换令牌、不刷新、不过期。', 'zh-TW': 'Key 本身就是憑證,無需 refreshToken —— 不換令牌、不刷新、不過期。', 'en': 'The key is the credential — no refreshToken, nothing exchanged, refreshed or expiring.', 'ja': 'キー自体が資格情報です。refreshToken は不要で、交換も更新も期限もありません。', 'ko': '키 자체가 자격 증명입니다. refreshToken이 필요 없고 교환·갱신·만료도 없습니다.' },
+  'add.needApiKey':      { 'zh-CN': '请填写 Kiro API Key', 'zh-TW': '請填寫 Kiro API Key', 'en': 'Kiro API Key is required', 'ja': 'Kiro API Key を入力してください', 'ko': 'Kiro API Key를 입력하세요' },
   'add.methodIdc':        { 'zh-CN': 'IdC/Builder-ID/IAM', 'zh-TW': 'IdC/Builder-ID/IAM', 'en': 'IdC/Builder-ID/IAM', 'ja': 'IdC/Builder-ID/IAM', 'ko': 'IdC/Builder-ID/IAM' },
   'add.refreshTokenPh':   { 'zh-CN': '请输入 Refresh Token', 'zh-TW': '請輸入 Refresh Token', 'en': 'Enter Refresh Token', 'ja': 'Refresh Token を入力', 'ko': 'Refresh Token 입력' },
   'add.emailPh':          { 'zh-CN': '请输入账号邮箱（用于标识账号）', 'zh-TW': '請輸入帳號信箱（用於標識帳號）', 'en': 'Account email (used to identify the account)', 'ja': 'アカウントのメール（アカウント識別用）', 'ko': '계정 이메일 (계정 식별용)' },
