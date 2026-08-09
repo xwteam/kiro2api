@@ -147,10 +147,12 @@ pub fn build_router_with_persist_handles(
     // 捕获进程启动时刻(幂等):admin system-info 端点据此算 uptimeSecs。
     // 首次调用置入,后续调用(如测试重复建 router)不覆盖,保留最早时刻。
     let _ = SERVER_START.get_or_init(Instant::now);
+    // 伪装身份的静态配置灌进进程级默认值:令牌刷新那条链路拿不到 Config,靠它取版本号。
+    crate::kiro::provider::init_impersonation_defaults(&cfg);
     // 从配置路径加载凭据;文件不存在回落空池,/v1/messages 遇空池返回 503
     // (不影响 health/webui 路由,默认配置测试保持全绿)。
     // **解析失败不再静默当空池**:先原样备份、再逐条抢救、并大声报错,见 load_credentials_resilient。
-    let creds = load_credentials_resilient(&cfg.credentials_path);
+    let mut creds = load_credentials_resilient(&cfg.credentials_path);
     // 启动期把账号数写进日志:池为 0 时运营者据此一眼分清「文件没放/里面没账号」与
     // 「文件坏了被抢救成 0」(后者上面已有逐条 error 明细),不必对着面板的 total:0 猜。
     if creds.is_empty() {
@@ -165,6 +167,24 @@ pub fn build_router_with_persist_handles(
     // 旧安装没有该旁挂文件 → `None` → 传 0,由 `with_next_id` 平滑退化为 `max(现有 id)+1`
     // 的原语义。不接这一步的话高水位只写不读,重启即退回复用编号(旧令牌覆盖新账号凭据)。
     let persisted_next_id = credential::load_next_id(&cfg.credentials_path).unwrap_or(0);
+    // 机器 ID 一次性冻结并落盘。
+    //
+    // 此前 machineId 是**每次请求现算**的 `sha256("KotlinNativeAPI/" + 当前 refreshToken)`,
+    // 从不落盘。而刷新响应会回带新的 refreshToken(我们照收),于是同一个账号**每刷新一次
+    // 就换一台机器**——真实设备绝不会这样,这是最刺眼的一种身份漂移。
+    //
+    // 冻结只补给"还没有 machineId"的凭据,且仅在配置未全局指定 machineId 时进行
+    //(配置级本就是让整池共用一个身份的开关,冻结会把它固化进每条凭据、日后改不动)。
+    let frozen = credential::freeze_machine_ids(&mut creds, cfg.machine_id.as_deref());
+    if frozen > 0 {
+        tracing::info!(
+            count = frozen,
+            "已为无 machineId 的凭据一次性派生并冻结机器 ID(此后不再随 refreshToken 轮换而漂移)"
+        );
+        if let Err(e) = credential::save(&cfg.credentials_path, &creds) {
+            tracing::warn!(error = ?e, "冻结的 machineId 落盘失败:本次进程内仍稳定,但重启后会重算");
+        }
+    }
     let mut pool_inner = Pool::with_next_id(creds, LbMode::Priority, persisted_next_id);
     // RPM 限流与负载均衡模式均来自配置(默认无限 RPM/Priority,保持既有行为)。
     pool_inner.set_max_rpm(cfg.max_rpm_per_credential);

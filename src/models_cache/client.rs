@@ -11,7 +11,6 @@
 //! URL 组装、header 构造、请求体拼装、响应解析、错误分类均为本项目自写。
 
 use crate::kiro::credential::Credential;
-use crate::kiro::machine_id;
 use crate::kiro::provider::Impersonation;
 use crate::models_cache::model::AvailableModelsResponse;
 
@@ -93,13 +92,8 @@ fn region_base(region: &str) -> String {
 
 /// 由凭据 + 配置构造伪装身份(machine_id 优先显式,否则由 refresh_token 派生)。
 fn impersonation_for(cred: &Credential, cfg: &crate::config::Config) -> Impersonation {
-    Impersonation {
-        machine_id: machine_id::resolve(cred.machine_id.as_deref(), &cred.refresh_token),
-        kiro_version: cfg.kiro_version.clone(),
-        agent_mode: "vibe".to_string(),
-        system_version: cfg.system_version.clone(),
-        node_version: cfg.node_version.clone(),
-    }
+    // 收口到唯一入口(理由同 balance::client):此前这份不认配置级 machineId。
+    Impersonation::for_credential(cred, cfg)
 }
 
 /// 组装请求体:`{"origin":"AI_EDITOR"[,"profileArn":"<arn>"]}`。
@@ -138,19 +132,24 @@ pub async fn fetch_at(
         "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
         imp.kiro_version, imp.machine_id
     );
-    let resp = client
+    let req = client
         .post(&url)
         .header("content-type", "application/x-amz-json-1.0")
         .header("x-amz-target", AMZ_TARGET)
-        .header("authorization", format!("Bearer {}", cred.access_token))
+        // bearer 走 `cred.bearer()` + 配套 tokentype:ksk 凭据的令牌在 `kiro_api_key` 里,
+        // 读 `access_token` 会发出空 Bearer,模型清单必然 401/403(理由同 balance::client)。
+        .header("authorization", format!("Bearer {}", cred.bearer()))
         .header("amz-sdk-invocation-id", inv)
         .header("amz-sdk-request", "attempt=1; max=1")
         .header("x-amz-user-agent", amz_user_agent)
         .header(reqwest::header::USER_AGENT, user_agent)
-        .body(body)
-        .send()
-        .await
-        .map_err(|_| ModelsError::Http)?;
+        .header("connection", "close");
+    let req = if cred.is_api_key() {
+        req.header("tokentype", "API_KEY")
+    } else {
+        req
+    };
+    let resp = req.body(body).send().await.map_err(|_| ModelsError::Http)?;
     let status = resp.status();
     if !status.is_success() {
         // 读错误体(有界)并解析 amz-json 的 message,带进错误里供管理员看清真因。

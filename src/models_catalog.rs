@@ -29,6 +29,7 @@ pub const CATALOG: &[CatalogEntry] = &[
     e("claude-opus-4.6", "Claude Opus 4.6", 200_000),
     e("claude-opus-4.7", "Claude Opus 4.7", 200_000),
     e("claude-opus-4.8", "Claude Opus 4.8", 200_000),
+    e("claude-opus-5", "Claude Opus 5", 200_000),
     e("claude-haiku-4.5", "Claude Haiku 4.5", 200_000),
     e("claude-fable-5", "Claude Fable 5", 200_000),
     e("deepseek-3.2", "DeepSeek 3.2", 128_000),

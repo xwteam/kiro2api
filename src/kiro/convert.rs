@@ -89,6 +89,10 @@ pub fn map_model(client_model: &str) -> Option<String> {
             "claude-opus-4.7".to_string()
         } else if ver(&m, "4.8") {
             "claude-opus-4.8".to_string()
+        // opus-5 必须在默认分支**之前**判:漏了它就会被静默降级成 opus-4.6,
+        // 客户端拿到的是一个它没要过的、更弱的模型,而且毫无提示。
+        } else if m.contains("opus-5") || m.contains("opus5") {
+            "claude-opus-5".to_string()
         } else {
             "claude-opus-4.6".to_string()
         });
@@ -1058,6 +1062,15 @@ mod tests {
         assert_eq!(map_model("opus-4.5"), Some("claude-opus-4.5".to_string()));
         assert_eq!(map_model("opus-4.7"), Some("claude-opus-4.7".to_string()));
         assert_eq!(map_model("opus-4.8"), Some("claude-opus-4.8".to_string()));
+        // opus-5 曾被漏判,静默降级成 opus-4.6:请求方要的是 5,拿到的是 4.6 且毫无提示。
+        assert_eq!(
+            map_model("claude-opus-5"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-20260115"),
+            Some("claude-opus-5".to_string())
+        );
         assert_eq!(map_model("opus"), Some("claude-opus-4.6".to_string()));
     }
 

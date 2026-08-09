@@ -47,11 +47,86 @@ struct RefreshResp {
     profile_arn: Option<String>,
 }
 
+/// 令牌刷新请求的伪装头。
+///
+/// 此前这条链路**一个头都不带** —— 连 User-Agent 都没有。而 Social 的刷新端点
+/// `prod.{region}.auth.desktop.kiro.dev` 是 Kiro **自家**的服务,日志完全在他们手里,
+/// 一个没有 UA 的请求几乎等于自报家门;更要命的是刷新是**每个账号都必然走**的路径,
+/// 数据面伪装得再像,这里先把身份交代了。
+///
+/// 两条链路在真实客户端里由**不同的库**发出,故形态完全不同,不能合并:
+/// - Social:桌面端用 axios 打自家 auth 服务。`Accept: application/json, text/plain, */*`
+///   与 `Accept-Encoding: gzip, compress, deflate, br` 都是 axios 的默认值,UA 是
+///   `KiroIDE-{版本}-{machineId}` 这种自定义短串,**不是** aws-sdk 那套。
+/// - IdC:走 AWS SSO-OIDC,是标准 aws-sdk-js 请求,故带 `x-amz-user-agent` /
+///   `amz-sdk-invocation-id` / `amz-sdk-request`,且 SDK 版本是 sso-oidc 自己的 3.980.0
+///   (不是数据面那个 1.0.34),尾部也**不带** machineId。
+///
+/// 注意 `Accept-Encoding`:声明了就必须真解得开,故 reqwest 必须开着 gzip/brotli/deflate
+/// 特性(见 Cargo.toml)。声明了却解不开,每次刷新都会拿到一堆压缩字节。
+fn refresh_headers(
+    cred: &Credential,
+    imp: &crate::kiro::provider::Impersonation,
+    base: &str,
+) -> reqwest::header::HeaderMap {
+    use reqwest::header::{HeaderMap, HeaderValue};
+    let hv = |s: &str| HeaderValue::from_str(s).unwrap_or_else(|_| HeaderValue::from_static(""));
+    // 插入顺序即线上顺序,照真实客户端排。
+    let mut h = HeaderMap::new();
+    match cred.auth {
+        AuthMethod::Social => {
+            h.insert(
+                "accept",
+                HeaderValue::from_static("application/json, text/plain, */*"),
+            );
+            h.insert("content-type", HeaderValue::from_static("application/json"));
+            h.insert(
+                reqwest::header::USER_AGENT,
+                hv(&format!("KiroIDE-{}-{}", imp.kiro_version, imp.machine_id)),
+            );
+            h.insert(
+                "accept-encoding",
+                HeaderValue::from_static("gzip, compress, deflate, br"),
+            );
+        }
+        _ => {
+            h.insert("content-type", HeaderValue::from_static("application/json"));
+            if let Ok(name) = reqwest::header::HeaderName::from_bytes(b"x-amz-user-agent") {
+                h.insert(name, HeaderValue::from_static("aws-sdk-js/3.980.0 KiroIDE"));
+            }
+            h.insert(
+                reqwest::header::USER_AGENT,
+                hv(&format!(
+                    "aws-sdk-js/3.980.0 ua/2.1 os/{} lang/js md/nodejs#{} api/sso-oidc#3.980.0 m/E KiroIDE",
+                    imp.system_version, imp.node_version
+                )),
+            );
+        }
+    }
+    if let Some(host) = crate::kiro::provider::host_of(base) {
+        h.insert("host", hv(&host));
+    }
+    if cred.auth != AuthMethod::Social {
+        h.insert(
+            "amz-sdk-invocation-id",
+            hv(&crate::kiro::provider::new_invocation_id()),
+        );
+        // 刷新链路的重试上限与数据面不同(真实客户端如此):数据面 max=3,刷新 max=4。
+        h.insert(
+            "amz-sdk-request",
+            HeaderValue::from_static("attempt=1; max=4"),
+        );
+    }
+    h.insert("connection", HeaderValue::from_static("close"));
+    h
+}
+
 /// 向 `base` 发刷新请求,返回更新后的 Credential。
 pub async fn refresh_at(
     client: &reqwest::Client,
     base: &str,
     cred: &Credential,
+    imp: &crate::kiro::provider::Impersonation,
     now_unix: u64,
 ) -> Result<Credential, LoginError> {
     let body = match cred.auth {
@@ -64,8 +139,16 @@ pub async fn refresh_at(
         // 明确报错而不是拿着空 body 去打上游——后者会得到一个与真实病因无关的 4xx。
         AuthMethod::ApiKey => return Err(LoginError::Http),
     };
+    // Social 走 axios 形态、要声明 Accept-Encoding,故必须用开着解压的那个客户端;
+    // 其余(IdC)沿用调用方传入的控制面客户端(不带该头,与真实 aws-sdk-js 一致)。
+    static AXIOS: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = match cred.auth {
+        AuthMethod::Social => AXIOS.get_or_init(crate::http::axios),
+        _ => client,
+    };
     let resp = client
         .post(base)
+        .headers(refresh_headers(cred, imp, base))
         .json(&body)
         .send()
         .await
@@ -109,7 +192,8 @@ pub async fn refresh(
     now_unix: u64,
 ) -> Result<Credential, LoginError> {
     let base = endpoint(cred);
-    refresh_at(client, &base, cred, now_unix).await
+    let imp = crate::kiro::provider::Impersonation::for_credential_global(cred);
+    refresh_at(client, &base, cred, &imp, now_unix).await
 }
 
 #[cfg(test)]
@@ -118,6 +202,105 @@ mod tests {
     use crate::kiro::credential::{AuthMethod, Credential};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Social 刷新必须带齐 axios 那套头。
+    ///
+    /// 回归:这条链路曾经**一个头都不带**——连 User-Agent 都没有。而它打的
+    /// `auth.desktop.kiro.dev` 是 Kiro 自家服务,且每个账号都必然走这条路。
+    #[tokio::test]
+    async fn social_refresh_sends_the_axios_headers() {
+        let server = MockServer::start().await;
+        let c = cred(AuthMethod::Social);
+        Mock::given(method("POST"))
+            .and(path("/refreshToken"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accessToken": "new", "expiresIn": 3600
+            })))
+            .mount(&server)
+            .await;
+        let out = refresh_at(
+            &reqwest::Client::new(),
+            &format!("{}/refreshToken", server.uri()),
+            &c,
+            &imp_for(&c),
+            1000,
+        )
+        .await
+        .expect("请求应成功");
+        assert_eq!(out.access_token, "new");
+
+        // 逐条核实际发出的头。
+        //
+        // 不用 wiremock 的 `header()` 匹配器:它把逗号分隔的取值拆成多个值再比,而
+        // axios 那两个头(`Accept`、`Accept-Encoding`)本来就是**一行里带逗号**的单值,
+        // 匹配器永远对不上 —— 那是匹配器的语义问题,不是我们发错了。
+        let reqs = server.received_requests().await.unwrap();
+        let h = &reqs[0].headers;
+        let get = |k: &str| h[k].to_str().unwrap().to_string();
+        assert_eq!(get("accept"), "application/json, text/plain, */*");
+        assert_eq!(get("accept-encoding"), "gzip, compress, deflate, br");
+        assert_eq!(get("content-type"), "application/json");
+        assert_eq!(get("connection"), "close");
+        assert!(h.contains_key("host"), "必须显式带 host");
+
+        // UA 从实际请求里核。**不**拿 imp_for 现算的值去比:那份读的是进程级 OnceLock,
+        // 而并行跑的 server 测试可能在两次读之间把它灌上,比对就会随执行顺序飘。
+        // 这里只钉住形状 —— 必须是 `KiroIDE-<版本>-<64 位十六进制 machineId>`,
+        // 且**绝不能**是 aws-sdk 那套(刷新链路由 axios 发出,不是 SDK)。
+        let reqs = server.received_requests().await.unwrap();
+        let ua = reqs[0].headers["user-agent"].to_str().unwrap();
+        assert!(ua.starts_with("KiroIDE-"), "UA 形态不对: {ua}");
+        assert!(
+            !ua.contains("aws-sdk-js"),
+            "Social 刷新不该用 aws-sdk 形态: {ua}"
+        );
+        let mid = ua.rsplit('-').next().unwrap();
+        assert_eq!(mid.len(), 64, "UA 尾部应是 64 位 machineId: {ua}");
+        assert!(mid.chars().all(|c| c.is_ascii_hexdigit()), "{ua}");
+    }
+
+    /// 声明了 `Accept-Encoding` 就必须真解得开。
+    ///
+    /// 这条不是形式主义:我们照真实客户端声明了 `gzip, compress, deflate, br`,上游据此
+    /// 压缩响应是完全合法的。若 reqwest 没开解压特性,拿到的就是一堆压缩字节,
+    /// **每一次刷新都会失败**——而刷新失败会被记成账号故障。
+    #[tokio::test]
+    async fn social_refresh_decodes_a_gzipped_response() {
+        // {"accessToken":"AT2","expiresIn":3600} 的 gzip 字节(固定,便于确定性重放)
+        const GZ: &[u8] = &[
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 3, 171, 86, 74, 76, 78, 78, 45, 46, 14, 201, 207, 78,
+            205, 83, 178, 82, 114, 12, 49, 82, 210, 81, 74, 173, 40, 200, 44, 74, 45, 246, 4, 138,
+            24, 155, 25, 24, 212, 2, 0, 63, 51, 10, 91, 38, 0, 0, 0,
+        ];
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/refreshToken"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(GZ)
+                    .insert_header("content-encoding", "gzip")
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let c = cred(AuthMethod::Social);
+        let out = refresh_at(
+            &reqwest::Client::new(),
+            &format!("{}/refreshToken", server.uri()),
+            &c,
+            &imp_for(&c),
+            1000,
+        )
+        .await
+        .expect("压缩响应必须能解开");
+        assert_eq!(out.access_token, "AT2");
+        assert_eq!(out.expires_at_unix, 1000 + 3600);
+    }
+
+    /// 测试夹具:按被测凭据取伪装身份(生产同一入口)。
+    fn imp_for(c: &Credential) -> crate::kiro::provider::Impersonation {
+        crate::kiro::provider::Impersonation::for_credential_global(c)
+    }
 
     fn cred(auth: AuthMethod) -> Credential {
         Credential {
@@ -153,9 +336,15 @@ mod tests {
             .await;
         let client = reqwest::Client::new();
         let c = cred(AuthMethod::Social);
-        let out = refresh_at(&client, &format!("{}/refreshToken", server.uri()), &c, 1000)
-            .await
-            .unwrap();
+        let out = refresh_at(
+            &client,
+            &format!("{}/refreshToken", server.uri()),
+            &c,
+            &imp_for(&c),
+            1000,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.access_token, "new");
         assert_eq!(out.refresh_token, "rt2");
         assert_eq!(out.expires_at_unix, 1000 + 3600);
@@ -173,9 +362,15 @@ mod tests {
             .await;
         let client = reqwest::Client::new();
         let c = cred(AuthMethod::Idc);
-        let out = refresh_at(&client, &format!("{}/token", server.uri()), &c, 500)
-            .await
-            .unwrap();
+        let out = refresh_at(
+            &client,
+            &format!("{}/token", server.uri()),
+            &c,
+            &imp_for(&c),
+            500,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.access_token, "new");
         assert_eq!(out.refresh_token, "rt"); // 响应未带则保留旧的
         assert_eq!(out.expires_at_unix, 500 + 1800);
@@ -197,9 +392,15 @@ mod tests {
             .await;
         let client = reqwest::Client::new();
         let c = cred(AuthMethod::Idc);
-        let out = refresh_at(&client, &format!("{}/token", server.uri()), &c, 1000)
-            .await
-            .unwrap();
+        let out = refresh_at(
+            &client,
+            &format!("{}/token", server.uri()),
+            &c,
+            &imp_for(&c),
+            1000,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.access_token, "jwt-data-plane"); // 采 idToken,不是 portal token
         assert_eq!(out.refresh_token, "rt2");
     }
@@ -216,9 +417,15 @@ mod tests {
             .await;
         let client = reqwest::Client::new();
         let c = cred(AuthMethod::Idc);
-        let out = refresh_at(&client, &format!("{}/token", server.uri()), &c, 500)
-            .await
-            .unwrap();
+        let out = refresh_at(
+            &client,
+            &format!("{}/token", server.uri()),
+            &c,
+            &imp_for(&c),
+            500,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.access_token, "only-access"); // 无 idToken → 回落 accessToken
     }
 
@@ -236,9 +443,15 @@ mod tests {
             .await;
         let client = reqwest::Client::new();
         let c = cred(AuthMethod::Social);
-        let out = refresh_at(&client, &format!("{}/refreshToken", server.uri()), &c, 1000)
-            .await
-            .unwrap();
+        let out = refresh_at(
+            &client,
+            &format!("{}/refreshToken", server.uri()),
+            &c,
+            &imp_for(&c),
+            1000,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.access_token, "social-at");
     }
 
@@ -256,9 +469,15 @@ mod tests {
             .await;
         let client = reqwest::Client::new();
         let c = cred(AuthMethod::Social); // profile_arn 初始 None
-        let out = refresh_at(&client, &format!("{}/refreshToken", server.uri()), &c, 1000)
-            .await
-            .unwrap();
+        let out = refresh_at(
+            &client,
+            &format!("{}/refreshToken", server.uri()),
+            &c,
+            &imp_for(&c),
+            1000,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             out.profile_arn.as_deref(),
             Some("arn:aws:codewhisperer:us-east-1:222222222222:profile/NEW")
@@ -278,9 +497,15 @@ mod tests {
         let client = reqwest::Client::new();
         let mut c = cred(AuthMethod::Social);
         c.profile_arn = Some("arn:existing".into());
-        let out = refresh_at(&client, &format!("{}/refreshToken", server.uri()), &c, 1000)
-            .await
-            .unwrap();
+        let out = refresh_at(
+            &client,
+            &format!("{}/refreshToken", server.uri()),
+            &c,
+            &imp_for(&c),
+            1000,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.profile_arn.as_deref(), Some("arn:existing")); // 响应未带则保留旧值
     }
 
@@ -299,7 +524,14 @@ mod tests {
             .await;
         let client = reqwest::Client::new();
         let c = cred(AuthMethod::Social);
-        let r = refresh_at(&client, &format!("{}/refreshToken", server.uri()), &c, 1000).await;
+        let r = refresh_at(
+            &client,
+            &format!("{}/refreshToken", server.uri()),
+            &c,
+            &imp_for(&c),
+            1000,
+        )
+        .await;
         match r {
             Err(LoginError::UpstreamHttp { status, body }) => {
                 assert_eq!(status, 400);
@@ -325,7 +557,15 @@ mod tests {
             .await;
         let client = reqwest::Client::new();
         let c = cred(AuthMethod::Social);
-        match refresh_at(&client, &format!("{}/refreshToken", server.uri()), &c, 1000).await {
+        match refresh_at(
+            &client,
+            &format!("{}/refreshToken", server.uri()),
+            &c,
+            &imp_for(&c),
+            1000,
+        )
+        .await
+        {
             Err(LoginError::UpstreamHttp { status, body }) => {
                 assert_eq!(status, 503);
                 assert_eq!(
@@ -348,7 +588,15 @@ mod tests {
             .await;
         let client = reqwest::Client::new();
         let c = cred(AuthMethod::Social);
-        match refresh_at(&client, &format!("{}/refreshToken", server.uri()), &c, 1000).await {
+        match refresh_at(
+            &client,
+            &format!("{}/refreshToken", server.uri()),
+            &c,
+            &imp_for(&c),
+            1000,
+        )
+        .await
+        {
             Err(LoginError::UpstreamHttp { body, .. }) => {
                 assert!(
                     body.len() <= 8 * 1024,

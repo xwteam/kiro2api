@@ -10,7 +10,6 @@
 
 use crate::balance::model::UsageLimitsResponse;
 use crate::kiro::credential::Credential;
-use crate::kiro::machine_id;
 use crate::kiro::provider::Impersonation;
 
 /// 上游错误体里回带的说明文字截断上限(字符数),避免超长响应刷爆日志/响应。
@@ -117,13 +116,9 @@ fn region_base(region: &str) -> String {
 
 /// 由凭据 + 配置构造伪装身份(machine_id 优先显式,否则由 refresh_token 派生)。
 fn impersonation_for(cred: &Credential, cfg: &crate::config::Config) -> Impersonation {
-    Impersonation {
-        machine_id: machine_id::resolve(cred.machine_id.as_deref(), &cred.refresh_token),
-        kiro_version: cfg.kiro_version.clone(),
-        agent_mode: "vibe".to_string(),
-        system_version: cfg.system_version.clone(),
-        node_version: cfg.node_version.clone(),
-    }
+    // 收口到唯一入口。此前这里自写了一份**两级** resolve,不认配置级 machineId,
+    // 于是配置里设了 machineId 时,同一个账号在数据面报一个机器、在这里报另一个。
+    Impersonation::for_credential(cred, cfg)
 }
 
 /// 向 `base` 发一次 getUsageLimits 并解析。测试可注入 mock base;生产用 [`fetch_usage_limits`]。
@@ -143,13 +138,26 @@ pub async fn fetch_at(
         "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
         imp.kiro_version, imp.machine_id
     );
-    let resp = client
+    let mut req = client
         .get(&url)
-        .header("authorization", format!("Bearer {}", cred.access_token))
+        .header("x-amz-user-agent", amz_user_agent)
+        .header(reqwest::header::USER_AGENT, user_agent);
+    if let Some(host) = crate::kiro::provider::host_of(&url) {
+        req = req.header("host", host);
+    }
+    // bearer 必须走 `cred.bearer()`:ksk 凭据的令牌在 `kiro_api_key` 里,直接读
+    // `access_token` 会发出一个**空 Bearer**,额度查询必然 401/403。
+    // 同理 tokentype 必须跟着走,否则上游按 OAuth 令牌解析这枚 ksk。
+    req = req
         .header("amz-sdk-invocation-id", inv)
         .header("amz-sdk-request", "attempt=1; max=1")
-        .header("x-amz-user-agent", amz_user_agent)
-        .header(reqwest::header::USER_AGENT, user_agent)
+        .header("authorization", format!("Bearer {}", cred.bearer()));
+    if cred.is_api_key() {
+        req = req.header("tokentype", "API_KEY");
+    }
+    // 控制面同样每请求一条新连接:与数据面自相矛盾的连接行为本身就是可观测差异。
+    let resp = req
+        .header("connection", "close")
         .send()
         .await
         .map_err(|_| BalanceError::Http)?;

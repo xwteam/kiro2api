@@ -79,6 +79,12 @@ pub fn streaming() -> reqwest::Client {
         // 另外 `Connection: close` 是 HTTP/1.1 的头,h2 明确禁止它:不锁到 1.1,那个头
         // 只是摆设(此前版本正是如此)。
         .http1_only()
+        // **不要**自动补 accept-encoding。开了 gzip/brotli/deflate 特性后 reqwest 会给每个
+        // 没显式带该头的请求自动加一个,而真实客户端(aws-sdk-js on Node)数据面**不发**
+        // 这个头。特性是为 Social 刷新那条 axios 链路开的(见 `axios`),数据面必须关掉。
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -95,6 +101,26 @@ pub fn unary() -> reqwest::Client {
         .http1_only()
         // 控制面同样不复用:令牌刷新与余额查询一样是**逐账号**的,复用会把多个账号的
         // 刷新请求串在同一条连接上,与数据面同一个问题。
+        .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+        // 同数据面:余额查询、模型清单、IdC 刷新在真实客户端里都是 aws-sdk-js 请求,
+        // 一律不带 accept-encoding。
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Social 令牌刷新专用客户端:**开着解压**。
+///
+/// 桌面端用 axios 打自家 auth 服务,axios 固定声明 `Accept-Encoding: gzip, compress,
+/// deflate, br`。要对齐这个声明就必须真解得开上游据此压缩的响应,故只有这一条链路开解压;
+/// 其余链路都关着,以免 reqwest 给它们自动补上一个真实客户端不发的头。
+pub fn axios() -> reqwest::Client {
+    with_tls(reqwest::Client::builder())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(UNARY_TOTAL_TIMEOUT)
+        .http1_only()
         .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
@@ -166,7 +192,7 @@ mod tests {
     /// 此前经 ALPN 协商到了 **h2**(实测),协议版本本身就是可识别的差异。另外
     /// `Connection: close` 是 HTTP/1.1 的头,h2 明确禁止它 —— 不锁到 1.1,那个头只是摆设。
     #[test]
-    fn both_clients_are_pinned_to_http1() {
+    fn all_clients_are_pinned_to_http1() {
         let src = include_str!("http.rs");
         // 只数真正的 builder 调用行(去掉缩进后以 `.http1_only()` 开头),
         // 不数文档注释里提到它的地方 —— 否则加一句注释就会把测试弄红。
@@ -174,7 +200,10 @@ mod tests {
             .lines()
             .filter(|l| l.trim_start().starts_with(concat!(".http1", "_only()")))
             .count();
-        assert_eq!(calls, 2, "数据面与控制面都必须锁 HTTP/1.1");
+        assert_eq!(
+            calls, 3,
+            "数据面、控制面、axios 刷新三个客户端都必须锁 HTTP/1.1"
+        );
     }
 
     /// TLS 后端默认必须是 native-tls(OpenSSL)。

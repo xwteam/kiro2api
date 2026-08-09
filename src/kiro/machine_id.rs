@@ -36,6 +36,54 @@ pub fn resolve(explicit: Option<&str>, refresh_token: &str) -> String {
     resolve_with_config(explicit, None, refresh_token)
 }
 
+/// 为一条凭据定出机器 ID:**凭据自带 > 配置全局 > 按凭据类型派生**。
+///
+/// 这是全项目唯一的入口 —— 数据面、令牌刷新、余额查询、模型清单必须**全部**走它。
+/// 此前每个模块各写一份,于是同一个账号在数据面报一个 machineId、在余额查询报另一个,
+/// 上游在同一时刻看到同一个 Bearer 声称来自两台机器。
+///
+/// 派生按凭据类型**互斥**分流:
+/// - API Key(ksk)凭据 → `sha256("KiroAPIKey/" + ksk)`
+/// - OAuth 凭据 → `sha256("KotlinNativeAPI/" + refreshToken)`
+///
+/// 两条路**不互相回落**。此前 ksk 凭据也走 refreshToken 那条,而 ksk 账号根本没有
+/// refreshToken(空串),于是全部落到 `sha256("KotlinNativeAPI/")` 这个**固定常量**——
+/// 所有 ksk 账号对上游自称同一台机器,而且这个常量在任何人的部署里都一样。
+///
+/// 两样材料都没有时返回 `None`:调用方须用一个稳定的兜底(见 [`fallback_for`]),
+/// 绝不能把常量指纹发出去。
+pub fn for_credential(
+    explicit: Option<&str>,
+    config_level: Option<&str>,
+    is_api_key: bool,
+    api_key: Option<&str>,
+    refresh_token: &str,
+) -> Option<String> {
+    if let Some(v) = explicit.and_then(normalize) {
+        return Some(v);
+    }
+    if let Some(v) = config_level.and_then(normalize) {
+        return Some(v);
+    }
+    if is_api_key {
+        return api_key.filter(|k| !k.is_empty()).map(derive_from_api_key);
+    }
+    if refresh_token.is_empty() {
+        return None;
+    }
+    Some(derive(refresh_token))
+}
+
+/// 缺派生材料时的兜底机器 ID:`sha256("KiroFallback/" + <凭据 id>)`。
+///
+/// 按凭据 id 派生而非随机,是为了让同一个账号在**进程重启后仍是同一台机器**——
+/// 随机兜底会让每次重启都换一批设备身份,那和"每次刷新换一台机器"是同一个病。
+pub fn fallback_for(credential_id: &str) -> String {
+    hex::encode(Sha256::digest(
+        format!("KiroFallback/{credential_id}").as_bytes(),
+    ))
+}
+
 /// 三级优先:凭据自带 > 配置全局 > 由 refresh_token 派生。
 ///
 /// 配置级是此前缺的一层。它的用途是让整池共用一个 machineId ——
@@ -83,6 +131,33 @@ mod tests {
         assert_eq!(resolve(Some(&full), "rt"), full); // explicit 合法
         assert_eq!(resolve(Some("bad"), "rt"), derive("rt")); // explicit 非法→derive
         assert_eq!(resolve(None, "rt"), derive("rt")); // 无 explicit→derive
+    }
+
+    /// ksk 凭据必须走 KiroAPIKey 那条盐,**绝不**回落到 refreshToken 那条。
+    ///
+    /// 回归:`derive_from_api_key` 曾是死代码(全仓零调用),而 ksk 账号没有 refreshToken
+    /// (空串),于是全部落到 `sha256("KotlinNativeAPI/")` 这个固定常量 —— 所有 ksk 账号
+    /// 对上游自称同一台机器,且该常量在任何人的部署里都一样。
+    #[test]
+    fn api_key_credentials_derive_from_their_own_key_never_a_constant() {
+        let a = for_credential(None, None, true, Some("ksk_AAA"), "").expect("应派生出来");
+        let b = for_credential(None, None, true, Some("ksk_BBB"), "").expect("应派生出来");
+        assert_eq!(a, derive_from_api_key("ksk_AAA"));
+        assert_ne!(a, b, "两个不同 ksk 必须派生出不同 machineId");
+        // 决不能等于"空 refreshToken 派生"那个常量
+        assert_ne!(a, derive(""));
+        assert_ne!(b, derive(""));
+        // 材料都缺 → None,由调用方走按 id 的稳定兜底,而不是把常量发出去
+        assert_eq!(for_credential(None, None, true, None, ""), None);
+        assert_eq!(for_credential(None, None, false, None, ""), None);
+    }
+
+    /// 兜底值按凭据 id 稳定:同一个账号重启前后必须是同一台机器。
+    #[test]
+    fn fallback_is_stable_per_credential() {
+        assert_eq!(fallback_for("7"), fallback_for("7"));
+        assert_ne!(fallback_for("7"), fallback_for("8"));
+        assert_eq!(fallback_for("7").len(), 64);
     }
 
     /// 三级优先:凭据自带 > 配置全局 > 由 refresh_token 派生。

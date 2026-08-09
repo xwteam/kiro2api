@@ -18,6 +18,94 @@ pub struct Impersonation {
     pub node_version: String,
 }
 
+/// 伪装用的进程级静态配置(kiro/系统/node 版本 + 全局 machineId)。
+///
+/// 为什么要有这么一份:令牌刷新发生在 `ensure_fresh` 里,而那条路径上没有 `Config`——
+/// 它被 keepalive、余额查询、模型清单、数据面共用,每个调用方都塞一份 config 进去会把
+/// 签名污染一大片。而这几个值本就是**进程启动后不再变**的静态配置,放一份全局的正合适。
+///
+/// 没初始化时回落 [`crate::config::Config::default`] 的取值(测试即走这条),
+/// 于是任何路径都不会因为"忘了初始化"而发出空的版本号。
+#[derive(Debug, Clone)]
+pub struct ImpersonationDefaults {
+    pub kiro_version: String,
+    pub system_version: String,
+    pub node_version: String,
+    pub machine_id: Option<String>,
+}
+
+static IMP_DEFAULTS: std::sync::OnceLock<ImpersonationDefaults> = std::sync::OnceLock::new();
+
+/// 进程启动时灌入一次。重复调用无效(OnceLock 语义),不会中途改变身份。
+pub fn init_impersonation_defaults(cfg: &crate::config::Config) {
+    let _ = IMP_DEFAULTS.set(ImpersonationDefaults {
+        kiro_version: cfg.kiro_version.clone(),
+        system_version: cfg.system_version.clone(),
+        node_version: cfg.node_version.clone(),
+        machine_id: cfg.machine_id.clone(),
+    });
+}
+
+fn imp_defaults() -> ImpersonationDefaults {
+    IMP_DEFAULTS.get().cloned().unwrap_or_else(|| {
+        let d = crate::config::Config::default();
+        ImpersonationDefaults {
+            kiro_version: d.kiro_version,
+            system_version: d.system_version,
+            node_version: d.node_version,
+            machine_id: d.machine_id,
+        }
+    })
+}
+
+impl Impersonation {
+    /// 同 [`Impersonation::for_credential`],但从进程级默认值取静态配置。
+    /// 供拿不到 `Config` 的路径(令牌刷新)使用。
+    pub fn for_credential_global(cred: &Credential) -> Self {
+        let d = imp_defaults();
+        let machine_id = crate::kiro::machine_id::for_credential(
+            cred.machine_id.as_deref(),
+            d.machine_id.as_deref(),
+            cred.is_api_key(),
+            cred.kiro_api_key.as_deref(),
+            &cred.refresh_token,
+        )
+        .unwrap_or_else(|| crate::kiro::machine_id::fallback_for(&cred.id));
+        Self {
+            machine_id,
+            kiro_version: d.kiro_version,
+            agent_mode: "vibe".to_string(),
+            system_version: d.system_version,
+            node_version: d.node_version,
+        }
+    }
+
+    /// 为一条凭据定出完整伪装身份。**全项目唯一入口** —— 数据面、令牌刷新、余额查询、
+    /// 模型清单都必须走它。
+    ///
+    /// 此前 handler / balance / models_cache 各写了一份 `impersonation_for`,而且三份并不
+    /// 一致:只有数据面那份认配置级 machineId,另两份不认。于是配置里设了 machineId 时,
+    /// 同一个账号在数据面报一个机器、在余额查询报另一个 —— 同一时刻同一个 Bearer 来自
+    /// 两台机器,这恰恰是最该避免的形状。刷新链路更是**一份都没有**。
+    pub fn for_credential(cred: &Credential, cfg: &crate::config::Config) -> Self {
+        let machine_id = crate::kiro::machine_id::for_credential(
+            cred.machine_id.as_deref(),
+            cfg.machine_id.as_deref(),
+            cred.is_api_key(),
+            cred.kiro_api_key.as_deref(),
+            &cred.refresh_token,
+        )
+        .unwrap_or_else(|| crate::kiro::machine_id::fallback_for(&cred.id));
+        Self {
+            machine_id,
+            kiro_version: cfg.kiro_version.clone(),
+            agent_mode: "vibe".to_string(),
+            system_version: cfg.system_version.clone(),
+            node_version: cfg.node_version.clone(),
+        }
+    }
+}
+
 fn hv(s: &str) -> HeaderValue {
     HeaderValue::from_str(s).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
@@ -52,11 +140,33 @@ pub(crate) async fn read_body_capped(mut resp: reqwest::Response) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// 生成一个随机的请求关联 id(16 字节 CSPRNG 十六进制),供 amz-sdk-invocation-id 使用。
-fn new_invocation_id() -> String {
-    let mut raw = [0u8; 16];
-    getrandom::getrandom(&mut raw).expect("CSPRNG");
-    hex::encode(raw)
+/// 生成 `amz-sdk-invocation-id` 的取值:**UUID v4 的标准写法**(8-4-4-4-12,带连字符)。
+///
+/// 此前发的是 32 位无连字符十六进制。aws-sdk-js 这个头**永远**是 UUID v4,格式不对是个
+/// 零成本、100% 命中的判别器 —— 每一个请求都带着它。这里手工按 RFC 4122 置好 version
+/// 与 variant 位并加连字符,不引第三方依赖。
+pub fn new_invocation_id() -> String {
+    let mut b = [0u8; 16];
+    getrandom::getrandom(&mut b).expect("CSPRNG");
+    b[6] = (b[6] & 0x0f) | 0x40; // version = 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant = RFC 4122
+    let h = hex::encode(b);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
+}
+
+/// 从 `https://host/path` 里取出 host(不含端口以外的任何修饰)。
+/// 取不出就返回 None —— 那种情况下交给 hyper 自己补,总好过发一个错的 host。
+pub fn host_of(url: &str) -> Option<String> {
+    let rest = url.split("://").nth(1)?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 /// 构造一次数据面请求的头(照观测,契约 §3)。
@@ -66,13 +176,13 @@ pub fn build_headers(
     ep: &Endpoint,
     invocation_id: &str,
 ) -> HeaderMap {
+    // **插入顺序即线上顺序**(HeaderMap 按插入序迭代),故这里的次序不是风格问题。
+    //
+    // HTTP 头顺序是与 TLS 指纹并列的一个标准识别维度:同一个客户端库发出的头次序是固定的。
+    // 此前我们的次序与真实客户端不同,且 `host` 因为没有显式设置、被 hyper 追加到了倒数
+    // 第二位(真实客户端把它排在中间)。本函数的次序照真实客户端逐项对齐,改动前请先用
+    // 探针抓一遍真实字节再动。
     let mut h = HeaderMap::new();
-    h.insert("authorization", hv(&format!("Bearer {}", cred.bearer())));
-    // API Key 凭据必须显式声明令牌类型,否则上游按 OAuth 令牌解析这枚 ksk 并拒绝。
-    // 该头为功能必需的 wire 事实(照观测,无公开文档),与 bearer 取值必须同时成立。
-    if cred.is_api_key() {
-        h.insert("tokentype", HeaderValue::from_static("API_KEY"));
-    }
     h.insert("content-type", HeaderValue::from_static("application/json"));
     // 每请求一条新连接,**绝不复用**。
     //
@@ -91,11 +201,6 @@ pub fn build_headers(
         HeaderValue::from_static("true"),
     );
     h.insert("x-amzn-kiro-agent-mode", hv(&imp.agent_mode));
-    h.insert("amz-sdk-invocation-id", hv(invocation_id));
-    h.insert(
-        "amz-sdk-request",
-        HeaderValue::from_static("attempt=1; max=3"),
-    );
     if let Ok(name) = HeaderName::from_bytes(b"x-amz-user-agent") {
         h.insert(
             name,
@@ -112,6 +217,22 @@ pub fn build_headers(
             imp.system_version, imp.node_version, imp.kiro_version, imp.machine_id
         )),
     );
+    // 显式设 host。不设的话 hyper 会在序列化时把它补到末尾,位置与真实客户端不同;
+    // 取值本身一样,但"在头序列里的落位"同样是可观测的。
+    if let Some(host) = host_of(&ep.url) {
+        h.insert("host", hv(&host));
+    }
+    h.insert("amz-sdk-invocation-id", hv(invocation_id));
+    h.insert(
+        "amz-sdk-request",
+        HeaderValue::from_static("attempt=1; max=3"),
+    );
+    h.insert("authorization", hv(&format!("Bearer {}", cred.bearer())));
+    // API Key 凭据必须显式声明令牌类型,否则上游按 OAuth 令牌解析这枚 ksk 并拒绝。
+    // 该头为功能必需的 wire 事实(照观测,无公开文档),与 bearer 取值必须同时成立。
+    if cred.is_api_key() {
+        h.insert("tokentype", HeaderValue::from_static("API_KEY"));
+    }
     if let Some(t) = ep.target
         && let Ok(name) = HeaderName::from_bytes(b"x-amz-target")
     {
@@ -328,6 +449,50 @@ pub async fn call_with_fallback_no_report(
 
 #[cfg(test)]
 mod tests {
+    /// `amz-sdk-invocation-id` 必须是 UUID v4 的标准写法。
+    ///
+    /// 回归:此前发的是 32 位无连字符十六进制。aws-sdk-js 这个头**永远**是 UUID v4,
+    /// 而它出现在每一个请求上 —— 格式不对就是个零成本、100% 命中的判别器。
+    #[test]
+    fn invocation_id_is_a_uuid_v4() {
+        let id = super::new_invocation_id();
+        assert_eq!(id.len(), 36, "带连字符的 UUID 长 36:{id}");
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12],
+            "分段应为 8-4-4-4-12:{id}"
+        );
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+            "只能是十六进制与连字符:{id}"
+        );
+        // version nibble = 4,variant 高两位 = 10
+        assert_eq!(
+            parts[2].chars().next().unwrap(),
+            '4',
+            "version 必须是 4:{id}"
+        );
+        assert!(
+            matches!(parts[3].chars().next().unwrap(), '8' | '9' | 'a' | 'b'),
+            "variant 必须是 RFC 4122:{id}"
+        );
+        assert_ne!(super::new_invocation_id(), id, "每次必须不同");
+    }
+
+    /// 从 URL 取 host。
+    #[test]
+    fn host_of_extracts_the_authority() {
+        assert_eq!(
+            super::host_of("https://q.us-east-1.amazonaws.com/generateAssistantResponse"),
+            Some("q.us-east-1.amazonaws.com".into())
+        );
+        assert_eq!(
+            super::host_of("http://127.0.0.1:8080/x?y=1"),
+            Some("127.0.0.1:8080".into())
+        );
+        assert_eq!(super::host_of("not-a-url"), None);
+    }
 
     /// ksk 凭据的两件事必须同时成立:bearer 是 ksk 本身,且带 `tokentype: API_KEY`。
     /// 只做前者会让上游按 OAuth 令牌去解析这枚 key 并拒绝——而错误信息不会提到令牌类型,
@@ -545,7 +710,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_endpoints_falls_back_on_429_then_succeeds() {
+    async fn try_endpoints_does_not_replay_429_onto_another_endpoint() {
         let bad = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(429))
@@ -570,12 +735,22 @@ mod tests {
             },
         ];
         let r = try_endpoints(&client, &eps, &cred(), &imp(), b"body").await;
-        assert!(r.is_ok());
-        assert_eq!(r.unwrap().status(), 200);
+        // **不再**因为 429 就换端点重放。此前一次限流会被放大成对多个入口的连续请求,
+        // 而那两个入口真实客户端根本不用——"被限流的账号紧接着去探别的服务入口"是探测
+        // 行为的形状。现在限流就只是限流,原地返回、由上层退避。
+        assert!(
+            matches!(&r, Err(f) if f.kind == FailureKind::Transient),
+            "429 不该被回退到下一个端点,got {r:?}"
+        );
+        assert_eq!(
+            good.received_requests().await.unwrap().len(),
+            0,
+            "第二个端点不该被打到"
+        );
     }
 
     #[tokio::test]
-    async fn try_endpoints_all_429_exhausts_to_quota() {
+    async fn try_endpoints_treats_429_as_transient_not_quota() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(429))
@@ -595,17 +770,21 @@ mod tests {
             },
         ];
         let r = try_endpoints(&client, &eps, &cred(), &imp(), b"body").await;
-        assert!(matches!(&r, Err(f) if f.kind == FailureKind::Quota));
+        // 429 是限流,不是配额:归 Transient,由上层退避重试,账号不吃长罚。
+        assert!(
+            matches!(&r, Err(f) if f.kind == FailureKind::Transient),
+            "got {r:?}"
+        );
     }
 
     #[tokio::test]
     async fn try_endpoints_keeps_quota_over_later_transport_error() {
-        // 先收到 429(配额,应吃长冷却),再在下一个端点上撞传输层错误:分类必须仍是 Quota。
-        // 若被最后一个错误覆盖成 Transient,账号只记 1 个 strike、不进 30 分钟冷却,
-        // 会立刻被重新选中继续撞配额墙。
+        // 先收到 402(额度真的耗尽),再在下一个端点上撞传输层错误:分类必须仍是 Quota。
+        // 若被最后一个错误覆盖成 Transient,这个已经没额度的号只记 1 个 strike,
+        // 会立刻被重新选中继续撞同一堵墙。
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(429))
+            .respond_with(ResponseTemplate::new(402))
             .mount(&server)
             .await;
         let client = reqwest::Client::new();
@@ -625,7 +804,7 @@ mod tests {
         let r = try_endpoints(&client, &eps, &cred(), &imp(), b"body").await;
         assert!(
             matches!(&r, Err(f) if f.kind == FailureKind::Quota),
-            "429 的配额信号不得被后续端点的传输错误降级,got {r:?}"
+            "402 的配额信号不得被后续端点的传输错误降级,got {r:?}"
         );
     }
 

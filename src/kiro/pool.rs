@@ -23,7 +23,12 @@ pub struct CredentialUpdate {
 /// 负载均衡方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LbMode {
-    /// 轮转优先(等权轮询)。
+    /// 优先:**粘住当前账号**,直到它不可用才换下一个。
+    ///
+    /// 这不是轮询。此前本档实现为"每请求 cursor+1 等权轮询",于是上游在同一个出口 IP 上
+    /// 看到几百个不同 machineId 在**秒级交替**出现 —— 那正是账号池最容易被识别的形状,
+    /// 而真实客户端永远是"一台机器、一个账号、连续干活"。粘滞让流量形态回到后者:
+    /// 一个账号一直用到它被判不可用,才切下一个。
     Priority,
     /// 均衡(按权重轮询)。
     Balanced,
@@ -53,11 +58,7 @@ pub enum FailureKind {
 }
 
 /// 自设冷却时长(秒)。
-const QUOTA_COOLDOWN: u64 = 30 * 60; // 配额类:30 分钟
 const TRANSIENT_COOLDOWN: u64 = 90; // 瞬时类:90 秒
-/// 歧义鉴权类(401/403 无明确失效信号)专用冷却:比瞬时类长,给上游权限抖动留恢复余地,
-/// 又不至于像配额那样锁 30 分钟。
-const AUTH_AMBIGUOUS_COOLDOWN: u64 = 5 * 60; // 5 分钟
 /// 瞬时错误连续多少次才冷却(自设)。
 const TRANSIENT_STRIKES: u32 = 3;
 /// 歧义鉴权类连续多少次才冷却(自设,比瞬时类更敏感:2 次即冷却)。
@@ -96,7 +97,11 @@ pub fn classify(status: u16) -> FailureKind {
 /// 分类退化(见 provider 的 `#6`)。本函数同时匹配 `__type` 与 `message` 措辞。
 pub fn classify_with_body(status: u16, body: &str) -> FailureKind {
     match status {
-        402 | 429 => FailureKind::Quota,
+        // 402 = 额度真的用尽(月度请求数),按配额处置。
+        // 429 **不是**配额:它是上游临时限流,退避后重试即可恢复。此前把 429 也判成配额,
+        // 于是一次限流就让账号进 30 分钟长冷却,而限流恰恰是高峰期最常见的响应。
+        402 => FailureKind::Quota,
+        429 => FailureKind::Transient,
         401 | 403 => {
             // 防御性短路(defense-in-depth):任何"可自愈"信号(过期/暂停/限流/配额/风控)
             // 一律降级为 AuthAmbiguous(冷却),永久禁用只保留给真正作废的凭据。
@@ -368,7 +373,11 @@ pub fn classify_refresh_failure(status: u16, body: &str) -> FailureKind {
         return FailureKind::AuthInvalid;
     }
     match status {
-        402 | 429 => FailureKind::Quota,
+        // 402 = 额度真的用尽(月度请求数),按配额处置。
+        // 429 **不是**配额:它是上游临时限流,退避后重试即可恢复。此前把 429 也判成配额,
+        // 于是一次限流就让账号进 30 分钟长冷却,而限流恰恰是高峰期最常见的响应。
+        402 => FailureKind::Quota,
+        429 => FailureKind::Transient,
         401 | 403 => FailureKind::AuthAmbiguous,
         // 命中失效标记但状态码不构成确证 → 落 AuthAmbiguous(自愈冷却),绝不永久禁用。
         _ if signals_auth_invalid => FailureKind::AuthAmbiguous,
@@ -450,6 +459,8 @@ pub struct Pool {
     entries: Vec<Entry>,
     mode: LbMode,
     cursor: usize,
+    /// Priority 档粘住的当前账号 id。None = 尚未选过,下次取第一个可用账号。
+    current: Option<String>,
     /// 每账号每分钟最大请求数;0 = 无限(默认,兼容既有行为)。
     max_rpm: u32,
     /// 下一个待分配的数值 id(单调递增,删除账号**不回收**其编号)。
@@ -497,6 +508,7 @@ impl Pool {
             entries,
             mode,
             cursor: 0,
+            current: None,
             max_rpm: 0,
             next_id: persisted_next_id.max(max_existing.saturating_add(1)),
         }
@@ -640,19 +652,24 @@ impl Pool {
         }
         let pick = match self.mode {
             LbMode::Priority => {
-                // 等权轮询:从 cursor 起找下一个可用(disabled/cooldown/RPM/排除集均需跳过)
-                self.cursor = (self.cursor + 1) % n;
-                let mut idx = self.cursor;
-                let mut found = None;
-                for _ in 0..n {
-                    if eligible(&self.entries[idx]) {
-                        found = Some(idx);
-                        break;
-                    }
-                    idx = (idx + 1) % n;
-                }
-                self.cursor = idx;
-                found?
+                // 粘滞:当前账号还能用就继续用它,**不换**。
+                //
+                // 只有它不可用了(禁用/冷却/超 RPM/被本次请求排除)才前进到下一个可用账号,
+                // 并把它记成新的当前账号。于是上游看到的是"一个账号连续干活、坏了才换人",
+                // 而不是几百个身份在同一个 IP 上交替刷屏。
+                let sticky = self
+                    .current
+                    .as_ref()
+                    .and_then(|id| self.entries.iter().position(|e| &e.cred.id == id))
+                    .filter(|&i| eligible(&self.entries[i]));
+                let idx = match sticky {
+                    Some(i) => i,
+                    // 换人时取**第一个**可用账号(条目顺序即优先级顺序),而不是 cursor 的下一个:
+                    // 后者会让每次换人都往后漂,长期看又退化成轮询。
+                    None => active[0],
+                };
+                self.current = Some(self.entries[idx].cred.id.clone());
+                idx
             }
             LbMode::Balanced => {
                 // 按权重轮询(仅在可用 active 集合上展开):cursor 在"权重展开"序上前进
@@ -876,6 +893,10 @@ impl Pool {
             }
             e.strikes = 0;
             e.cooldown_until = 0;
+            // 运行期判下的"停止使用"(额度耗尽 / 连续鉴权失败)必须一并解除 —— 那是本进程
+            // 的判断,重置就是推翻它。但**不**动持久化的 disabled:那是管理员或配置文件明确
+            // 关掉的账号,重置按钮不该把它偷偷打开。回落到盘上的值,两者各归各位。
+            e.disabled = e.cred.disabled;
             // 结论也要清。封禁账号被 `is_active` 挡在池外、永远轮不到成功来清标签,
             // 「重置」是它唯一的出口;只清计时器不清结论,这个按钮对封禁号就是个空操作。
             e.set_status_reason(StatusReason::None);
@@ -930,9 +951,9 @@ impl Pool {
     ///
     /// 处置分级:
     /// - [`FailureKind::AuthInvalid`]:真凭据失效 → **永久禁用**(仅 admin 手工复活)。
-    /// - [`FailureKind::Quota`]:配额/额度耗尽 → 长冷却([`QUOTA_COOLDOWN`]),清零 strike。
+    /// - [`FailureKind::Quota`]:额度耗尽 → **停止使用**(内存态,重置/重启可复活)。
     /// - [`FailureKind::AuthAmbiguous`]:401/403 无失效信号 → 累计 strike,达
-    ///   [`AUTH_AMBIGUOUS_STRIKES`] 次后进入 [`AUTH_AMBIGUOUS_COOLDOWN`] 冷却,**不永久禁用**。
+    ///   [`AUTH_AMBIGUOUS_STRIKES`] 次后**停止使用**(内存态,非持久化禁用)。
     /// - [`FailureKind::Transient`]:瞬时错误 → 累计 strike,达 [`TRANSIENT_STRIKES`] 次后
     ///   进入 [`TRANSIENT_COOLDOWN`] 冷却。
     ///
@@ -974,14 +995,25 @@ impl Pool {
                     e.disabled = true;
                     e.cred.disabled = true;
                 }
+                // 额度真的用尽 → **本进程内不再选它**,而不是冷却后回池。
+                //
+                // 月度额度不会在 30 分钟后长回来:旧的"长冷却"等于让这个号每 30 分钟去
+                // 撞一次必然失败的墙,一天 48 次,几百个号叠起来就是一条持续不断的 402
+                // 背景流 —— 那正是"批量凭据校验"的形状。这里只置内存态 disabled,**不**写
+                // `cred.disabled`:重启或管理员重置即复活,下个计费周期不必手工捞回来。
                 FailureKind::Quota => {
-                    e.cooldown_until = now_unix.saturating_add(QUOTA_COOLDOWN);
+                    e.disabled = true;
                     e.strikes = 0;
                 }
+                // 401/403 但响应体没有明确失效信号(上游的封停响应正落在这一档)→
+                // 连续 AUTH_AMBIGUOUS_STRIKES 次后同样停止使用,不再"冷却 5 分钟又回池"。
+                //
+                // 旧行为是一个**已被上游封停**的账号每 5 分钟被重新拿去打一次、永不停止。
+                // 同样只置内存态,重启/重置可复活,避免把上游一次权限抖动变成永久损失。
                 FailureKind::AuthAmbiguous => {
                     e.strikes = e.strikes.saturating_add(1);
                     if e.strikes >= AUTH_AMBIGUOUS_STRIKES {
-                        e.cooldown_until = now_unix.saturating_add(AUTH_AMBIGUOUS_COOLDOWN);
+                        e.disabled = true;
                         e.strikes = 0;
                     }
                 }
@@ -1067,8 +1099,10 @@ mod tests {
     #[test]
     fn classify_by_status() {
         // 无响应体:401/403 保守落在 AuthAmbiguous(冷却),绝不因裸状态码永久禁用。
-        assert_eq!(classify(429), FailureKind::Quota);
-        assert_eq!(classify(402), FailureKind::Quota); // 402 = 额度耗尽
+        // 429 = 上游临时限流,退避重试即可恢复,**不是**配额耗尽。此前把它判成配额,
+        // 于是一次限流就让账号进长冷却,而限流恰恰是高峰期最常见的响应。
+        assert_eq!(classify(429), FailureKind::Transient);
+        assert_eq!(classify(402), FailureKind::Quota); // 402 = 额度真的耗尽
         assert_eq!(classify(401), FailureKind::AuthAmbiguous);
         assert_eq!(classify(403), FailureKind::AuthAmbiguous);
         assert_eq!(classify(503), FailureKind::Transient);
@@ -1206,8 +1240,8 @@ mod tests {
         let raw = r#"{"__type":"ThrottlingException","message":"Rate exceeded"}"#;
         assert!(body_signals_recoverable(raw));
         assert_eq!(classify_with_body(403, raw), FailureKind::AuthAmbiguous);
-        // 429 状态码本身仍归 Quota(与体无关)。
-        assert_eq!(classify_with_body(429, raw), FailureKind::Quota);
+        // 429 状态码本身归 Transient(与体无关):限流是"这次不走运",不是账号坏了。
+        assert_eq!(classify_with_body(429, raw), FailureKind::Transient);
     }
 
     #[test]
@@ -1341,11 +1375,35 @@ mod tests {
     }
 
     #[test]
-    fn round_robin_rotates_across_accounts() {
+    fn priority_sticks_to_one_account_instead_of_rotating() {
+        let mut p = Pool::new(vec![cred("a", 1), cred("b", 1)], LbMode::Priority);
+        // 粘滞:连续挑 50 次必须**始终是同一个账号**。
+        //
+        // 此前这里钉的是相反的行为(每次换一个),而那正是上游最容易识别的形状:
+        // 同一个出口 IP 上几百个不同 machineId 在秒级交替。真实客户端永远是
+        // "一台机器、一个账号、连续干活"。
+        let first = p.select(0).unwrap().id;
+        for _ in 0..50 {
+            assert_eq!(
+                p.select(0).unwrap().id,
+                first,
+                "Priority 档必须粘住同一个账号"
+            );
+        }
+    }
+
+    /// 粘住的账号一旦不可用,才切到下一个 —— 并且切过去之后同样粘住。
+    #[test]
+    fn priority_moves_on_only_when_the_current_account_becomes_unusable() {
         let mut p = Pool::new(vec![cred("a", 1), cred("b", 1)], LbMode::Priority);
         let first = p.select(0).unwrap().id;
+        // 让当前账号进入不可用(真凭据失效 → 禁用)
+        p.report_failure(&first, FailureKind::AuthInvalid, 0);
         let second = p.select(0).unwrap().id;
-        assert_ne!(first, second); // 两次挑到不同账号
+        assert_ne!(second, first, "当前账号不可用后必须换人");
+        for _ in 0..20 {
+            assert_eq!(p.select(0).unwrap().id, second, "换人之后同样要粘住");
+        }
     }
 
     #[test]
@@ -1447,27 +1505,43 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_auth_cools_with_strikes_not_permanent_disable() {
-        // 裸 403(无失效信号)不永久禁用:累计 AUTH_AMBIGUOUS_STRIKES 次后才冷却,冷却后恢复。
+    fn ambiguous_auth_stops_the_account_after_strikes_and_does_not_come_back() {
+        // 裸 403(无失效信号)——上游的封停响应正落在这一档。
         let mut p = Pool::new(vec![cred("a", 1)], LbMode::Priority);
-        let kind = classify(403); // 无响应体 → AuthAmbiguous
+        let kind = classify(403);
         assert_eq!(kind, FailureKind::AuthAmbiguous);
         p.report_failure("a", kind, 100);
-        assert!(p.select(100).is_some()); // 第 1 次还不冷却
+        assert!(p.select(100).is_some(), "第 1 次还不该停用");
         p.report_failure("a", kind, 100);
-        assert!(p.select(100).is_none()); // 第 2 次(达阈值)进入冷却
-        // 5 分钟冷却后恢复,且从未 disabled(永久)。
-        assert!(p.select(100 + AUTH_AMBIGUOUS_COOLDOWN + 1).is_some());
-        let st = p.stats(100 + AUTH_AMBIGUOUS_COOLDOWN + 1);
-        assert!(!st[0].disabled);
+        assert!(p.select(100).is_none(), "达阈值后停用");
+        // 关键:**不再**"冷却 5 分钟又回池"。旧行为让一个已被上游封停的账号每 5 分钟
+        // 被重新拿去打一次,永不停止 —— 几百个号就是一条持续的 401/403 背景流。
+        assert!(
+            p.select(100 + 5 * 60 + 1).is_none(),
+            "被判不可用的账号不该在冷却后自行回池"
+        );
+        assert!(p.select(100 + 86_400).is_none());
+        // 同样只是内存态:重启或管理员重置可复活,避免把上游一次权限抖动变成永久损失。
+        p.reset_failures("a");
+        assert!(p.select(100 + 86_400).is_some(), "重置后应可复活");
     }
 
     #[test]
-    fn quota_failure_cools_then_recovers() {
+    fn quota_exhaustion_stops_using_the_account_instead_of_retrying_forever() {
         let mut p = Pool::new(vec![cred("a", 1)], LbMode::Priority);
         p.report_failure("a", FailureKind::Quota, 100);
-        assert!(p.select(200).is_none()); // 冷却中
-        assert!(p.select(100 + 30 * 60 + 1).is_some()); // 30 分钟后恢复
+        assert!(p.select(200).is_none());
+        // 关键:**不会**在 30 分钟后自己回来。月度额度不会在半小时后长回来,旧行为等于
+        // 让这个号每 30 分钟去撞一次必然失败的墙(一天 48 次),几百个号叠成一条持续的
+        // 402 背景流。
+        assert!(
+            p.select(100 + 30 * 60 + 1).is_none(),
+            "配额耗尽的账号不该自行回池"
+        );
+        assert!(p.select(100 + 86_400).is_none(), "一天后同样不该自行回池");
+        // 只是内存态:管理员重置即复活(不必等下个计费周期手工捞)。
+        p.reset_failures("a");
+        assert!(p.select(100 + 86_400).is_some(), "重置后应可复活");
     }
 
     #[test]
@@ -1510,17 +1584,14 @@ mod tests {
     #[test]
     fn set_mode_switches_selection_behavior_live() {
         let mut p = Pool::new(vec![cred("a", 3), cred("b", 1)], LbMode::Priority);
-        // priority:等权轮转 → 两账号计数接近(各约一半)。
+        // priority:粘滞 → 100 次全落在同一个账号上。
         let mut a0 = 0;
         for _ in 0..100 {
             if p.select(0).unwrap().id == "a" {
                 a0 += 1;
             }
         }
-        assert!(
-            (40..=60).contains(&a0),
-            "priority should be roughly balanced, got a={a0}"
-        );
+        assert_eq!(a0, 100, "priority 是粘滞的,不该分散到两个账号");
 
         // 运行期切到 balanced → 高权 a 明显多于低权 b。
         p.set_mode(LbMode::Balanced);
@@ -1634,13 +1705,15 @@ mod tests {
     }
 
     #[test]
-    fn stats_reflects_quota_cooldown() {
+    fn stats_reflects_quota_exhaustion_as_disabled() {
         let mut p = Pool::new(vec![cred("a", 1)], LbMode::Priority);
         p.report_failure("a", FailureKind::Quota, 100);
         let stats = p.stats(100);
         assert_eq!(stats[0].failures, 1);
-        assert!(stats[0].in_cooldown);
-        assert!(stats[0].cooldown_until > 100);
+        // 配额耗尽现在是"停用"而不是"冷却中":面板要如实显示这个号本周期不会再被用,
+        // 而不是显示一个 30 分钟后会自己好的倒计时。
+        assert!(stats[0].disabled);
+        assert!(!stats[0].in_cooldown);
     }
 
     #[test]
@@ -1786,9 +1859,9 @@ mod tests {
     #[test]
     fn reset_failures_clears_strikes_and_cooldown() {
         let mut p = Pool::new(vec![cred("a", 1)], LbMode::Priority);
-        // 打到配额冷却
+        // 打到配额停用
         p.report_failure("a", FailureKind::Quota, 100);
-        assert!(p.select(200).is_none()); // 冷却中
+        assert!(p.select(200).is_none()); // 已停用
         assert!(p.reset_failures("a"));
         assert!(p.select(200).is_some()); // 重置后立即可选
         // strikes 也清零
@@ -1828,7 +1901,8 @@ mod tests {
             classify_refresh_failure(401, r#"{"message":"Bad credentials"}"#),
             FailureKind::AuthAmbiguous
         );
-        assert_eq!(classify_refresh_failure(429, ""), FailureKind::Quota);
+        // 刷新被限流同样是"这次不走运",退避重试即可 —— 不是账号额度耗尽。
+        assert_eq!(classify_refresh_failure(429, ""), FailureKind::Transient);
     }
 
     /// 永久禁用只允许发生在上游"真的在报授权作废"的状态码(400/401/403)上;其余状态码

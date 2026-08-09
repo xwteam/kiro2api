@@ -695,7 +695,9 @@ mod tests {
         }
         let attempt = match base_override {
             Some(base) => {
-                crate::kiro::refresh::refresh_at(client, base, &cred_snapshot, now_unix).await
+                let imp =
+                    crate::kiro::provider::Impersonation::for_credential_global(&cred_snapshot);
+                crate::kiro::refresh::refresh_at(client, base, &cred_snapshot, &imp, now_unix).await
             }
             None => crate::kiro::refresh::refresh(client, &cred_snapshot, now_unix).await,
         };
@@ -778,7 +780,9 @@ mod tests {
         }
         let attempt = match base_override {
             Some(base) => {
-                crate::kiro::refresh::refresh_at(client, base, &cred_snapshot, now_unix).await
+                let imp =
+                    crate::kiro::provider::Impersonation::for_credential_global(&cred_snapshot);
+                crate::kiro::refresh::refresh_at(client, base, &cred_snapshot, &imp, now_unix).await
             }
             None => crate::kiro::refresh::refresh(client, &cred_snapshot, now_unix).await,
         };

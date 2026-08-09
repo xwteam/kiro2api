@@ -10,41 +10,37 @@ pub struct Endpoint {
     pub target: Option<&'static str>,
 }
 
-/// 三个端点(region 化,固定顺序:Kiro IDE、CodeWhisperer、AmazonQ)。
+/// 数据面端点。**只有一个** —— 真实客户端只打这一个。
+///
+/// 曾经这里有三个:另外两个是 `codewhisperer.{region}` 这台主机,以及把
+/// `AmazonQDeveloperStreamingService.SendMessage` 这个 `x-amz-target` 打在
+/// `/generateAssistantResponse` 这条 REST 路径上。两者真实客户端都不产生,而且后者本身
+/// 不自洽:`x-amz-target` 是 awsJson 协议的头,真实客户端配它时路径是 `/`。
+///
+/// 更糟的是它们何时被用:上游一限流(429),我们就**立刻拿同一个账号的令牌**去打这两个
+/// 端点。于是"被限流的账号紧接着去探另外两个服务入口"——这是探测行为的形状,不是客户端
+/// 行为的形状。收敛成一个之后,限流就只是限流,退避重试即可。
 pub fn all(region: &str) -> Vec<Endpoint> {
-    vec![
-        Endpoint {
-            url: format!("https://q.{region}.amazonaws.com/generateAssistantResponse"),
-            origin: "AI_EDITOR",
-            target: None,
-        },
-        Endpoint {
-            url: format!("https://codewhisperer.{region}.amazonaws.com/generateAssistantResponse"),
-            origin: "AI_EDITOR",
-            target: Some("AmazonCodeWhispererStreamingService.GenerateAssistantResponse"),
-        },
-        Endpoint {
-            url: format!("https://q.{region}.amazonaws.com/generateAssistantResponse"),
-            origin: "AI_EDITOR",
-            target: Some("AmazonQDeveloperStreamingService.SendMessage"),
-        },
-    ]
+    vec![Endpoint {
+        url: format!("https://q.{region}.amazonaws.com/generateAssistantResponse"),
+        origin: "AI_EDITOR",
+        target: None,
+    }]
 }
 
-/// 命名 → 在 all() 里的下标。
+/// 命名 → 下标。只剩 `kiro` 一个真实端点;`codewhisperer`/`amazonq` 两个历史名字仍被
+/// 接受(旧配置不会因此报错),但一律解析到同一个真实端点,不再另发请求。
 fn named_index(name: &str) -> Option<usize> {
     match name {
-        "kiro" => Some(0),
-        "codewhisperer" => Some(1),
-        "amazonq" => Some(2),
+        "kiro" | "codewhisperer" | "amazonq" => Some(0),
         _ => None,
     }
 }
 
-/// 选择端点尝试顺序:
-/// - `preferred` 为 `""`/`auto`/未知 → 全部三个原序(忽略 fallback);
-/// - 命名且 `fallback=false` → 只该一个;
-/// - 命名且 `fallback=true` → 该一个在前、其余按原序补后。
+/// 选择端点尝试顺序。
+///
+/// 端点收敛成一个之后,本函数**恒返回那一个**;`preferred` / `fallback` 两个参数保留是为了
+/// 不破坏调用方与配置的既有形状(旧配置写着 `codewhisperer` 也不会报错)。
 pub fn sorted(region: &str, preferred: &str, fallback: bool) -> Vec<Endpoint> {
     let eps = all(region);
     match named_index(preferred) {
@@ -110,29 +106,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_three_regionalized() {
+    fn only_the_real_endpoint_exists_and_is_regionalized() {
         let eps = all("eu-west-1");
-        assert_eq!(eps.len(), 3);
+        // **只有一个**。曾经这里有三个,另外两个(codewhisperer 主机、带 x-amz-target 的
+        // AmazonQ 变体)真实客户端从不产生,却会在被限流后拿同一个账号去打 —— 那是探测
+        // 行为的形状。收敛回一个,并把"只有一个"钉死。
+        assert_eq!(eps.len(), 1, "数据面端点只能有一个(真实客户端只打这一个)");
         assert!(eps[0].url.contains("q.eu-west-1.amazonaws.com"));
-        assert_eq!(eps[0].target, None); // Kiro IDE 无 target
-        assert!(eps[1].url.contains("codewhisperer.eu-west-1"));
-        assert!(eps[1].target.is_some());
+        assert!(eps[0].url.ends_with("/generateAssistantResponse"));
+        assert_eq!(eps[0].target, None, "真实客户端不发 x-amz-target");
+        assert!(
+            !eps.iter().any(|e| e.url.contains("codewhisperer")),
+            "codewhisperer 主机真实客户端从不访问"
+        );
     }
 
     #[test]
-    fn sorted_auto_returns_all_in_order() {
+    fn sorted_auto_returns_the_single_endpoint() {
         let s = sorted("us-east-1", "auto", false);
-        assert_eq!(s.len(), 3);
+        assert_eq!(s.len(), 1);
         assert_eq!(s[0].origin, all("us-east-1")[0].origin);
     }
 
     #[test]
-    fn sorted_named_no_fallback_is_single() {
-        let s = sorted("us-east-1", "codewhisperer", false);
-        assert_eq!(s.len(), 1);
-        assert!(s[0].url.contains("codewhisperer"));
-        // 真机契约:三个端点 path 都是 /generateAssistantResponse(非裸 /)。
-        assert!(s[0].url.ends_with("/generateAssistantResponse"));
+    fn legacy_endpoint_names_still_parse_but_map_to_the_real_one() {
+        // 旧配置里可能写着 codewhisperer/amazonq。它们仍被接受(不报错、不回落成"未知"),
+        // 但一律解析到唯一的真实端点,不再另发请求到那两台主机。
+        for name in ["kiro", "codewhisperer", "amazonq"] {
+            let s = sorted("us-east-1", name, false);
+            assert_eq!(s.len(), 1, "{name}:只应得到一个端点");
+            assert!(s[0].url.contains("q.us-east-1.amazonaws.com"), "{name}");
+            assert!(!s[0].url.contains("codewhisperer"), "{name}");
+            assert_eq!(s[0].target, None, "{name}");
+            assert!(s[0].url.ends_with("/generateAssistantResponse"), "{name}");
+        }
     }
 
     #[test]
@@ -148,10 +155,12 @@ mod tests {
     }
 
     #[test]
-    fn sorted_named_with_fallback_puts_it_first() {
+    fn fallback_flag_no_longer_adds_extra_endpoints() {
+        // 开着 fallback 也只有一个端点可打。此前 fallback=true 会把另外两个端点补在后面,
+        // 于是一次 429 会被放大成三次上游请求(还都打在真实客户端不用的入口上)。
         let s = sorted("us-east-1", "amazonq", true);
-        assert_eq!(s.len(), 3);
-        assert!(s[0].target.unwrap().contains("AmazonQ"));
+        assert_eq!(s.len(), 1);
+        assert!(s[0].url.contains("q.us-east-1.amazonaws.com"));
     }
 
     #[test]

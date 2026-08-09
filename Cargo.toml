@@ -2,7 +2,7 @@
 # 版本单一真源在 ./VERSION;此处 version 须与之保持一致。
 [package]
 name = "kiro2api"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2024"
 license = "MIT"
 authors = ["xwteam"]
@@ -28,7 +28,13 @@ native-tls-backend = ["reqwest/native-tls-vendored"]
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "socks", "http2", "charset"] }
+# gzip/brotli/deflate:**必须**与 Social 刷新声明的 `Accept-Encoding` 同时成立。真实桌面端
+# 用 axios 打自家 auth 服务,固定声明 `gzip, compress, deflate, br`;我们要对齐这个声明,就
+# 必须真能解开上游据此压缩的响应,否则每次刷新都拿到一堆压缩字节、JSON 解析全挂。
+# 注意这会让 reqwest 给**没有**显式 accept-encoding 的请求自动补一个 —— 数据面不能带这个头
+# (真实 aws-sdk-js on Node 不发),故 http.rs 里数据面/控制面客户端一律 no_gzip/no_brotli/
+# no_deflate 关掉自动补,只在刷新那条链路上显式声明。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "socks", "http2", "charset", "gzip", "brotli", "deflate"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"

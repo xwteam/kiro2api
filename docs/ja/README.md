@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.9.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.10.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日付 | 更新内容 |
 |------|----------|
+| 2026-08-09 | v0.10.0 - 🎯 **挙動の形を実クライアントに合わせました。** 長期安定している同種実装とモジュール単位で比較した結果、前 2 版の BAN 原因の推定は覆りました:その実装は接続を再利用し、HTTP/1.1 に固定せず、TLS も既定が rustls です — こちらが賭けた 3 点をどれも行っていません。実際の差分:① `priority` は**リクエストごとに アカウントを切り替え**ており、同一の出口 IP 上で数百の machineId が秒単位で交互に現れていました → **1 つのアカウントが使えなくなるまで固定**する方式へ;② 停止/枠を使い切ったアカウントが 5 分・30 分のクールダウン後に**プールへ復帰**し、壁に当たり続けていました → 使用停止(メモリ上のみ、リセットで復活);③ **トークン更新リクエストに User-Agent すら無い**状態でした(実測)。しかも Kiro 自身のエンドポイントで、全アカウントが必ず通る経路です → axios と sso-oidc の 2 つの実形態に合わせて補完;④ **machineId が更新のたびに変化**(ローテーションする refreshToken から都度算出)→ 読み込み時に凍結して永続化;⑤ ksk アカウントの machineId が単一の定数に退化 → 資格情報の種別ごとに導出。ほかに 429 を一時的スロットリングへ再分類、データプレーンのエンドポイントを 3 つから 1 つへ集約、`amz-sdk-invocation-id` を UUID v4 化、ヘッダ順序の一致、`claude-opus-5` マッピング追加、SSE に 25 秒のキープアライブ |
 | 2026-08-09 | v0.9.1 - 🔧 **上流接続を HTTP/1.1 に固定し、TLS バックエンドを native-tls へ**。v0.9.0 は `Connection: close` を追加しましたがプロトコルを固定していませんでした —— これは HTTP/1.1 のヘッダで h2 では禁止されており、ALPN では h2 が選ばれていたため、当時この設定は**飾りにすぎませんでした**(実測:固定により送信プロトコルが HTTP/2 から HTTP/1.1 へ)。TLS バックエンドは既定で **native-tls(OpenSSL)**:実クライアントは Electron/Node で OpenSSL 経由の握手を行い、その ClientHello は rustls と大きく異なります。指紋は HTTP の内容が送られる**前**に露出します。また machineId に設定レベルのフォールバックを追加 |
 | 2026-08-09 | v0.9.0 - 🔥 **プール全体が上流に停止されていました:一つの TCP 接続が複数のアカウント身元を運んでいた**ためです。中継は接続プール(idle 90 秒)を使っており、同一の TCP/TLS 上に異なるアカウントのトークンが次々と現れ、しかも各アカウントは user-agent 内の machineId で別のマシンだと名乗っていました。実際のクライアントには不可能です。本番では 1046 アカウントが健全 22 件まで減った一方、**中継を一度も通っていない**アカウントは直接照会で正常でした。現在はリクエストに `Connection: close` を付与し、両クライアントとも `pool_max_idle_per_host(0)`、UA の SDK バージョンは観測された実クライアントに整合。**診断の訂正**:初版は「切替が速すぎる」と結論しサーキットブレーカーを入れましたが、比較分析で**反証**され、ブレーカーは全面的に撤回しました |
 | 2026-08-03 | v0.8.1 - 🐛 パネルに Kiro API Key を入力する場所がありませんでした。v0.8.0 でバックエンドとエンドポイントは用意されたものの、**「アカウント追加」フォームに入力欄を追加していなかった**ため、UI からはこの機能が存在しないのと同じで、curl でしか到達できませんでした。認証方式の選択に **API Key (`ksk_…`)** を追加し、選ぶとキー入力欄が現れ、**refreshToken の行は隠れます**(この種の資格情報には存在せず、必須に見える空欄が残っていると入力漏れと誤解されるため)。送信時にも要求しません |
@@ -243,7 +244,7 @@ docker compose logs -f
 ```bash
 # ヘルスチェック
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.9.1"}
+# {"service":"kiro2api","status":"ok","version":"0.10.0"}
 
 # 利用可能なモデルを表示
 curl http://localhost:8080/v1/models \

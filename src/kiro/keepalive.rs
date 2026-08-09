@@ -209,7 +209,10 @@ mod tests {
         let creds: Vec<_> = (0..MAX_PER_TICK * 4)
             .map(|i| cred(&format!("c{i}"), now + 60))
             .collect();
-        let pool = Arc::new(Mutex::new(Pool::new(creds, LbMode::Priority)));
+        // 这里用 Balanced 而不是 Priority:Priority 现在是**粘滞**的(一个账号一直用到
+        // 它不可用),连选 20 次只会把 1 个账号标成"用过",凑不出"一堆账号同时临近过期"
+        // 这个被测场景。Balanced 会在账号间铺开,正好造出该场景。
+        let pool = Arc::new(Mutex::new(Pool::new(creds, LbMode::Balanced)));
         {
             let mut g = pool.lock().await;
             for _ in 0..MAX_PER_TICK * 4 {

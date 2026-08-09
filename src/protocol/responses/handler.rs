@@ -555,7 +555,15 @@ pub async fn responses_stream(
         usage_guard.flush();
     };
 
-    Ok(Sse::new(body))
+    Ok(Sse::new(body).keep_alive(
+        // SSE 保活。上游"想"得久时(长推理、长工具链)会有几十秒一个字节都不出,
+        // 中间的 CDN / 反代 / 客户端读超时会把这条静默的连接掐掉,表现成"会话莫名其妙断了"。
+        // 25 秒一个注释帧,既低于常见的 30/60 秒空闲阈值,又不干扰任何客户端解析
+        //(`:` 开头的注释行是 SSE 规范里明确要求忽略的)。
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(25))
+            .text("keep-alive"),
+    ))
 }
 
 /// axum handler:`POST /v1/responses`(与 `/openai/v1/responses` 共用)。

@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.9.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.10.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-08-09 | v0.10.0 - 🎯 **按行为形态对齐真实客户端**。对照一个长期稳定的同类实现逐模块比对后,前两版对封号的归因被推翻:那份实现既复用连接、也不锁 HTTP/1.1、TLS 还默认 rustls,我们赌的三件事它一件没做。真正的差异是:①`priority` 此前**每请求换一个账号**,上游在同一 IP 上看到几百个 machineId 秒级交替 → 改为**粘住一个账号直到它不可用**;②封停/额度耗尽的账号此前冷却 5/30 分钟后**自动回池**,等于永不停止地去撞墙 → 改为停止使用(内存态,重置可复活);③**令牌刷新请求连 User-Agent 都没有**(实测字节),而那是 Kiro 自家端点、每个账号必走 → 按 axios/sso-oidc 两种真实形态补齐;④**machineId 每刷新一次就变**(由会轮换的 refreshToken 现算)→ 载入时冻结落盘;⑤ksk 账号 machineId 退化成全局常量 → 按类型互斥派生。另:429 改判瞬时限流、数据面端点三个收敛为一个、`amz-sdk-invocation-id` 改 UUID v4、头顺序对齐、补 `claude-opus-5` 映射、SSE 加 25 秒保活 |
 | 2026-08-09 | v0.9.1 - 🔧 **上游连接锁 HTTP/1.1 + TLS 后端改 native-tls**。v0.9.0 加了 `Connection: close` 却没锁协议——而它是 HTTP/1.1 的头、**h2 明确禁止**,我们经 ALPN 协商到的正是 h2,所以那个头当时**只是摆设**(实测锁定后出站协议从 HTTP/2 变为 HTTP/1.1)。TLS 后端默认改 **native-tls(OpenSSL)**:真实客户端是 Electron/Node,握手走 OpenSSL,其 ClientHello 指纹与 rustls 截然不同,而**指纹在任何 HTTP 内容发出前就暴露**。另:machineId 增加配置级兜底(凭据 > 配置 > 派生) |
 | 2026-08-09 | v0.9.0 - 🔥 **整池账号被上游成批封停:同一条 TCP 连接上轮换了多个账号身份**。中转走连接池(idle 90s),同一条 TCP/TLS 上依次发出不同账号的令牌,而每个账号在 user-agent 里还各自声称是不同机器 —— 真实客户端不可能这样,这是账号共享最直接的证据(同 IP 还能用 NAT 解释,同一条连接解释不了)。线上 1046 个账号烧到只剩 22 个健康,而**从未经过中转**的账号直查上游全部正常:账号不是进来就死的。现数据面带 `Connection: close`,两个客户端均 `pool_max_idle_per_host(0)`;UA 的 SDK 版本对齐被观测的真实客户端。另:瞬态失败换账号前指数退避 200ms→2s+抖动,账号级失败不退避。**诊断修正**:初版归因于「换号太快」并做了熔断器,经对照分析**被证伪**,熔断器已整个回退 |
 | 2026-08-03 | v0.8.1 - 🐛 面板上没有地方填 Kiro API Key:v0.8.0 后端与接口都做好了,却**没给「新增账号」表单加输入框**——从界面看这功能等于不存在,只能去敲 curl。现在认证方式下拉多一项 **API Key (`ksk_…`)**,选中即显示 ksk 输入框并隐藏 refreshToken 那一栏(这类凭据本就没有它,留着必填框只会让人以为漏填),提交也不再要求它 |
@@ -284,7 +285,7 @@ docker compose logs -f
 ```bash
 # 健康检查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.9.1"}
+# {"service":"kiro2api","status":"ok","version":"0.10.0"}
 
 # 查看可用模型
 curl http://localhost:8080/v1/models \

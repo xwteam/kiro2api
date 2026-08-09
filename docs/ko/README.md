@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.9.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.10.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 날짜 | 업데이트 내용 |
 |------|----------|
+| 2026-08-09 | v0.10.0 - 🎯 **동작 형태를 실제 클라이언트에 맞췄습니다.** 오랫동안 안정적으로 운영되는 동종 구현과 모듈 단위로 비교한 결과, 앞선 두 릴리스의 정지 원인 진단이 뒤집혔습니다: 그 구현은 연결을 재사용하고, HTTP/1.1로 고정하지 않으며, TLS 기본값도 rustls입니다 — 우리가 걸었던 세 가지를 하나도 하지 않습니다. 실제 차이는: ① `priority`가 **요청마다 계정을 교체**해, 같은 출구 IP에서 수백 개의 machineId가 초 단위로 번갈아 나타났습니다 → **한 계정을 쓸 수 없게 될 때까지 고정**하도록 변경; ② 정지/한도 소진 계정이 5분·30분 쿨다운 후 **풀로 복귀**해 벽을 계속 들이받았습니다 → 사용 중단(메모리 상태, 초기화하면 복구); ③ **토큰 갱신 요청에 User-Agent조차 없었습니다**(바이트 실측). 그것도 Kiro 자체 엔드포인트이며 모든 계정이 반드시 지나는 경로입니다 → axios와 sso-oidc 두 가지 실제 형태로 보완; ④ **machineId가 갱신할 때마다 바뀜**(교체되는 refreshToken에서 매번 계산) → 로드 시 고정해 디스크에 기록; ⑤ ksk 계정의 machineId가 전역 상수로 퇴화 → 자격 증명 유형별로 파생. 그 밖에 429를 일시적 스로틀링으로 재분류, 데이터 플레인 엔드포인트를 3개에서 1개로 축소, `amz-sdk-invocation-id`를 UUID v4로, 헤더 순서 정렬, `claude-opus-5` 매핑 추가, SSE에 25초 keep-alive 추가 |
 | 2026-08-09 | v0.9.1 - 🔧 **업스트림 연결을 HTTP/1.1로 고정하고 TLS 백엔드를 native-tls로 변경**. v0.9.0은 `Connection: close`를 추가했지만 프로토콜을 고정하지 않았습니다 —— 이는 HTTP/1.1 헤더이며 h2에서는 금지되어 있고 ALPN은 h2를 선택하고 있었으므로 당시 그 헤더는 **장식일 뿐이었습니다**(실측: 고정 후 송신 프로토콜이 HTTP/2에서 HTTP/1.1로 변경). TLS 백엔드는 기본값이 **native-tls(OpenSSL)**입니다: 실제 클라이언트는 Electron/Node로 OpenSSL을 통해 핸드셰이크하며 그 ClientHello는 rustls와 크게 다릅니다. 지문은 HTTP 내용이 전송되기 **전에** 노출됩니다. 또한 machineId에 설정 수준 폴백 추가 |
 | 2026-08-09 | v0.9.0 - 🔥 **풀 전체가 업스트림에 정지되고 있었습니다: 하나의 TCP 연결이 여러 계정 신원을 실어 나르고 있었습니다.** 중계가 연결 풀(idle 90초)을 쓰다 보니 같은 TCP/TLS 세션 위에 서로 다른 계정의 토큰이 차례로 나타났고, 각 계정은 user-agent의 machineId로 서로 다른 기기라고 주장했습니다. 실제 클라이언트는 그럴 수 없습니다. 운영에서 1046개 계정이 건강한 22개로 줄어든 반면, **중계를 한 번도 거치지 않은** 계정은 직접 조회에서 정상이었습니다. 이제 요청에 `Connection: close`를 붙이고 두 클라이언트 모두 `pool_max_idle_per_host(0)`, UA의 SDK 버전은 관측된 실제 클라이언트에 맞췄습니다. **진단 정정**: 초판은 「전환이 너무 빠르다」고 결론짓고 서킷 브레이커를 넣었으나 비교 분석으로 **반증**되어 전면 철회했습니다 |
 | 2026-08-03 | v0.8.1 - 🐛 패널에 Kiro API Key를 입력할 곳이 없었습니다. v0.8.0에서 백엔드와 엔드포인트는 준비했지만 **「계정 추가」 폼에 입력란을 추가하지 않아** UI 상으로는 기능이 없는 것과 같았고 curl로만 접근할 수 있었습니다. 인증 방식 드롭다운에 **API Key (`ksk_…`)** 를 추가했고, 선택하면 키 입력란이 나타나며 **refreshToken 행은 숨겨집니다**(이 자격 증명에는 없는 항목이라, 필수처럼 보이는 빈칸을 남겨두면 입력 누락으로 오해하게 됩니다). 제출 시에도 요구하지 않습니다 |
@@ -239,7 +240,7 @@ docker compose logs -f
 ```bash
 # 헬스 체크
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.9.1"}
+# {"service":"kiro2api","status":"ok","version":"0.10.0"}
 
 # 프로토콜 고정 모델 목록 조회
 curl http://localhost:8080/v1/models \

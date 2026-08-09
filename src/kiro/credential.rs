@@ -261,6 +261,44 @@ fn sweep_stale_tmp(path: &str) {
 ///
 /// #11:每次 save 顺手清理同目录下遗留的**孤儿** `{path}.tmp.*`(此前进程在 tmp 写完与 rename
 /// 之间崩溃留下的),仅清足够旧的,不碰并发写者正在写的新 tmp。
+/// 给还没有 `machineId` 的凭据一次性派生并**写入**机器 ID,返回补了几条。
+///
+/// 为什么必须冻结:派生材料是 `refreshToken`,而刷新响应会回带新的 refreshToken(我们照收
+/// 并覆盖)。不冻结的话,同一个账号每刷新一次就换一个 machineId —— 上游看到的是"这台机器
+/// 换了身份"或"这个账号换了机器",两种解读都指向凭据被共享。真实设备的机器 ID 是装机时
+/// 定下、终生不变的。
+///
+/// `config_machine_id` 若已设定合法值,则**不冻结**:那是"整池共用一个身份"的全局开关,
+/// 把它固化进每条凭据会让日后改配置失效(凭据级优先级高于配置级)。
+///
+/// 派生材料都缺(ksk 为空、refreshToken 也为空)时用按凭据 id 的稳定兜底,
+/// 绝不落到"空串派生"那个所有部署都一样的常量上。
+pub fn freeze_machine_ids(creds: &mut [Credential], config_machine_id: Option<&str>) -> usize {
+    if config_machine_id
+        .and_then(crate::kiro::machine_id::normalize)
+        .is_some()
+    {
+        return 0;
+    }
+    let mut n = 0;
+    for c in creds.iter_mut() {
+        if c.machine_id.is_some() {
+            continue;
+        }
+        let mid = crate::kiro::machine_id::for_credential(
+            None,
+            None,
+            c.is_api_key(),
+            c.kiro_api_key.as_deref(),
+            &c.refresh_token,
+        )
+        .unwrap_or_else(|| crate::kiro::machine_id::fallback_for(&c.id));
+        c.machine_id = Some(mid);
+        n += 1;
+    }
+    n
+}
+
 pub fn save(path: &str, creds: &[Credential]) -> anyhow::Result<()> {
     let data = serde_json::to_vec_pretty(creds)?;
     atomic_write(path, &data).map_err(Into::into)
@@ -379,6 +417,47 @@ pub async fn persist_pool_credentials_serialized(
 
 #[cfg(test)]
 mod tests {
+    /// 机器 ID 一次冻结之后,**refreshToken 轮换也不再改变它**。
+    ///
+    /// 回归:此前 machineId 每次请求现算 `sha256("KotlinNativeAPI/" + 当前 refreshToken)`,
+    /// 而刷新响应会回带新的 refreshToken(我们照收覆盖)——于是同一个账号每刷新一次就换
+    /// 一台机器。真实设备的机器 ID 是装机时定下、终生不变的。
+    #[test]
+    fn frozen_machine_id_survives_refresh_token_rotation() {
+        let mut c = super::tests_support_cred();
+        assert!(c.machine_id.is_none());
+        let n = super::freeze_machine_ids(std::slice::from_mut(&mut c), None);
+        assert_eq!(n, 1);
+        let frozen = c.machine_id.clone().expect("应已冻结");
+        assert_eq!(frozen.len(), 64);
+
+        // 模拟一次刷新:上游回带新的 refreshToken
+        c.refresh_token = "rotated-refresh-token".into();
+        // 再冻结一次不应改动已有值(幂等)
+        assert_eq!(
+            super::freeze_machine_ids(std::slice::from_mut(&mut c), None),
+            0
+        );
+        assert_eq!(
+            c.machine_id.as_deref(),
+            Some(frozen.as_str()),
+            "轮换后必须仍是同一台机器"
+        );
+    }
+
+    /// 配置里设了全局 machineId 时**不冻结**:那是"整池共用一个身份"的开关,
+    /// 固化进每条凭据会让日后改配置失效(凭据级优先级高于配置级)。
+    #[test]
+    fn config_level_machine_id_suppresses_freezing() {
+        let mut c = super::tests_support_cred();
+        let n = super::freeze_machine_ids(std::slice::from_mut(&mut c), Some(&"a".repeat(64)));
+        assert_eq!(n, 0);
+        assert!(c.machine_id.is_none());
+        // 非法的配置值不算数,照常冻结
+        let n2 = super::freeze_machine_ids(std::slice::from_mut(&mut c), Some("not-hex"));
+        assert_eq!(n2, 1);
+        assert!(c.machine_id.is_some());
+    }
 
     /// ksk 凭据没有 `expiresAt`,导入时通常也不带该键 → 缺省落 0。若过期判定照常按 0 比,
     /// 账号一进池就被读成「1970 年就过期了」,立刻被判死;必须对这类凭据恒答"未过期"。
