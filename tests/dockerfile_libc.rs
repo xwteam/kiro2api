@@ -29,8 +29,7 @@ fn the_builder_and_runtime_glibc_generations_match() {
     let b = suite_of(builder).unwrap_or_else(|| {
         panic!("builder 未钉 Debian 世代(浮动标签会随上游滚到更新的 glibc):{builder}")
     });
-    let r = suite_of(runtime)
-        .unwrap_or_else(|| panic!("运行镜像未钉 Debian 世代:{runtime}"));
+    let r = suite_of(runtime).unwrap_or_else(|| panic!("运行镜像未钉 Debian 世代:{runtime}"));
 
     assert_eq!(
         b, r,
