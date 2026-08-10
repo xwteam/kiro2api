@@ -598,6 +598,8 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.14.0**:`tlsBackend` 可在設定裡切換(`native-tls` 預設 / `rustls`),改設定重啟即生效。
+> 走自簽 CA 代理時往往只有其中一個後端握得上手。取值非法時按預設處理並記 warn。
 > **v0.13.0**:`thinking` 現在真正生效(翻譯成上游認的指令,回應裡作為獨立 `thinking` 區塊,
 > 串流為 `thinking_delta`;其餘協議並入正文而非丟棄)。token 估算改為按字元類別加權
 > (此前對中文低估約三倍),串流的輸入 token 此前**恆為 0**、現同樣走估算。
@@ -1247,7 +1249,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.13.0"}
+{"service":"kiro2api","status":"ok","version":"0.14.0"}
 ```
 
 ### GET /v1/ping

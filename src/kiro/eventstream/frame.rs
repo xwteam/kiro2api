@@ -58,7 +58,8 @@ pub fn parse_one(buf: &[u8]) -> Result<(Message, usize), Error> {
     let body = &buf[..total_len - TRAILER_LEN];
     let msg_crc = be_u32(&buf[total_len - TRAILER_LEN..total_len]);
     if crc32(body) != msg_crc {
-        return Err(Error::CrcMismatch);
+        // prelude CRC 已经过了 → 帧边界可信,整帧跳过而不是逐字节扫。
+        return Err(Error::CorruptFrame { total_len });
     }
 
     let headers_start = PRELUDE_LEN;
@@ -66,9 +67,10 @@ pub fn parse_one(buf: &[u8]) -> Result<(Message, usize), Error> {
     // 走到这里整帧字节已全部到齐,headers 段是一段定长切片:段内声明的长度越过段尾
     // 属格式错误,再多等字节也补不齐。因此把 header 解析的 Truncated 收敛为 BadHeader,
     // 让上层走重新同步;若原样传播 Truncated,上层会一直等一个永远凑不齐的段而停滞。
-    let headers = parse_headers(&buf[headers_start..headers_end]).map_err(|e| match e {
-        Error::Truncated => Error::BadHeader,
-        other => other,
+    let headers = parse_headers(&buf[headers_start..headers_end]).map_err(|_| {
+        // 同上:帧边界可信,整帧跳过。header 段的任何问题(越界/未知类型/非法 UTF-8)
+        // 都属"这一帧坏了",再多等字节也补不齐,故不传播 Truncated。
+        Error::CorruptFrame { total_len }
     })?;
     let payload = buf[headers_end..total_len - TRAILER_LEN].to_vec();
 
@@ -148,7 +150,10 @@ mod tests {
         let mut frame = build_frame(":event-type", "x", b"ab");
         let n = frame.len();
         frame[n - 1] ^= 0xFF; // 破坏 message_crc
-        assert_eq!(parse_one(&frame), Err(Error::CrcMismatch));
+        // prelude CRC 仍然有效 → **帧边界可信**,故报 CorruptFrame 并带上整帧长度,
+        // 让解码器一步跳到下一帧起点。此前报 CrcMismatch,上层只能逐字节再同步:
+        // 把这一帧的整段 payload 当噪声重扫一遍,既慢,又可能从 payload 里凑出假帧头。
+        assert_eq!(parse_one(&frame), Err(Error::CorruptFrame { total_len: n }));
     }
 
     #[test]
@@ -208,7 +213,14 @@ mod tests {
         // 两处 CRC 也都正确。这属于格式错误而非数据不足:必须返回 BadHeader 触发
         // 上层重新同步,返回 Truncated 会让解码器永远等一个定长段补齐(永久停滞)。
         let frame = build_frame_raw(&[6u8, b'a', b'b', b'c', b'd'], b"payload");
-        assert_eq!(parse_one(&frame), Err(Error::BadHeader));
+        // 同上:格式错误但帧边界可信,整帧跳过;绝不能返回 Truncated——那会让解码器
+        // 永远等一个定长段补齐(永久停滞)。
+        assert_eq!(
+            parse_one(&frame),
+            Err(Error::CorruptFrame {
+                total_len: frame.len()
+            })
+        );
     }
 
     #[test]
@@ -217,7 +229,13 @@ mod tests {
         // 段内实际只剩 2 字节。同样应判坏帧。
         let headers = [1u8, b'x', 7u8, 0x00, 0x10, b'a', b'b'];
         let frame = build_frame_raw(&headers, b"payload");
-        assert_eq!(parse_one(&frame), Err(Error::BadHeader));
+        // 帧边界可信(prelude CRC 有效)→ 整帧跳过。
+        assert_eq!(
+            parse_one(&frame),
+            Err(Error::CorruptFrame {
+                total_len: frame.len()
+            })
+        );
     }
 
     #[test]

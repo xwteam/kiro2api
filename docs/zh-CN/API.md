@@ -106,6 +106,11 @@ cat data/config.json | grep apiKey
 | 422 | 请求体反序列化失败（缺必填字段 / 类型不符），axum 默认拒收，`text/plain` 纯文本。出现在带 body 提取器的端点上：`/api/admin/*` 与 `POST /api/user/login`（四个协议对话端点与 `/v1/messages/count_tokens` 已自行接管拒收、改回各自形状的 `400`）（`/api/user/*` 的其余端点只收 query，参数类型不符是 `400` 而非 `422`） |
 
 
+> **v0.14.0:`tlsBackend` 可在配置里切换**
+> `"tlsBackend": "native-tls"`(默认)或 `"rustls"`,改配置重启即生效。两者的 CA 处理不同:
+> native-tls 用系统证书库,rustls 用内置根证书 —— 走**自签 CA 的代理**(企业出口、自建
+> MITM 代理)时往往只有其中一个握得上手,而现象是「刷不出令牌」或「直接连不上」,
+> 与 TLS 毫无字面关系。取值非法时按默认处理并记 warn,不会让服务起不来。
 > **v0.13.0:扩展思考、token 计量与上下文窗口**
 > - **`thinking` 现在真正生效**:`{"type":"enabled","budget_tokens":N}` 与 `{"type":"adaptive"}`
 >   都会被翻译成上游认的指令。响应里思考内容作为独立的 `thinking` 内容块返回,流式为
@@ -1274,7 +1279,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1462,7 +1467,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.13.0"
+  "version": "0.14.0"
 }
 ```
 

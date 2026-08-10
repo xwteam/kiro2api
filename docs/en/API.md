@@ -624,6 +624,12 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.14.0: `tlsBackend` is configurable.** Set `"tlsBackend": "native-tls"` (default) or
+> `"rustls"`; the change takes effect on restart. The two differ in trust handling — native-tls
+> uses the system store, rustls carries its own roots — and behind a **self-signed-CA proxy**
+> typically only one of them completes the handshake, presenting as "cannot refresh tokens" or
+> "cannot connect" with nothing on the surface pointing at TLS. An unrecognised value falls back
+> to the default with a warning rather than preventing startup.
 > **v0.13.0: extended thinking, token accounting and context windows**
 > - **`thinking` now actually works.** Both `{"type":"enabled","budget_tokens":N}` and
 >   `{"type":"adaptive"}` are translated into the directive upstream understands, and the
@@ -1269,7 +1275,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1485,7 +1491,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.13.0"
+  "version": "0.14.0"
 }
 ```
 

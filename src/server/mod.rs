@@ -149,6 +149,8 @@ pub fn build_router_with_persist_handles(
     let _ = SERVER_START.get_or_init(Instant::now);
     // 伪装身份的静态配置灌进进程级默认值:令牌刷新那条链路拿不到 Config,靠它取版本号。
     crate::kiro::provider::init_impersonation_defaults(&cfg);
+    // TLS 后端按配置选定(运行时可切):自签 CA 代理下往往只有一个后端握得上手。
+    crate::http::init_tls_backend(&cfg);
     // 从配置路径加载凭据;文件不存在回落空池,/v1/messages 遇空池返回 503
     // (不影响 health/webui 路由,默认配置测试保持全绿)。
     // **解析失败不再静默当空池**:先原样备份、再逐条抢救、并大声报错,见 load_credentials_resilient。

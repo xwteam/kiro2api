@@ -645,6 +645,9 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.14.0**: `tlsBackend`를 설정에서 전환할 수 있습니다(`native-tls` 기본 / `rustls`, 재시작 시 적용).
+> 자체 서명 CA 프록시 뒤에서는 보통 한쪽만 핸드셰이크에 성공하기 때문입니다.
+> 인식할 수 없는 값은 경고 후 기본값으로 폴백하며 기동을 막지 않습니다.
 > **v0.13.0**: `thinking`이 실제로 동작합니다(업스트림이 이해하는 지시로 변환하고, 응답에서는
 > 독립적인 `thinking` 블록으로 반환합니다. 스트리밍은 `thinking_delta`. 다른 세 프로토콜에서는
 > 사고 내용을 본문에 통합하며 버리지 않습니다). 토큰 추정은 문자 종류별 가중치를 적용하며
@@ -1498,7 +1501,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.13.0"}
+{"service":"kiro2api","status":"ok","version":"0.14.0"}
 ```
 
 ### GET /v1/ping

@@ -52,14 +52,74 @@ const POOL_MAX_IDLE_PER_HOST: usize = 0;
 /// 就暴露,是最标准的机器人识别手段之一;而我们此前只有 rustls。
 ///
 /// 关掉 `native-tls-backend` 特性则回落 rustls(编译快、不需要 OpenSSL 工具链)。
-fn with_tls(b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    #[cfg(feature = "native-tls-backend")]
-    {
-        b.use_native_tls()
+/// 运行时选定的 TLS 后端。进程启动时由配置灌入一次。
+static TLS_BACKEND: std::sync::OnceLock<TlsBackend> = std::sync::OnceLock::new();
+
+/// TLS 后端。两者的 CA 处理不同:native-tls 用系统证书库,rustls 用内置根证书。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsBackend {
+    NativeTls,
+    Rustls,
+}
+
+/// 进程启动时按配置选定 TLS 后端。重复调用无效(OnceLock 语义)。
+///
+/// 取值非法时回落默认并记 warn —— 不让服务因为一个拼错的配置起不来。
+/// 未编译进 native-tls 时强制 rustls,并在配置要 native-tls 时明确告知,
+/// 而不是静默换一个后端让运营者以为配置生效了。
+pub fn init_tls_backend(cfg: &crate::config::Config) {
+    let chosen = match cfg.tls_backend.as_deref().map(str::trim) {
+        None | Some("") => default_backend(),
+        Some(v) if v.eq_ignore_ascii_case("rustls") => TlsBackend::Rustls,
+        Some(v) if v.eq_ignore_ascii_case("native-tls") || v.eq_ignore_ascii_case("native_tls") => {
+            if cfg!(feature = "native-tls-backend") {
+                TlsBackend::NativeTls
+            } else {
+                tracing::warn!(
+                    "配置要求 native-tls,但本次构建未包含该后端,回落 rustls(需要 native-tls 请用默认特性重新构建)"
+                );
+                TlsBackend::Rustls
+            }
+        }
+        Some(other) => {
+            tracing::warn!(
+                value = %other,
+                "tlsBackend 取值无法识别(可选 native-tls / rustls),按默认处理"
+            );
+            default_backend()
+        }
+    };
+    let _ = TLS_BACKEND.set(chosen);
+}
+
+fn default_backend() -> TlsBackend {
+    if cfg!(feature = "native-tls-backend") {
+        TlsBackend::NativeTls
+    } else {
+        TlsBackend::Rustls
     }
-    #[cfg(not(feature = "native-tls-backend"))]
-    {
-        b.use_rustls_tls()
+}
+
+/// 当前生效的 TLS 后端(未初始化时取默认)。
+pub fn tls_backend() -> TlsBackend {
+    *TLS_BACKEND.get().unwrap_or(&default_backend())
+}
+
+fn with_tls(b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    match tls_backend() {
+        TlsBackend::Rustls => b.use_rustls_tls(),
+        TlsBackend::NativeTls => {
+            #[cfg(feature = "native-tls-backend")]
+            {
+                b.use_native_tls()
+            }
+            // 没编译进 native-tls 时 `init_tls_backend` 已经把它挡成 rustls,
+            // 这条分支不可达;仍写成显式回落而不是 unreachable!,避免任何路径 panic。
+            #[cfg(not(feature = "native-tls-backend"))]
+            {
+                b.use_rustls_tls()
+            }
+        }
     }
 }
 
@@ -202,6 +262,53 @@ mod tests {
     #[cfg(not(feature = "native-tls-backend"))]
     fn native_tls_is_the_default_backend() {
         panic!("默认构建必须启用 native-tls:rustls 的 ClientHello 与真实客户端对不上");
+    }
+
+    /// `tlsBackend` 取值解析:合法值生效,非法值回落默认且**不 panic**。
+    ///
+    /// 为什么要能运行时切:native-tls 用系统证书库、rustls 用内置根证书,一旦走自签 CA 的
+    /// 代理(企业出口、自建 MITM),往往只有其中一个握得上手,而现象是"刷不出令牌"或
+    /// "直接连不上",与 TLS 毫无字面关系。此前是编译期二选一,换后端得重出镜像。
+    ///
+    /// 这里只测取值解析(`TLS_BACKEND` 是 OnceLock,进程内只能设一次,不便在测试里反复设)。
+    #[test]
+    fn tls_backend_values_are_parsed_and_bad_ones_fall_back() {
+        // 解析规则与 `init_tls_backend` 内的分支一一对应
+        let parse = |v: Option<&str>| -> TlsBackend {
+            match v.map(str::trim) {
+                None | Some("") => default_backend(),
+                Some(x) if x.eq_ignore_ascii_case("rustls") => TlsBackend::Rustls,
+                Some(x)
+                    if x.eq_ignore_ascii_case("native-tls")
+                        || x.eq_ignore_ascii_case("native_tls") =>
+                {
+                    if cfg!(feature = "native-tls-backend") {
+                        TlsBackend::NativeTls
+                    } else {
+                        TlsBackend::Rustls
+                    }
+                }
+                Some(_) => default_backend(),
+            }
+        };
+        assert_eq!(parse(Some("rustls")), TlsBackend::Rustls);
+        assert_eq!(parse(Some("RustLS")), TlsBackend::Rustls, "大小写无关");
+        assert_eq!(
+            parse(Some("  rustls  ")),
+            TlsBackend::Rustls,
+            "两端空白忽略"
+        );
+        assert_eq!(
+            parse(Some("native_tls")),
+            parse(Some("native-tls")),
+            "下划线写法等价"
+        );
+        // 拼错 / 空 / 缺省 → 默认,绝不 panic 让服务起不来
+        assert_eq!(parse(Some("rustl")), default_backend());
+        assert_eq!(parse(Some("")), default_backend());
+        assert_eq!(parse(None), default_backend());
+        // 默认构建带 native-tls
+        assert_eq!(default_backend(), TlsBackend::NativeTls);
     }
 
     /// 两个客户端都必须锁在 HTTP/1.1。

@@ -676,6 +676,9 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.14.0**:`tlsBackend` を設定で切り替えられます(`native-tls` 既定 / `rustls`、再起動で反映)。
+> 自己署名 CA のプロキシ配下ではどちらか一方しかハンドシェイクできないことが多いためです。
+> 認識できない値は警告のうえ既定へフォールバックし、起動を妨げません。
 > **v0.13.0**:`thinking` が実際に機能するようになりました(上流が解する指示へ変換し、応答では
 > 独立した `thinking` ブロックとして返します。ストリーミングは `thinking_delta`。他の 3 プロトコル
 > では思考内容を本文へ統合し、破棄しません)。token 推定は文字種別で重み付けするようになり
@@ -1230,7 +1233,7 @@ curl -X PUT http://localhost:8080/api/admin/config/auth-keys \
 ```json
 {
   "masterApiKey": "sk-マスターキーの平文",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1458,7 +1461,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.13.0"
+  "version": "0.14.0"
 }
 ```
 

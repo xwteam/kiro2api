@@ -696,7 +696,18 @@ fn anthropic_to_kiro_inner(
                 let tool_uses = message_tool_uses(msg);
                 Ok(HistoryItem::AssistantResponseMessage {
                     assistant_response_message: AssistantResponseMessage {
-                        content: text.clone(),
+                        // 助手轮的内容**不能是空串**。
+                        //
+                        // 纯工具调用的那一轮(只有 tool_use、没有文本)在这里就是空,而上游
+                        // 对空的 assistantResponseMessage.content 会拒掉整条请求。用户轮早有
+                        // `non_empty_content` 兜底,助手轮一直漏着 —— 于是"上一轮只调了工具、
+                        // 没说话"的对话再发一次就必挂,而那恰恰是工具链里最常见的形态。
+                        // 占位用单个空格:既非空,又不给模型塞进任何它没说过的内容。
+                        content: if text.trim().is_empty() {
+                            " ".to_string()
+                        } else {
+                            text.clone()
+                        },
                         tool_uses: if tool_uses.is_empty() {
                             None
                         } else {
@@ -1300,6 +1311,48 @@ mod tests {
     #[test]
     fn maps_fable() {
         assert_eq!(map_model("Fable"), Some("claude-fable-5".to_string()));
+    }
+
+    /// 历史里助手轮的 `content` **不能是空串**。
+    ///
+    /// 回归:纯工具调用的那一轮(只有 tool_use、没有文本)在这里就是空,而上游对空的
+    /// `assistantResponseMessage.content` 会拒掉整条请求。用户轮早有兜底,助手轮一直漏着——
+    /// 于是"上一轮只调了工具、没说话"的对话再发一次就必挂,而那正是工具链里最常见的形态。
+    #[test]
+    fn assistant_history_content_is_never_empty() {
+        let req = base_req(vec![
+            InMsg {
+                role: "assistant".into(),
+                content: ContentIn::Blocks(vec![Block::ToolUse {
+                    id: "t1".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({"cmd": "ls"}),
+                }]),
+            },
+            InMsg {
+                role: "user".into(),
+                content: ContentIn::Text("继续".into()),
+            },
+        ]);
+        let kiro = anthropic_to_kiro(&req, None).expect("应转换成功");
+        let item = &kiro.conversation_state.history[0];
+        match item {
+            HistoryItem::AssistantResponseMessage {
+                assistant_response_message,
+            } => {
+                assert!(
+                    !assistant_response_message.content.is_empty(),
+                    "助手轮内容不得为空串"
+                );
+                // 占位不得夹带模型没说过的内容
+                assert_eq!(assistant_response_message.content, " ");
+                assert!(
+                    assistant_response_message.tool_uses.is_some(),
+                    "工具调用必须保留"
+                );
+            }
+            other => panic!("首条应是助手轮,实得 {other:?}"),
+        }
     }
 
     /// 开启 thinking 时,上游认的指令必须排在 system 最前面;不开则一个字符都不加。

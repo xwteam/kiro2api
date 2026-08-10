@@ -45,6 +45,15 @@ impl StreamDecoder {
                     self.dropped_since_progress = 0;
                 }
                 Err(Error::Truncated) => break, // 等更多字节
+                // 帧边界已确知的坏帧:整帧跳过,一步落到下一帧起点。
+                // 逐字节扫会把这一帧的 payload 当噪声重扫一遍,既慢又可能凑出假帧头。
+                Err(Error::CorruptFrame { total_len })
+                    if total_len > 0 && start + total_len <= self.buf.len() =>
+                {
+                    start += total_len;
+                    self.errors = self.errors.saturating_add(1);
+                    self.dropped_since_progress = 0;
+                }
                 Err(_) => {
                     // 头部 1 字节判为噪声,丢弃后重试(逐字节再同步)。
                     if start < self.buf.len() {
@@ -190,6 +199,31 @@ mod tests {
         assert!(d.errors() >= 1);
         // 坏帧被逐字节跳过、合法帧被消费,缓冲不残留。
         assert_eq!(d.buf_len_for_test(), 0);
+    }
+
+    /// 坏帧之后紧跟的合法帧**必须还能解出来**,而且是一步跳过、不逐字节扫。
+    ///
+    /// 这才是"整帧跳过"的价值所在:prelude CRC 有效意味着帧长可信,逐字节扫会把损坏帧的
+    /// 整段 payload 当噪声重扫一遍 —— 既慢,又可能从 payload 字节里凑出一个"看着像 prelude"
+    /// 的假帧头,于是解出一条根本不存在的消息。
+    #[test]
+    fn a_corrupt_frame_is_skipped_whole_and_the_next_frame_survives() {
+        // 损坏帧的 payload 故意塞进大量 0,增加逐字节扫出假帧头的机会
+        let mut bad = frame(&[0u8; 64]);
+        let n = bad.len();
+        bad[n - 1] ^= 0xFF; // 破坏 message_crc,但 prelude 仍有效
+        let good = frame(b"{\"ok\":1}");
+
+        let mut d = StreamDecoder::new();
+        d.push(&bad);
+        d.push(&good);
+        let msgs = d.drain();
+
+        assert_eq!(msgs.len(), 1, "应恰好解出后面那条合法帧,不多不少");
+        assert_eq!(msgs[0].payload, b"{\"ok\":1}");
+        assert!(d.errors() >= 1, "坏帧要计数");
+        // 一步跳过:错误计数只加一次,而不是按坏帧字节数累加
+        assert_eq!(d.errors(), 1, "整帧跳过应只记一次错误,实得 {}", d.errors());
     }
 
     #[test]

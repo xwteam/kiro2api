@@ -33,6 +33,16 @@ pub struct Config {
     /// 全局出站代理。凭据级 `proxyUrl` 未设时用它;凭据级填 `"direct"` 可单独退回直连。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// TLS 后端:`"native-tls"`(默认)或 `"rustls"`。**运行时可切,改配置重启即生效。**
+    ///
+    /// 为什么要能切:两者的 CA 处理不同 —— native-tls 用系统证书库,rustls 用内置根证书。
+    /// 一旦走自签 CA 的代理(企业出口、自建 MITM 代理),往往只有其中一个能握上手,
+    /// 而现象是"刷不出令牌"或"直接连不上",与 TLS 毫无字面关系。此前是**编译期**二选一,
+    /// 换后端得重新出镜像 —— 排查时最不该卡在这种地方。
+    ///
+    /// 取值非法时按默认处理并记 warn,不让服务因为一个拼错的配置起不来。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_backend: Option<String>,
     /// 每凭据每分钟最大请求数;0 = 无限(默认,兼容既有行为)。
     pub max_rpm_per_credential: u32,
     /// 负载均衡模式:"priority"(默认,等权轮询)或 "balanced"(按权重轮询)。
@@ -73,6 +83,7 @@ impl Default for Config {
             node_version: "22.22.0".into(),
             machine_id: None,
             proxy_url: None,
+            tls_backend: None,
             max_rpm_per_credential: 0,
             load_balancing_mode: "priority".into(),
             trusted_proxy_hops: 1,
