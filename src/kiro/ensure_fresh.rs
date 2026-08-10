@@ -222,7 +222,10 @@ async fn report_refresh_failure(
             _ => FailureKind::Transient,
         };
         pool_lock.report_failure_with_reason(credential_id, kind, reason, now_unix);
-        if !matches!(err, LoginError::UpstreamHttp { .. } | LoginError::Upstream(_)) {
+        if !matches!(
+            err,
+            LoginError::UpstreamHttp { .. } | LoginError::Upstream(_)
+        ) {
             pool_lock.note_refresh_transport_failure(credential_id);
         }
         kind
@@ -1511,7 +1514,10 @@ mod tests {
             FailureKind::InvalidRequest,
             FailureKind::ModelUnavailable,
         ] {
-            assert!(!failure_kind_is_persistent(k), "{k:?} 不写落盘字段,不该触发写盘");
+            assert!(
+                !failure_kind_is_persistent(k),
+                "{k:?} 不写落盘字段,不该触发写盘"
+            );
         }
     }
 }

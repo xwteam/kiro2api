@@ -2736,7 +2736,10 @@ mod tests {
             c.machine_id = None;
             c
         };
-        let st = state(&server.uri(), vec![ksk("1", "ksk_AAA"), ksk("2", "ksk_BBB")]);
+        let st = state(
+            &server.uri(),
+            vec![ksk("1", "ksk_AAA"), ksk("2", "ksk_BBB")],
+        );
         let app = messages_router(st);
         let body = r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#;
         for _ in 0..2 {
@@ -4128,10 +4131,10 @@ mod tests {
         // 其后:正常的 pong。
         Mock::given(method("POST"))
             .and(path("/generateAssistantResponse"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(event_frame("assistantResponseEvent", br#"{"content":"pong"}"#)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(event_frame(
+                "assistantResponseEvent",
+                br#"{"content":"pong"}"#,
+            )))
             .with_priority(5)
             .mount(&server)
             .await;
@@ -4143,7 +4146,11 @@ mod tests {
             r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#,
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "该换个账号重试,而不是把拒绝丢给用户");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "该换个账号重试,而不是把拒绝丢给用户"
+        );
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["content"][0]["text"], "pong");
 
@@ -4183,7 +4190,10 @@ mod tests {
 
         let stats = pool.lock().await.stats(1000);
         let successes: u64 = stats.iter().map(|a| a.successes).sum();
-        assert_eq!(successes, 0, "被上游拒掉的请求一次都不该记成功;实际:{stats:?}");
+        assert_eq!(
+            successes, 0,
+            "被上游拒掉的请求一次都不该记成功;实际:{stats:?}"
+        );
         assert_eq!(
             stats.iter().map(|a| a.failures).sum::<u64>(),
             4,
@@ -4214,10 +4224,10 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/generateAssistantResponse"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(event_frame("assistantResponseEvent", br#"{"content":"pong"}"#)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(event_frame(
+                "assistantResponseEvent",
+                br#"{"content":"pong"}"#,
+            )))
             .with_priority(5)
             .mount(&server)
             .await;

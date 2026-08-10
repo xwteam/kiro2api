@@ -2584,10 +2584,7 @@ const MACHINE_ID_HINT: &str = "machineId must be 32 or 64 hexadecimal characters
 ///
 /// 顺带把 32 位 / 含大写的合法值归一成规范形式再落库:磁盘上放规范值,谁读都是同一台机器。
 fn normalized_machine_id(raw: Option<String>) -> Result<Option<String>, &'static str> {
-    match raw
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
+    match raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
         None => Ok(None),
         Some(v) => crate::kiro::machine_id::normalize(&v)
             .map(Some)
@@ -6599,10 +6596,7 @@ mod tests {
         .await;
         assert_eq!(st, HttpStatusCode::OK);
         assert_eq!(v["refreshed"], 0);
-        assert_eq!(
-            v["failed"], 1,
-            "只有仍可用的那个账号该被拿去打上游:{v}"
-        );
+        assert_eq!(v["failed"], 1, "只有仍可用的那个账号该被拿去打上游:{v}");
         let errors = v["errors"].as_array().expect("errors[] 应在场");
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0]["id"], 4, "被打的必须是健康的那个:{v}");
@@ -6680,7 +6674,11 @@ mod tests {
             Some(r#"{"refreshToken":"rt-bad-mid","machineId":"550e8400-e29b-41d4-a716-446655440000"}"#),
         )
         .await;
-        assert_eq!(st, HttpStatusCode::BAD_REQUEST, "非法 machineId 必须被拒:{v}");
+        assert_eq!(
+            st,
+            HttpStatusCode::BAD_REQUEST,
+            "非法 machineId 必须被拒:{v}"
+        );
         let on_disk = crate::kiro::credential::load(&path).expect("凭据文件应可读");
         assert!(on_disk.is_empty(), "被拒的凭据不得落库:{on_disk:?}");
     }
@@ -6723,7 +6721,11 @@ mod tests {
             Some(r#"{"machineId":"550e8400-e29b-41d4-a716-446655440000"}"#),
         )
         .await;
-        assert_eq!(st, HttpStatusCode::BAD_REQUEST, "非法 machineId 必须被拒:{v}");
+        assert_eq!(
+            st,
+            HttpStatusCode::BAD_REQUEST,
+            "非法 machineId 必须被拒:{v}"
+        );
         let in_pool = pool.lock().await.snapshot_credentials();
         assert_eq!(
             in_pool[0].machine_id, None,

@@ -808,7 +808,9 @@ fn merge_adjacent_same_role(messages: Vec<InMsg>) -> Vec<InMsg> {
     let mut out: Vec<InMsg> = Vec::with_capacity(messages.len());
     for msg in messages {
         match out.last_mut() {
-            Some(prev) if same_turn_side(&prev.role, &msg.role) => merge_into_previous_turn(prev, msg),
+            Some(prev) if same_turn_side(&prev.role, &msg.role) => {
+                merge_into_previous_turn(prev, msg)
+            }
             _ => out.push(msg),
         }
     }
@@ -3662,11 +3664,26 @@ mod tests {
     #[test]
     fn non_assistant_roles_count_as_one_side_when_merging() {
         let msgs = vec![
-            InMsg { role: "system".into(), content: ContentIn::Text("S".into()) },
-            InMsg { role: "user".into(), content: ContentIn::Text("U".into()) },
-            InMsg { role: "assistant".into(), content: ContentIn::Text("A".into()) },
-            InMsg { role: "developer".into(), content: ContentIn::Text("D".into()) },
-            InMsg { role: "user".into(), content: ContentIn::Text("U2".into()) },
+            InMsg {
+                role: "system".into(),
+                content: ContentIn::Text("S".into()),
+            },
+            InMsg {
+                role: "user".into(),
+                content: ContentIn::Text("U".into()),
+            },
+            InMsg {
+                role: "assistant".into(),
+                content: ContentIn::Text("A".into()),
+            },
+            InMsg {
+                role: "developer".into(),
+                content: ContentIn::Text("D".into()),
+            },
+            InMsg {
+                role: "user".into(),
+                content: ContentIn::Text("U2".into()),
+            },
         ];
         let out = merge_adjacent_same_role(msgs);
         assert_eq!(out.len(), 3, "非 assistant 的连续几条应合成一轮: {out:?}");

@@ -344,7 +344,9 @@ fn text_chunk(t: String) -> GenerateContentResponse {
                     text: Some(t),
                     inline_data: None,
                     function_call: None,
-                    function_response: None, ..Default::default() }],
+                    function_response: None,
+                    ..Default::default()
+                }],
             },
             finish_reason: None,
             index: 0,
@@ -2039,9 +2041,7 @@ mod tests {
             .as_array()
             .expect("应有 parts");
         assert!(
-            parts
-                .iter()
-                .any(|p| p["functionCall"]["name"] == long),
+            parts.iter().any(|p| p["functionCall"]["name"] == long),
             "非流式出口同样要回客户端声明的原名;实际:{v}"
         );
     }

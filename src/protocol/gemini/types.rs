@@ -386,7 +386,7 @@ mod tests {
                         inline_data: None,
                         function_call: None,
                         function_response: None,
-                    ..Default::default()
+                        ..Default::default()
                     }],
                 },
                 finish_reason: Some("STOP".to_string()),
@@ -420,7 +420,7 @@ mod tests {
                 args: serde_json::json!({"city": "Paris"}),
             }),
             function_response: None,
-        ..Default::default()
+            ..Default::default()
         };
         let v = serde_json::to_value(&part).expect("序列化失败");
         assert_eq!(v["functionCall"]["id"], "tu1");
@@ -444,7 +444,7 @@ mod tests {
                 args: serde_json::json!({}),
             }),
             function_response: None,
-        ..Default::default()
+            ..Default::default()
         };
         let s = serde_json::to_string(&part).expect("序列化失败");
         assert!(

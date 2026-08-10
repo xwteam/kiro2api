@@ -282,7 +282,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("{p}: 一个打向 portal 的请求不能不带 User-Agent"))
                 .to_str()
                 .unwrap();
-            assert!(ua.contains("Mozilla/5.0"), "{p}: portal 只见得到浏览器: {ua}");
+            assert!(
+                ua.contains("Mozilla/5.0"),
+                "{p}: portal 只见得到浏览器: {ua}"
+            );
             // 同源 XHR:Origin 与 Referer 每一步都在,不能时有时无。
             assert!(r.headers.contains_key("referer"), "{p}: 缺 Referer");
             assert!(r.headers.contains_key("origin"), "{p}: 缺 Origin");

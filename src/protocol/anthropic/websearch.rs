@@ -283,7 +283,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(403).set_body_string("{\"__type\":\"AccessDenied\"}"))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_string("{\"__type\":\"AccessDenied\"}"),
+            )
             .mount(&server)
             .await;
 

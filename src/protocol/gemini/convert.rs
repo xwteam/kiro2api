@@ -341,7 +341,9 @@ pub fn hub_to_gemini(resp: MessagesResponse) -> GenerateContentResponse {
                 text: Some(text.clone()),
                 inline_data: None,
                 function_call: None,
-                function_response: None, ..Default::default() },
+                function_response: None,
+                ..Default::default()
+            },
             // 把中枢 tool_use_id 原样带进 `functionCall.id`:客户端回填 functionResponse 时
             // 带上它,就能在并行同名调用里精确配对(缺 id 才回落到按同名序号配对)。
             OutBlock::ToolUse { id, name, input } => Part {
@@ -352,7 +354,9 @@ pub fn hub_to_gemini(resp: MessagesResponse) -> GenerateContentResponse {
                     name: name.clone(),
                     args: input.clone(),
                 }),
-                function_response: None, ..Default::default() },
+                function_response: None,
+                ..Default::default()
+            },
         })
         .collect();
 
@@ -394,7 +398,9 @@ mod tests {
                 text: Some(text.to_string()),
                 inline_data: None,
                 function_call: None,
-                function_response: None, ..Default::default() }],
+                function_response: None,
+                ..Default::default()
+            }],
         }
     }
 
@@ -418,7 +424,9 @@ mod tests {
                                 name: "get_weather".to_string(),
                                 args: json!({"city": "SF"}),
                             }),
-                            function_response: None, ..Default::default() }],
+                            function_response: None,
+                            ..Default::default()
+                        }],
                     },
                     // 客户端回填的结果:只有 name + response,**没有 id**
                     Content {
@@ -431,7 +439,9 @@ mod tests {
                                 id: None,
                                 name: "get_weather".to_string(),
                                 response: json!({"temp": 20}),
-                            }), ..Default::default() }],
+                            }),
+                            ..Default::default()
+                        }],
                     },
                 ],
                 system_instruction: None,
@@ -492,7 +502,7 @@ mod tests {
                     args: json!({}),
                 }),
                 function_response: None,
-            ..Default::default()
+                ..Default::default()
             }
         }
         fn resp(id: Option<&str>) -> Part {
@@ -505,7 +515,7 @@ mod tests {
                     name: "read_file".to_string(),
                     response: json!({}),
                 }),
-            ..Default::default()
+                ..Default::default()
             }
         }
         let hub = gemini_to_hub(
@@ -568,7 +578,7 @@ mod tests {
                     args: json!({}),
                 }),
                 function_response: None,
-            ..Default::default()
+                ..Default::default()
             }
         }
         fn resp(id: Option<&str>) -> Part {
@@ -581,7 +591,7 @@ mod tests {
                     name: "f".to_string(),
                     response: json!({}),
                 }),
-            ..Default::default()
+                ..Default::default()
             }
         }
         let hub = gemini_to_hub(
@@ -633,7 +643,9 @@ mod tests {
                     text: Some("s".to_string()),
                     inline_data: None,
                     function_call: None,
-                    function_response: None, ..Default::default() }],
+                    function_response: None,
+                    ..Default::default()
+                }],
             }),
             tools: None,
             tool_config: None,
@@ -681,7 +693,9 @@ mod tests {
                     text: Some("hey".to_string()),
                     inline_data: None,
                     function_call: None,
-                    function_response: None, ..Default::default() }],
+                    function_response: None,
+                    ..Default::default()
+                }],
             }],
             system_instruction: None,
             tools: None,
@@ -707,7 +721,9 @@ mod tests {
                         name: "get_weather".to_string(),
                         args: json!({"city": "Paris"}),
                     }),
-                    function_response: None, ..Default::default() }],
+                    function_response: None,
+                    ..Default::default()
+                }],
             }],
             system_instruction: None,
             tools: None,
@@ -740,7 +756,9 @@ mod tests {
                 name: "get_weather".to_string(),
                 args: json!({"city": city}),
             }),
-            function_response: None, ..Default::default() };
+            function_response: None,
+            ..Default::default()
+        };
         let req = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("model".to_string()),
@@ -780,7 +798,9 @@ mod tests {
                             name: "get_weather".to_string(),
                             args: json!({}),
                         }),
-                        function_response: None, ..Default::default() }],
+                        function_response: None,
+                        ..Default::default()
+                    }],
                 },
                 Content {
                     role: Some("user".to_string()),
@@ -792,7 +812,9 @@ mod tests {
                             id: Some("call-42".to_string()),
                             name: "get_weather".to_string(),
                             response: json!("ok"),
-                        }), ..Default::default() }],
+                        }),
+                        ..Default::default()
+                    }],
                 },
             ],
             system_instruction: None,
@@ -827,7 +849,9 @@ mod tests {
                 name: "f".to_string(),
                 args: json!({}),
             }),
-            function_response: None, ..Default::default() };
+            function_response: None,
+            ..Default::default()
+        };
         let result = || Part {
             text: None,
             inline_data: None,
@@ -836,7 +860,9 @@ mod tests {
                 id: None,
                 name: "f".to_string(),
                 response: json!("ok"),
-            }), ..Default::default() };
+            }),
+            ..Default::default()
+        };
         let req = GenerateContentRequest {
             contents: vec![
                 Content {
@@ -884,7 +910,9 @@ mod tests {
                         id: None,
                         name: "get_weather".to_string(),
                         response: json!({"temp": 20}),
-                    }), ..Default::default() }],
+                    }),
+                    ..Default::default()
+                }],
             }],
             system_instruction: None,
             tools: None,
@@ -925,7 +953,9 @@ mod tests {
                         id: None,
                         name: "f".to_string(),
                         response: json!("ok"),
-                    }), ..Default::default() }],
+                    }),
+                    ..Default::default()
+                }],
             }],
             system_instruction: None,
             tools: None,
@@ -954,7 +984,9 @@ mod tests {
                         data: "AAAA".to_string(),
                     }),
                     function_call: None,
-                    function_response: None, ..Default::default() }],
+                    function_response: None,
+                    ..Default::default()
+                }],
             }],
             system_instruction: None,
             tools: None,
@@ -1150,7 +1182,9 @@ mod tests {
                             data: "JVBERi0".to_string(),
                         }),
                         function_call: None,
-                        function_response: None, ..Default::default() }],
+                        function_response: None,
+                        ..Default::default()
+                    }],
                 }],
                 system_instruction: None,
                 tools: None,
@@ -1182,7 +1216,9 @@ mod tests {
                         data: "AAAA".to_string(),
                     }),
                     function_call: None,
-                    function_response: None, ..Default::default() }],
+                    function_response: None,
+                    ..Default::default()
+                }],
             }],
             system_instruction: None,
             tools: None,

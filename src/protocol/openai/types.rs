@@ -449,7 +449,7 @@ mod tests {
                     role: Some("assistant".to_string()),
                     content: Some("hi".to_string()),
                     tool_calls: None,
-                ..Default::default()
+                    ..Default::default()
                 },
                 finish_reason: None,
             }],
@@ -487,7 +487,7 @@ mod tests {
             role: Some("assistant".to_string()),
             content: None,
             tool_calls: None,
-        ..Default::default()
+            ..Default::default()
         };
         let v = serde_json::to_value(&delta).expect("序列化失败");
         assert_eq!(v.as_object().expect("应为 object").len(), 1);
