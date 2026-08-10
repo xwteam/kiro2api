@@ -228,8 +228,14 @@ pub async fn responses_stream(
     let crate::protocol::anthropic::handler::CallOutcome {
         mut resp,
         credential_id,
-        tool_name_map: _,
+        // 超长工具名在上行时被缩短了,上游回来的 `toolUseEvent` 用的就是短名。这张表必须一路
+        // 带进读循环:丢掉它,客户端会在 `function_call` 条目里收到一个**它自己没声明过**的
+        // 工具名,那一轮工具调用直接作废。非流式那条走中枢内核,早已还原。
+        tool_name_map,
+        cred_id,
     } = select_and_call_with_retry(&state, &hub_req, now_unix, bound.as_ref()).await?;
+    // 流里报错时要反馈账号池,而 state 会被移进 stream! —— 先留一份。
+    let feedback_state = state.clone();
     // 统计层用量句柄(Arc,移入哨兵);记账经 Drop 哨兵在流**任意方式结束**时都落一条(#8/#9/#15)。
     let usage_handle = state.stats.usage.clone();
     let model = hub_req.model.clone();
@@ -310,6 +316,11 @@ pub async fn responses_stream(
         // 传输层中断(连接重置 / 读超时 / chunked 体未收尾):与 in-band exception 一样
         // 必须以 response.failed 收束,否则 agent 框架会把半截回答当完整结果继续用。
         let mut transport_err: Option<(u16, String)> = None;
+        // 思考切分器 + reasoning 输出项的懒开状态(与 msg_open 同一模式:真有内容才开项)。
+        let mut splitter = crate::kiro::convert::ThinkingSplitter::new();
+        let mut reasoning_open = false;
+        let mut reasoning_index: u64 = 0;
+        let mut reasoning_item_id = String::new();
 
         'read: loop {
             match resp.chunk().await {
@@ -340,20 +351,56 @@ pub async fn responses_stream(
                                 })));
                             }
                             usage_guard.total_chars += t.chars().count();
-                            full_text.push_str(&t);
-                            yield Ok(emit!("response.output_text.delta", serde_json::json!({
-                                "item_id": msg_item_id,
-                                "output_index": msg_index,
-                                "content_index": 0,
-                                "delta": t,
-                            })));
+                            // 先切出 thinking:上游把思考过程用 `<thinking>…</thinking>` 包在普通
+                            // 文本里下发。不切的话它会混进 output_text —— 而本协议刚支持了开启
+                            // extended thinking,不切等于把问题放大。思考走 reasoning 通道,
+                            // 且**不进** full_text(它是最终答复正文)。
+                            for piece in splitter.feed(&t) {
+                                match piece {
+                                    crate::kiro::convert::Piece::Text(x) => {
+                                        full_text.push_str(&x);
+                                        yield Ok(emit!("response.output_text.delta", serde_json::json!({
+                                            "item_id": msg_item_id,
+                                            "output_index": msg_index,
+                                            "content_index": 0,
+                                            "delta": x,
+                                        })));
+                                    }
+                                    crate::kiro::convert::Piece::Thinking(x) => {
+                                        if !reasoning_open {
+                                            reasoning_open = true;
+                                            reasoning_index = next_output_index;
+                                            next_output_index += 1;
+                                            reasoning_item_id = format!("rs_{}", crate::protocol::responses::convert::random_hex_id());
+                                            yield Ok(emit!("response.output_item.added", serde_json::json!({
+                                                "output_index": reasoning_index,
+                                                "item": {
+                                                    "type": "reasoning",
+                                                    "id": reasoning_item_id,
+                                                    "status": "in_progress",
+                                                    "summary": [],
+                                                },
+                                            })));
+                                        }
+                                        yield Ok(emit!("response.reasoning_summary_text.delta", serde_json::json!({
+                                            "item_id": reasoning_item_id,
+                                            "output_index": reasoning_index,
+                                            "summary_index": 0,
+                                            "delta": x,
+                                        })));
+                                    }
+                                }
+                            }
                         } else if let Some(v) = crate::kiro::convert::tool_use_frame(&frame) {
                             let Some(id) = v["toolUseId"].as_str() else { continue };
                             if !tools.contains_key(id) {
                                 let index = next_output_index;
                                 next_output_index += 1;
                                 let item_id = format!("fc_{}", crate::protocol::responses::convert::random_hex_id());
-                                let name = v["name"].as_str().unwrap_or("").to_string();
+                                let raw_name = v["name"].as_str().unwrap_or("");
+                                // 还原成客户端认识的原名(见上面 tool_name_map 的说明)。
+                                // 名字都没超长时该表为空,`get` 直接落空、零开销。
+                                let name = tool_name_map.get(raw_name).map(String::as_str).unwrap_or(raw_name).to_string();
                                 yield Ok(emit!("response.output_item.added", serde_json::json!({
                                     "output_index": index,
                                     "item": {
@@ -414,6 +461,17 @@ pub async fn responses_stream(
                             truncation = Some(tr);
                         } else if let Some(e) = crate::kiro::convert::frame_exception(&frame) {
                             // 非截断 exception:后续帧再无意义,停读并走 response.failed 收尾。
+                            // 反馈账号池:上游在 200 的流里报错 = 这次它其实没干成。不反馈的话,
+                            // 这个账号在池子眼里永远只有"刚刚成功过",坏号一次都不会被惩罚 ——
+                            // 此前只有原生 Anthropic 那条出口做了,另外三个协议全漏。
+                            crate::protocol::anthropic::handler::report_stream_exception(
+                                &feedback_state,
+                                &cred_id,
+                                credential_id,
+                                &e,
+                                now_unix,
+                            )
+                            .await;
                             upstream_error = Some(e);
                             break 'read;
                         }
@@ -1535,5 +1593,245 @@ mod tests {
                 .any(|item| item["type"] == "function_call" && item["name"] == "get_weather"),
             "output 应含 function_call;实际: {output:?}"
         );
+    }
+
+    /// 取一个超长工具名经中枢缩短后的短名。
+    ///
+    /// 刻意走**上行时真正用的那一份**实现(`anthropic_to_kiro_full`),不在测试里另抄一遍缩短
+    /// 算法:抄的那份会随算法一起变,这个用例也就再也测不出东西。
+    fn shortened_tool_name(long: &str) -> String {
+        use crate::protocol::anthropic::types::{ContentIn, InMsg, MessagesRequest, ToolDef};
+        let hub = MessagesRequest {
+            model: "sonnet".to_string(),
+            system: None,
+            messages: vec![InMsg {
+                role: "user".to_string(),
+                content: ContentIn::Text("hi".to_string()),
+            }],
+            max_tokens: None,
+            stream: None,
+            tools: Some(vec![ToolDef {
+                tool_type: None,
+                name: long.to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+            }]),
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+        };
+        crate::kiro::convert::anthropic_to_kiro_full(&hub, None)
+            .expect("转换应成功")
+            .tool_name_map
+            .keys()
+            .next()
+            .cloned()
+            .expect("超长工具名必须被缩短并登记进还原表")
+    }
+
+    /// 从 mock 收到的**上行请求体**里取 `currentMessage` 的文本(拼给上游的那一份)。
+    fn upstream_current_text(req: &wiremock::Request) -> String {
+        let v: serde_json::Value = serde_json::from_slice(&req.body).expect("上行体应是 JSON");
+        v["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// 从 mock 收到的上行请求体里取 `conversationId`。
+    fn upstream_conversation_id(req: &wiremock::Request) -> String {
+        let v: serde_json::Value = serde_json::from_slice(&req.body).expect("上行体应是 JSON");
+        v["conversationState"]["conversationId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// F1 回归:超长工具名上行前被缩短,上游回来的 `tool_use` 用的就是短名。流式出口不还原的话,
+    /// 客户端会在 `function_call` 条目里收到一个**它自己没声明过**的工具名,那一轮工具调用直接
+    /// 作废。非流式出口走中枢 `relay_core_outcome`,那条早已还原;流式这条是自写的。
+    #[tokio::test]
+    async fn stream_restores_shortened_tool_name() {
+        let long =
+            "get_weather_for_a_city_with_an_absurdly_long_but_perfectly_legal_client_side_name";
+        assert!(long.len() > 63, "用例前提:工具名必须超过上游长度上限");
+        let short = shortened_tool_name(long);
+
+        let server = MockServer::start().await;
+        let mut body = event_frame(
+            "toolUseEvent",
+            format!(r#"{{"name":"{short}","toolUseId":"tu1"}}"#).as_bytes(),
+        );
+        body.extend(event_frame(
+            "toolUseEvent",
+            format!(r#"{{"input":"{{}}","name":"{short}","toolUseId":"tu1"}}"#).as_bytes(),
+        ));
+        body.extend(event_frame(
+            "toolUseEvent",
+            format!(r#"{{"name":"{short}","stop":true,"toolUseId":"tu1"}}"#).as_bytes(),
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = responses_router(state(&server.uri(), vec![cred()]));
+        let req_body = format!(
+            r#"{{"model":"sonnet","input":"weather?","tools":[{{"type":"function","name":"{long}","parameters":{{"type":"object"}}}}],"stream":true}}"#
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains(&format!("\"name\":\"{long}\"")),
+            "客户端应收到它自己声明的工具名;实际:\n{s}"
+        );
+        assert!(
+            !s.contains(&short),
+            "缩短后的内部名不该外泄给客户端;实际:\n{s}"
+        );
+
+        // 非流式那条走中枢内核,还原早就有了;一并钉住,免得哪天两条出口又各走各的。
+        let req_body = format!(
+            r#"{{"model":"sonnet","input":"weather?","tools":[{{"type":"function","name":"{long}","parameters":{{"type":"object"}}}}]}}"#
+        );
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["output"]
+                .as_array()
+                .expect("output 应为数组")
+                .iter()
+                .any(|item| item["name"] == long),
+            "非流式出口同样要回客户端声明的原名;实际:{v}"
+        );
+    }
+
+    /// F2 回归:`reasoning.effort` 必须真的开出 extended thinking。
+    ///
+    /// 断言的是**上行请求体**:上游认的是写在正文最前面的 `<thinking_mode>` 指令,
+    /// 此前这个协议入口恒传 thinking=None,于是无论客户端怎么要求推理都开不出来。
+    #[tokio::test]
+    async fn reasoning_effort_turns_on_extended_thinking() {
+        let server = MockServer::start().await;
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+        let app = responses_router(state(&server.uri(), vec![cred()]));
+
+        for body in [
+            r#"{"model":"sonnet","input":"hi","reasoning":{"effort":"low"}}"#,
+            r#"{"model":"sonnet","input":"hi"}"#,
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/responses")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2, "该有两次上行请求");
+        let with_effort = upstream_current_text(&reqs[0]);
+        assert!(
+            with_effort.starts_with("<thinking_mode>enabled</thinking_mode><max_thinking_length>"),
+            "reasoning.effort 应开出 thinking 指令;实际上行正文:{with_effort}"
+        );
+        let without = upstream_current_text(&reqs[1]);
+        assert!(
+            !without.contains("<thinking_mode>"),
+            "没要求推理时不该平白加指令;实际上行正文:{without}"
+        );
+    }
+
+    /// F3 回归:同一场多轮对话的每一轮,上行 `conversationId` 必须是同一个。
+    ///
+    /// 恒传 metadata=None 时中枢会给每个请求新生成一个 —— 上游看到的是"同一个账号每分钟开
+    /// 几十段全新会话",既丢了会话连续性,这个形状本身也不正常。
+    #[tokio::test]
+    async fn multi_turn_conversation_keeps_one_conversation_id() {
+        let server = MockServer::start().await;
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+        let app = responses_router(state(&server.uri(), vec![cred()]));
+
+        for body in [
+            // 同一场对话的第一轮与第二轮(第二轮把上一轮的输出整段回灌,官方 SDK 即如此)。
+            r#"{"model":"sonnet","input":[{"role":"user","content":"讲讲 Rust"}]}"#,
+            r#"{"model":"sonnet","input":[{"role":"user","content":"讲讲 Rust"},{"role":"assistant","content":"好"},{"role":"user","content":"再多说点"}]}"#,
+            // 另一场对话。
+            r#"{"model":"sonnet","input":[{"role":"user","content":"帮我写个正则"}]}"#,
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/responses")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 3, "该有三次上行请求");
+        let first = upstream_conversation_id(&reqs[0]);
+        let second = upstream_conversation_id(&reqs[1]);
+        let other = upstream_conversation_id(&reqs[2]);
+        assert!(
+            crate::kiro::is_uuid(&first),
+            "conversationId 必须是标准 UUID 写法;实际:{first}"
+        );
+        assert_eq!(first, second, "同一场对话的两轮应共用一个 conversationId");
+        assert_ne!(first, other, "两场不同的对话不该被并成同一段会话");
     }
 }

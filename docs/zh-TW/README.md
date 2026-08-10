@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.16.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.17.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-08-10 | v0.17.0 - 🎯 **專查一件事:每處修復是不是真的落到了全部呼叫點**——公用函式改好了、某個呼叫點沒用它,或者某個檔案留了一份**同名私有實作**把共用實作遮蔽掉,於是全庫搜尋時看著像"已統一"。這一輪找出 26 處、修完再複核又抓出 6 處只做了一半,一併修掉。重點:①**所有 ksk 帳號在資料面共用同一個 machineId**——資料面那份私有實作按 refresh_token 派生,而 ksk 的 refresh_token 本就是空的,於是全部落到同一常數,在上游看來就是一台機器跑幾十個號,同時餘額/模型清單又各算各的;②**上游回 200 但串流裡帶 exception 被記成成功**:成敗在拿到 200 那一刻就落了,壞號永不被降權、也不換號重試,使用者直接吃失敗;③**舊啟停介面改了池不落盤、正常停機(docker stop)根本不刷盤**——容器每重啟一次就把配額/封號/machineId 這些結論忘光,再拿使用者額度重學一遍;④權杖續期用了另一套可用性判據,少了"配額耗盡"那檔,已被拒的帳號仍在按點刷權杖;⑤**超長工具名還原只落在四條串流出口的一條**,另三個協定的用戶端會收到自己沒宣告過的工具名。新增:三個協定可開 extended thinking(回應方向同步剝離思考,只開不切會混進正文)、帶工作階段識別、Gemini 串流保活、CORS、`KIRO_API_KEY` 環境變數 |
 | 2026-08-10 | v0.16.0 - 🔍 **又跑了一轮独立复核,找出 6 处——好几处是此前的修复只落了一半**。①`amz-sdk-invocation-id` 的 UUID 修复**只落了 3/5 个调用点**:balance 与 models_cache 各自私有一份同名旧生成器被局部遮蔽,搜索时看着像"已统一",实际同一枚 Bearer 在数据面发 UUID、在余额发裸 hex;②**登录流对 oidc 主机一个头都不带、连 UA 都没有**——正是 v0.10.0 在刷新链路修过的同一缺陷,而登录打的是**同一台主机的相邻路径**,且注册裸奔、几分钟后同一 clientId 又用完美 SDK 头去刷新,这种前后矛盾比裸请求更易被关联;③**region 三条链路各算各的**(数据面按 profileArn、余额/模型用裸 cred.region)→ 余额恒查不出,且同一枚 Bearer 同时命中两个 region;④history 里的工具名没走缩短,与 tools 列表的短名对不上;⑤**改优先级不触发重新选号**,粘滞档下等于没改;⑥**全池被判停后无自愈**——上游抖一阵把所有号判停,池子就此彻底不可用直到有人重启。另:README 更新历史只留最近 10 条,完整看 CHANGELOG |
 | 2026-08-10 | v0.15.0 - 🔁 **额度耗尽的账号不再每次重启都要重新学一遍**(用户直接问到:"额度用完的号不是已经禁用了吗,为什么还会请求到已禁用的账号?")。是禁用了,但只在**内存**里——v0.10.2 为免一次抖动把账号永久写死,让运行期停用不落盘;而配额恰恰是**有明确恢复时刻**的那类。于是每次发版重启就把"谁没额度"忘光,再拿**用户的请求**去重新发现(实测 13 个耗尽号:前 2 次 502、第 3 次才成)→ 现按恢复时刻落盘,重启仍记得、到点自动回池;恢复时刻优先取上游 `nextResetAt`,没有才按下月一号估。另:**服务端内置搜索 `web_search` 真正接上了** —— 此前只是"容忍"这个工具声明(不再 400),但从不真的搜索,模型照常回段文本、客户端以为搜过了。现在这类请求在进数据面前被截住,调上游 `/mcp` 端点拿结果再合成 `server_tool_use` + `web_search_tool_result` |
 | 2026-08-10 | v0.14.1 - 🔧 **线上验证时当场发现的两件事**。①响应里 `usage.input_tokens` **恒为 0**:v0.13.0 补的输入估算只喂给了计费、没回写客户端 —— 账单里有、响应里没有,而客户端拿它算成本和上下文占用 → 非流式 `usage` 与流式 `message_start` 现在都带同一个值;②**池里有一批耗尽的号时,用户前几次请求会连续失败**:配额耗尽此前与鉴权失败共用 3 次重试预算,实测 13 个耗尽号要连烧 2 次 502、第 3 次才成 → 配额是**确定性**结论(本周期换谁都一样),现与"模型不可用"同归账号级确定性档、按池大小给预算;瞬态/鉴权仍保持 3 次小上限。全池确实耗尽时回 `429` 并说清是额度问题,而不是语焉不详的 502 |
@@ -70,7 +71,6 @@
 | 2026-08-09 | v0.11.1 - 🔬 **線上實測挖出的兩件事**。①**工具描述為空時上游拒掉整條請求**(實測:同一工具帶描述 200,去掉描述 → `400 Invalid tool use format / REQUEST_BODY_INVALID`)。v0.11.0 把 null 改成空串,而上游要的是**非空** → 現用工具名兜底;②`REQUEST_BODY_INVALID` 被當成可重試:它是確定性的,此前一條畸形請求連燒幾個帳號的重試配額最後回個 502 → 現直接回 400 並點明多半是工具規格的問題 |
 | 2026-08-09 | v0.11.0 - 🧰 **修「會讓請求被上游拒」的一類**。①服務端內建工具(web_search 等)沒有 `input_schema`,而該欄位此前是必填 → 客戶端一用官方寫法,請求就在我們這層 400;②工具 `description` 會序列化成 **null**;③`input_schema` 原樣透傳,形狀不合法會被上游拒掉**整條請求** → 現統一規範化;④超長工具名不縮短(上游上限 63)、縮短後也無法還原 → 現確定性縮短並把 `短名→原名` 帶到出口;⑤`:message-type == "error"` 的框架級錯誤幀被整個忽略 → 上游報錯卻還原成 200+空訊息;⑥面板缺失資源返回 200+HTML 而非 404。另:新增 `POST /api/admin/credentials/{id}/refresh` |
 | 2026-08-09 | v0.10.2 - 🩹 **修:執行期停用被寫進磁碟,「重啟即復活」形同虛設**。v0.10.0 宣告只置記憶體態,但落盤時 `snapshot_credentials()` 拿執行時 `disabled` 覆寫了 `cred.disabled` —— 一次額度耗盡或兩次 401/403 就把帳號**永久**寫死在 credentials.json 裡,比修復前更糟。現落盤只取持久結論。**若你的 credentials.json 裡有你沒手工停過的 `"disabled": true`,改回 false 即可恢復** |
-| 2026-08-09 | v0.10.1 - 🔌 **出站代理按帳號分流 + 補齊工作階段身分欄位**。①代理三件套此前**收下即丟**、`hasProxy` 還硬編碼 false —— 面板顯示配好了、實際全程直連;現真正落庫生效,優先級 憑證級 > 全域 > 直連(`"direct"` 顯式直連),且**同一帳號的資料面/重新整理/餘額/模型清單/背景續期一律同一出口**;②`conversationId` 此前每請求新生成且不是 UUID 形狀 → 改為優先取客戶端 `metadata.user_id` 裡的 session UUID,同工作階段共用;③此前**根本不發** `agentContinuationId`,已補;④管理面新增的帳號不會凍結 machineId,現入池即凍結;⑤`isCurrent` 硬編碼 false,現報真值 |
 
 ---
 
@@ -424,6 +424,7 @@ resp = client.chat.completions.create(
 | `LOAD_BALANCING_MODE` | ❌ | `priority` | 負載平衡：`priority`（等權輪詢）/ `balanced`（按 weight 加權） |
 | `MAX_RPM_PER_CREDENTIAL` | ❌ | `0` | 每帳號每分鐘請求上限，`0` = 無限 |
 | `CREDENTIALS_PATH` | ❌ | `credentials.json`（相對 `-c` 設定檔所在目錄解析，容器內即 `/app/data/credentials.json`） | 憑證檔案路徑；被命令列 `--credentials` 覆蓋 |
+| `KIRO_API_KEY` | ❌ | 無 | 用一個 Kiro API Key（`ksk_` 開頭）直接啟動服務：啟動時併入帳號池並落盤，同名 key 不重複匯入。掛載卷裡沒有憑證檔案時靠它就能跑 |
 
 **`data/config.json`**（camelCase，均可選；`logCapacity` 僅在此配置）：
 

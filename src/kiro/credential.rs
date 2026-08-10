@@ -358,7 +358,16 @@ pub fn freeze_machine_ids(creds: &mut [Credential], config_machine_id: Option<&s
     }
     let mut n = 0;
     for c in creds.iter_mut() {
-        if c.machine_id.is_some() {
+        // 只有**能用**的既有值才跳过。此前这里是"有值就跳过",于是一条不合法的 machineId
+        // (例如带连字符的 36 位 UUID —— 归一只认 32/64 位十六进制)一旦落库就再也纠不回来:
+        // 消费方对不合法的值只能回落到"按当前 refreshToken 现算",而 refreshToken 每刷新一次
+        // 就换一个,账号于是每刷新一次就对上游换一台机器 —— 正是冻结本要防住的那件事,
+        // 而冻结自己把它短路掉了。
+        if c.machine_id
+            .as_deref()
+            .and_then(crate::kiro::machine_id::normalize)
+            .is_some()
+        {
             continue;
         }
         let mid = crate::kiro::machine_id::for_credential(
@@ -554,6 +563,34 @@ mod tests {
             Some(frozen.as_str()),
             "轮换后必须仍是同一台机器"
         );
+    }
+
+    /// 冻结必须换掉**用不了**的既有 machineId,而不是见到"有值"就跳过。
+    ///
+    /// 一个不合法的值(例如带连字符的 36 位 UUID,`normalize` 只认 32/64 位十六进制)
+    /// 一旦落库,消费方对它只能回落到"按当前 refreshToken 现算",而 refreshToken 每刷新
+    /// 一次就换一个——账号于是每刷新一次就对上游换一台机器,正是冻结要防的那件事;
+    /// 而冻结自己见到"已经有值"就短路,这个坑再也自愈不了。
+    #[test]
+    fn freezing_replaces_a_machine_id_that_cannot_be_used() {
+        let mut c = super::tests_support_cred();
+        c.machine_id = Some("550e8400-e29b-41d4-a716-446655440000".into());
+        let n = super::freeze_machine_ids(std::slice::from_mut(&mut c), None);
+        assert_eq!(n, 1, "非法值必须被换掉");
+        assert_eq!(
+            c.machine_id.as_deref(),
+            Some(crate::kiro::machine_id::derive(&c.refresh_token).as_str()),
+            "换成按凭据自己派生的稳定值"
+        );
+
+        // 合法值照旧不动(幂等,轮换 refreshToken 也不改)。
+        let legal = "b".repeat(64);
+        c.machine_id = Some(legal.clone());
+        assert_eq!(
+            super::freeze_machine_ids(std::slice::from_mut(&mut c), None),
+            0
+        );
+        assert_eq!(c.machine_id.as_deref(), Some(legal.as_str()));
     }
 
     /// 配置里设了全局 machineId 时**不冻结**:那是"整池共用一个身份"的开关,

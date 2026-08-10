@@ -115,6 +115,28 @@ fn convert_input_item(item: &InputItem) -> Option<InMsg> {
     }
 }
 
+/// 定出本次请求的会话标识:按"最贴近会话语义"取第一个非空的。
+///
+/// `conversation` 是这个协议里真正的会话句柄(裸 id 串或 `{"id": …}` 两种写法都认);
+/// 其次是 `prompt_cache_key`(官方定义就是"同一场会话共用一个值");最后才回落到
+/// `user`(它标识的是人,不是某一场对话,故只当兜底)。都没有则返回 None,
+/// 由 [`session_metadata`](crate::protocol::openai::convert::session_metadata) 单靠对话开头做指纹。
+fn session_ref(
+    conversation: &Option<Value>,
+    prompt_cache_key: &Option<String>,
+    user: &Option<String>,
+) -> Option<String> {
+    let from_conversation = conversation.as_ref().and_then(|v| {
+        v.as_str()
+            .or_else(|| v.get("id").and_then(|x| x.as_str()))
+            .map(str::to_string)
+    });
+    from_conversation
+        .or_else(|| prompt_cache_key.clone())
+        .or_else(|| user.clone())
+        .filter(|s| !s.trim().is_empty())
+}
+
 /// 把 Responses `ResponsesRequest` 转换成中枢 `MessagesRequest`。
 ///
 /// `model` 原样透传;真正的模型名映射(及未知模型判定)发生在下游
@@ -167,8 +189,19 @@ pub fn responses_to_hub(req: ResponsesRequest) -> Result<MessagesRequest, Respon
     });
 
     Ok(MessagesRequest {
-        thinking: None,
-        metadata: None,
+        // `reasoning.effort` 是这个协议表达"要不要思考 / 思考多深"的唯一方式;此前恒传 None,
+        // 于是 Responses 入口**完全开不出** extended thinking(而 Anthropic 入口可以)。
+        // 映射与 Chat Completions 的 `reasoning_effort` 共用一份:同一个 effort 在两个入口上
+        // 开出不同深度,使用者根本无从察觉。
+        thinking: crate::protocol::openai::convert::thinking_from_effort(
+            req.reasoning.as_ref().and_then(|r| r.effort.as_deref()),
+        ),
+        // 会话标识:按"最贴近会话语义"排序取第一个非空的,再与对话开头一起做指纹
+        // (见 `session_metadata`)。共用同一份实现,不在这里另抄一遍。
+        metadata: crate::protocol::openai::convert::session_metadata(
+            session_ref(&req.conversation, &req.prompt_cache_key, &req.user).as_deref(),
+            &messages,
+        ),
         model: req.model,
         system: req.instructions.map(SystemPrompt::Text),
         messages,
@@ -266,6 +299,10 @@ mod tests {
             stream: None,
             max_output_tokens: None,
             previous_response_id: None,
+            reasoning: None,
+            conversation: None,
+            prompt_cache_key: None,
+            user: None,
         };
         let hub = responses_to_hub(req).expect("应转换成功");
         assert_eq!(hub.system.as_ref().map(|s| s.text()).as_deref(), Some("s"));
@@ -285,6 +322,10 @@ mod tests {
             stream: None,
             max_output_tokens: None,
             previous_response_id: Some("resp_x".to_string()),
+            reasoning: None,
+            conversation: None,
+            prompt_cache_key: None,
+            user: None,
         };
         let err = responses_to_hub(req).expect_err("应拒绝");
         assert_eq!(err, ResponsesConvertError::PreviousResponseUnsupported);
@@ -301,6 +342,10 @@ mod tests {
             stream: None,
             max_output_tokens: None,
             previous_response_id: Some(String::new()),
+            reasoning: None,
+            conversation: None,
+            prompt_cache_key: None,
+            user: None,
         };
         let hub = responses_to_hub(req).expect("空字符串应放行");
         assert_eq!(hub.messages.len(), 1);
@@ -320,6 +365,10 @@ mod tests {
             stream: None,
             max_output_tokens: None,
             previous_response_id: None,
+            reasoning: None,
+            conversation: None,
+            prompt_cache_key: None,
+            user: None,
         };
         let hub = responses_to_hub(req).expect("应转换成功");
         assert_eq!(hub.messages.len(), 1);
@@ -342,6 +391,10 @@ mod tests {
             stream: None,
             max_output_tokens: None,
             previous_response_id: None,
+            reasoning: None,
+            conversation: None,
+            prompt_cache_key: None,
+            user: None,
         };
         let hub = responses_to_hub(req).expect("应转换成功");
         assert_eq!(hub.messages.len(), 1);
@@ -374,6 +427,10 @@ mod tests {
             stream: None,
             max_output_tokens: None,
             previous_response_id: None,
+            reasoning: None,
+            conversation: None,
+            prompt_cache_key: None,
+            user: None,
         };
         let hub = responses_to_hub(req).expect("应转换成功");
         match &hub.messages[0].content {
@@ -399,6 +456,10 @@ mod tests {
             stream: None,
             max_output_tokens: None,
             previous_response_id: None,
+            reasoning: None,
+            conversation: None,
+            prompt_cache_key: None,
+            user: None,
         };
         let hub = responses_to_hub(req).expect("应转换成功");
         assert_eq!(hub.messages[0].role, "user");
@@ -444,6 +505,10 @@ mod tests {
             stream: None,
             max_output_tokens: None,
             previous_response_id: None,
+            reasoning: None,
+            conversation: None,
+            prompt_cache_key: None,
+            user: None,
         };
         let hub = responses_to_hub(req).expect("应转换成功");
         match &hub.messages[0].content {
@@ -481,6 +546,10 @@ mod tests {
             stream: None,
             max_output_tokens: None,
             previous_response_id: None,
+            reasoning: None,
+            conversation: None,
+            prompt_cache_key: None,
+            user: None,
         };
         let hub = responses_to_hub(req).expect("应转换成功");
         let tools = hub.tools.expect("tools 应存在");
@@ -503,6 +572,10 @@ mod tests {
             stream: Some(true),
             max_output_tokens: Some(256),
             previous_response_id: None,
+            reasoning: None,
+            conversation: None,
+            prompt_cache_key: None,
+            user: None,
         };
         let hub = responses_to_hub(req).expect("应转换成功");
         assert_eq!(hub.max_tokens, Some(256));
@@ -598,6 +671,10 @@ mod tests {
             stream: None,
             max_output_tokens: None,
             previous_response_id: None,
+            reasoning: None,
+            conversation: None,
+            prompt_cache_key: None,
+            user: None,
         };
         let hub = responses_to_hub(req).expect("应转换成功");
         assert_eq!(hub.messages[0].role, "assistant");

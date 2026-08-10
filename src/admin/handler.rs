@@ -171,6 +171,30 @@ pub struct SuccessResponse {
     pub message: String,
 }
 
+/// 手工启停的**唯一**内核:改活池 + 立刻落盘,返回是否命中该账号。
+///
+/// 落盘不能省:只改活池的话,这个操作要靠后续某次刷新顺带把它带下去,中间重启一次就没了
+/// ——运维禁用掉的账号会自己回到池里继续接流量,与"配额耗尽只记在内存里"是同一个病。
+///
+/// 收成一个内核是因为启停有**两组**端点(前端契约的 `/api/admin/credentials/{id}/disabled`
+/// 与向后兼容的 `/admin/api/accounts/{id}/{enable,disable}`):此前各写各的,落盘只补在新的
+/// 那一组上,旧端点改完就返回。走同一个内核就不会再出现"修了一处漏了另一处"。
+async fn set_disabled_and_persist(state: &MessagesState, id: &str, disabled: bool) -> bool {
+    let found = {
+        let mut pool = state.pool.lock().await;
+        pool.set_disabled(id, disabled)
+    };
+    if found && let Err(e) = persist_pool_credentials(state).await {
+        tracing::warn!(
+            error = %e,
+            credential_id = %id,
+            disabled,
+            "启停后落盘失败:重启后该账号会回到落盘时的启停状态"
+        );
+    }
+    found
+}
+
 /// `POST /api/admin/credentials/{id}/disabled`:按前端契约设置禁用状态,
 /// body `{disabled}`,返回 `{success,message}`。
 pub async fn set_disabled(
@@ -178,14 +202,7 @@ pub async fn set_disabled(
     Path(id): Path<String>,
     Json(req): Json<SetDisabledRequest>,
 ) -> Response {
-    let mut pool = state.pool.lock().await;
-    let found = pool.set_disabled(&id, req.disabled);
-    drop(pool);
-    // 手工启停同样要立刻落盘:此前只改活池,靠后续某次刷新顺带把它带下去,中间重启一次
-    // 这个操作就没了——运维禁用的账号会自己回到池里。
-    if found && let Err(e) = persist_pool_credentials(&state).await {
-        tracing::warn!(error = %e, "启停后落盘失败");
-    }
+    let found = set_disabled_and_persist(&state, &id, req.disabled).await;
     if found {
         Json(SuccessResponse {
             success: true,
@@ -414,9 +431,12 @@ struct LazySweepOutcome {
 /// - 并集连续 [`DISCOVERY_STALL_LIMIT`] 次成功无增长即停(其余账号的档位很可能已被涵盖);
 /// - 失败累计到 [`LAZY_REFRESH_FAILURE_CAP`] 即停(上游整体故障时不再往下打)。
 async fn lazy_refresh_sweep(state: &MessagesState, now: u64, start: usize) -> LazySweepOutcome {
+    // 只扫池子认为**可用**的账号(口径见 `Pool::snapshot_active_credentials`)。此前这里按
+    // 持久 `disabled` 过滤,于是运行期已判封禁 / 额度耗尽未到恢复时刻 / 正在冷却的账号照样
+    // 被拿去实拉一遍 —— 那些请求注定白打,还等于拿一批已经出问题的凭据挨个去撞上游。
     let creds = {
         let pool = state.pool.lock().await;
-        pool.snapshot_credentials()
+        pool.snapshot_active_credentials(now)
     };
     let mut out = LazySweepOutcome::default();
     if creds.is_empty() {
@@ -434,9 +454,6 @@ async fn lazy_refresh_sweep(state: &MessagesState, now: u64, start: usize) -> La
         }
         out.scanned = off + 1;
         let cred = &creds[(start + off) % len];
-        if cred.disabled {
-            continue;
-        }
         if state.models_cache.is_fresh(&cred.id, now).await {
             continue;
         }
@@ -551,7 +568,7 @@ const DISCOVERY_SUCCESS_CAP: usize = 12;
 /// 一个档位、漏掉另一档位的模型;而串行刷全部 ~175 账号又太慢(60s+)且猛打上游。
 ///
 /// 本实现按档位精确刷新,保证**每个已知档位**各出一个代表账号、并集自然涵盖全档位模型:
-/// 1. 快照池内凭据(跳过已禁用)。
+/// 1. 快照池内**可用**凭据(口径见 `Pool::snapshot_active_credentials`)。
 /// 2. 用 `balance.tier_of(id)` 按档位分组:每个**已知**档位挑一个代表账号;
 ///    档位未缓存的账号(如冷启动余额缓存尚空)归入 `unknown` 列表。
 /// 3. 刷新每个已知档位的那**一个**代表账号(`refresh_one` 会 PUT 进模型缓存,并集即含该档位)。
@@ -564,9 +581,12 @@ const DISCOVERY_SUCCESS_CAP: usize = 12;
 /// 若无任何已知档位且发现也一无所获 → `refreshed` 可能为 0(优雅兜底,UI 据此提示)。
 pub async fn refresh_all_models(State(state): State<MessagesState>) -> Response {
     let now = now_unix();
+    // 只取池子认为**可用**的账号。此前按持久 `disabled` 过滤,于是运行期已判封禁 /
+    // 额度耗尽未到恢复时刻 / 正在冷却的账号照样被拿去实拉:那些请求注定失败,除了把一批
+    // 已经出问题的凭据挨个送到上游面前之外什么也换不来。判"谁还能用"只有池子说了算。
     let creds = {
         let pool = state.pool.lock().await;
-        pool.snapshot_credentials()
+        pool.snapshot_active_credentials(now)
     };
 
     // 按档位分组:每个已知档位保留一个代表 Credential;档位未缓存者归入 unknown。
@@ -574,9 +594,6 @@ pub async fn refresh_all_models(State(state): State<MessagesState>) -> Response 
     let mut tier_reps: Vec<(String, crate::kiro::credential::Credential)> = Vec::new();
     let mut unknown: Vec<crate::kiro::credential::Credential> = Vec::new();
     for cred in creds {
-        if cred.disabled {
-            continue;
-        }
         match state.balance.tier_of(&cred.id, now).await {
             Some(tier) => {
                 if !tier_reps.iter().any(|(t, _)| t == &tier) {
@@ -1078,6 +1095,16 @@ pub struct RestartResponse {
 /// 规矩(含"磁盘上的 api_keys.json 解析不动且内存里一把 key 都没有时跳过写入"的自保阀),
 /// 不在此另起一套平行实现。
 async fn flush_persistent_state_before_exit(state: &MessagesState) {
+    // 活池先落。它的持久字段(封禁结论、配额恢复时刻、确证失效后的禁用)是数据面与令牌刷新
+    // 途中就地写下的,那些路径未必每次都当场落过盘;这里直接 exit(0),不补这一次就等于把这些
+    // 结论全丢掉——重启后只能拿用户的额度把"谁被封了、谁没额度"重新学一遍,而学费是连续
+    // 失败的真实请求。落盘失败只记 error,绝不阻断退出(停机路径宁可少落一项也不能卡住)。
+    if let Err(e) = persist_pool_credentials(state).await {
+        tracing::error!(
+            error = %e,
+            "退出前凭据落盘失败:封禁/配额等运行期结论将在重启后回滚"
+        );
+    }
     crate::server::PersistHandles {
         stats: state.stats.clone(),
         balance: state.balance.clone(),
@@ -1085,6 +1112,10 @@ async fn flush_persistent_state_before_exit(state: &MessagesState) {
         // 与 `build_router` 同一推断规则(数据目录 = credentials_path 的父目录),
         // 故这里算出的就是本进程 ApiKeyStore 实际读写的那份 api_keys.json。
         api_keys_path: crate::apikey::api_keys_path_from(&state.cfg.credentials_path),
+        pool: state.pool.clone(),
+        // 与刷新路径同一把落盘锁,两处写盘互斥、不会互相覆盖成旧快照。
+        persist_lock: state.refresh_ctx.persist_lock.clone(),
+        credentials_path: state.cfg.credentials_path.clone(),
     }
     .flush_before_exit()
     .await;
@@ -1268,11 +1299,10 @@ fn not_found(id: &str) -> Response {
         .into_response()
 }
 
-/// `POST /admin/api/accounts/{id}/enable`:恢复账号参与选择。
+/// `POST /admin/api/accounts/{id}/enable`:恢复账号参与选择(改活池 + 落盘,见
+/// [`set_disabled_and_persist`])。
 pub async fn enable(State(state): State<MessagesState>, Path(id): Path<String>) -> Response {
-    let mut pool = state.pool.lock().await;
-    let found = pool.set_disabled(&id, false);
-    drop(pool);
+    let found = set_disabled_and_persist(&state, &id, false).await;
     if found {
         (
             StatusCode::OK,
@@ -1284,11 +1314,10 @@ pub async fn enable(State(state): State<MessagesState>, Path(id): Path<String>) 
     }
 }
 
-/// `POST /admin/api/accounts/{id}/disable`:手动禁用账号(不参与选择)。
+/// `POST /admin/api/accounts/{id}/disable`:手动禁用账号(不参与选择;改活池 + 落盘,见
+/// [`set_disabled_and_persist`])。
 pub async fn disable(State(state): State<MessagesState>, Path(id): Path<String>) -> Response {
-    let mut pool = state.pool.lock().await;
-    let found = pool.set_disabled(&id, true);
-    drop(pool);
+    let found = set_disabled_and_persist(&state, &id, true).await;
     if found {
         (
             StatusCode::OK,
@@ -2543,6 +2572,29 @@ fn persist_failed(e: &anyhow::Error) -> Response {
         .into_response()
 }
 
+/// machineId 非法时给调用方的说明(归一只认 32/64 位十六进制)。
+const MACHINE_ID_HINT: &str = "machineId must be 32 or 64 hexadecimal characters";
+
+/// 机器 ID 的**写入闸**:空/缺省 → `Ok(None)`;合法值 → 归一后的规范形式;非法 → `Err`。
+///
+/// 为什么必须在写入端就拦下来:落库之后再也纠不回来了。冻结逻辑的职责是"别让机器身份随
+/// refreshToken 轮换而变",它认的是"这条凭据有没有一个能用的值";而各消费方拿到一个用不了
+/// 的值只能各自回落到"按当前 refreshToken 现算" —— 于是令牌每轮换一次,这个账号对上游就
+/// 换一台机器,恰恰是冻结要防住的那件事。
+///
+/// 顺带把 32 位 / 含大写的合法值归一成规范形式再落库:磁盘上放规范值,谁读都是同一台机器。
+fn normalized_machine_id(raw: Option<String>) -> Result<Option<String>, &'static str> {
+    match raw
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        None => Ok(None),
+        Some(v) => crate::kiro::machine_id::normalize(&v)
+            .map(Some)
+            .ok_or(MACHINE_ID_HINT),
+    }
+}
+
 /// `authMethod` 串 → 枚举;缺省/未知回落 Social(与前端可选默认一致)。
 /// `"idc"`(大小写不敏感)→ Idc,其余 → Social。
 fn parse_auth_method(s: Option<&str>) -> AuthMethod {
@@ -2624,6 +2676,13 @@ pub async fn add_credential(
         return bad_request("clientId and clientSecret are required for idc auth");
     }
 
+    // machineId 走写入闸:非法值宁可当场回 400,也不能默默收下 —— 面板会显示"保存成功",
+    // 而这条凭据从此每刷新一次令牌就换一台机器,再也纠不回来(见 `normalized_machine_id`)。
+    let machine_id = match normalized_machine_id(req.machine_id) {
+        Ok(v) => v,
+        Err(msg) => return bad_request(msg),
+    };
+
     // region:优先 apiRegion(数据面),回落 authRegion,再回落 us-east-1。
     let region = req
         .api_region
@@ -2650,7 +2709,7 @@ pub async fn add_credential(
         client_id: req.client_id.filter(|s| !s.is_empty()),
         client_secret: req.client_secret.filter(|s| !s.is_empty()),
         profile_arn: req.profile_arn.filter(|s| !s.is_empty()),
-        machine_id: req.machine_id.filter(|s| !s.is_empty()),
+        machine_id,
         email: req.email.filter(|s| !s.is_empty()),
         nickname: req.nickname.filter(|s| !s.is_empty()),
         weight,
@@ -2704,6 +2763,11 @@ pub async fn update_credential(
         .clone()
         .or_else(|| req.auth_region.clone())
         .filter(|s| !s.trim().is_empty());
+    // 更新端与新增端同一道写入闸:两处都是用户输入的入口,只堵一处等于没堵。
+    let machine_id = match normalized_machine_id(req.machine_id) {
+        Ok(v) => v,
+        Err(msg) => return bad_request(msg),
+    };
 
     let upd = CredentialUpdate {
         refresh_token: req.refresh_token.filter(|s| !s.is_empty()),
@@ -2713,7 +2777,7 @@ pub async fn update_credential(
         client_id: req.client_id.filter(|s| !s.is_empty()),
         client_secret: req.client_secret.filter(|s| !s.is_empty()),
         profile_arn: req.profile_arn.filter(|s| !s.is_empty()),
-        machine_id: req.machine_id.filter(|s| !s.is_empty()),
+        machine_id,
         weight: req.weight,
         region,
     };
@@ -3106,6 +3170,21 @@ pub async fn import_credentials_batch(
             .map(|p| if p < 1 { 1 } else { p as u32 })
             .unwrap_or(1);
 
+        // machineId 同样过写入闸,但这条路**逐项韧性**:导出文件里的 machineId 常常是带
+        // 连字符的 UUID,为一个装饰性字段把整个账号挡在门外不值当 —— 丢掉非法值,让入池
+        // 冻结按这条凭据自己派生一个稳定的(见 `credential::freeze_machine_id`),账号照用。
+        // 唯独不能做的是原样收下:那会让它永远顶着一个用不了的值(见 `normalized_machine_id`)。
+        let machine_id = match normalized_machine_id(item.machine_id.clone()) {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::warn!(
+                    index,
+                    "导入项的 machineId 不是 32/64 位十六进制,已丢弃并改由凭据自行派生"
+                );
+                None
+            }
+        };
+
         let cred = Credential {
             quota_reset_unix: None,
             priority: crate::kiro::credential::DEFAULT_PRIORITY,
@@ -3118,7 +3197,7 @@ pub async fn import_credentials_batch(
             client_id: item.client_id,
             client_secret: item.client_secret,
             profile_arn: None,
-            machine_id: item.machine_id,
+            machine_id,
             email: item.email.clone(),
             nickname: item.nickname,
             weight,
@@ -4400,7 +4479,10 @@ mod tests {
 
     #[tokio::test]
     async fn disable_then_enable_roundtrip_and_missing_account_404s() {
-        let state = state_with(vec![cred("a"), cred("b")], Config::default());
+        // 落盘路径必须落在临时目录:旧启停端点现在也会立刻写 credentials.json,用
+        // `Config::default()` 的相对路径会把带假 token 的凭据文件写进仓库根目录,
+        // `Config::default()` 从此加载到非空池,别处「空池应回 503」的测试全部变 502(实际踩过)。
+        let state = state_with(vec![cred("a"), cred("b")], cfg_with_temp_creds());
         let app = admin_api_router(state);
 
         // disable "a"
@@ -6429,5 +6511,255 @@ mod tests {
         let (_st, v) = get(&app, "/api/admin/credentials/6/failure-logs").await;
         assert_eq!(v["total"], 1, "不得误伤其它账号的失败日志:{v}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ============ 落盘时机 / 可用性口径 / machineId 写入闸 ============
+
+    /// 旧的启停端点(`/admin/api/accounts/{id}/{enable,disable}`)同样必须落盘。
+    ///
+    /// 只改活池的话,运维在面板上禁掉一个账号,进程一重启它就自己回到池里继续接流量——
+    /// 与"配额耗尽只记在内存里"是同一个病。新端点(`/api/admin/credentials/{id}/disabled`)
+    /// 早就落盘了,旧端点漏在外面。
+    #[tokio::test]
+    async fn legacy_enable_disable_endpoints_persist_the_toggle() {
+        let dir = tmp_dir("legacy_toggle_persist");
+        let state = state_with_data_dir_creds(&dir, vec![cred("1")]);
+        let creds_path = state.cfg.credentials_path.clone();
+        let app = admin_api_router(state);
+
+        let (st, _) = send(&app, Method::POST, "/admin/api/accounts/1/disable", None).await;
+        assert_eq!(st, HttpStatusCode::OK);
+        let on_disk = crate::kiro::credential::load(&creds_path).expect("凭据文件应可读");
+        assert_eq!(on_disk.len(), 1, "禁用后 credentials.json 必须写出来");
+        assert!(on_disk[0].disabled, "禁用没落盘:重启后账号会自己回到池里");
+
+        let (st, _) = send(&app, Method::POST, "/admin/api/accounts/1/enable", None).await;
+        assert_eq!(st, HttpStatusCode::OK);
+        let on_disk = crate::kiro::credential::load(&creds_path).expect("凭据文件应可读");
+        assert!(!on_disk[0].disabled, "启用没落盘:重启后账号又变回禁用");
+    }
+
+    /// 上游确定性不可达的账号夹具:region 解析不出来 → 每次实拉都在传输层失败一次,
+    /// 于是"失败计数"恰好等于真被拿去打上游的账号数(绝不打真 AWS)。
+    fn unreachable_cred(id: &str) -> Credential {
+        let mut c = cred(id);
+        c.region = "invalid-region-does-not-resolve".into();
+        c
+    }
+
+    /// 批量模型刷新只能拿**池子认为可用**的账号去打上游。
+    ///
+    /// 只看持久 `disabled` 的后果:运行期已被判封禁、额度耗尽未到恢复时刻、正在冷却的账号
+    /// 照样被拿去实拉——给已经出问题的账号继续发请求正是最该避免的形状,而且这些请求注定
+    /// 白打。
+    #[tokio::test]
+    async fn batch_model_refresh_only_touches_accounts_the_pool_still_considers_usable() {
+        let dir = tmp_dir("models_refresh_active_only");
+        let state = state_with_data_dir_creds(
+            &dir,
+            vec![
+                unreachable_cred("1"),
+                unreachable_cred("2"),
+                unreachable_cred("3"),
+                unreachable_cred("4"),
+            ],
+        );
+        let now = super::now_unix();
+        let pool = state.pool.clone();
+        {
+            let mut p = pool.lock().await;
+            // 1:上游确证的封禁(持久 disabled 仍是 false)。
+            p.report_failure_with_reason(
+                "1",
+                crate::kiro::pool::FailureKind::AuthAmbiguous,
+                crate::kiro::pool::StatusReason::Banned,
+                now,
+            );
+            // 2:额度耗尽,恢复时刻还没到。
+            p.set_quota_reset("2", now + 3_600);
+            // 3:连续瞬时失败 → 冷却中。
+            for _ in 0..3 {
+                p.report_failure("3", crate::kiro::pool::FailureKind::Transient, now);
+            }
+            // 4:健康——用来证明这个断言真的看得见"被打了一次"。
+            assert_eq!(
+                p.active_count(now),
+                1,
+                "前提:四个账号里只有 4 号还可用,否则这个测试是空转的"
+            );
+        }
+
+        let app = admin_api_router(state);
+        let (st, v) = send(
+            &app,
+            Method::POST,
+            "/api/admin/credentials/models/refresh",
+            None,
+        )
+        .await;
+        assert_eq!(st, HttpStatusCode::OK);
+        assert_eq!(v["refreshed"], 0);
+        assert_eq!(
+            v["failed"], 1,
+            "只有仍可用的那个账号该被拿去打上游:{v}"
+        );
+        let errors = v["errors"].as_array().expect("errors[] 应在场");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["id"], 4, "被打的必须是健康的那个:{v}");
+    }
+
+    /// 惰性回填与批量刷新同一口径:封禁/配额未恢复/冷却中的账号一律不实拉。
+    #[tokio::test]
+    async fn lazy_model_sweep_only_touches_accounts_the_pool_still_considers_usable() {
+        let dir = tmp_dir("lazy_sweep_active_only");
+        let state =
+            state_with_data_dir_creds(&dir, vec![unreachable_cred("1"), unreachable_cred("2")]);
+        let now = super::now_unix();
+        state.pool.lock().await.report_failure_with_reason(
+            "1",
+            crate::kiro::pool::FailureKind::AuthAmbiguous,
+            crate::kiro::pool::StatusReason::Banned,
+            now,
+        );
+        let out = super::lazy_refresh_sweep(&state, now, 0).await;
+        assert_eq!(
+            out.attempts, 1,
+            "被封禁的账号不得被回填顺手再打一次:{out:?}"
+        );
+        assert_eq!(out.failures, 1);
+    }
+
+    /// 退出前的刷盘必须把活池的持久结论一并落下去。
+    ///
+    /// 封禁结论、配额恢复时刻这些是数据面/刷新途中写进持久字段的,进程在 `restart` 里直接
+    /// `exit(0)`,不补这一次就等于把它们全丢了——重启后又要拿用户的额度把"谁被封了、谁没
+    /// 额度"重新学一遍。
+    #[tokio::test]
+    async fn flush_before_exit_persists_pool_conclusions() {
+        let dir = tmp_dir("flush_exit_pool");
+        let state = state_with_data_dir_creds(&dir, vec![cred("1")]);
+        let creds_path = state.cfg.credentials_path.clone();
+        {
+            let mut p = state.pool.lock().await;
+            p.report_failure_with_reason(
+                "1",
+                crate::kiro::pool::FailureKind::Quota,
+                crate::kiro::pool::StatusReason::Banned,
+                1_000,
+            );
+        }
+        super::flush_persistent_state_before_exit(&state).await;
+
+        let on_disk = crate::kiro::credential::load(&creds_path).expect("凭据文件应可读");
+        assert_eq!(on_disk.len(), 1, "退出前必须把活池写出来");
+        assert_eq!(
+            on_disk[0].status_reason.as_deref(),
+            Some("banned"),
+            "封禁结论没落盘:重启后这个号又回到池里挨个白打"
+        );
+        assert!(
+            on_disk[0].quota_reset_unix.is_some(),
+            "配额恢复时刻没落盘:重启后要拿用户的额度重新学一遍"
+        );
+    }
+
+    /// 带连字符的 36 位 UUID 不是合法 machineId(只认 32/64 位十六进制),必须在写入端就挡住。
+    ///
+    /// 放进去就再也纠不回来:冻结逻辑见到"已经有值"直接跳过(它防的是"每刷新一次换一台机器",
+    /// 不判这个值本身能不能用),而消费方对不合法的值只能回落到"按当前 refreshToken 现算"——
+    /// 于是令牌每轮换一次,这个账号对上游就换一台机器,正是冻结本要防住的那件事。
+    #[tokio::test]
+    async fn add_credential_rejects_a_machine_id_that_is_not_hex() {
+        let cfg = cfg_with_temp_creds();
+        let path = cfg.credentials_path.clone();
+        let app = admin_api_router(state_with(vec![], cfg));
+        let (st, v) = send(
+            &app,
+            Method::POST,
+            "/api/admin/credentials",
+            Some(r#"{"refreshToken":"rt-bad-mid","machineId":"550e8400-e29b-41d4-a716-446655440000"}"#),
+        )
+        .await;
+        assert_eq!(st, HttpStatusCode::BAD_REQUEST, "非法 machineId 必须被拒:{v}");
+        let on_disk = crate::kiro::credential::load(&path).expect("凭据文件应可读");
+        assert!(on_disk.is_empty(), "被拒的凭据不得落库:{on_disk:?}");
+    }
+
+    /// 合法但非规范形式(32 位、含大写)必须归一后再落库,免得各消费方各自解释。
+    #[tokio::test]
+    async fn add_credential_stores_the_normalized_machine_id() {
+        let cfg = cfg_with_temp_creds();
+        let path = cfg.credentials_path.clone();
+        let app = admin_api_router(state_with(vec![], cfg));
+        let (st, _v) = send(
+            &app,
+            Method::POST,
+            "/api/admin/credentials",
+            Some(r#"{"refreshToken":"rt-ok-mid","machineId":"0123456789ABCDEF0123456789abcdef"}"#),
+        )
+        .await;
+        assert_eq!(st, HttpStatusCode::OK);
+        let on_disk = crate::kiro::credential::load(&path).expect("凭据文件应可读");
+        let want = crate::kiro::machine_id::normalize("0123456789abcdef0123456789abcdef")
+            .expect("32 位十六进制是合法的");
+        assert_eq!(
+            on_disk[0].machine_id.as_deref(),
+            Some(want.as_str()),
+            "落库的必须是归一后的规范形式"
+        );
+    }
+
+    /// 更新端同样是写入端:非法 machineId 必须被拒,且不得改动既有凭据。
+    #[tokio::test]
+    async fn update_credential_rejects_a_machine_id_that_is_not_hex() {
+        let dir = tmp_dir("update_bad_machine_id");
+        let state = state_with_data_dir_creds(&dir, vec![cred("1")]);
+        let pool = state.pool.clone();
+        let app = admin_api_router(state);
+        let (st, v) = send(
+            &app,
+            Method::PUT,
+            "/api/admin/credentials/1",
+            Some(r#"{"machineId":"550e8400-e29b-41d4-a716-446655440000"}"#),
+        )
+        .await;
+        assert_eq!(st, HttpStatusCode::BAD_REQUEST, "非法 machineId 必须被拒:{v}");
+        let in_pool = pool.lock().await.snapshot_credentials();
+        assert_eq!(
+            in_pool[0].machine_id, None,
+            "被拒的值不得写进活池:{in_pool:?}"
+        );
+    }
+
+    /// 批量导入按逐项韧性处理:第三方导出里 machineId 常常是带连字符的 UUID,为一个装饰性
+    /// 字段把整个账号挡在门外不值当——丢掉非法值,让入池冻结按凭据自己派生一个稳定的。
+    /// 但**绝不能**把非法值原样写进去。
+    #[tokio::test]
+    async fn batch_import_drops_an_illegal_machine_id_and_freezes_a_derived_one() {
+        let cfg = cfg_with_temp_creds();
+        let path = cfg.credentials_path.clone();
+        let app = admin_api_router(state_with(vec![], cfg));
+        let (st, v) = send(
+            &app,
+            Method::POST,
+            "/api/admin/credentials/batch-import",
+            Some(
+                r#"{"data":[{"refreshToken":"rt-import-mid","machineId":"550e8400-e29b-41d4-a716-446655440000"}]}"#,
+            ),
+        )
+        .await;
+        assert_eq!(st, HttpStatusCode::OK);
+        assert_eq!(v["added"], 1, "非法 machineId 不该把整个账号挡在门外:{v}");
+        let on_disk = crate::kiro::credential::load(&path).expect("凭据文件应可读");
+        let mid = on_disk[0].machine_id.as_deref().expect("入池即应冻结");
+        assert_ne!(
+            mid, "550e8400-e29b-41d4-a716-446655440000",
+            "非法值绝不能原样落库"
+        );
+        assert_eq!(
+            mid,
+            crate::kiro::machine_id::derive("rt-import-mid"),
+            "该按凭据自己派生一个稳定的"
+        );
     }
 }

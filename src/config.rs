@@ -64,6 +64,34 @@ pub struct Config {
     /// (对齐 gemini2api 的"全量连续日志"体验:每请求一条 INFO + 关键生命周期事件,容量要够大
     /// 才能在实时日志页看到一段连续的活动记录,而非只剩最近十几条)。
     pub log_capacity: usize,
+    /// 浏览器跨源访问(CORS)允许的来源清单。`["*"]`(默认)= 任意来源;**空数组 = 整个 CORS 层关闭**。
+    ///
+    /// 为什么默认放开:四条协议端点的调用方常常是浏览器里的网页(自建聊天前端、在线调试页),
+    /// 而浏览器在发真正的请求之前会先发一次预检 `OPTIONS`。没有 CORS 层时预检落到路由上吃 405,
+    /// 浏览器当场把随后的请求掐掉 —— 现象是"网页端一个端点都调不通,同样的 key 用 curl 却全通",
+    /// 排查方向完全被带偏。放开的代价很小:本服务的鉴权材料一律走请求头(Authorization / x-api-key),
+    /// 不用 Cookie,浏览器不会替攻击者自动附上任何凭据。
+    ///
+    /// 但这只对**协议端点 + /health** 成立;管理面/用户面 REST API 另说,见 [`Self::cors_allow_admin`]。
+    pub cors_allow_origins: Vec<String>,
+    /// 是否把 CORS 一并加到 admin / user 的 REST API 上(默认 **false**)。
+    ///
+    /// 默认关掉不是保守,是因为这两组的暴露面完全不同:未配置 `admin_api_key`/`api_key` 时管理面
+    /// 是**完全开放**的(首次部署体验,见 `auth_startup_warnings`),此时若再放开跨源读取,
+    /// 运营者浏览器打开的任意一个恶意网页都能直接把 `/api/admin/credentials`(账号、密钥、统计)
+    /// 读走并回传 —— 服务只要对那台机器可达(localhost / 内网)就成立。
+    /// 只有把管理前端单独部署在另一个域名下时才需要打开它,且届时必须先设好管理员密钥。
+    pub cors_allow_admin: bool,
+    /// 用环境变量直接注入的 Kiro API Key(`ksk_…`);多把用逗号或换行分隔。
+    ///
+    /// 容器化部署此前只有"挂载 credentials.json"一条路:临时起一个实例、CI 里跑一次冒烟、
+    /// 用 compose 的 `env_file` 统一发配置时,都要先在宿主机上落一个文件才能有账号。
+    /// 有了它,`-e KIRO_API_KEY=ksk_xxx` 就能把服务起起来。
+    ///
+    /// 装载语义见 `server::inject_configured_api_keys`:与文件里已有的账号按 key 去重,
+    /// 只有确实新增时才写盘。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kiro_api_key: Option<String>,
     /// 本配置文件的磁盘路径(不从 JSON 读入,由 `load()` 注入),供运行期改写落盘定位。
     #[serde(skip)]
     pub config_path: String,
@@ -88,6 +116,9 @@ impl Default for Config {
             load_balancing_mode: "priority".into(),
             trusted_proxy_hops: 1,
             log_capacity: 5000,
+            cors_allow_origins: vec![CORS_ANY_ORIGIN.to_string()],
+            cors_allow_admin: false,
+            kiro_api_key: None,
             config_path: "config.json".into(),
         }
     }
@@ -174,6 +205,51 @@ impl Config {
         {
             self.trusted_proxy_hops = n;
         }
+        if let Some(v) = env_non_empty("KIRO_API_KEY") {
+            self.kiro_api_key = Some(v);
+        }
+        if let Some(v) = env_non_empty("CORS_ALLOW_ORIGINS") {
+            self.cors_allow_origins = parse_origin_list(&v);
+        }
+        if let Some(v) = env_bool("CORS_ALLOW_ADMIN") {
+            self.cors_allow_admin = v;
+        }
+    }
+}
+
+/// CORS 通配来源的取值(既是默认值,也是白名单里的"任意来源"标记)。
+pub const CORS_ANY_ORIGIN: &str = "*";
+
+/// 逗号分隔的来源清单 → 归一后的白名单。
+///
+/// 归一两件事:去掉尾部 `/`(`https://a.com/` 与 `https://a.com` 是同一个来源,但浏览器发出的
+/// `Origin` 头**永远不带**尾斜杠,照抄进白名单就永远匹配不上)、转小写(scheme 与 host 大小写不敏感)。
+/// 整串写 `none`/`off`/`disabled` 时返回空清单 = 彻底关掉 CORS —— 环境变量给空串会被当作"未设置"
+/// (见 [`env_non_empty`]),故必须留一个显式的关闭写法。
+fn parse_origin_list(raw: &str) -> Vec<String> {
+    if matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "none" | "off" | "disabled" | "false"
+    ) {
+        return Vec::new();
+    }
+    raw.split(',')
+        .map(|s| s.trim().trim_end_matches('/'))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
+}
+
+/// 读取布尔型环境变量:`1/true/yes/on` 为真,`0/false/no/off` 为假,**其余一律返回 `None`**。
+///
+/// 拼错一个开关(`CORS_ALLOW_ADMIN=ture`)不能被静默当成"关":那样运营者以为配置生效了,
+/// 实际什么都没变,而日志里一个字都没有。返回 `None` 让调用方保留原值,语义与
+/// [`env_non_empty`] 的"看不懂就当没设"一致。
+fn env_bool(name: &str) -> Option<bool> {
+    match env_non_empty(name)?.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -347,6 +423,89 @@ mod tests {
         assert_eq!(c.kiro_version, "1.2.3");
         // 未给的字段仍取默认
         assert_eq!(c.system_version, "win32#10.0.22631");
+    }
+
+    /// CORS 的默认形态:协议端点对任意来源放开(浏览器里的网页客户端才调得通),
+    /// 但管理面/用户面**不跟着放开**(未设管理员密钥时它是完全开放的,跨源放开等于
+    /// 让运营者浏览器里的任意网页都能读走账号与密钥)。
+    #[test]
+    fn cors_defaults_open_protocol_but_not_admin() {
+        let c = Config::default();
+        assert_eq!(c.cors_allow_origins, vec![CORS_ANY_ORIGIN.to_string()]);
+        assert!(!c.cors_allow_admin);
+        assert!(c.kiro_api_key.is_none());
+    }
+
+    /// config.json 里可以直接写 CORS 与 ksk 注入两项(camelCase 与其它字段一致)。
+    #[test]
+    fn camel_case_config_parses_cors_and_api_key_injection() {
+        let raw = r#"{"corsAllowOrigins":["https://a.example"],"corsAllowAdmin":true,"kiroApiKey":"ksk_x"}"#;
+        let c: Config = serde_json::from_str(raw).unwrap();
+        assert_eq!(c.cors_allow_origins, vec!["https://a.example".to_string()]);
+        assert!(c.cors_allow_admin);
+        assert_eq!(c.kiro_api_key.as_deref(), Some("ksk_x"));
+    }
+
+    /// 来源清单的归一:尾斜杠与大小写都要抹平 —— 浏览器发出的 `Origin` 永远不带尾斜杠,
+    /// 而配置里顺手写成 `https://A.com/` 是最常见的写法,不归一就永远匹配不上且毫无提示。
+    /// 显式的 `none` 是"关掉 CORS"的写法(环境变量给空串会被当成未设置)。
+    #[test]
+    fn origin_list_is_normalized_and_can_be_switched_off() {
+        assert_eq!(
+            parse_origin_list("https://A.com/, https://b.com ,, "),
+            vec!["https://a.com".to_string(), "https://b.com".to_string()]
+        );
+        assert!(parse_origin_list("none").is_empty());
+        assert!(parse_origin_list(" OFF ").is_empty());
+    }
+
+    /// 布尔开关拼错(`ture`)时必须返回 `None` 让调用方保留原值,而不是静默当成"关" ——
+    /// 后者会让运营者以为配置生效了,实际什么都没变,日志里也一个字都没有。
+    #[test]
+    fn bool_env_only_accepts_known_spellings() {
+        unsafe { std::env::set_var("K2A_TEST_BOOL", "ON") }
+        assert_eq!(env_bool("K2A_TEST_BOOL"), Some(true));
+        unsafe { std::env::set_var("K2A_TEST_BOOL", "0") }
+        assert_eq!(env_bool("K2A_TEST_BOOL"), Some(false));
+        unsafe { std::env::set_var("K2A_TEST_BOOL", "ture") }
+        assert_eq!(env_bool("K2A_TEST_BOOL"), None);
+        unsafe { std::env::remove_var("K2A_TEST_BOOL") }
+        assert_eq!(env_bool("K2A_TEST_BOOL"), None);
+    }
+
+    /// 环境变量层:CORS 两项可由 `CORS_ALLOW_ORIGINS` / `CORS_ALLOW_ADMIN` 覆盖,
+    /// 且拼错的开关不得改动已配好的值。
+    #[test]
+    fn cors_env_overrides_win_but_typos_do_not() {
+        let mut c = Config {
+            cors_allow_admin: true,
+            ..Config::default()
+        };
+        unsafe {
+            std::env::set_var(
+                "CORS_ALLOW_ORIGINS",
+                "https://Panel.example/ , https://b.com",
+            );
+            std::env::set_var("CORS_ALLOW_ADMIN", "nope");
+        }
+        c.apply_env_overrides();
+        assert_eq!(
+            c.cors_allow_origins,
+            vec![
+                "https://panel.example".to_string(),
+                "https://b.com".to_string()
+            ]
+        );
+        assert!(c.cors_allow_admin, "拼错的开关不得把已配好的值改掉");
+
+        unsafe { std::env::set_var("CORS_ALLOW_ADMIN", "false") }
+        c.apply_env_overrides();
+        assert!(!c.cors_allow_admin);
+
+        unsafe {
+            std::env::remove_var("CORS_ALLOW_ORIGINS");
+            std::env::remove_var("CORS_ALLOW_ADMIN");
+        }
     }
 
     #[test]

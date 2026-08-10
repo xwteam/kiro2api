@@ -903,6 +903,21 @@ impl Pool {
         self.entries.iter().map(|e| e.cred.clone()).collect()
     }
 
+    /// 当前**可用**账号的凭据快照,口径与选号完全一致(见 [`is_active`](Self::is_active):
+    /// 排除禁用、冷却中、上游确证的封禁、配额未到恢复时刻)。
+    ///
+    /// 给"要拿账号去打上游"的旁路用(模型清单刷新之类)。它们此前各自只看持久 `disabled`,
+    /// 于是运行期已经判停的账号照样被拿去实拉:给一个刚被封禁 / 没额度 / 正在冷却的账号
+    /// 继续发请求,注定白打,还把"这批凭据在被轮着试"这个形状送到上游眼前。
+    /// 判"谁还能用"只有池子说了算,旁路不许再自己拼一套。
+    pub fn snapshot_active_credentials(&self, now_unix: u64) -> Vec<Credential> {
+        self.entries
+            .iter()
+            .filter(|e| Self::is_active(e, now_unix))
+            .map(|e| e.cred.clone())
+            .collect()
+    }
+
     /// 为新凭据分配数值 id:取单调递增计数器,并与"现有 id 最大值 +1"取较大者
     /// (兜住手工编辑 credentials.json 塞进更大 id 的情形)。分配后计数器前进。
     ///
@@ -944,6 +959,12 @@ impl Pool {
         // 不在这里补的话它们照旧每请求现算 —— 而派生材料 refreshToken 会被刷新轮换,
         // 于是这些新号又回到"每刷新一次换一台机器"的老毛病上。
         crate::kiro::credential::freeze_machine_id(&mut cred);
+        // **必须解除粘滞**,理由与 [`set_priority`](Self::set_priority) 完全相同。
+        //
+        // Priority 档只有当前账号不可用才换人。新导入一个更高优先级的账号后不松开粘滞,
+        // 它得一直等到在用的那个坏掉才轮得到——运营者刚把号加进来、面板上也列着,流量却
+        // 纹丝不动。"优先级即时生效"此前只落在 set_priority 一个入口,新增这条路漏了。
+        self.current = None;
         let email = cred.email.clone();
         self.entries.push(Entry {
             unsupported_models: std::collections::HashSet::new(),
@@ -1837,6 +1858,26 @@ mod tests {
         let mid = stored.machine_id.expect("入池即应冻结");
         assert_eq!(mid.len(), 64);
         assert!(mid.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    /// 新加进来的账号必须**当场**参与选号,而不是等在用的那个坏掉才轮到。
+    ///
+    /// Priority 档是粘滞的:不解除粘滞的话,运营者新导入一个更高优先级的号(比如刚买的
+    /// 大额度账号),池子仍旧粘在旧号上,要等旧号坏了才切——面板上号已经在了,流量却
+    /// 纹丝不动。这与"改优先级必须当场生效"是同一条纪律,此前只落在 `set_priority` 一个入口。
+    #[test]
+    fn adding_a_higher_priority_account_takes_effect_immediately() {
+        let mut p = Pool::new(vec![cred("old", 1)], LbMode::Priority);
+        assert_eq!(p.select(0).unwrap().id, "old", "先粘在既有账号上");
+
+        let mut fresh = cred("ignored", 1);
+        fresh.priority = 1; // 比既有的 999 更优先
+        let (new_id, _) = p.add_credential(fresh);
+        assert_eq!(
+            p.select(0).unwrap().id,
+            new_id,
+            "新导入的高优先级账号应当场顶上,而不是等旧号坏掉"
+        );
     }
 
     /// `is_current` 必须如实反映粘住的那个账号(此前管理接口硬编码 false)。

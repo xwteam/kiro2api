@@ -171,6 +171,14 @@ pub fn host_of(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
+/// 取 URL 的 origin(`scheme://host[:port]`),用于同源 XHR 的 `Origin` 头。
+/// 与 [`host_of`] 的区别是保留 scheme 且不含路径 —— `Origin` 的定义就是这一段。
+pub fn origin_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    (!scheme.is_empty() && !host.is_empty()).then(|| format!("{scheme}://{host}"))
+}
+
 /// 构造一次数据面请求的头(照观测,契约 §3)。
 pub fn build_headers(
     cred: &Credential,

@@ -411,6 +411,68 @@ mod tests {
         assert_eq!(cred.expires_in_secs, 3600);
     }
 
+    /// 设备码登录**实际发出去**的请求头必须带进程级配置的版本号。
+    ///
+    /// 回归:登录流的伪装身份曾经取编译期默认值,而同一台 `oidc.{region}.amazonaws.com`
+    /// 上的令牌刷新取的是进程级真值。于是配置里改过版本号的部署,注册时报一个操作系统
+    /// 和 node 版本、几分钟后同一个 clientId 刷新时报的是另一套 —— 一个客户端在几分钟内
+    /// 换了机器,这比两边都用默认值更容易被关联。
+    #[tokio::test]
+    async fn device_flow_requests_carry_the_process_level_versions() {
+        let effective = crate::kiro::login::install_test_process_config();
+        assert_ne!(
+            effective.system_version,
+            crate::config::Config::default().system_version,
+            "夹具没能把进程级配置灌进去,本用例失去区分力"
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/client/register"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"clientId":"cid","clientSecret":"csec"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/device_authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "deviceCode":"dev","userCode":"ABCD-1234",
+                "verificationUri":"https://view.awsapps.com/start/#/device","interval":5
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accessToken":"atok","refreshToken":"rtok","expiresIn":3600
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let p = start(&client, &server.uri()).await.unwrap();
+        poll(&client, &server.uri(), "us-east-1", &p).await.unwrap();
+
+        // register / device_authorization / token 三步都必须报同一套、且是配置里的那套。
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 3, "三步都该发出");
+        for r in &reqs {
+            let ua = r.headers["user-agent"].to_str().unwrap();
+            assert!(
+                ua.contains(&format!("os/{}", effective.system_version)),
+                "{}: UA 没带进程级 system_version: {ua}",
+                r.url.path()
+            );
+            assert!(
+                ua.contains(&format!("md/nodejs#{}", effective.node_version)),
+                "{}: UA 没带进程级 node_version: {ua}",
+                r.url.path()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn poll_prefers_id_token_for_sso_data_plane() {
         // 设备码换 token 回带 idToken(JWT):铸凭据须采 idToken,不是 portal accessToken。

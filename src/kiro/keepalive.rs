@@ -102,9 +102,18 @@ pub fn spawn(pool: Arc<Mutex<Pool>>, client: reqwest::Client, ctx: RefreshCtx) {
 ///
 /// 只读一次池锁后立即释放 —— 刷新是网络操作,绝不能持池锁跨 await。
 async fn due_for_refresh(pool: &Arc<Mutex<Pool>>, now: u64) -> Vec<String> {
-    let stats = {
+    // 「谁还能用」只有池子说了算。此处曾自己拼一份 `!disabled && !in_cooldown && != banned`,
+    // 少了**配额耗尽未到恢复时刻**那一档 —— 于是一个刚被判定配额耗尽的账号,选号路径已经不再
+    // 碰它,续期路径却还在按点给它刷令牌:一个上游已经拒绝的账号仍在持续产生出站请求。
+    // 现在与选号同源,池子加一档这里自动跟上。
+    let (stats, usable_ids) = {
         let guard = pool.lock().await;
-        guard.stats(now)
+        let ids: std::collections::HashSet<String> = guard
+            .snapshot_active_credentials(now)
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        (guard.stats(now), ids)
     };
     stats
         .into_iter()
@@ -112,9 +121,7 @@ async fn due_for_refresh(pool: &Arc<Mutex<Pool>>, now: u64) -> Vec<String> {
             // 闲置账号不续:上游流量必须正比于真实使用量。
             let active =
                 a.last_used_unix > 0 && now.saturating_sub(a.last_used_unix) <= ACTIVE_WINDOW_SECS;
-            // 已禁用/冷却中/被封禁的不续:它们本就不该被选中,续了也用不上,
-            // 反而是在给一个上游已经拒绝的账号继续发请求。
-            let usable = !a.disabled && !a.in_cooldown && a.status_reason != "banned";
+            let usable = usable_ids.contains(&a.id);
             // 没有到期时刻的凭据不需要续(也无从判断该何时续)。
             let has_expiry = a.expires_at_unix > 0;
             let expiring = a.expires_at_unix <= now.saturating_add(REFRESH_MARGIN_SECS);

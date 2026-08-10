@@ -74,7 +74,12 @@ async fn approve_with_bearer(
     bearer: &str,
     user_code: &str,
 ) -> Result<(), LoginError> {
-    let auth = |req: reqwest::RequestBuilder| req.bearer_auth(bearer);
+    // 四步共用**同一份**浏览器形态的头(含 Referer/Origin/UA)。portal 只见得到浏览器,
+    // 而且同一个页面里的连续同源 XHR 不会时有时无地带 Referer —— 此前四步里只有第三步带,
+    // 其余三步连 User-Agent 都没有。
+    let mut headers = reqwest::header::HeaderMap::new();
+    super::apply_portal_headers(&mut headers, &super::login_impersonation(), portal);
+    let auth = |req: reqwest::RequestBuilder| req.headers(headers.clone()).bearer_auth(bearer);
 
     // 确认身份。
     approve_step("whoAmI", auth(client.get(format!("{portal}/token/whoAmI")))).await?;
@@ -86,11 +91,10 @@ async fn approve_with_bearer(
     )
     .await?;
 
-    // 接受 userCode(Referer 头照观测带上)。
+    // 接受 userCode。
     approve_step(
         "accept_user_code",
         auth(client.post(format!("{portal}/device_authorization/accept_user_code")))
-            .header("Referer", portal)
             .json(&serde_json::json!({ "userCode": user_code })),
     )
     .await?;
@@ -240,6 +244,108 @@ mod tests {
         redeem(&client, &s.uri(), &s.uri(), "us-east-1", "bearer-xyz")
             .await
             .unwrap_err()
+    }
+
+    /// portal 批准链的四步必须**头一致、且都带 User-Agent**。
+    ///
+    /// 回归:这条链是我们自有的功能(登录/刷新那两条已在 v0.16.0 补齐,portal 是**第三条
+    /// 路径**,当时漏了)。它此前一个 header 都不设 —— reqwest 不配就连 `User-Agent` 都
+    /// 不发。四个打向 AWS portal 主机的请求,零 UA,而且四步里只有第三步带 `Referer`:
+    /// 浏览器对同一个页面发出的同源 XHR 不会时有时无地带 Referer。这两件事都是自动化的
+    /// 形状,不是浏览器的形状,而且发生在账号刚被创建、上游最会看指纹的时刻。
+    #[tokio::test]
+    async fn portal_approval_steps_share_one_browser_shaped_header_set() {
+        let s = mock_full_chain().await;
+        let client = reqwest::Client::new();
+        redeem(&client, &s.uri(), &s.uri(), "us-east-1", "bearer-xyz")
+            .await
+            .unwrap();
+
+        let reqs = s.received_requests().await.unwrap();
+        let portal: Vec<_> = reqs
+            .iter()
+            .filter(|r| {
+                let p = r.url.path();
+                p.contains("whoAmI")
+                    || p.contains("session/device")
+                    || p.contains("accept_user_code")
+                    || p.contains("associate_token")
+            })
+            .collect();
+        assert_eq!(portal.len(), 4, "四步都该发出");
+
+        for r in &portal {
+            let p = r.url.path();
+            let ua = r
+                .headers
+                .get("user-agent")
+                .unwrap_or_else(|| panic!("{p}: 一个打向 portal 的请求不能不带 User-Agent"))
+                .to_str()
+                .unwrap();
+            assert!(ua.contains("Mozilla/5.0"), "{p}: portal 只见得到浏览器: {ua}");
+            // 同源 XHR:Origin 与 Referer 每一步都在,不能时有时无。
+            assert!(r.headers.contains_key("referer"), "{p}: 缺 Referer");
+            assert!(r.headers.contains_key("origin"), "{p}: 缺 Origin");
+            assert!(r.headers.contains_key("accept"), "{p}: 缺 Accept");
+            assert!(
+                r.headers["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("Bearer "),
+                "{p}: bearer 不能丢"
+            );
+        }
+
+        // 四步的 UA 必须**是同一个**(同一个页面里的连续 XHR)。
+        let uas: std::collections::BTreeSet<_> = portal
+            .iter()
+            .map(|r| r.headers["user-agent"].to_str().unwrap())
+            .collect();
+        assert_eq!(uas.len(), 1, "四步的 UA 必须一致: {uas:?}");
+    }
+
+    /// portal 那四步的浏览器 UA 必须跟着**进程级**配置的操作系统走。
+    ///
+    /// 回归:登录流的伪装身份曾经取编译期默认值。于是把 `systemVersion` 配成 macOS 的部署,
+    /// sso-oidc 那条链照配置报 macOS,portal 这条链却仍按编译期默认的 Windows 报 —— 同一次
+    /// 登录里两台主机看到同一个人来自两个操作系统,这比整条链都用默认值更显眼。
+    #[tokio::test]
+    async fn portal_browser_ua_follows_the_process_level_os() {
+        let effective = crate::kiro::login::install_test_process_config();
+        assert_ne!(
+            effective.system_version,
+            crate::config::Config::default().system_version,
+            "夹具没能把进程级配置灌进去,本用例失去区分力"
+        );
+        let want = crate::kiro::login::browser_user_agent(&effective.system_version);
+        assert_ne!(
+            want,
+            crate::kiro::login::browser_user_agent(
+                &crate::config::Config::default().system_version
+            ),
+            "夹具的 system_version 必须落在与默认值不同的平台上,否则本用例分不出对错"
+        );
+
+        let s = mock_full_chain().await;
+        let client = reqwest::Client::new();
+        redeem(&client, &s.uri(), &s.uri(), "us-east-1", "bearer-xyz")
+            .await
+            .unwrap();
+
+        let reqs = s.received_requests().await.unwrap();
+        let portal: Vec<_> = reqs
+            .iter()
+            .filter(|r| APPROVE_STEPS.iter().any(|(_, p)| r.url.path() == *p))
+            .collect();
+        assert_eq!(portal.len(), 4, "四步都该发出");
+        for r in &portal {
+            assert_eq!(
+                r.headers["user-agent"].to_str().unwrap(),
+                want,
+                "{}: portal 的浏览器 UA 没跟着进程级 system_version 走",
+                r.url.path()
+            );
+        }
     }
 
     #[tokio::test]

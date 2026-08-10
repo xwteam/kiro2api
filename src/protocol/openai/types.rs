@@ -19,6 +19,16 @@ pub struct ChatCompletionRequest {
     pub stream_options: Option<StreamOptions>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// 推理档位(`minimal`/`low`/`medium`/`high`,以及明确关掉的 `none`)。
+    ///
+    /// 这是 Chat Completions 里唯一表达"要不要思考、思考多深"的字段。不解析它,这个协议
+    /// 就完全开不出 extended thinking —— 客户端把开关拨了,链路上却没有任何一环收得到。
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// 调用方给的终端用户标识。与对话开头一起做会话指纹(见 `convert::session_metadata`),
+    /// 使同一场多轮对话在上游共用一个 conversationId,而不是每轮都开一段新会话。
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 /// 流式附加选项(照 OpenAI 公开规范)。
@@ -217,6 +227,11 @@ pub struct Delta {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallChunk>>,
+    /// 思考增量。上游把思考过程用 `<thinking>…</thinking>` 包在普通文本里下发,不切出来的话
+    /// 客户端会把整段思考当正文显示。这条通道是业界通行的 `reasoning_content`(与 content
+    /// 并列的独立字段),客户端不认得它时按缺省忽略,总好过混进正文。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// 流式工具调用增量。
@@ -434,6 +449,7 @@ mod tests {
                     role: Some("assistant".to_string()),
                     content: Some("hi".to_string()),
                     tool_calls: None,
+                ..Default::default()
                 },
                 finish_reason: None,
             }],
@@ -471,6 +487,7 @@ mod tests {
             role: Some("assistant".to_string()),
             content: None,
             tool_calls: None,
+        ..Default::default()
         };
         let v = serde_json::to_value(&delta).expect("序列化失败");
         assert_eq!(v.as_object().expect("应为 object").len(), 1);

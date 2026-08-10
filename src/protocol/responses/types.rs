@@ -22,6 +22,28 @@ pub struct ResponsesRequest {
     pub max_output_tokens: Option<u32>,
     #[serde(default)]
     pub previous_response_id: Option<String>,
+    /// 推理配置。`effort`(`minimal`/`low`/`medium`/`high`,以及明确关掉的 `none`)是这个协议
+    /// 表达"要不要思考、思考多深"的唯一方式;不解析它,这个入口就完全开不出 extended thinking。
+    #[serde(default)]
+    pub reasoning: Option<ReasoningConfig>,
+    /// 会话句柄。Responses 规范里它既可以是裸的会话 id 字符串,也可以是 `{"id": "conv_…"}`,
+    /// 故按 `Value` 收下,由转换层取值(见 `convert::session_ref`)。
+    #[serde(default)]
+    pub conversation: Option<serde_json::Value>,
+    /// 缓存分组键。官方定义就是"同一场会话/同一个前缀共用一个值",是仅次于 `conversation`
+    /// 的稳定会话标识。
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+    /// 调用方给的终端用户标识(会话标识都缺失时的最后一档)。
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+/// `reasoning` 配置(照 OpenAI 公开 Responses 规范;`summary` 等其余键忽略)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningConfig {
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 /// 请求的 `input`:裸字符串或输入条目数组。

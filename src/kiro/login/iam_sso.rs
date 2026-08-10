@@ -250,6 +250,47 @@ mod tests {
         }
     }
 
+    /// IdC 授权码登录**实际发出去**的请求头必须带进程级配置的版本号。
+    ///
+    /// 回归:登录流的伪装身份曾经取编译期默认值,而同一台 `oidc.{region}.amazonaws.com`
+    /// 上的令牌刷新取的是进程级真值 —— 同一个 clientId 注册时报一套版本、几分钟后刷新时
+    /// 报另一套。IdC 这条路自己拼头(`oidc_headers`),必须单独钉住,不能靠设备码那条路的
+    /// 用例代管。
+    #[tokio::test]
+    async fn register_request_carries_the_process_level_versions() {
+        let effective = crate::kiro::login::install_test_process_config();
+        assert_ne!(
+            effective.system_version,
+            crate::config::Config::default().system_version,
+            "夹具没能把进程级配置灌进去,本用例失去区分力"
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/client/register"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"clientId":"cid","clientSecret":"csec"})),
+            )
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        start(&client, &server.uri(), "https://x.awsapps.com/start")
+            .await
+            .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let ua = reqs[0].headers["user-agent"].to_str().unwrap();
+        assert!(
+            ua.contains(&format!("os/{}", effective.system_version)),
+            "UA 没带进程级 system_version: {ua}"
+        );
+        assert!(
+            ua.contains(&format!("md/nodejs#{}", effective.node_version)),
+            "UA 没带进程级 node_version: {ua}"
+        );
+    }
+
     #[tokio::test]
     async fn complete_exchanges_code() {
         let server = MockServer::start().await;

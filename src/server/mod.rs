@@ -74,6 +74,15 @@ pub struct PersistHandles {
     pub api_keys: Arc<crate::apikey::ApiKeyStore>,
     /// `api_keys.json` 路径:停机落盘前据此判磁盘上那份是否还解析得动(见 [`PersistHandles::flush_before_exit`])。
     pub api_keys_path: PathBuf,
+    /// 账号池 + 凭据落盘所需的上下文。
+    ///
+    /// 账号池不走去抖模型,但它同样有「只在内存里」的持久结论:配额耗尽的恢复时刻、
+    /// 封号判定、冻结的 machineId。管理面重启端点已经会先刷一次,而**正常停机**
+    /// (docker stop / SIGTERM / Ctrl-C)这条路此前完全不刷 —— 于是容器重启一次,
+    /// 这些结论就全丢,下次启动又拿用户的额度把它们重新学一遍。
+    pub pool: Arc<tokio::sync::Mutex<crate::kiro::pool::Pool>>,
+    pub persist_lock: Arc<tokio::sync::Mutex<()>>,
+    pub credentials_path: String,
 }
 
 impl PersistHandles {
@@ -87,6 +96,17 @@ impl PersistHandles {
         // 余额缓存:删账号时的 invalidate 同样只置脏,不刷则残留条目随旧文件复活,
         // 复用同一 id 的新账号会显示上一位主人的余额/订阅档位(最长 5 分钟)。
         self.balance.flush_now().await;
+        // 账号池:配额恢复时刻/封号判定/冻结的 machineId 都是持久结论,不刷则容器每重启一次
+        // 就全部遗忘,下次启动拿用户的额度重新学一遍(用户为此连吃过几次 502)。
+        if let Err(e) = crate::kiro::credential::persist_pool_credentials_serialized(
+            &self.pool,
+            &self.persist_lock,
+            &self.credentials_path,
+        )
+        .await
+        {
+            tracing::error!(error = ?e, "账号池停机落盘失败:配额恢复时刻与封号判定将在重启后回滚");
+        }
         // API-KEY:create/update/delete/disable 都只 `mark_dirty()`,真正写盘要等下一拍定时器。
         if !self.api_keys_overwrite_is_safe() {
             tracing::error!(
@@ -139,6 +159,246 @@ impl PersistHandles {
 /// 交给调用方决定。
 const PROTOCOL_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
+/// 预检响应里声明允许的方法。取本服务实际用到的全集(协议端点 GET/POST,管理面还有
+/// PUT/PATCH/DELETE),不写 `*` —— 那个值在带凭据的请求里无效,而客户端是否带凭据我们左右不了。
+const CORS_ALLOW_METHODS: &str = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
+
+/// 预检没有声明 `Access-Control-Request-Headers` 时的兜底头部清单。
+/// 正常情况一律**回声**客户端声明的那份:各家 SDK 各带一堆自有头
+/// (`anthropic-version`、`anthropic-beta`、`x-goog-api-key`、`x-stainless-*` …),
+/// 写死清单必定漏,而漏一个的后果就是整条请求被浏览器拦下。
+const CORS_DEFAULT_ALLOW_HEADERS: &str = "authorization, content-type, accept, x-api-key, anthropic-version, anthropic-beta, x-goog-api-key";
+
+/// 预检结果的浏览器缓存时长(秒)。一天:协议端点是高频调用,每次都重新预检会给
+/// 每个真实请求前面多挂一个 RTT。
+const CORS_MAX_AGE_SECS: &str = "86400";
+
+/// 浏览器跨源(CORS)策略:从 [`Config`] 抽出的不可变快照,作为中间件 state 共享。
+#[derive(Debug)]
+struct CorsPolicy {
+    /// 白名单里出现 `*`:任意来源放行,回 `Access-Control-Allow-Origin: *`。
+    allow_any: bool,
+    /// 归一后的来源白名单(小写、无尾斜杠);`allow_any` 为真时不看它。
+    origins: Vec<String>,
+}
+
+impl CorsPolicy {
+    /// 配置里来源清单为空 = 彻底关掉 CORS:返回 `None`,连中间件都不挂(零开销、
+    /// 也不会有任何 `Access-Control-*` 头出现在响应里)。
+    fn from_config(cfg: &Config) -> Option<Arc<Self>> {
+        let origins: Vec<String> = cfg
+            .cors_allow_origins
+            .iter()
+            .map(|s| s.trim().trim_end_matches('/').to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if origins.is_empty() {
+            return None;
+        }
+        Some(Arc::new(Self {
+            allow_any: origins.iter().any(|o| o == crate::config::CORS_ANY_ORIGIN),
+            origins,
+        }))
+    }
+
+    /// 该 `Origin` 放行时返回要回写的 `Access-Control-Allow-Origin` 值,否则 `None`
+    /// (不放行就一个 CORS 头都不加,由浏览器自己拦下,而不是我们回一个 4xx —— 后者会让
+    ///  非浏览器调用方也跟着受影响)。
+    ///
+    /// 比对前把两边都归一(小写、去尾斜杠):浏览器发出的 `Origin` 永远不带尾斜杠,而配置里
+    /// 顺手写成 `https://a.com/` 是最常见的写法,不归一就永远匹配不上、且毫无提示。
+    fn allow_origin_value(&self, origin: &str) -> Option<axum::http::HeaderValue> {
+        if self.allow_any {
+            return Some(axum::http::HeaderValue::from_static(
+                crate::config::CORS_ANY_ORIGIN,
+            ));
+        }
+        let norm = origin.trim().trim_end_matches('/').to_ascii_lowercase();
+        if !self.origins.contains(&norm) {
+            return None;
+        }
+        // 回声调用方原样的 Origin(不是归一后的):该头必须与浏览器发出的值逐字相同。
+        axum::http::HeaderValue::from_str(origin).ok()
+    }
+}
+
+/// 给一组路由挂上 CORS 层;策略为 `None`(配置里关掉)时原样返回,不挂任何中间件。
+fn with_cors(router: Router, policy: Option<&Arc<CorsPolicy>>) -> Router {
+    match policy {
+        Some(p) => router.layer(axum::middleware::from_fn_with_state(
+            p.clone(),
+            cors_middleware,
+        )),
+        None => router,
+    }
+}
+
+/// 把 `Origin` 追加进 `Vary`:响应内容随来源而变,缓存(CDN / 浏览器)必须按 Origin 分桶,
+/// 否则允许来源拿到的那份带 `Allow-Origin` 的响应会被喂给下一个不允许的来源。
+fn append_vary_origin(headers: &mut axum::http::HeaderMap) {
+    headers.append(
+        axum::http::header::VARY,
+        axum::http::HeaderValue::from_static("origin"),
+    );
+}
+
+/// CORS 中间件。**必须是所在这组路由的最外层**(在鉴权闸与体积上限之外):
+/// 预检请求按浏览器规范**不携带任何凭据**,继续往下走会先被鉴权闸判 401;
+/// 而协议路由只注册了 GET/POST,即便开放模式下预检也只会吃一个 405。两种结果都会让
+/// 浏览器把随后的真实请求整个掐掉,现象是"网页端一个端点都调不通,同样的 key 用 curl 全通"。
+async fn cors_middleware(
+    axum::extract::State(policy): axum::extract::State<Arc<CorsPolicy>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::header;
+    let allow = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|o| policy.allow_origin_value(o));
+
+    // 预检 = OPTIONS + `Access-Control-Request-Method`。只认这个组合,普通的 OPTIONS
+    // (少数客户端用来探能力)照旧交给路由处理,不被这层吞掉。
+    let is_preflight = req.method() == axum::http::Method::OPTIONS
+        && req
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD);
+    if is_preflight {
+        let requested_headers = req
+            .headers()
+            .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+            .cloned();
+        let mut resp = axum::response::Response::new(axum::body::Body::empty());
+        *resp.status_mut() = axum::http::StatusCode::NO_CONTENT;
+        if let Some(origin) = allow {
+            let h = resp.headers_mut();
+            h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+            h.insert(
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                axum::http::HeaderValue::from_static(CORS_ALLOW_METHODS),
+            );
+            h.insert(
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                requested_headers.unwrap_or_else(|| {
+                    axum::http::HeaderValue::from_static(CORS_DEFAULT_ALLOW_HEADERS)
+                }),
+            );
+            h.insert(
+                header::ACCESS_CONTROL_MAX_AGE,
+                axum::http::HeaderValue::from_static(CORS_MAX_AGE_SECS),
+            );
+            append_vary_origin(h);
+        }
+        return resp;
+    }
+
+    let mut resp = next.run(req).await;
+    if let Some(origin) = allow {
+        let h = resp.headers_mut();
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+        // 不加这个头,页面只读得到 CORS 那份安全清单里的响应头,自定义头(请求 id、
+        // 用量回执之类)一律读不到 —— 而调试跨源问题时恰恰要看这些。
+        h.insert(
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            axum::http::HeaderValue::from_static("*"),
+        );
+        append_vary_origin(h);
+    }
+    resp
+}
+
+/// 把配置 / 环境变量(`KIRO_API_KEY`)里给的 Kiro API Key 注入账号池,返回**新增**条数。
+///
+/// 缺口在于容器化部署此前只有"挂载 credentials.json"一条路:临时起一个实例、CI 里跑一次
+/// 冒烟、用 compose 的 `env_file` 统一发配置时,都得先在宿主机上落一个文件才能有账号。
+///
+/// 两个关键决定:
+///
+/// 1. **按 key 去重**。判据只能是 key 本身 —— 文件里那条可能是上一次注入落盘的,也可能是
+///    运营者在面板里手工加的,两者除了 key 没有别的共同标识。不去重的话每重启一次池里就多
+///    一个同 key 的账号,轮询会把同一把 key 当成 N 个账号来铺流量,额度一样烧得更快。
+/// 2. **新增才落盘**(由调用方执行)。看起来"只放内存里更干净",但做不到:令牌刷新与管理面
+///    的任何一次写盘都是**整池快照**覆写 credentials.json,内存里的账号早晚会在某个说不准的
+///    时刻被顺带写进去。与其让落盘时机随机,不如在启动时确定地写一次 —— 账号从此有稳定编号,
+///    用量统计、失败记录、余额缓存(全部按 id 归档)重启后仍认得出它是同一个账号。
+///    代价要说清楚:轮换 `KIRO_API_KEY` 之后,**旧的那把仍留在 credentials.json 里**,
+///    需要在面板上手工删掉;这里不做自动删除 —— 启动路径上的账号删除一旦有 bug 就是不可逆的。
+fn inject_configured_api_keys(
+    creds: &mut Vec<credential::Credential>,
+    configured: Option<&str>,
+    region: &str,
+    persisted_next_id: u64,
+) -> usize {
+    let Some(raw) = configured else {
+        return 0;
+    };
+    // 一个变量塞多把 key:逗号或任意空白(含换行)分隔,便于在 compose 里写成多行。
+    let keys: Vec<&str> = raw
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if keys.is_empty() {
+        return 0;
+    }
+    // 起始编号与 `Pool::with_next_id` 用同一套算法(高水位与"现有最大 id + 1"取大者)。
+    // 自己另起一套的话,注入的账号会占到一个随后又被池分配出去的编号,两个账号共用一个 id ——
+    // 而用量统计、失败/限流日志、余额缓存全部按 id 归档,混号之后这些数据再也分不开。
+    let mut next_id = persisted_next_id.max(
+        creds
+            .iter()
+            .filter_map(|c| c.id.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
+    let region = if region.trim().is_empty() {
+        "us-east-1"
+    } else {
+        region.trim()
+    };
+    let mut added = 0usize;
+    for key in keys {
+        // 同一批里写了两遍也只进一次:上一遍已经 push 进 creds,这里就查得到。
+        if creds.iter().any(|c| c.kiro_api_key.as_deref() == Some(key)) {
+            continue;
+        }
+        creds.push(credential::Credential {
+            id: next_id.to_string(),
+            // ksk 凭据**本身就是数据面 bearer**,不换取令牌、不刷新、不过期:
+            // access/refresh 一律留空,expiresAt 留 0(这类凭据恒判未过期)。
+            access_token: String::new(),
+            refresh_token: String::new(),
+            kiro_api_key: Some(key.to_string()),
+            expires_at_unix: 0,
+            region: region.to_string(),
+            auth: credential::AuthMethod::ApiKey,
+            client_id: None,
+            client_secret: None,
+            profile_arn: None,
+            // 留空由随后的冻结按 ksk 的盐派生并写死,与文件里的账号同一条路径。
+            machine_id: None,
+            email: None,
+            nickname: None,
+            weight: 1,
+            priority: credential::DEFAULT_PRIORITY,
+            // 落盘留个来源标记:运营者日后在文件里看到这条账号时,知道它是环境变量带进来的,
+            // 光删文件不改环境变量的话下次启动它还会回来。
+            label: Some("env:KIRO_API_KEY".to_string()),
+            disabled: false,
+            status_reason: None,
+            quota_reset_unix: None,
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
+        });
+        next_id += 1;
+        added += 1;
+    }
+    added
+}
+
 /// 与 [`build_router_with_handles`] 相同的路由,但交出全部需要在退出前落盘的句柄。
 pub fn build_router_with_persist_handles(
     cfg: Arc<Config>,
@@ -151,10 +411,31 @@ pub fn build_router_with_persist_handles(
     crate::kiro::provider::init_impersonation_defaults(&cfg);
     // TLS 后端按配置选定(运行时可切):自签 CA 代理下往往只有一个后端握得上手。
     crate::http::init_tls_backend(&cfg);
+    // 浏览器跨源策略快照;来源清单为空 = 关掉 CORS,此时连中间件都不挂。
+    let cors = CorsPolicy::from_config(&cfg);
     // 从配置路径加载凭据;文件不存在回落空池,/v1/messages 遇空池返回 503
     // (不影响 health/webui 路由,默认配置测试保持全绿)。
     // **解析失败不再静默当空池**:先原样备份、再逐条抢救、并大声报错,见 load_credentials_resilient。
     let mut creds = load_credentials_resilient(&cfg.credentials_path);
+    // 账号 id 高水位:读上次落盘值,使"已删除账号的编号"重启后也不被复用。
+    // 旧安装没有该旁挂文件 → `None` → 传 0,由 `with_next_id` 平滑退化为 `max(现有 id)+1`
+    // 的原语义。不接这一步的话高水位只写不读,重启即退回复用编号(旧令牌覆盖新账号凭据)。
+    // 必须在注入环境变量账号**之前**读到:注入要按同一套规则分配编号(见 inject_configured_api_keys)。
+    let persisted_next_id = credential::load_next_id(&cfg.credentials_path).unwrap_or(0);
+    // 环境变量 / 配置里给的 ksk 直接进池(容器里可以不挂 credentials.json 就起服务)。
+    // 放在池计数日志之前:否则"账号池为空"的告警会对着一个其实有账号的池喊。
+    let injected = inject_configured_api_keys(
+        &mut creds,
+        cfg.kiro_api_key.as_deref(),
+        &cfg.region,
+        persisted_next_id,
+    );
+    if injected > 0 {
+        tracing::info!(
+            count = injected,
+            "已按 KIRO_API_KEY 注入 API Key 账号(与文件里已有的按 key 去重);轮换该变量后旧的那把仍留在凭据文件里,需在管理面手工删除"
+        );
+    }
     // 启动期把账号数写进日志:池为 0 时运营者据此一眼分清「文件没放/里面没账号」与
     // 「文件坏了被抢救成 0」(后者上面已有逐条 error 明细),不必对着面板的 total:0 猜。
     if creds.is_empty() {
@@ -165,10 +446,6 @@ pub fn build_router_with_persist_handles(
     } else {
         tracing::info!(path = %cfg.credentials_path, accounts = creds.len(), "已载入账号凭据");
     }
-    // 账号 id 高水位:读上次落盘值,使"已删除账号的编号"重启后也不被复用。
-    // 旧安装没有该旁挂文件 → `None` → 传 0,由 `with_next_id` 平滑退化为 `max(现有 id)+1`
-    // 的原语义。不接这一步的话高水位只写不读,重启即退回复用编号(旧令牌覆盖新账号凭据)。
-    let persisted_next_id = credential::load_next_id(&cfg.credentials_path).unwrap_or(0);
     // 机器 ID 一次性冻结并落盘。
     //
     // 此前 machineId 是**每次请求现算**的 `sha256("KotlinNativeAPI/" + 当前 refreshToken)`,
@@ -183,9 +460,13 @@ pub fn build_router_with_persist_handles(
             count = frozen,
             "已为无 machineId 的凭据一次性派生并冻结机器 ID(此后不再随 refreshToken 轮换而漂移)"
         );
-        if let Err(e) = credential::save(&cfg.credentials_path, &creds) {
-            tracing::warn!(error = ?e, "冻结的 machineId 落盘失败:本次进程内仍稳定,但重启后会重算");
-        }
+    }
+    // 冻结出的 machineId 与新注入的账号都要写回,且**合并成一次写**:两件事各写一次的话,
+    // 后一次会拿着自己那份快照把前一次的结果覆盖掉。
+    if (frozen > 0 || injected > 0)
+        && let Err(e) = credential::save(&cfg.credentials_path, &creds)
+    {
+        tracing::warn!(error = ?e, "凭据落盘失败:本次进程内的账号池仍是对的,但重启后冻结的 machineId 会重算、注入的账号会重新分配编号");
     }
     let mut pool_inner = Pool::with_next_id(creds, LbMode::Priority, persisted_next_id);
     // RPM 限流与负载均衡模式均来自配置(默认无限 RPM/Priority,保持既有行为)。
@@ -194,6 +475,12 @@ pub fn build_router_with_persist_handles(
         pool_inner.set_mode(LbMode::Balanced);
     }
     let pool = Arc::new(Mutex::new(pool_inner));
+    // 刷新上下文提前建出:它那把 `persist_lock` 同时被**停机刷盘**复用(见 PersistHandles),
+    // 两处必须是同一把锁,否则停机写盘会与正在进行的刷新写盘并发,互相覆盖成旧快照。
+    let refresh_ctx = crate::kiro::ensure_fresh::RefreshCtx::new(cfg.credentials_path.clone());
+    // 停机刷盘要用到的两份,趁 pool / cfg 尚未被 move 进 state 与路由时先取出来。
+    let persist_pool = pool.clone();
+    let persist_creds_path = cfg.credentials_path.clone();
     // 统计持久化层:数据目录由 credentials_path 的父目录推断。
     // relay 数据面记录用量/失败/限流,admin 只读查询,二者共用同一 Arc<StatsManager>。
     let stats = crate::stats::StatsManager::load_from_credentials_path(&cfg.credentials_path);
@@ -239,7 +526,7 @@ pub fn build_router_with_persist_handles(
         // 令牌刷新上下文:per-credential 单飞锁 + credentials.json 路径 + 落盘锁。
         // 三条协议路由 + admin balance/models 共用同一份,使并发刷新同一凭据单飞、
         // 刷新后原子落盘,修复级联 401(Bug A)与重启后旧 token 401(Bug B)。
-        refresh_ctx: crate::kiro::ensure_fresh::RefreshCtx::new(cfg.credentials_path.clone()),
+        refresh_ctx: refresh_ctx.clone(),
     };
 
     // 活跃账号的令牌提前续期。只对近期真被选中过的账号生效 —— 全池定时续期会给每个账号
@@ -279,6 +566,7 @@ pub fn build_router_with_persist_handles(
             auth::require_api_key,
         ))
         // 多模态请求体上限:必须显式抬高,否则走 axum 的默认 2MB(`DEFAULT_LIMIT`)。
+        // (下面的 CORS 层还要再套在这两层之外,见 with_cors 处的说明。)
         // 四条协议端点都用 `Json<T>` 提取器,而多模态请求把图片以 base64 内联在 body 里
         // (Gemini `inlineData.data` / OpenAI `image_url` 的 data: URI / Anthropic image block),
         // base64 把原图放大 4/3 —— 2MB 的上限意味着约 1.5MB 的 JPEG/PNG 就在 handler 之前
@@ -287,6 +575,10 @@ pub fn build_router_with_persist_handles(
         .layer(axum::extract::DefaultBodyLimit::max(
             PROTOCOL_BODY_LIMIT_BYTES,
         ));
+    // CORS 必须挂在鉴权闸与体积上限**之外**(axum 的 .layer() 后加的在外层):预检请求
+    // 按浏览器规范不带任何凭据,挂在里面的话开了 api_key 的部署一律回 401,浏览器随即掐掉
+    // 真实请求,而日志里只留下一串莫名其妙的 401。
+    let protocol = with_cors(protocol, cors.as_ref());
 
     // 用户面 REST API 单独一组:**不叠加任何鉴权 .layer()**——这些端点由调用方随
     // 请求携带的 API-KEY 自鉴权(handler 内经 Arc<ApiKeyStore> 校验),故与 admin/协议
@@ -313,10 +605,24 @@ pub fn build_router_with_persist_handles(
         // admin 已鉴权,放宽仅限受信管理面。
         .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024));
 
+    // 管理面 / 用户面 REST API 的 CORS **默认不开**,与协议组分开决策。
+    //
+    // 这两组的暴露面和协议端点完全不是一回事:未配置 admin_api_key/api_key 时管理面是
+    // 完全开放的(首次部署体验,见 auth_startup_warnings),此时若再放开跨源读取,运营者
+    // 浏览器里打开的任意一个网页都能把 /api/admin/credentials(账号、密钥、统计)读走 ——
+    // 服务只要对那台机器可达(localhost / 内网)就成立,而这恰恰是自部署最常见的形态。
+    // 只有把管理前端单独部署在别的域名下时才需要 cors_allow_admin,且届时必须先设好管理员密钥。
+    let admin_cors = cors.as_ref().filter(|_| cfg.cors_allow_admin);
+    let admin = with_cors(admin, admin_cors);
+    let user = with_cors(user, admin_cors);
+
     let router = Router::new()
         .route("/health", get(health))
         .route("/v1/ping", get(ping))
-        .with_state(cfg)
+        .with_state(cfg);
+    // /health、/v1/ping 同样放开:网页端探活走的就是它们,被预检挡住的话前端只看到
+    // "服务不可达",与真的挂了分不出来。
+    let router = with_cors(router, cors.as_ref())
         // 不用 .nest():axum 0.8 的 nest 对挂载路径末尾斜杠敏感,
         // "/admin" 与 "/admin/" 只能二选一匹配,会导致另一种写法 404。
         // 改为 .merge() 绝对路径路由(webui::admin_router()/user_router()
@@ -334,6 +640,9 @@ pub fn build_router_with_persist_handles(
             balance,
             api_keys,
             api_keys_path,
+            pool: persist_pool,
+            persist_lock: refresh_ctx.persist_lock.clone(),
+            credentials_path: persist_creds_path,
         },
     )
 }
@@ -1612,6 +1921,355 @@ mod tests {
             broken,
             "损坏的密钥文件不得被空存储覆盖"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 取响应里某个头的字符串值(缺失返回 None)。
+    fn header_str(resp: &axum::response::Response, name: &str) -> Option<String> {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    }
+
+    /// 构造一次浏览器预检(OPTIONS + Origin + Access-Control-Request-*)。
+    fn preflight(uri: &str, origin: &str) -> Request<Body> {
+        Request::builder()
+            .method("OPTIONS")
+            .uri(uri)
+            .header("origin", origin)
+            .header("access-control-request-method", "POST")
+            .header(
+                "access-control-request-headers",
+                "authorization, content-type, anthropic-version",
+            )
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// 关键回归:浏览器里的跨源客户端(网页版聊天前端之类)调协议端点前必先发预检 OPTIONS。
+    /// 路由上没有 CORS 层时,预检要么 405 要么没有 `Access-Control-Allow-Origin`,浏览器
+    /// 当场把随后的真实请求掐掉 —— 现象是"网页端一个协议端点都调不通,curl 却一切正常"。
+    #[tokio::test]
+    async fn protocol_preflight_is_granted_by_default() {
+        let app = build_router(Arc::new(Config::default()));
+        let resp = app
+            .oneshot(preflight("/v1/messages", "https://chat.example"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "预检必须由 CORS 层直接答复,而不是落到路由上吃 405"
+        );
+        assert_eq!(
+            header_str(&resp, "access-control-allow-origin").as_deref(),
+            Some("*")
+        );
+        let allow_headers = header_str(&resp, "access-control-allow-headers")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            allow_headers.contains("anthropic-version"),
+            "预检必须回声客户端声明要发的头部,否则浏览器拦下真实请求:{allow_headers}"
+        );
+        assert!(
+            header_str(&resp, "access-control-allow-methods").is_some(),
+            "预检必须给出允许的方法"
+        );
+    }
+
+    /// 真实(非预检)跨源请求的响应也必须带 `Access-Control-Allow-Origin`,
+    /// 否则浏览器虽然把请求发出去了,却不让页面读到响应体。
+    #[tokio::test]
+    async fn cross_origin_actual_request_carries_allow_origin() {
+        let app = build_router(Arc::new(Config::default()));
+        let mut req = messages_request("/v1/messages", None);
+        req.headers_mut().insert(
+            "origin",
+            axum::http::HeaderValue::from_static("https://chat.example"),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "空池 503");
+        assert_eq!(
+            header_str(&resp, "access-control-allow-origin").as_deref(),
+            Some("*"),
+            "跨源响应缺这个头,页面就读不到响应体"
+        );
+    }
+
+    /// 预检**不带任何凭据**(浏览器规定 OPTIONS 预检不携带 Authorization),
+    /// 故 CORS 层必须在鉴权闸之外先答复它 —— 否则开了 api_key 的部署里预检一律 401,
+    /// 网页端连不上,而运营者从日志里只看到一串莫名其妙的 401。
+    #[tokio::test]
+    async fn preflight_is_not_blocked_by_auth_gate() {
+        let cfg = Config {
+            api_key: Some("secret".into()),
+            ..Config::default()
+        };
+        let app = build_router(Arc::new(cfg));
+        let resp = app
+            .oneshot(preflight("/v1/messages", "https://chat.example"))
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "预检不带凭据是浏览器行为,不能被鉴权闸拦掉"
+        );
+        assert_eq!(
+            header_str(&resp, "access-control-allow-origin").as_deref(),
+            Some("*")
+        );
+    }
+
+    /// 安全边界:管理面 / 用户面 REST API **默认不跨源放开**,只有显式打开开关才放行。
+    ///
+    /// 为什么这条必须钉死:没配管理员密钥时管理面是完全开放的(首次部署体验),此时若跟着
+    /// 协议端点一起无条件放开跨源,运营者浏览器里打开的任意一个网页都能把
+    /// `/api/admin/credentials`(账号、密钥、统计)读走并回传 —— 服务只要对那台机器可达
+    /// (localhost / 内网)就成立,而这正是自部署最常见的形态。
+    #[tokio::test]
+    async fn admin_api_is_not_cors_opened_by_default_but_can_be_opted_in() {
+        let app = build_router(Arc::new(Config::default()));
+        let resp = app
+            .oneshot(preflight("/api/admin/credentials", "https://evil.example"))
+            .await
+            .unwrap();
+        assert!(
+            header_str(&resp, "access-control-allow-origin").is_none(),
+            "管理面默认不得跨源放开,状态码 {}",
+            resp.status()
+        );
+
+        let cfg = Config {
+            cors_allow_admin: true,
+            ..Config::default()
+        };
+        let app = build_router(Arc::new(cfg));
+        let resp = app
+            .oneshot(preflight("/api/admin/credentials", "https://panel.example"))
+            .await
+            .unwrap();
+        assert_eq!(
+            header_str(&resp, "access-control-allow-origin").as_deref(),
+            Some("*"),
+            "显式打开 corsAllowAdmin 后,管理面预检必须放行(独立部署的管理前端要用)"
+        );
+    }
+
+    /// 白名单形态:只回声列出的来源,其它来源一个 CORS 头都不给(由浏览器拦下,
+    /// 而不是回 4xx —— 那会连非浏览器调用方一起误伤)。
+    ///
+    /// 一并钉住两件事:配置里写成 `https://Good.Example/`(带尾斜杠、含大写)也要能匹配上
+    /// 浏览器实际发出的 `https://good.example`;以及放行时必须带 `Vary: Origin`,
+    /// 否则中间的缓存会把放行来源那份带 `Allow-Origin` 的响应喂给下一个不放行的来源。
+    #[tokio::test]
+    async fn origin_allowlist_echoes_only_listed_origins() {
+        let cfg = Config {
+            cors_allow_origins: vec!["https://Good.Example/".into()],
+            ..Config::default()
+        };
+        let app = build_router(Arc::new(cfg));
+        let resp = app
+            .clone()
+            .oneshot(preflight("/v1/messages", "https://good.example"))
+            .await
+            .unwrap();
+        assert_eq!(
+            header_str(&resp, "access-control-allow-origin").as_deref(),
+            Some("https://good.example"),
+            "白名单命中时必须逐字回声调用方的 Origin"
+        );
+        assert!(
+            header_str(&resp, "vary")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("origin"),
+            "按来源变化的响应必须声明 Vary: Origin"
+        );
+
+        let resp = app
+            .oneshot(preflight("/v1/messages", "https://evil.example"))
+            .await
+            .unwrap();
+        assert!(
+            header_str(&resp, "access-control-allow-origin").is_none(),
+            "白名单之外的来源一个 CORS 头都不能给"
+        );
+    }
+
+    /// 来源清单为空 = 彻底关掉:响应里不该出现任何 `Access-Control-*` 头
+    /// (给那些"这台机器只服务本机/内网,别多发一个字节"的部署留的退出口)。
+    #[tokio::test]
+    async fn empty_origin_list_disables_cors_entirely() {
+        let cfg = Config {
+            cors_allow_origins: Vec::new(),
+            ..Config::default()
+        };
+        let app = build_router(Arc::new(cfg));
+        let mut req = messages_request("/v1/messages", None);
+        req.headers_mut().insert(
+            "origin",
+            axum::http::HeaderValue::from_static("https://chat.example"),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            header_str(&resp, "access-control-allow-origin").is_none(),
+            "配置里关掉 CORS 后不该再出现任何 Access-Control-* 头"
+        );
+    }
+
+    /// 注入的编号必须接着**高水位**往下发,而不是从 1 重来。
+    ///
+    /// 这是最容易埋雷的一处:用量统计、失败/限流日志、余额缓存全部按账号 id 归档,
+    /// 注入的账号一旦占到一个随后又被池分配出去的编号,两个账号的数据就永远分不开了。
+    /// 一并钉住去重:文件里已有同一把 key、以及同一批里写了两遍,都只能进一个。
+    #[test]
+    fn injected_api_keys_dedupe_and_continue_the_id_high_water_mark() {
+        let mut creds = vec![credential::Credential {
+            kiro_api_key: Some("ksk_already_there".into()),
+            auth: credential::AuthMethod::ApiKey,
+            ..blank_api_key_credential("3")
+        }];
+        // 高水位 9(比现有最大 id 3 大):注入必须从 9 开始,不能复用 4。
+        let added = inject_configured_api_keys(
+            &mut creds,
+            Some("ksk_already_there, ksk_new_a\nksk_new_b , ksk_new_a"),
+            "eu-west-1",
+            9,
+        );
+        assert_eq!(
+            added, 2,
+            "重复的 key(文件里已有 + 同批写两遍)都不能再进一份"
+        );
+        assert_eq!(creds.len(), 3);
+        assert_eq!(creds[1].id, "9");
+        assert_eq!(creds[2].id, "10");
+        assert_eq!(creds[1].kiro_api_key.as_deref(), Some("ksk_new_a"));
+        assert_eq!(creds[2].kiro_api_key.as_deref(), Some("ksk_new_b"));
+        assert_eq!(creds[1].auth, credential::AuthMethod::ApiKey);
+        assert_eq!(creds[1].region, "eu-west-1", "region 跟随部署配置");
+        assert!(
+            creds[1].refresh_token.is_empty() && creds[1].access_token.is_empty(),
+            "ksk 凭据本身就是数据面 bearer,不该占用 access/refresh 字段"
+        );
+
+        // 没给任何 key 时不动池子(空串同样,环境变量层已把它当未设置)。
+        assert_eq!(
+            inject_configured_api_keys(&mut creds, None, "us-east-1", 9),
+            0
+        );
+        assert_eq!(
+            inject_configured_api_keys(&mut creds, Some("  ,  "), "us-east-1", 9),
+            0
+        );
+        assert_eq!(creds.len(), 3);
+    }
+
+    /// 造一条只有 id 的空白 API Key 凭据,给上面的用例填字段用。
+    fn blank_api_key_credential(id: &str) -> credential::Credential {
+        credential::Credential {
+            id: id.to_string(),
+            access_token: String::new(),
+            refresh_token: String::new(),
+            kiro_api_key: None,
+            expires_at_unix: 0,
+            region: "us-east-1".into(),
+            auth: credential::AuthMethod::ApiKey,
+            client_id: None,
+            client_secret: None,
+            profile_arn: None,
+            machine_id: None,
+            email: None,
+            nickname: None,
+            weight: 1,
+            priority: credential::DEFAULT_PRIORITY,
+            label: None,
+            disabled: false,
+            status_reason: None,
+            quota_reset_unix: None,
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
+        }
+    }
+
+    /// 关键回归:容器化部署此前只能靠挂载 credentials.json 才有账号,
+    /// 没法用一个环境变量塞把 ksk 就把服务起起来。
+    ///
+    /// 同时钉住两件事:注入的账号要**落盘**(拿到稳定编号,统计/用量不会每次重启换号),
+    /// 且重启后**不得重复导入**同一把 key(否则每重启一次池里就多一个同 key 的账号)。
+    #[tokio::test]
+    async fn kiro_api_key_env_injects_account_into_pool_and_dedupes_on_restart() {
+        let dir = unique_temp_dir("kskenv");
+        let cfg_path = dir.join("config.json");
+        let creds_path = dir.join("credentials.json");
+        std::fs::write(
+            &cfg_path,
+            serde_json::json!({ "credentialsPath": creds_path.to_string_lossy() }).to_string(),
+        )
+        .unwrap();
+        // 前后空白照旧要被剔掉(.env 行尾的 CR/空格不该混进密钥)。
+        unsafe { std::env::set_var("KIRO_API_KEY", "  ksk_env_injected  ") }
+        let mut cfg = Config::load(cfg_path.to_str().unwrap()).unwrap();
+        // 同进程里并行跑的环境变量用例可能正巧把 API_KEY 塞在进程环境里(见 config 模块的
+        // 那几个用例),那会让下面读 admin 端点时撞上鉴权闸。本用例只关心账号注入,显式清掉。
+        cfg.api_key = None;
+        cfg.admin_api_key = None;
+        let app = build_router(Arc::new(cfg));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/credentials")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["total"], 1, "环境变量里的 ksk 必须进池:{v}");
+        assert_eq!(v["credentials"][0]["authMethod"], "apikey", "{v}");
+        assert_eq!(
+            v["available"], 1,
+            "注入的账号必须是**可选中**的,进了池却选不出来等于没注入:{v}"
+        );
+
+        // 落盘:拿到编号、按 API Key 凭据存,重启后统计/用量还认得出是同一个账号。
+        let on_disk = credential::load(creds_path.to_str().unwrap()).expect("凭据文件应可读");
+        assert_eq!(on_disk.len(), 1, "{on_disk:?}");
+        assert_eq!(
+            on_disk[0].kiro_api_key.as_deref(),
+            Some("ksk_env_injected"),
+            "前后空白必须已剔除"
+        );
+        assert!(!on_disk[0].id.is_empty(), "必须分配到编号");
+
+        // 重启一次:同一把 key 不得再导入一份。
+        let mut cfg2 = Config::load(cfg_path.to_str().unwrap()).unwrap();
+        cfg2.api_key = None;
+        cfg2.admin_api_key = None;
+        let app2 = build_router(Arc::new(cfg2));
+        let resp2 = app2
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/credentials")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes2 = axum::body::to_bytes(resp2.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
+        unsafe { std::env::remove_var("KIRO_API_KEY") }
+        assert_eq!(v2["total"], 1, "重启后不得重复导入同一把 key:{v2}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

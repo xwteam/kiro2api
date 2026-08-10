@@ -314,21 +314,171 @@ pub fn apply_sso_oidc_headers(
     );
 }
 
-/// 登录流用的伪装身份。登录时还没有凭据,故 machineId 不参与(sso-oidc 的 UA 本就不带它)。
-pub fn login_impersonation() -> crate::kiro::provider::Impersonation {
-    let cfg = crate::config::Config::default();
-    crate::kiro::provider::Impersonation {
-        machine_id: String::new(),
-        kiro_version: cfg.kiro_version,
-        agent_mode: "vibe".to_string(),
-        system_version: cfg.system_version,
-        node_version: cfg.node_version,
+/// portal 批准链用的浏览器形态请求头。
+///
+/// 这条链(`/token/whoAmI`、`/session/device`、`/device_authorization/accept_user_code`、
+/// `/device_authorization/associate_token`)打的不是 `oidc.{region}.amazonaws.com`,而是
+/// **portal 主机**;而 portal 只见得到浏览器 —— 那四个端点本就是 SSO 起始页里的 JS 发出的
+/// 同源 XHR。此前这四步一个 header 都不设:reqwest 不配 `user_agent` 就连 `User-Agent`
+/// 都不发,于是四个打向 AWS portal 的请求全部零 UA;而且只有第三步带 `Referer`,浏览器
+/// 对同一个页面发出的连续同源 XHR 不会时有时无地带它。这是 sso-oidc 那条路修好之后**剩下
+/// 的第三条路径**。
+///
+/// UA 里的操作系统跟着配置的 `system_version` 走 —— 同一次登录里 sso-oidc 的 UA 说
+/// `os/win32#10.0.22631`、portal 的 UA 却说 Macintosh,这种自相矛盾比裸奔更显眼。
+pub fn apply_portal_headers(
+    h: &mut reqwest::header::HeaderMap,
+    imp: &crate::kiro::provider::Impersonation,
+    portal: &str,
+) {
+    use reqwest::header::{HeaderName, HeaderValue};
+    let hv = |s: &str| HeaderValue::from_str(s).unwrap_or_else(|_| HeaderValue::from_static(""));
+    h.insert(
+        reqwest::header::ACCEPT,
+        HeaderValue::from_static("application/json, text/plain, */*"),
+    );
+    h.insert(
+        reqwest::header::ACCEPT_LANGUAGE,
+        HeaderValue::from_static("en-US,en;q=0.9"),
+    );
+    h.insert(
+        reqwest::header::USER_AGENT,
+        hv(&browser_user_agent(&imp.system_version)),
+    );
+    if let Some(origin) = crate::kiro::provider::origin_of(portal) {
+        h.insert(reqwest::header::ORIGIN, hv(&origin));
     }
+    h.insert(reqwest::header::REFERER, hv(portal));
+    if let Ok(name) = HeaderName::from_bytes(b"sec-fetch-site") {
+        h.insert(name, HeaderValue::from_static("same-origin"));
+    }
+    if let Ok(name) = HeaderName::from_bytes(b"sec-fetch-mode") {
+        h.insert(name, HeaderValue::from_static("cors"));
+    }
+    if let Ok(name) = HeaderName::from_bytes(b"sec-fetch-dest") {
+        h.insert(name, HeaderValue::from_static("empty"));
+    }
+}
+
+/// 由伪装用的 `system_version`(如 `win32#10.0.22631` / `darwin#23.5.0`)推出配套的浏览器
+/// UA。两者必须指向同一个操作系统 —— 见 [`apply_portal_headers`]。
+pub fn browser_user_agent(system_version: &str) -> String {
+    let platform = match system_version.split('#').next().unwrap_or("") {
+        "darwin" => "Macintosh; Intel Mac OS X 10_15_7",
+        "linux" => "X11; Linux x86_64",
+        // win32 及未知一律按 Windows(与默认 system_version 一致)。
+        _ => "Windows NT 10.0; Win64; x64",
+    };
+    format!(
+        "Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+}
+
+/// 登录流用的伪装身份。登录时还没有凭据,故 machineId 不参与(sso-oidc 的 UA 本就不带它)。
+///
+/// 版本三元组取**进程级**配置,与令牌刷新、数据面同源。这里曾经写的是
+/// `Config::default()`:用户在配置里改了 kiroVersion / systemVersion / nodeVersion 之后,
+/// 登录流仍报编译期默认值,而同一台 `oidc.{region}.amazonaws.com` 上的令牌刷新报的是配置
+/// 里的真值 —— 同一个 clientId,注册时说自己是一台 Windows 机器,几分钟后刷新时说自己是
+/// 另一台机器、另一个 node 版本。这种前后矛盾比两边都用默认值更容易被关联出来,而且它只
+/// 在"配置被改过"的部署上发作,默认部署跑测试是看不出来的。
+pub fn login_impersonation() -> crate::kiro::provider::Impersonation {
+    // 进程级配置只经 `for_credential_global` 一个口子对外(见 `placeholder_cred`)。
+    let mut imp = crate::kiro::provider::Impersonation::for_credential_global(&placeholder_cred());
+    imp.machine_id = String::new();
+    imp
+}
+
+/// 取进程级伪装配置用的占位凭据。
+///
+/// 进程级配置(kiro/系统/node 版本)只经
+/// [`crate::kiro::provider::Impersonation::for_credential_global`] 一个口子对外,而它以凭据
+/// 为参数 —— 登录时还没有凭据,故传这一枚全空的占位件。由它算出的 machineId 随即被丢弃
+/// (sso-oidc 的 UA 本就不带 machineId)。
+///
+/// 绕这一下,是为了不在本文件里再写一份"版本号从哪来"的实现:版本值只能有一个来源,
+/// 否则改了配置之后总有一条链路还在报旧值。
+fn placeholder_cred() -> crate::kiro::credential::Credential {
+    crate::kiro::credential::Credential {
+        id: String::new(),
+        access_token: String::new(),
+        refresh_token: String::new(),
+        expires_at_unix: 0,
+        region: String::new(),
+        auth: crate::kiro::credential::AuthMethod::Social,
+        client_id: None,
+        client_secret: None,
+        profile_arn: None,
+        machine_id: None,
+        email: None,
+        nickname: None,
+        weight: 0,
+        priority: crate::kiro::credential::DEFAULT_PRIORITY,
+        label: None,
+        disabled: false,
+        kiro_api_key: None,
+        status_reason: None,
+        proxy_url: None,
+        proxy_username: None,
+        proxy_password: None,
+        quota_reset_unix: None,
+    }
+}
+
+/// 测试夹具:把一份**区别于编译期默认值**的伪装配置灌进进程级槽位,再按生产的唯一入口
+/// 读回**实际生效**的那份。
+///
+/// 全 crate 只此一处灌、取值固定:那个槽位只认第一次写入,多处灌不同值会让用例随执行
+/// 顺序飘。返回的是读回来的值而不是想灌的值 —— 万一这一处不是第一个写进去的,用例仍按
+/// 实际生效的去断言,不会假绿。
+#[cfg(test)]
+pub(crate) fn install_test_process_config() -> crate::kiro::provider::Impersonation {
+    let cfg = crate::config::Config {
+        kiro_version: "9.9.99".into(),
+        system_version: "darwin#23.5.0".into(),
+        node_version: "99.9.9".into(),
+        ..crate::config::Config::default()
+    };
+    crate::kiro::provider::init_impersonation_defaults(&cfg);
+    crate::kiro::provider::Impersonation::for_credential_global(&placeholder_cred())
 }
 
 #[cfg(test)]
 mod sso_header_tests {
     use super::*;
+
+    /// portal 的浏览器 UA 必须与 sso-oidc 的 `os/` 指向**同一个操作系统**。
+    ///
+    /// 同一次登录里 sso-oidc 说 `os/win32#10.0.22631`、portal 却说 Macintosh —— 这种
+    /// 自相矛盾比裸奔更显眼,因为它证明两边是拼出来的而不是同一台机器发的。
+    #[test]
+    fn portal_browser_ua_agrees_with_the_configured_os() {
+        assert!(browser_user_agent("win32#10.0.22631").contains("Windows NT 10.0"));
+        assert!(browser_user_agent("darwin#23.5.0").contains("Macintosh"));
+        assert!(browser_user_agent("linux#6.1.0").contains("X11; Linux"));
+        // 未知/空一律回落 Windows(与默认 system_version 同侧),绝不产出没有平台段的 UA。
+        assert!(browser_user_agent("").contains("Windows NT 10.0"));
+        assert!(browser_user_agent("plan9#1").contains("Windows NT 10.0"));
+
+        // 两条链自洽:portal 的浏览器 UA 必须跟着**当前生效**的 system_version 走。
+        // 这里不钉死 win32 —— system_version 是可配置项,钉死等于只测了编译期默认值那一种
+        // 情形,而配置被改过才是真正会出岔子的情形。
+        let imp = login_impersonation();
+        let mut h = reqwest::header::HeaderMap::new();
+        apply_portal_headers(&mut h, &imp, "https://x.awsapps.com/start");
+        let portal_ua = h[reqwest::header::USER_AGENT].to_str().unwrap();
+        assert_eq!(portal_ua, browser_user_agent(&imp.system_version));
+
+        // Origin 只到主机,不带路径 —— Origin 的定义就是这一段。
+        assert_eq!(
+            h[reqwest::header::ORIGIN].to_str().unwrap(),
+            "https://x.awsapps.com"
+        );
+        assert_eq!(
+            h[reqwest::header::REFERER].to_str().unwrap(),
+            "https://x.awsapps.com/start"
+        );
+    }
 
     /// SSO-OIDC 请求必须带齐伪装头,**登录流与刷新用同一份**。
     ///
@@ -353,5 +503,29 @@ mod sso_header_tests {
             "aws-sdk-js/3.980.0 KiroIDE"
         );
         assert_eq!(h["content-type"].to_str().unwrap(), "application/json");
+    }
+
+    /// 登录流的伪装身份必须取**进程级**配置,与刷新/数据面同源。
+    ///
+    /// 回归:这里曾经写死 `Config::default()`。于是用户在配置里改了
+    /// kiroVersion/systemVersion/nodeVersion 之后,登录流仍报编译期默认值,而同一台
+    /// `oidc.{region}.amazonaws.com` 上的令牌刷新报的是配置里的真值 —— 同一个 clientId
+    /// 注册时说自己是一台 Windows、几分钟后刷新时说自己是另一台机器另一个 node 版本。
+    /// 这种前后矛盾比两边都用默认值更容易被关联出来。
+    #[test]
+    fn login_identity_is_read_from_the_process_level_config() {
+        let effective = install_test_process_config();
+        assert_ne!(
+            effective.system_version,
+            crate::config::Config::default().system_version,
+            "夹具没能把进程级配置灌进去,本用例失去区分力"
+        );
+
+        let imp = login_impersonation();
+        assert_eq!(imp.kiro_version, effective.kiro_version);
+        assert_eq!(imp.system_version, effective.system_version);
+        assert_eq!(imp.node_version, effective.node_version);
+        // 登录时还没有凭据,machineId 不参与(sso-oidc 的 UA 本就不带它)。
+        assert!(imp.machine_id.is_empty(), "登录流不该带 machineId");
     }
 }

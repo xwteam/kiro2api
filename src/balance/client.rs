@@ -151,16 +151,18 @@ pub async fn fetch_at(
     req = req
         .header("amz-sdk-invocation-id", inv)
         .header("amz-sdk-request", "attempt=1; max=1")
-        .header("authorization", format!("Bearer {}", cred.bearer()));
+        .header("authorization", format!("Bearer {}", cred.bearer()))
+        // 控制面同样每请求一条新连接:与数据面自相矛盾的连接行为本身就是可观测差异。
+        //
+        // 这一行的**位置**也照数据面/MCP 排:那两处都是 `connection` 在 `tokentype` 之前。
+        // 此前它被链在整条头的末尾,于是 ksk 账号的 getUsageLimits 发出的是
+        // authorization → tokentype → connection —— 非 ksk 账号看不出差别,ksk 一走这条
+        // 链路就把不一致暴露在线上。链上的次序即线上顺序,故这不是风格问题。
+        .header("connection", "close");
     if cred.is_api_key() {
         req = req.header("tokentype", "API_KEY");
     }
-    // 控制面同样每请求一条新连接:与数据面自相矛盾的连接行为本身就是可观测差异。
-    let resp = req
-        .header("connection", "close")
-        .send()
-        .await
-        .map_err(|_| BalanceError::Http)?;
+    let resp = req.send().await.map_err(|_| BalanceError::Http)?;
     let status = resp.status();
     if !status.is_success() {
         // 读错误体(有界)并解析 amz-json 的 message,带进错误里供管理员看清真因。
@@ -292,6 +294,61 @@ mod tests {
             system_version: "win32#10.0.22631".into(),
             node_version: "22.22.0".into(),
         }
+    }
+
+    /// 采集一次请求里**线上真实的头名次序**,只保留 `want` 里点名的头 —— 过滤掉
+    /// reqwest 自动补的 `accept-encoding` 等不由本模块决定的项。
+    fn ordered(req: &wiremock::Request, want: &[&str]) -> Vec<String> {
+        req.headers
+            .iter()
+            .map(|(k, _)| k.as_str().to_ascii_lowercase())
+            .filter(|k| want.contains(&k.as_str()))
+            .collect()
+    }
+
+    /// ksk 凭据的额度查询里,`tokentype` 必须是**最后**一条条件头,排在 `connection` 之后。
+    ///
+    /// 回归:此前 `connection: close` 被链在整条头的末尾,于是 ksk 账号发出的是
+    /// authorization → tokentype → connection,而数据面/MCP 一律是 connection 在
+    /// tokentype 之前。非 ksk 账号两种排法看不出差别,ksk 一走 getUsageLimits 就把这处
+    /// 不一致暴露在线上 —— 同一个客户端库的头次序是固定的,同一个账号在两条链路上排得
+    /// 不一样本身就是可识别的差异。
+    #[tokio::test]
+    async fn balance_tokentype_comes_after_connection_for_api_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "subscriptionInfo": { "subscriptionTitle": "KIRO FREE" },
+                "usageBreakdownList": [{
+                    "currentUsageWithPrecision": 0.0,
+                    "usageLimitWithPrecision": 50.0
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let mut c = cred();
+        c.auth = AuthMethod::ApiKey;
+        c.kiro_api_key = Some("ksk_TESTKEY".into());
+        c.access_token = String::new();
+        fetch_at(&reqwest::Client::new(), &server.uri(), &c, &imp())
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        let want = [
+            "x-amz-user-agent",
+            "user-agent",
+            "host",
+            "amz-sdk-invocation-id",
+            "amz-sdk-request",
+            "authorization",
+            "connection",
+            "tokentype",
+        ];
+        assert_eq!(
+            ordered(&reqs[0], &want),
+            want.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "ksk 额度查询的头序:connection 须在 tokentype 之前"
+        );
     }
 
     #[test]

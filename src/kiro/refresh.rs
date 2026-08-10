@@ -4,22 +4,20 @@ use crate::kiro::credential::{AuthMethod, Credential};
 use crate::kiro::login::LoginError;
 use serde::Deserialize;
 
-/// 刷新/OIDC 端点使用的 region:与数据面保持一致地优先取 profileArn 里的 region,
-/// 缺省(无 arn 或 arn 不含合法 region 段)才回落 `cred.region`。
+/// 刷新端点(照观测)。region 走全项目唯一入口
+/// [`crate::kiro::endpoint::effective_region`](profileArn > `cred.region` > `us-east-1`)。
 ///
-/// #12:此前刷新端点直接用 `cred.region`,而数据面 region 来自 profileArn,二者可能
-/// 不一致 → IdC 账号可能把 OIDC 刷新打到与数据面不同的 region。这里复用
-/// [`crate::kiro::endpoint::region_from_profile_arn`] 统一来源。
-fn refresh_region(cred: &Credential) -> String {
-    cred.profile_arn
-        .as_deref()
-        .and_then(crate::kiro::endpoint::region_from_profile_arn)
-        .unwrap_or_else(|| cred.region.clone())
-}
-
-/// 刷新端点(照观测)。region 与数据面一致地优先取 profileArn(#12)。
+/// 这里曾经自己算过一份 region:同样是"profileArn 优先",但回落时把 `cred.region` **原样**
+/// 拼进主机名。于是一枚 `region` 为空串/只剩空白、又没有 profileArn 的凭据,数据面照唯一
+/// 入口回落到 us-east-1 正常收发,刷新却拼出 `https://oidc..amazonaws.com/token` —— 主机名
+/// 里少了一段,DNS 根本解不出来,该账号每次续期都失败、还会被记成账号故障。
+///
+/// 本函数是刷新 region 的**唯一**产出口:[`refresh`] 用它,[`crate::kiro::ensure_fresh`]
+/// 的全部刷新路径经 [`refresh`] 用它,keepalive 的提前续期又经 `ensure_fresh` 用它。
+/// 所以这里不能再留第二份实现 —— 两份只要有一份改了口径,同一枚凭据就会在同一分钟命中
+/// 两个 region。
 pub fn endpoint(cred: &Credential) -> String {
-    let region = refresh_region(cred);
+    let region = crate::kiro::endpoint::effective_region(cred);
     match cred.auth {
         AuthMethod::Social => format!("https://prod.{region}.auth.desktop.kiro.dev/refreshToken"),
         AuthMethod::Idc => format!("https://oidc.{region}.amazonaws.com/token"),
@@ -638,6 +636,54 @@ mod tests {
             endpoint(&s),
             "https://prod.eu-west-1.auth.desktop.kiro.dev/refreshToken"
         );
+    }
+
+    /// 刷新端点的 region 必须与数据面**同一个来源**。
+    ///
+    /// 回归:这里曾经自己算过一份 region,回落时把 `cred.region` 原样拼进主机名。于是一枚
+    /// `region` 是空串/只剩空白、又没有 profileArn 的凭据,数据面照唯一入口回落 us-east-1
+    /// 正常收发,刷新却拼出 `https://oidc..amazonaws.com/token` —— 主机名少了一段,DNS 直接
+    /// 解不出来,该账号每次续期都失败并被记成账号故障。
+    #[test]
+    fn refresh_endpoint_region_comes_from_the_single_source() {
+        // 同一枚凭据,刷新端点与数据面端点的 region 段必须逐字相同。
+        let same_region_as_data_plane = |c: &Credential| {
+            let want = crate::kiro::endpoint::effective_region(c);
+            let data_plane = crate::kiro::endpoint::all(&want)[0].url.clone();
+            let refresh_host = crate::kiro::provider::host_of(&endpoint(c)).unwrap_or_default();
+            let data_host = crate::kiro::provider::host_of(&data_plane).unwrap_or_default();
+            assert!(
+                refresh_host.contains(&format!(".{want}.")),
+                "刷新主机 {refresh_host} 里没有 region 段 {want}"
+            );
+            assert!(data_host.contains(&format!(".{want}.")), "{data_host}");
+            assert!(
+                !refresh_host.contains(".."),
+                "主机名里出现空 region 段(DNS 必然解析失败): {refresh_host}"
+            );
+        };
+
+        for auth in [AuthMethod::Social, AuthMethod::Idc] {
+            // region 空/只剩空白且无 profileArn:唯一入口回落 us-east-1,自算那份回落空串。
+            let mut c = cred(auth);
+            c.profile_arn = None;
+            c.region = "   ".into();
+            same_region_as_data_plane(&c);
+            c.region = String::new();
+            same_region_as_data_plane(&c);
+
+            // profileArn 合法时以它为准(与数据面一致)。
+            let mut c = cred(auth);
+            c.region = "us-east-1".into();
+            c.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:1:profile/A".into());
+            same_region_as_data_plane(&c);
+
+            // profileArn 畸形 → 回落 cred.region,同样两边一致。
+            let mut c = cred(auth);
+            c.region = "ap-northeast-1".into();
+            c.profile_arn = Some("arn:aws:codewhisperer:NOT_A_REGION:1:profile/A".into());
+            same_region_as_data_plane(&c);
+        }
     }
 
     /// #12:profileArn 缺省或不含合法 region 段时回落 cred.region。

@@ -70,22 +70,55 @@ pub fn new_server_tool_use_id() -> String {
     format!("srvtoolu_{}", crate::kiro::uuid_v4().replace('-', ""))
 }
 
-/// 调 MCP 取搜索结果。失败**不抛**:返回 None,由调用方合成一个"没搜到"的响应 ——
-/// 搜索挂了不该让整条请求失败,那会让客户端完全拿不到东西。
+/// 搜索没拿到结果的原因。
+///
+/// 分两档是因为**它们对账号池的含义完全不同**:调用被上游拒了是这个账号的事(令牌失效、
+/// 没额度、被限流),池子必须知道;而载荷形状不认识是我们和上游的协议对不上,账号本身
+/// 好好的,罚它只会平白削掉一个能用的号。
+#[derive(Debug)]
+pub enum SearchError {
+    /// MCP 调用本身失败(非 2xx / 传输层)。**账号级**信号,调用方须反馈账号池。
+    Call(crate::kiro::login::LoginError),
+    /// 调用通过了,但响应里没有我们认识的结果载荷。账号没问题。
+    Malformed,
+}
+
+/// 调 MCP 取搜索结果。
+///
+/// 失败**不让整条请求失败**(由调用方合成一个"没搜到"的响应),但失败这件事必须原样
+/// 交回调用方:此前这里把错误吞掉只返回 `None`,于是"这个账号刚刚被上游拒了"这个事实
+/// 连传都传不出去 —— 账号池什么都学不到,同一个坏号会被一次次挑中去打同一枪。
 pub async fn search(
     client: &reqwest::Client,
     region: &str,
     cred: &Credential,
     imp: &Impersonation,
     query: &str,
-) -> Option<WebSearchResults> {
-    let base = crate::kiro::mcp::endpoint(region);
+) -> Result<WebSearchResults, SearchError> {
+    search_at(
+        client,
+        &crate::kiro::mcp::endpoint(region),
+        cred,
+        imp,
+        query,
+    )
+    .await
+}
+
+/// 向指定 MCP base 发一次搜索(测试可注入 mock base;生产由 [`search`] 按 region 取)。
+pub async fn search_at(
+    client: &reqwest::Client,
+    base: &str,
+    cred: &Credential,
+    imp: &Impersonation,
+    query: &str,
+) -> Result<WebSearchResults, SearchError> {
     let req = crate::kiro::mcp::tools_call("web_search", serde_json::json!({ "query": query }));
-    match crate::kiro::mcp::call_at(client, &base, cred, imp, &req).await {
-        Ok(resp) => parse_results(&resp),
+    match crate::kiro::mcp::call_at(client, base, cred, imp, &req).await {
+        Ok(resp) => parse_results(&resp).ok_or(SearchError::Malformed),
         Err(e) => {
             tracing::warn!(error = ?e, "web_search MCP 调用失败,按空结果继续");
-            None
+            Err(SearchError::Call(e))
         }
     }
 }
@@ -237,6 +270,39 @@ mod tests {
 
         // 没结果时给空数组而不是 null —— 客户端按数组遍历
         assert_eq!(to_result_blocks(None), Vec::<serde_json::Value>::new());
+    }
+
+    /// MCP 调用被上游拒绝时,**失败这件事必须传回调用方**。
+    ///
+    /// 回归:此前这里把错误吞掉只返回 `None`,调用方无从分辨"搜到了 0 条"和"这个账号
+    /// 刚刚被上游拒了" —— 账号池因此什么都学不到,同一个坏号被一次次挑中去打同一枪。
+    #[tokio::test]
+    async fn a_rejected_mcp_call_is_reported_back_not_swallowed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("{\"__type\":\"AccessDenied\"}"))
+            .mount(&server)
+            .await;
+
+        let c = crate::kiro::credential::tests_support_cred();
+        let imp = crate::kiro::provider::Impersonation::for_credential_global(&c);
+        let r = search_at(
+            &reqwest::Client::new(),
+            &format!("{}/mcp", server.uri()),
+            &c,
+            &imp,
+            "rust",
+        )
+        .await;
+        match r {
+            Err(SearchError::Call(crate::kiro::login::LoginError::UpstreamHttp {
+                status, ..
+            })) => assert_eq!(status, 403, "状态码要原样带回,调用方据它分类"),
+            other => panic!("失败必须传回调用方而不是被吞成空结果;实际:{other:?}"),
+        }
     }
 
     /// 服务端工具调用 id 的形状。

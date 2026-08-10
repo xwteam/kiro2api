@@ -4,7 +4,8 @@ use super::types::{
     OpenAiUsage, RespMessage, ToolCall, ToolCallFunction,
 };
 use crate::protocol::anthropic::types::{
-    Block, ContentIn, InMsg, MessagesRequest, MessagesResponse, OutBlock, SystemPrompt, ToolDef,
+    Block, ContentIn, InMsg, MessagesRequest, MessagesResponse, OutBlock, RequestMetadata,
+    SystemPrompt, ThinkingConfig, ToolDef,
 };
 use serde_json::{Value, json};
 
@@ -13,6 +14,113 @@ fn random_hex_id() -> String {
     let mut raw = [0u8; 16];
     getrandom::getrandom(&mut raw).expect("CSPRNG");
     hex::encode(raw)
+}
+
+/// 推理档位 → 思考预算(token)。
+///
+/// OpenAI 系协议只给一个档位名,而中枢/上游要的是一个具体上限(见 `kiro::convert` 里
+/// thinking 配置怎么变成 system 指令),故必须在这里定一组数。档位之间按量级拉开,
+/// 最高档也留在一轮回答能写完的范围内,不至于把预算全烧在思考上。
+fn effort_budget(effort: &str) -> Option<u32> {
+    Some(match effort {
+        "minimal" => 1024,
+        "low" => 4096,
+        "medium" => 16384,
+        "high" => 32768,
+        _ => return None,
+    })
+}
+
+/// OpenAI 系推理档位 → 中枢 thinking 配置。
+///
+/// Chat Completions 的 `reasoning_effort` 与 Responses 的 `reasoning.effort` 是同一套取值,
+/// 故**两个入口共用这一份**:各写一份必然漂移,而"同一个 effort 在两个入口上开出不同的思考
+/// 深度"是使用者根本无从察觉的差异。
+///
+/// 缺省 / `none` / `off` → 不开思考(绝不无故给请求加指令)。认得出的档位按 [`effort_budget`]
+/// 给定额预算;认不出的档位(将来新增的档位名)按 `adaptive` 让模型自己决定深浅 ——
+/// 客户端明明要求了推理,只是我们不认识这个名字,静默关掉比开浅一点更违背它的意图。
+pub(crate) fn thinking_from_effort(effort: Option<&str>) -> Option<ThinkingConfig> {
+    let e = effort?.trim().to_ascii_lowercase();
+    if e.is_empty() || e == "none" || e == "off" {
+        return None;
+    }
+    match effort_budget(&e) {
+        Some(budget) => Some(ThinkingConfig {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: budget,
+        }),
+        None => Some(ThinkingConfig {
+            thinking_type: "adaptive".to_string(),
+            budget_tokens: 0,
+        }),
+    }
+}
+
+/// 由"协议自带的会话标识 + 对话开头"派生中枢 `metadata`,使同一场多轮对话的每个请求
+/// 在上游看到的是**同一个** conversationId。
+///
+/// 为什么需要:上游的 conversationId 取自 `metadata.user_id` 里的 session UUID(见
+/// `kiro::convert`)。OpenAI / Gemini / Responses 三个入口此前恒传 None,于是同一场对话的
+/// 每一轮在上游看来都是一段全新会话 —— 既丢了会话连续性,"同一个账号每分钟开几十段全新
+/// 会话"这个形状本身也不正常。
+///
+/// 取材两处,一起做指纹:
+/// - `explicit`:协议自己的会话标识(OpenAI 的 `user`、Responses 的 `conversation` /
+///   `prompt_cache_key` / `user`)。Gemini 的请求体里根本没有这类字段,故恒为 None。
+/// - 对话开头:同一场对话的第一条消息在多轮之间是不变的(每一轮都会把完整历史重发),
+///   是唯一一个所有协议都拿得到的稳定锚点。
+///
+/// 两者一起用,才能既不把同一个用户的两场对话并成一段,也不把同一场对话拆成两段。
+/// 刻意接受的取舍:没有 `explicit` 且两场对话的开场白一字不差时会共用一个 id —— 这比
+/// "每个请求都是一段全新会话"离真实客户端的形态近得多。
+///
+/// 三个协议共用这一份实现,不各抄一遍:本仓已经因为"同名私有实现遮蔽共享实现"栽过几次,
+/// 每次都是全仓 grep 看着已经统一、实际只落了一部分调用点。
+pub(crate) fn session_metadata(
+    explicit: Option<&str>,
+    messages: &[InMsg],
+) -> Option<RequestMetadata> {
+    let explicit = explicit.map(str::trim).unwrap_or_default();
+    let opening = messages.first().map(|m| m.text()).unwrap_or_default();
+    // 两样都没有(如首轮就是纯图片且没有任何会话标识)→ 不硬造,交回中枢按老路新生成一个。
+    if explicit.is_empty() && opening.is_empty() {
+        return None;
+    }
+    Some(RequestMetadata {
+        user_id: Some(format!(
+            "session_{}",
+            derive_session_uuid(explicit, &opening)
+        )),
+    })
+}
+
+/// 把 `(会话标识, 对话开头)` 折成一个 UUID v4 写法的会话 id。
+///
+/// 必须是标准 UUID 写法:中枢只认 8-4-4-4-12 的 session id(其余一律丢弃重新生成),
+/// 而 conversationId 出现在**每一个**上行请求里,形状不对就是个零成本、100% 命中的判别器。
+/// 必须确定性:同一场对话的每一轮都得算出同一个值,否则等于没做。
+fn derive_session_uuid(explicit: &str, opening: &str) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    // 分隔符是必需的:没有它,("ab","c") 与 ("a","bc") 会撞成同一个会话。
+    h.update(explicit.as_bytes());
+    h.update([0u8]);
+    h.update(opening.as_bytes());
+    let digest = h.finalize();
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&digest[..16]);
+    b[6] = (b[6] & 0x0f) | 0x40; // version = 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant = RFC 4122
+    let hex = hex::encode(b);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// 解析 `data:<mime>;base64,<data>` 形式的 data URL,失败返回 `None`。
@@ -222,8 +330,11 @@ pub fn openai_to_hub(req: ChatCompletionRequest) -> MessagesRequest {
     });
 
     MessagesRequest {
-        thinking: None,
-        metadata: None,
+        // `reasoning_effort` 是这个协议表达"要不要思考 / 思考多深"的唯一方式;此前恒传 None,
+        // 于是 OpenAI 入口**完全开不出** extended thinking(而 Anthropic 入口可以)。
+        thinking: thinking_from_effort(req.reasoning_effort.as_deref()),
+        // 会话标识:OpenAI 只有 `user` 这一个稳定标识,再与对话开头一起做指纹(见 session_metadata)。
+        metadata: session_metadata(req.user.as_deref(), &messages),
         model: req.model,
         system: system.map(SystemPrompt::Text),
         messages,
@@ -382,6 +493,8 @@ mod tests {
             stream: None,
             stream_options: None,
             max_tokens: None,
+            reasoning_effort: None,
+            user: None,
         }
     }
 
@@ -409,6 +522,8 @@ mod tests {
             stream: None,
             stream_options: None,
             max_tokens: None,
+            reasoning_effort: None,
+            user: None,
         };
         let hub = openai_to_hub(req);
         assert_eq!(hub.system.as_ref().map(|s| s.text()).as_deref(), Some("s"));
@@ -428,6 +543,8 @@ mod tests {
             stream: None,
             stream_options: None,
             max_tokens: None,
+            reasoning_effort: None,
+            user: None,
         };
         let hub = openai_to_hub(req);
         assert_eq!(
@@ -453,6 +570,8 @@ mod tests {
             stream: None,
             stream_options: None,
             max_tokens: None,
+            reasoning_effort: None,
+            user: None,
         };
         let hub = openai_to_hub(req);
         let tools = hub.tools.expect("tools 应存在");
@@ -486,6 +605,8 @@ mod tests {
             stream: None,
             stream_options: None,
             max_tokens: None,
+            reasoning_effort: None,
+            user: None,
         };
         let hub = openai_to_hub(req);
         let msg = &hub.messages[0];
@@ -525,6 +646,8 @@ mod tests {
             stream: None,
             stream_options: None,
             max_tokens: None,
+            reasoning_effort: None,
+            user: None,
         };
         let hub = openai_to_hub(req);
         match &hub.messages[0].content {
@@ -551,6 +674,8 @@ mod tests {
             stream: None,
             stream_options: None,
             max_tokens: None,
+            reasoning_effort: None,
+            user: None,
         };
         let hub = openai_to_hub(req);
         let msg = &hub.messages[0];
@@ -596,6 +721,8 @@ mod tests {
             stream: None,
             stream_options: None,
             max_tokens: None,
+            reasoning_effort: None,
+            user: None,
         };
         let hub = openai_to_hub(req);
         match &hub.messages[0].content {
@@ -639,6 +766,8 @@ mod tests {
             stream: None,
             stream_options: None,
             max_tokens: None,
+            reasoning_effort: None,
+            user: None,
         };
         let hub = openai_to_hub(req);
         assert_eq!(
@@ -666,6 +795,8 @@ mod tests {
             stream: None,
             stream_options: None,
             max_tokens: None,
+            reasoning_effort: None,
+            user: None,
         };
         let hub = openai_to_hub(req);
         assert_eq!(
@@ -701,6 +832,8 @@ mod tests {
             stream: None,
             stream_options: None,
             max_tokens: None,
+            reasoning_effort: None,
+            user: None,
         };
         let hub = openai_to_hub(req);
         match &hub.messages[0].content {
@@ -739,6 +872,8 @@ mod tests {
             stream: None,
             stream_options: None,
             max_tokens: None,
+            reasoning_effort: None,
+            user: None,
         };
         let hub = openai_to_hub(req);
         match &hub.messages[0].content {

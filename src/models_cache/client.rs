@@ -144,23 +144,36 @@ pub async fn fetch_at(
         "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
         imp.kiro_version, imp.machine_id
     );
-    let req = client
+    // **链上的次序即线上顺序**,故下面每一行的位置都不是风格问题:头次序是与 TLS 指纹
+    // 并列的识别维度,同一个客户端库发出的次序是固定的。这条链路曾经自成一派 ——
+    // `authorization` 排在 UA 系列**之前**、`tokentype` 落在 `connection` **之后**,
+    // 而同一个账号在数据面、余额、MCP 上都是另一种排法,自己跟自己对不上。现按
+    // `provider::build_headers` 逐项对齐(那里是本项目头构造的唯一范本)。
+    let mut req = client
         .post(&url)
         .header("content-type", "application/x-amz-json-1.0")
-        .header("x-amz-target", AMZ_TARGET)
-        // bearer 走 `cred.bearer()` + 配套 tokentype:ksk 凭据的令牌在 `kiro_api_key` 里,
-        // 读 `access_token` 会发出空 Bearer,模型清单必然 401/403(理由同 balance::client)。
-        .header("authorization", format!("Bearer {}", cred.bearer()))
+        // 控制面同样每请求一条新连接,理由同数据面:一条连接上轮换多个账号的令牌,
+        // 而每个账号还各自声称是不同的机器,这在 wire 上解释不了。
+        .header("connection", "close")
+        .header("x-amz-user-agent", amz_user_agent)
+        .header(reqwest::header::USER_AGENT, user_agent);
+    // 显式设 host。不设的话底层 HTTP 库会在序列化时把它补到头列**末尾** —— 取值一样,
+    // 但落位不同;控制面客户端锁死 HTTP/1.1,Host 是以明文头真实上线的,位置可观测。
+    // 此前这里是全项目唯一不设 host 的 AWS 出站点。
+    if let Some(host) = crate::kiro::provider::host_of(&url) {
+        req = req.header("host", host);
+    }
+    // bearer 走 `cred.bearer()` + 配套 tokentype:ksk 凭据的令牌在 `kiro_api_key` 里,
+    // 读 `access_token` 会发出空 Bearer,模型清单必然 401/403(理由同 balance::client)。
+    req = req
         .header("amz-sdk-invocation-id", inv)
         .header("amz-sdk-request", "attempt=1; max=1")
-        .header("x-amz-user-agent", amz_user_agent)
-        .header(reqwest::header::USER_AGENT, user_agent)
-        .header("connection", "close");
-    let req = if cred.is_api_key() {
-        req.header("tokentype", "API_KEY")
-    } else {
-        req
-    };
+        .header("authorization", format!("Bearer {}", cred.bearer()));
+    if cred.is_api_key() {
+        req = req.header("tokentype", "API_KEY");
+    }
+    // amz-json 的 target 头压在末尾,与数据面一致。
+    req = req.header("x-amz-target", AMZ_TARGET);
     let resp = req.body(body).send().await.map_err(|_| ModelsError::Http)?;
     let status = resp.status();
     if !status.is_success() {
@@ -184,20 +197,18 @@ pub async fn fetch_available_models(
     cred: &Credential,
 ) -> Result<AvailableModelsResponse, ModelsError> {
     let imp = impersonation_for(cred, cfg);
-    match fetch_at(
-        client,
-        &region_base(&crate::kiro::endpoint::effective_region(cred)),
-        cred,
-        &imp,
-    )
-    .await
-    {
+    // region 只算一次并贯穿"主机 / 备用主机 / 日志"三处。此前日志打的是裸 `cred.region`,
+    // 而两个 base 都由 `effective_region` 算(优先取 profileArn 里编码的 region)——
+    // ARN 写 eu-central-1、导入时 region 填了 us-east-1 的账号,请求实打 `q.eu-central-1`
+    // 日志却说 us-east-1,排障的人照着日志去查另一个 region 只会白跑。
+    let region = crate::kiro::endpoint::effective_region(cred);
+    match fetch_at(client, &region_base(&region), cred, &imp).await {
         // 传输层失败(最常见的是主机在该 region 根本不存在)→ 换备用主机再试一次。
         // 只对传输失败回落:拿到了 HTTP 应答就说明主机是对的,那种失败换主机也没用。
         Err(ModelsError::Http) => {
-            let fb = region_base_fallback(&crate::kiro::endpoint::effective_region(cred));
+            let fb = region_base_fallback(&region);
             tracing::debug!(
-                region = %cred.region,
+                region = %region,
                 fallback = %fb,
                 "模型清单主机不可达,改用备用主机"
             );
@@ -312,6 +323,157 @@ mod tests {
             system_version: "win32#10.0.22631".into(),
             node_version: "22.22.0".into(),
         }
+    }
+
+    /// 采集一次请求里**线上真实的头名次序**,只保留 `want` 里点名的头 —— 过滤掉
+    /// reqwest 自动补的 `content-length`/`accept-encoding` 等不由本模块决定的项。
+    fn ordered(req: &wiremock::Request, want: &[&str]) -> Vec<String> {
+        req.headers
+            .iter()
+            .map(|(k, _)| k.as_str().to_ascii_lowercase())
+            .filter(|k| want.contains(&k.as_str()))
+            .collect()
+    }
+
+    fn want_vec(want: &[&str]) -> Vec<String> {
+        want.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 模型清单的头必须与数据面同一范本:次序一致,且 `host` **显式**设置。
+    ///
+    /// 回归:此前这条链路是全项目唯一不设 host 的 AWS 出站点 —— 不显式设的话底层 HTTP 库
+    /// 会在序列化时把 Host 补到头列**末尾**,而这两个客户端都锁死 HTTP/1.1、Host 是以明文
+    /// 头上线的,它在头序列里的落位一样可观测。次序本身也是独一份:`authorization` 排在
+    /// UA 系列**之前**、`tokentype` 落在 `connection` **之后**,而同一个账号在数据面、余额、
+    /// MCP 上都是另一种排法。同一个客户端库发出的头次序是固定的,自己跟自己对不上,
+    /// 比统一排错更刺眼。
+    #[tokio::test]
+    async fn models_headers_follow_the_data_plane_order_with_explicit_host() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "models": [] })),
+            )
+            .mount(&server)
+            .await;
+        fetch_at(&reqwest::Client::new(), &server.uri(), &cred(), &imp())
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        let want = [
+            "content-type",
+            "connection",
+            "x-amz-user-agent",
+            "user-agent",
+            "host",
+            "amz-sdk-invocation-id",
+            "amz-sdk-request",
+            "authorization",
+            "x-amz-target",
+        ];
+        assert_eq!(
+            ordered(&reqs[0], &want),
+            want_vec(&want),
+            "模型清单头序须与 provider::build_headers 逐项对齐"
+        );
+    }
+
+    /// ksk 凭据的 `tokentype` 落位同样照数据面:紧跟 `authorization`,在 `x-amz-target` 之前。
+    #[tokio::test]
+    async fn models_tokentype_sits_right_after_authorization_for_api_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "models": [] })),
+            )
+            .mount(&server)
+            .await;
+        let mut c = cred();
+        c.auth = AuthMethod::ApiKey;
+        c.kiro_api_key = Some("ksk_TESTKEY".into());
+        c.access_token = String::new();
+        fetch_at(&reqwest::Client::new(), &server.uri(), &c, &imp())
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        let want = [
+            "content-type",
+            "connection",
+            "x-amz-user-agent",
+            "user-agent",
+            "host",
+            "amz-sdk-invocation-id",
+            "amz-sdk-request",
+            "authorization",
+            "tokentype",
+            "x-amz-target",
+        ];
+        assert_eq!(
+            ordered(&reqs[0], &want),
+            want_vec(&want),
+            "ksk 的 tokentype 须紧跟 authorization"
+        );
+    }
+
+    /// 采日志用的写入端:把 fmt 层的输出攒在内存里供断言。
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// 回落备用主机时,日志里的 region 必须是**这次请求实际用的** region。
+    ///
+    /// 回归:此前日志打的是裸 `cred.region`,而两个 base 都由
+    /// [`crate::kiro::endpoint::effective_region`] 算(优先取 profileArn 里编码的 region)。
+    /// 于是 ARN 写 eu-central-1、导入时 region 填了 us-east-1 的账号,请求实打
+    /// `q.eu-central-1`、日志却说 us-east-1 —— 排障的人照着日志去查 us-east-1 只会白跑。
+    #[test]
+    fn fallback_log_reports_the_region_actually_used() {
+        let mut c = cred();
+        c.region = "us-east-1".into();
+        c.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:111:profile/ABC".into());
+        // 出口指向一个必然拒连的端口:两次请求都在传输层失败,既不做真实 DNS 解析也不出网,
+        // 但回落前那条日志照样会打 —— 这里要看的正是它。
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:1").unwrap())
+            .build()
+            .unwrap();
+        let buf = LogBuf::default();
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = rt.block_on(fetch_available_models(
+                &client,
+                &crate::config::Config::default(),
+                &c,
+            ));
+        });
+        let logs = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
+        assert!(logs.contains("备用主机"), "应打出回落日志: {logs}");
+        assert!(
+            logs.contains("region=eu-central-1"),
+            "日志须打实际用的 region: {logs}"
+        );
     }
 
     #[test]

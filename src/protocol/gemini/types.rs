@@ -40,11 +40,15 @@ pub struct Content {
 }
 
 /// 一个 Part 只填其一;用扁平 struct 而非 enum 以容忍未知字段。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Part {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// 该 part 是不是思考内容。上游把思考过程用 `<thinking>…</thinking>` 包在普通文本里下发,
+    /// 不标出来的话客户端会把整段思考当正文显示。Gemini 侧的表达就是这个布尔标记。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought: Option<bool>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -133,6 +137,23 @@ pub struct FunctionDeclaration {
 pub struct GenerationConfig {
     #[serde(default, alias = "max_output_tokens")]
     pub max_output_tokens: Option<u32>,
+    /// 思考配置。这是 Gemini 里唯一表达"要不要思考、思考多深"的字段;不解析它,这个协议
+    /// 就完全开不出 extended thinking —— 客户端把开关拨了,链路上却没有任何一环收得到。
+    #[serde(default, alias = "thinking_config")]
+    pub thinking_config: Option<ThinkingConfig>,
+}
+
+/// 思考配置(照 Gemini 公开规范)。
+///
+/// `thinkingBudget` 的取值有三档语义,必须分开处理:`0` = 明确关掉思考;负数(官方用 `-1`)
+/// = 交给模型自行决定深浅;正数 = 思考 token 上限。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThinkingConfig {
+    #[serde(default, alias = "include_thoughts")]
+    pub include_thoughts: Option<bool>,
+    #[serde(default, alias = "thinking_budget")]
+    pub thinking_budget: Option<i32>,
 }
 
 /// `generateContent` 非流响应体。
@@ -365,6 +386,7 @@ mod tests {
                         inline_data: None,
                         function_call: None,
                         function_response: None,
+                    ..Default::default()
                     }],
                 },
                 finish_reason: Some("STOP".to_string()),
@@ -398,6 +420,7 @@ mod tests {
                 args: serde_json::json!({"city": "Paris"}),
             }),
             function_response: None,
+        ..Default::default()
         };
         let v = serde_json::to_value(&part).expect("序列化失败");
         assert_eq!(v["functionCall"]["id"], "tu1");
@@ -421,6 +444,7 @@ mod tests {
                 args: serde_json::json!({}),
             }),
             function_response: None,
+        ..Default::default()
         };
         let s = serde_json::to_string(&part).expect("序列化失败");
         assert!(

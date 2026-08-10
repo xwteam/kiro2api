@@ -4,11 +4,12 @@ use std::fmt;
 
 use super::types::{
     Candidate, Content, FunctionCall, FunctionResponse, GenerateContentRequest,
-    GenerateContentResponse, Part, UsageMetadata,
+    GenerateContentResponse, GenerationConfig, Part, UsageMetadata,
 };
 use crate::kiro::convert::Truncation;
 use crate::protocol::anthropic::types::{
-    Block, ContentIn, InMsg, MessagesRequest, MessagesResponse, OutBlock, SystemPrompt, ToolDef,
+    Block, ContentIn, InMsg, MessagesRequest, MessagesResponse, OutBlock, SystemPrompt,
+    ThinkingConfig as HubThinkingConfig, ToolDef,
 };
 use serde_json::{Value, json};
 
@@ -188,6 +189,35 @@ fn convert_content(content: &Content, ids: &mut ToolIdAlloc) -> Result<InMsg, Ge
     })
 }
 
+/// `generationConfig.thinkingConfig` → 中枢 thinking 配置。
+///
+/// 三档语义各自对应中枢的一种表达(照 Gemini 公开规范的取值约定):
+/// - `thinkingBudget: 0` → 明确关掉思考,一个字符的指令都不加;
+/// - `thinkingBudget` 为负(官方用 `-1` 表示 dynamic)→ `adaptive`,让模型自行决定深浅;
+/// - `thinkingBudget` 为正 → `enabled`,该值即思考预算上限;
+/// - 没给预算但 `includeThoughts: true` → 客户端要的是"看得到思考",同样按 `adaptive` 开。
+///
+/// 此前这个入口恒传 thinking=None,于是 Gemini 协议**完全开不出** extended thinking。
+fn thinking_from_gemini(cfg: Option<&GenerationConfig>) -> Option<HubThinkingConfig> {
+    let tc = cfg?.thinking_config.as_ref()?;
+    let adaptive = || {
+        Some(HubThinkingConfig {
+            thinking_type: "adaptive".to_string(),
+            budget_tokens: 0,
+        })
+    };
+    match tc.thinking_budget {
+        Some(0) => None,
+        Some(b) if b < 0 => adaptive(),
+        Some(b) => Some(HubThinkingConfig {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: b as u32,
+        }),
+        None if tc.include_thoughts == Some(true) => adaptive(),
+        None => None,
+    }
+}
+
 /// 读出 `toolConfig.functionCallingConfig.mode`(统一成大写);缺失/形状不符 → `None`。
 fn tool_calling_mode(tool_config: Option<&Value>) -> Option<String> {
     tool_config?
@@ -254,8 +284,11 @@ pub fn gemini_to_hub(
         .and_then(|g| g.max_output_tokens);
 
     Ok(MessagesRequest {
-        thinking: None,
-        metadata: None,
+        thinking: thinking_from_gemini(req.generation_config.as_ref()),
+        // 会话标识:Gemini 的请求体里**没有**任何会话/用户标识字段(官方 API 就没有这个概念),
+        // 故只能拿对话开头做指纹 —— 同一场对话每一轮都会把完整历史重发,开头是稳定的。
+        // 共用 OpenAI 侧那一份实现,不在这里另抄一遍(见 `session_metadata` 的说明)。
+        metadata: crate::protocol::openai::convert::session_metadata(None, &messages),
         model,
         system: system.map(SystemPrompt::Text),
         messages,
@@ -308,8 +341,7 @@ pub fn hub_to_gemini(resp: MessagesResponse) -> GenerateContentResponse {
                 text: Some(text.clone()),
                 inline_data: None,
                 function_call: None,
-                function_response: None,
-            },
+                function_response: None, ..Default::default() },
             // 把中枢 tool_use_id 原样带进 `functionCall.id`:客户端回填 functionResponse 时
             // 带上它,就能在并行同名调用里精确配对(缺 id 才回落到按同名序号配对)。
             OutBlock::ToolUse { id, name, input } => Part {
@@ -320,8 +352,7 @@ pub fn hub_to_gemini(resp: MessagesResponse) -> GenerateContentResponse {
                     name: name.clone(),
                     args: input.clone(),
                 }),
-                function_response: None,
-            },
+                function_response: None, ..Default::default() },
         })
         .collect();
 
@@ -363,8 +394,7 @@ mod tests {
                 text: Some(text.to_string()),
                 inline_data: None,
                 function_call: None,
-                function_response: None,
-            }],
+                function_response: None, ..Default::default() }],
         }
     }
 
@@ -388,8 +418,7 @@ mod tests {
                                 name: "get_weather".to_string(),
                                 args: json!({"city": "SF"}),
                             }),
-                            function_response: None,
-                        }],
+                            function_response: None, ..Default::default() }],
                     },
                     // 客户端回填的结果:只有 name + response,**没有 id**
                     Content {
@@ -402,8 +431,7 @@ mod tests {
                                 id: None,
                                 name: "get_weather".to_string(),
                                 response: json!({"temp": 20}),
-                            }),
-                        }],
+                            }), ..Default::default() }],
                     },
                 ],
                 system_instruction: None,
@@ -464,6 +492,7 @@ mod tests {
                     args: json!({}),
                 }),
                 function_response: None,
+            ..Default::default()
             }
         }
         fn resp(id: Option<&str>) -> Part {
@@ -476,6 +505,7 @@ mod tests {
                     name: "read_file".to_string(),
                     response: json!({}),
                 }),
+            ..Default::default()
             }
         }
         let hub = gemini_to_hub(
@@ -538,6 +568,7 @@ mod tests {
                     args: json!({}),
                 }),
                 function_response: None,
+            ..Default::default()
             }
         }
         fn resp(id: Option<&str>) -> Part {
@@ -550,6 +581,7 @@ mod tests {
                     name: "f".to_string(),
                     response: json!({}),
                 }),
+            ..Default::default()
             }
         }
         let hub = gemini_to_hub(
@@ -601,8 +633,7 @@ mod tests {
                     text: Some("s".to_string()),
                     inline_data: None,
                     function_call: None,
-                    function_response: None,
-                }],
+                    function_response: None, ..Default::default() }],
             }),
             tools: None,
             tool_config: None,
@@ -650,8 +681,7 @@ mod tests {
                     text: Some("hey".to_string()),
                     inline_data: None,
                     function_call: None,
-                    function_response: None,
-                }],
+                    function_response: None, ..Default::default() }],
             }],
             system_instruction: None,
             tools: None,
@@ -677,8 +707,7 @@ mod tests {
                         name: "get_weather".to_string(),
                         args: json!({"city": "Paris"}),
                     }),
-                    function_response: None,
-                }],
+                    function_response: None, ..Default::default() }],
             }],
             system_instruction: None,
             tools: None,
@@ -711,8 +740,7 @@ mod tests {
                 name: "get_weather".to_string(),
                 args: json!({"city": city}),
             }),
-            function_response: None,
-        };
+            function_response: None, ..Default::default() };
         let req = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("model".to_string()),
@@ -752,8 +780,7 @@ mod tests {
                             name: "get_weather".to_string(),
                             args: json!({}),
                         }),
-                        function_response: None,
-                    }],
+                        function_response: None, ..Default::default() }],
                 },
                 Content {
                     role: Some("user".to_string()),
@@ -765,8 +792,7 @@ mod tests {
                             id: Some("call-42".to_string()),
                             name: "get_weather".to_string(),
                             response: json!("ok"),
-                        }),
-                    }],
+                        }), ..Default::default() }],
                 },
             ],
             system_instruction: None,
@@ -801,8 +827,7 @@ mod tests {
                 name: "f".to_string(),
                 args: json!({}),
             }),
-            function_response: None,
-        };
+            function_response: None, ..Default::default() };
         let result = || Part {
             text: None,
             inline_data: None,
@@ -811,8 +836,7 @@ mod tests {
                 id: None,
                 name: "f".to_string(),
                 response: json!("ok"),
-            }),
-        };
+            }), ..Default::default() };
         let req = GenerateContentRequest {
             contents: vec![
                 Content {
@@ -860,8 +884,7 @@ mod tests {
                         id: None,
                         name: "get_weather".to_string(),
                         response: json!({"temp": 20}),
-                    }),
-                }],
+                    }), ..Default::default() }],
             }],
             system_instruction: None,
             tools: None,
@@ -902,8 +925,7 @@ mod tests {
                         id: None,
                         name: "f".to_string(),
                         response: json!("ok"),
-                    }),
-                }],
+                    }), ..Default::default() }],
             }],
             system_instruction: None,
             tools: None,
@@ -932,8 +954,7 @@ mod tests {
                         data: "AAAA".to_string(),
                     }),
                     function_call: None,
-                    function_response: None,
-                }],
+                    function_response: None, ..Default::default() }],
             }],
             system_instruction: None,
             tools: None,
@@ -962,6 +983,7 @@ mod tests {
             tool_config: None,
             generation_config: Some(GenerationConfig {
                 max_output_tokens: Some(256),
+                thinking_config: None,
             }),
         };
         let hub = gemini_to_hub(req, "m".to_string()).expect("转换应成功");
@@ -1128,8 +1150,7 @@ mod tests {
                             data: "JVBERi0".to_string(),
                         }),
                         function_call: None,
-                        function_response: None,
-                    }],
+                        function_response: None, ..Default::default() }],
                 }],
                 system_instruction: None,
                 tools: None,
@@ -1161,8 +1182,7 @@ mod tests {
                         data: "AAAA".to_string(),
                     }),
                     function_call: None,
-                    function_response: None,
-                }],
+                    function_response: None, ..Default::default() }],
             }],
             system_instruction: None,
             tools: None,

@@ -28,7 +28,6 @@ use crate::kiro::convert::{
 use crate::kiro::endpoint::Endpoint;
 use crate::kiro::eventstream::decoder::StreamDecoder;
 use crate::kiro::login::LoginError;
-use crate::kiro::machine_id;
 use crate::kiro::pool::FailureKind;
 use crate::kiro::pool::{Pool, classify_with_body};
 use crate::kiro::provider::{self, Impersonation};
@@ -350,25 +349,6 @@ fn exception_detail(e: &StreamException) -> String {
     }
 }
 
-/// 由选中的凭据构造伪装身份(machine_id 优先取显式、否则由 refresh_token 派生)。
-fn impersonation_for(
-    cfg: &Config,
-    refresh_token: &str,
-    explicit_machine_id: Option<&str>,
-) -> Impersonation {
-    Impersonation {
-        machine_id: machine_id::resolve_with_config(
-            explicit_machine_id,
-            cfg.machine_id.as_deref(),
-            refresh_token,
-        ),
-        kiro_version: cfg.kiro_version.clone(),
-        agent_mode: "vibe".to_string(),
-        system_version: cfg.system_version.clone(),
-        node_version: cfg.node_version.clone(),
-    }
-}
-
 /// 选-调成功的产物:上游响应 + 选中凭据的数值 id(供统计层记录用量,已在池锁外)。
 pub(crate) struct CallOutcome {
     pub resp: reqwest::Response,
@@ -377,6 +357,10 @@ pub(crate) struct CallOutcome {
     /// `短名 → 原名`。超长工具名上行前被缩短,上游回来的 `tool_use` 用的是短名;
     /// 出口处必须还原,否则客户端收到一个它没声明过的工具名。名字都没超长时为空表。
     pub tool_name_map: std::collections::HashMap<String, String>,
+    /// 选中凭据的**字符串** id。数值 `credential_id` 只够记账,反馈账号池要的是这个 —— 缺了它,
+    /// 另外三个协议的流式出口在结构上就没法在「200 的流里报错」时惩罚账号、也没法换号:
+    /// 于是同一个坏号在那三条路上永远只有"刚刚成功过"。
+    pub cred_id: String,
 }
 
 /// 把响应里被缩短过的工具名还原成客户端原本声明的名字。
@@ -510,11 +494,242 @@ pub(crate) async fn select_and_call_with_retry(
     now_unix: u64,
     bound: Option<&BoundCredentialIds>,
 ) -> Result<CallOutcome, RelayError> {
+    let started = std::time::Instant::now();
+    match select_and_call_verified(state, req, now_unix, bound, started, VerifyMode::None).await? {
+        VerifiedCall::Ok(v) => match v.body {
+            VerifiedBody::Stream { resp, .. } => Ok(CallOutcome {
+                resp,
+                credential_id: v.credential_id,
+                tool_name_map: v.tool_name_map,
+                cred_id: v.cred_id,
+            }),
+            // 不验真的入口只会拿到 Stream 形态;防御性折成 502,不 panic。
+            VerifiedBody::Frames(_) => Err(RelayError::Upstream("unexpected body".to_string())),
+        },
+        // 同上:VerifyMode::None 产不出这一支。
+        VerifiedCall::Rejected(e) => Err(RelayError::Upstream(exception_detail(&e))),
+    }
+}
+
+/// 上游 200 之后**怎么判这次到底成没成**。
+///
+/// 上游把限流 / 鉴权 / 参数错误放在 HTTP 200 的事件流里下发,状态码根本看不出成败;
+/// 两条出口各有各的判法,但判完之后走的是同一条反馈路径。
+enum VerifyMode {
+    /// 不验真:调用方自己消费响应(其它协议的流式出口)。
+    None,
+    /// 非流式:读完整份体、查有没有 exception,再交还帧序列。
+    Buffered,
+    /// 流式:只预读开局,判是不是"一开口就被拒"(见 [`preroll_stream`])。
+    Stream,
+}
+
+/// 验真通过后交还给调用方的响应体。
+enum VerifiedBody {
+    /// 非流式:整份帧序列(已确认不含 exception)。
+    Frames(Vec<crate::kiro::eventstream::frame::Message>),
+    /// 流式 / 不验真:尚未读完的响应,外加**预读时已经从连接上取走**的字节 ——
+    /// 那些字节本就是这条流的一部分,必须原样交回主循环消化,不能凭空丢掉。
+    Stream {
+        resp: reqwest::Response,
+        preroll: Vec<u8>,
+    },
+}
+
+/// 验真通过的一次调用。
+struct VerifiedOk {
+    body: VerifiedBody,
+    /// 选中凭据的数值 id(统计层用)。
+    credential_id: u32,
+    /// 选中凭据的池内 id(后续反馈池用)。
+    cred_id: String,
+    tool_name_map: std::collections::HashMap<String, String>,
+    /// 选账号 + 跨账号重试 + 调上游至**上游响应就绪**的耗时(不含读体/下发)。
+    latency_ms: u64,
+}
+
+/// 一次调用验真后的结论。
+enum PostCall {
+    /// 这次调用确实成功了。
+    Done(VerifiedBody),
+    /// 上游回了 200,但事件流里带 exception —— 这次请求它其实拒了。
+    Rejected(StreamException),
+    /// 验真过程本身断了(读响应体时连接中断等)。按瞬态失败处置。
+    Broken(String),
+}
+
+/// 验真后的最终结果。
+enum VerifiedCall {
+    Ok(VerifiedOk),
+    /// 账号试尽了,拿到的仍是"200 + exception"。交由协议层按 [`exception_status`]
+    /// 映射出的状态码回错误,而不是压成一个笼统的 502。
+    Rejected(StreamException),
+}
+
+/// 循环里记下的"上一次到底怎么失败的",供试尽账号后决定回什么。
+enum LastFailure {
+    Err(RelayError),
+    Exception(StreamException),
+}
+
+fn give_up(last: Option<LastFailure>, fallback: RelayError) -> Result<VerifiedCall, RelayError> {
+    match last {
+        Some(LastFailure::Exception(e)) => Ok(VerifiedCall::Rejected(e)),
+        Some(LastFailure::Err(e)) => Err(e),
+        None => Err(fallback),
+    }
+}
+
+/// 流式开局预读的时间预算。
+///
+/// 为什么必须有上限:预读期间**响应头还发不出去**。上游"想"得久时(长推理、长工具链)
+/// 会几十秒一个字节都不出 —— 没有预算的话,这段沉默就从"流里的静默"(有 SSE keep-alive
+/// 兜着)变成"连响应头都没有",中间的 CDN / 反代 / 客户端会直接判超时。
+/// 而拒绝类 exception 上游是**立刻**回的,一个很短的预算就足以把它们全数拦下。
+const STREAM_PREROLL_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// [`preroll_stream`] 的结论。
+enum Preroll {
+    /// 上游已经开始出内容(或流已结束、或预算用尽)。预读走的字节原样交回,由主循环消化。
+    Content(Vec<u8>),
+    /// 上游在出任何内容**之前**就拒了这次请求 —— 此时一个字节都还没下发给客户端,
+    /// 换个账号重来完全来得及。
+    Rejected(StreamException),
+    /// 预读期间连接就断了。
+    Broken(String),
+}
+
+/// 流式的"开局验真":在把 SSE 交给客户端**之前**先读一小段上游流。
+///
+/// 为什么必须在这里判:上游把限流 / 鉴权失败放在 HTTP 200 的事件流里下发。等到 SSE 已经
+/// 开始下发才发现,既没法换账号重来(字节已经在线上了),账号池也只会记下一次"成功"。
+/// 预读把"一开口就被拒"的请求挡在流开始之前,于是它能和真实 HTTP 失败一样换号重试。
+///
+/// 不额外增加正常请求的延迟:一见到第一个内容帧就返回 —— 那本来就是首字节时刻。
+async fn preroll_stream(resp: &mut reqwest::Response) -> Preroll {
+    let deadline = std::time::Instant::now() + STREAM_PREROLL_BUDGET;
+    let mut raw: Vec<u8> = Vec::new();
+    let mut dec = StreamDecoder::new();
+    let mut saw_content = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Preroll::Content(raw);
+        }
+        match tokio::time::timeout(remaining, resp.chunk()).await {
+            // 预算用尽:上游只是在想,别再挡着响应头了。剩下的交给主循环边读边判。
+            Err(_) => return Preroll::Content(raw),
+            Ok(Ok(None)) => return Preroll::Content(raw),
+            Ok(Err(e)) => return Preroll::Broken(e.to_string()),
+            Ok(Ok(Some(chunk))) => {
+                raw.extend_from_slice(&chunk);
+                dec.push(&chunk);
+                for frame in dec.drain() {
+                    if let Some(e) = crate::kiro::convert::frame_exception(&frame) {
+                        // 已经出过内容 → 不算"一开口就被拒",照常建流,由主循环收尾。
+                        if saw_content {
+                            return Preroll::Content(raw);
+                        }
+                        return Preroll::Rejected(e);
+                    }
+                    // 任何非 exception 帧都说明上游已经开始干活了。
+                    saw_content = true;
+                }
+                if saw_content {
+                    return Preroll::Content(raw);
+                }
+            }
+        }
+    }
+}
+
+/// 把一次"200 但事件流里带 exception"折成与真实 HTTP 失败同一套分类。
+///
+/// 上游把限流 / 鉴权 / 参数错误放在 HTTP 200 的事件流里下发,响应本身没有状态码可依;
+/// 这里按 exception 类型还原出它**本该**是的状态码,再连同一份合成响应体交给池的
+/// body-aware 分类器 —— 于是"200 里的额度耗尽"和"402"落在同一档处置上,不必两套规则。
+///
+/// 合成体同时带 `__type` 与 `message`:池的判定既匹配机器稳定的异常名,也匹配人类措辞,
+/// 只给其中一个会漏判(见 [`classify_with_body`] 对完整响应体的要求)。
+fn stream_exception_failure(e: &StreamException) -> (FailureKind, u16, String) {
+    let status = exception_status(&e.kind);
+    let body = serde_json::json!({ "__type": e.kind, "message": e.message }).to_string();
+    let kind = classify_with_body(status, &body);
+    // 校验类 exception 被映射成 400,而 classify 在 400 上的兜底是"瞬态、可重试"。它不是:
+    // 请求本身不合法,换账号重试只会把一个个健康账号打伤(线上曾一下午把 253 个号打成
+    // 149 个带伤、26 个进冷却,而每一次重试都注定失败)。故 400 上的兜底改判为确定性请求错误。
+    let kind = if status == 400 && kind == FailureKind::Transient {
+        FailureKind::InvalidRequest
+    } else {
+        kind
+    };
+    (kind, status, body)
+}
+
+/// 把一次"200 但流内 exception"反馈账号池 + 统计层,并当场落盘持久结论。
+/// 返回分类与合成响应体,供调用方决定是否换号重试。
+///
+/// 流式与非流式两条出口共用这一份:上游拒绝就是拒绝,不该因为客户端要不要流式而分两套账。
+pub(crate) async fn report_stream_exception(
+    state: &MessagesState,
+    cred_id: &str,
+    credential_id: u32,
+    e: &StreamException,
+    now_unix: u64,
+) -> (FailureKind, String) {
+    let (kind, status, body) = stream_exception_failure(e);
+    // 这两档**不罚账号**,与真实 HTTP 失败那条路的处置严格一致(见 `select_and_call_once`
+    // 的 5.5 / 5.6):请求本身不合法是请求的事;模型不可用只是这个账号的档位不含它 ——
+    // 账号都没坏。罚下去只会把一个个健康账号打成带伤,而每次重试都注定失败。
+    if matches!(
+        kind,
+        FailureKind::InvalidRequest | FailureKind::ModelUnavailable
+    ) {
+        return (kind, body);
+    }
+    {
+        let mut pool = state.pool.lock().await;
+        pool.report_failure_with_reason(
+            cred_id,
+            kind,
+            crate::kiro::pool::status_reason_from_body(&body),
+            now_unix,
+        );
+    }
+    crate::kiro::ensure_fresh::persist_failure_conclusion(
+        &state.pool,
+        Some(&state.refresh_ctx),
+        kind,
+    )
+    .await;
+    record_classified_failure(&state.stats, credential_id, kind, status, &body, now_unix).await;
+    (kind, body)
+}
+
+/// [`select_and_call_with_retry`] 的本体:多一个**验真**环节。
+///
+/// 为什么需要验真:上游把限流 / 鉴权 / 参数错误放在 **HTTP 200** 的事件流里下发。只看
+/// HTTP 状态码的话,这类被拒的请求会被记成成功 —— 坏账号的 strike 每次都清零、永远不被
+/// 惩罚,而且**不换号重试**,用户直接吃到失败。`verify` 由调用方给出(非流式读完整帧序列、
+/// 流式预读开局),它说 [`PostCall::Rejected`] 就走与真实 HTTP 失败**同一条**反馈路径。
+///
+/// 成功也只在验真通过后才记(`report_success`),故被拒的那次不会把 strike 清零。
+///
+/// `started` 是调用方开始计时的时刻:延迟口径统一为"至上游响应就绪",跨账号重试的耗时
+/// 算在里面(用户等的就是这段),读体与下发不算。
+async fn select_and_call_verified(
+    state: &MessagesState,
+    req: &MessagesRequest,
+    now_unix: u64,
+    bound: Option<&BoundCredentialIds>,
+    started: std::time::Instant,
+    mode: VerifyMode,
+) -> Result<VerifiedCall, RelayError> {
     let pool_size = { state.pool.lock().await.len() };
     let max_attempts = cross_account_attempts(pool_size);
 
     let mut tried_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut last_err: Option<RelayError> = None;
+    let mut last: Option<LastFailure> = None;
     // "该模型对这个账号不可用"单独计数,**不占**账号故障的重试预算。
     //
     // 两者代价与含义都不同:账号故障意味着上游可能真出问题了,连试几个就该收手;而模型
@@ -530,8 +745,121 @@ pub(crate) async fn select_and_call_with_retry(
     let mut attempt = 0usize;
     while attempt < max_attempts + deterministic_skips {
         match select_and_call_once(state, req, now_unix, &tried_ids, bound).await {
-            // 成功:直接返回(响应体尚未开始消费)。
-            Ok((outcome, _tried_id)) => return Ok(outcome),
+            // 上游收下了(HTTP 2xx),但还得验真:200 的事件流里可能是一个 exception。
+            Ok((outcome, tried_id)) => {
+                let CallOutcome {
+                    mut resp,
+                    credential_id,
+                    tool_name_map,
+                    cred_id: _outcome_cred_id,
+                } = outcome;
+                let latency_ms = started.elapsed().as_millis() as u64;
+                let verdict = match mode {
+                    VerifyMode::None => PostCall::Done(VerifiedBody::Stream {
+                        resp,
+                        preroll: Vec::new(),
+                    }),
+                    VerifyMode::Buffered => match resp.bytes().await {
+                        Ok(bytes) => {
+                            let mut dec = StreamDecoder::new();
+                            dec.push(&bytes);
+                            let frames = dec.drain();
+                            // 必须先于还原响应查 exception:交给 kiro_events_to_anthropic 只会得到
+                            // 空内容 + end_turn(截断类另有 Truncation 路径,与此互斥,不会被抢走)。
+                            match extract_exception(&frames) {
+                                Some(e) => PostCall::Rejected(e),
+                                None => PostCall::Done(VerifiedBody::Frames(frames)),
+                            }
+                        }
+                        Err(e) => PostCall::Broken(format!("read body: {e}")),
+                    },
+                    VerifyMode::Stream => match preroll_stream(&mut resp).await {
+                        Preroll::Content(preroll) => {
+                            PostCall::Done(VerifiedBody::Stream { resp, preroll })
+                        }
+                        Preroll::Rejected(e) => PostCall::Rejected(e),
+                        Preroll::Broken(msg) => PostCall::Broken(msg),
+                    },
+                };
+                match verdict {
+                    // 真成功 —— 此刻才记成功(在此之前记的话,被拒的那次会把 strike 清零)。
+                    PostCall::Done(body) => {
+                        state.pool.lock().await.report_success(&tried_id);
+                        return Ok(VerifiedCall::Ok(VerifiedOk {
+                            body,
+                            credential_id,
+                            cred_id: tried_id,
+                            tool_name_map,
+                            latency_ms,
+                        }));
+                    }
+                    // 200 但流内 exception:走与真实 HTTP 失败**同一条**反馈路径,再按分类决定换不换号。
+                    PostCall::Rejected(e) => {
+                        let (kind, body) =
+                            report_stream_exception(state, &tried_id, credential_id, &e, now_unix)
+                                .await;
+                        tracing::warn!(
+                            event = "upstream_stream_exception",
+                            model = %req.model,
+                            account_id = credential_id,
+                            kind = %e.kind,
+                            failure = ?kind,
+                            "上游 200 事件流里下发 exception"
+                        );
+                        tried_ids.insert(tried_id.clone());
+                        last = Some(LastFailure::Exception(e));
+                        match kind {
+                            // 请求本身不合法:换谁都一样,立刻以 400 把原因说清,别拿健康账号去撞。
+                            FailureKind::InvalidRequest => {
+                                return Err(RelayError::InvalidRequest(
+                                    crate::kiro::pool::invalid_request_message(&body, &req.model),
+                                ));
+                            }
+                            // 账号级**确定性**结论:换个账号就可能成,不占瞬态那档的重试预算。
+                            FailureKind::ModelUnavailable => {
+                                state
+                                    .pool
+                                    .lock()
+                                    .await
+                                    .mark_model_unsupported(&tried_id, &req.model);
+                                deterministic_skips += 1;
+                            }
+                            FailureKind::Quota => deterministic_skips += 1,
+                            // 瞬态:换号前退避一下,免得把上游的抖动放大成尖峰。
+                            FailureKind::Transient => {
+                                if tried_ids.len() < max_attempts {
+                                    tokio::time::sleep(transient_backoff(attempt)).await;
+                                }
+                            }
+                            FailureKind::AuthInvalid | FailureKind::AuthAmbiguous => {}
+                        }
+                        if deterministic_skips > max_deterministic_skips {
+                            break;
+                        }
+                        attempt += 1;
+                        continue;
+                    }
+                    // 验真过程本身断了(读体中途连接中断):与瞬态失败同档,换个账号重试。
+                    PostCall::Broken(msg) => {
+                        {
+                            let mut pool = state.pool.lock().await;
+                            pool.report_failure_with_reason(
+                                &tried_id,
+                                FailureKind::Transient,
+                                crate::kiro::pool::StatusReason::None,
+                                now_unix,
+                            );
+                        }
+                        tried_ids.insert(tried_id);
+                        last = Some(LastFailure::Err(RelayError::UpstreamTransient(msg)));
+                        if tried_ids.len() < max_attempts {
+                            tokio::time::sleep(transient_backoff(attempt)).await;
+                        }
+                        attempt += 1;
+                        continue;
+                    }
+                }
+            }
             // 请求级致命错误:任何账号上都会同样失败,不重试。
             // - Convert:请求无法转换(含未映射模型);
             // - InvalidModel:上游确定性拒绝(INVALID_MODEL_ID:该模型对当前档位不可用)。
@@ -540,9 +868,9 @@ pub(crate) async fn select_and_call_with_retry(
             }
             // 池级:已无可选账号(可能是所有健康账号都被本请求试过了)。
             // 首个尝试就 NoAccount → 池确实空/全不可用,返回 NoAccount;
-            // 非首个尝试 NoAccount → 说明前面的账号已试尽,返回上一次真实的账号级错误。
+            // 非首个尝试 NoAccount → 说明前面的账号已试尽,返回上一次真实的失败。
             Err((RelayError::NoAccount, _)) => {
-                return Err(last_err.unwrap_or(RelayError::NoAccount));
+                return give_up(last, RelayError::NoAccount);
             }
             // 模型对该账号不可用:**换个账号再试**,而不是直接回 400。
             //
@@ -556,7 +884,7 @@ pub(crate) async fn select_and_call_with_retry(
                 if let Some(id) = tried_id {
                     tried_ids.insert(id);
                 }
-                last_err = Some(e);
+                last = Some(LastFailure::Err(e));
                 deterministic_skips += 1;
                 if deterministic_skips > max_deterministic_skips {
                     break;
@@ -570,7 +898,7 @@ pub(crate) async fn select_and_call_with_retry(
                 if let Some(id) = tried_id {
                     tried_ids.insert(id);
                 }
-                last_err = Some(e);
+                last = Some(LastFailure::Err(e));
                 // 生命周期日志(#7):账号级失败,即将跨账号换下一个健康账号重试。
                 // 仅当还有下一轮才算真正"跨账号重试"。不含令牌/密钥/提示词。
                 if tried_ids.len() < max_attempts {
@@ -593,7 +921,10 @@ pub(crate) async fn select_and_call_with_retry(
         }
     }
 
-    Err(last_err.unwrap_or(RelayError::Upstream("all accounts exhausted".to_string())))
+    give_up(
+        last,
+        RelayError::Upstream("all accounts exhausted".to_string()),
+    )
 }
 
 /// 选账号→(即将过期则内存刷新)→转换→调用 Kiro→反馈池,返回上游响应 + 凭据 id。
@@ -682,7 +1013,7 @@ pub(crate) async fn select_and_call_once(
     // 4) 构造伪装身份并调用 Kiro。
     //    这里先释放池锁:数据面调用**不持锁**发出(force_refresh 内部要重取池锁,持锁会死锁),
     //    调用返回后再短暂重取锁反馈成败。
-    let imp = impersonation_for(&state.cfg, &cred.refresh_token, cred.machine_id.as_deref());
+    let imp = Impersonation::for_credential(&cred, &state.cfg);
     drop(pool);
 
     // 一次数据面尝试:成功→Ok(Response);失败→Err((kind, status))。**不反馈池**,由本函数
@@ -724,11 +1055,7 @@ pub(crate) async fn select_and_call_once(
             .await
             {
                 Ok(fresh) => {
-                    let imp2 = impersonation_for(
-                        &state.cfg,
-                        &fresh.refresh_token,
-                        fresh.machine_id.as_deref(),
-                    );
+                    let imp2 = Impersonation::for_credential(&fresh, &state.cfg);
                     // 用刷新后的凭据重试一次(仍不反馈池)。
                     call_data_plane(state, &fresh, &imp2, &body).await
                 }
@@ -772,26 +1099,34 @@ pub(crate) async fn select_and_call_once(
         ));
     }
 
-    // 6) 依最终结果反馈池(短暂持锁)。分类失败随后在池锁释放外落统计。
-    let failure_to_record: Option<(FailureKind, u16, String)> = {
-        let mut pool = state.pool.lock().await;
-        match &outcome {
-            Ok(_) => {
-                pool.report_success(&cred.id);
-                None
-            }
-            Err((kind, status, body)) => {
-                // 顺带把这次失败的**具体原因**记进池:上游响应体在这里还在手上,分类完就丢
-                // 的话,面板永远只能显示一个笼统的"异常"(封禁/限流/额度耗尽全混在一起)。
-                let reason = crate::kiro::pool::status_reason_from_body(body);
-                pool.report_failure_with_reason(&cred.id, *kind, reason, now_unix);
-                Some((*kind, *status, body.clone()))
-            }
+    // 6) 失败则反馈池(短暂持锁)。分类失败随后在池锁释放外落统计。
+    //
+    // **成功不在这里记**:上游会把限流/鉴权失败放在 HTTP 200 的事件流里,拿到 200 的这一刻
+    // 还不知道这次到底成没成。此前在这里就 `report_success`,于是流里带 exception 的请求被
+    // 记成成功——坏账号的 strike 每次都被清零、永远攒不到阈值,也就永远不被惩罚。成功由
+    // [`select_and_call_verified`] 在**验真之后**统一记。
+    let failure_to_record: Option<(FailureKind, u16, String)> = match &outcome {
+        Ok(_) => None,
+        Err((kind, status, body)) => {
+            // 顺带把这次失败的**具体原因**记进池:上游响应体在这里还在手上,分类完就丢
+            // 的话,面板永远只能显示一个笼统的"异常"(封禁/限流/额度耗尽全混在一起)。
+            let reason = crate::kiro::pool::status_reason_from_body(body);
+            let mut pool = state.pool.lock().await;
+            pool.report_failure_with_reason(&cred.id, *kind, reason, now_unix);
+            Some((*kind, *status, body.clone()))
         }
     };
 
     // 分类失败落库(池锁已释放,fire-and-forget,不阻塞热路径的其它请求)。
     if let Some((kind, status, body)) = failure_to_record {
+        // 写进持久字段的结论(永久禁用 / 额度恢复时刻)当场落盘:只写内存的话,进程被 kill
+        // 就全丢,重启后又拿用户的额度把"谁没额度"重新学一遍。
+        crate::kiro::ensure_fresh::persist_failure_conclusion(
+            &state.pool,
+            Some(&state.refresh_ctx),
+            kind,
+        )
+        .await;
         record_classified_failure(&state.stats, credential_id, kind, status, &body, now_unix).await;
         // 瞬态与账号级分开:前者值得退避后再换号(上游抖动时不放大),后者换个账号
         // 立刻就能成、等待纯属拖慢用户。此分工照观测 —— 真实客户端在 408/429/5xx 上退避、
@@ -817,6 +1152,7 @@ pub(crate) async fn select_and_call_once(
             resp,
             credential_id,
             tool_name_map,
+            cred_id: tried_id.clone(),
         },
         tried_id,
     ))
@@ -964,17 +1300,38 @@ pub async fn relay_core_outcome(
     now_unix: u64,
 ) -> Result<CoreOutcome, RelayError> {
     let started = std::time::Instant::now();
-    // 跨账号重试:账号级失败自动换下一个健康账号,直到成功或用尽自适应上限;
-    // 请求级致命错误(Convert/400)不重试。返回成功前不会开始读 body。
-    let CallOutcome {
-        resp,
-        credential_id,
-        tool_name_map,
-    } = select_and_call_with_retry(state, &req, now_unix, bound.as_ref()).await?;
-
-    // 端到端延迟(选账号+跨账号重试+调上游,至上游响应就绪):既用于 INFO 日志,也随用量记录落库
-    // 供 usage-summary 计 avgLatencyMs(与日志的 latency_ms 同源、口径一致)。
-    let latency_ms = started.elapsed().as_millis() as u64;
+    // 跨账号重试 + 验真:账号级失败自动换下一个健康账号,直到成功或用尽自适应上限;
+    // 请求级致命错误(Convert/400)不重试。
+    //
+    // 验真在这里就是"读完体、查有没有 exception":上游把限流/鉴权/参数错误放在 HTTP 200 的
+    // 事件流里下发,只看状态码的话这类被拒的请求会被记成成功——账号池永远学不会谁在被拒,
+    // 用户也拿不到重试。故读体挪进重试循环内,exception 与真实 HTTP 失败同路处置。
+    let verified = select_and_call_verified(
+        state,
+        &req,
+        now_unix,
+        bound.as_ref(),
+        started,
+        VerifyMode::Buffered,
+    )
+    .await?;
+    let (frames, credential_id, tool_name_map, latency_ms) = match verified {
+        VerifiedCall::Ok(VerifiedOk {
+            body: VerifiedBody::Frames(frames),
+            credential_id,
+            tool_name_map,
+            latency_ms,
+            ..
+        }) => (frames, credential_id, tool_name_map, latency_ms),
+        // VerifyMode::Buffered 只会交回 Frames;防御性折成 502,不 panic。
+        VerifiedCall::Ok(_) => return Err(RelayError::Upstream("unexpected body".to_string())),
+        // 账号试尽了仍是 200 + exception:按映射出的状态码回错误(429/403/400/502),
+        // 而不是 200 + 空内容 + end_turn 那种"客户端既察觉不到也不会重试"的假成功。
+        VerifiedCall::Rejected(e) => {
+            let status = exception_status(&e.kind);
+            return Ok(CoreOutcome::Exception { status, e });
+        }
+    };
 
     // 每请求一条 INFO(供 /admin 日志查看器):method/model/account/api-key/status/延迟,
     // 不含任何 token/密钥/提示词。热路径外、无锁,一行一请求。
@@ -987,31 +1344,6 @@ pub async fn relay_core_outcome(
         latency_ms = latency_ms,
         "relay 已处理请求"
     );
-
-    // 读 body → 解码事件流 → 还原 Anthropic 响应。
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| RelayError::Upstream(format!("read body: {e}")))?;
-    let mut dec = StreamDecoder::new();
-    dec.push(&bytes);
-    let frames = dec.drain();
-
-    // 必须先于还原响应查 exception:上游用 200 + exception 帧表达限流/鉴权/参数错误,
-    // 交给 kiro_events_to_anthropic 只会得到空内容 + end_turn(截断类另有 Truncation 路径,
-    // 与此互斥,不会被这里抢走)。
-    if let Some(e) = extract_exception(&frames) {
-        let status = exception_status(&e.kind);
-        tracing::warn!(
-            event = "upstream_stream_exception",
-            model = %req.model,
-            account_id = credential_id,
-            kind = %e.kind,
-            status = status,
-            "上游事件流下发 exception"
-        );
-        return Ok(CoreOutcome::Exception { status, e });
-    }
 
     let mut out = kiro_events_to_anthropic(&frames, &req.model);
     // 工具名还原:上行时超长名被缩短,上游回来的就是短名。不还原的话客户端收到一个
@@ -1230,16 +1562,56 @@ pub async fn relay_stream_attributed(
 ) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>> + use<>>, RelayError> {
     let started = std::time::Instant::now();
     // 跨账号重试在**流开始之前**完成:拿到成功响应才建 SSE,失败账号的响应永不会开始下发。
-    let CallOutcome {
-        mut resp,
-        credential_id,
-        tool_name_map,
-    } = select_and_call_with_retry(state, &req, now_unix, bound.as_ref()).await?;
+    //
+    // 验真(预读开局)同样在这之前:上游把限流/鉴权失败放在 HTTP 200 的事件流里下发,
+    // 等 SSE 都开始下发了才发现就换不了账号了 —— 用户直接吃到失败,而账号池只会记下
+    // 一次"成功"。预读把"一开口就被拒"挡在流开始之前,于是它能照常换号重试。
+    let verified = select_and_call_verified(
+        state,
+        &req,
+        now_unix,
+        bound.as_ref(),
+        started,
+        VerifyMode::Stream,
+    )
+    .await?;
+    // 账号试尽仍是"200 + exception":一个字节都还没下发,但 SSE 的错误契约要求以
+    // `event: error` 告知(状态码已在 error 事件里)。种进 `stream_error`,复用同一条收尾路径,
+    // 不另起一份下发逻辑。已在重试循环里逐个账号反馈过池,故此处**不再**重复反馈。
+    let (mut resp, preroll, credential_id, cred_id, tool_name_map, latency_ms, seeded_exception) =
+        match verified {
+            VerifiedCall::Ok(VerifiedOk {
+                body: VerifiedBody::Stream { resp, preroll },
+                credential_id,
+                cred_id,
+                tool_name_map,
+                latency_ms,
+            }) => (
+                Some(resp),
+                preroll,
+                credential_id,
+                cred_id,
+                tool_name_map,
+                latency_ms,
+                None,
+            ),
+            // VerifyMode::Stream 只会交回 Stream 形态;防御性折成 502,不 panic。
+            VerifiedCall::Ok(_) => {
+                return Err(RelayError::Upstream("unexpected body".to_string()));
+            }
+            VerifiedCall::Rejected(e) => (
+                None,
+                Vec::new(),
+                0u32,
+                String::new(),
+                std::collections::HashMap::new(),
+                started.elapsed().as_millis() as u64,
+                Some(e),
+            ),
+        };
     let model = req.model.clone();
-
-    // 流建立延迟(选账号+跨账号重试+调上游至 SSE 就绪):既用于 INFO 日志,也随用量记录落库供
-    // usage-summary 计 avgLatencyMs(与非流式 relay_core 的 latency 口径统一:皆测至上游响应就绪)。
-    let latency_ms = started.elapsed().as_millis() as u64;
+    // 流内 exception 的池反馈要在流里做(那时才知道有没有),故把 state 克隆进闭包。
+    let feedback_state = state.clone();
 
     // 每请求一条 INFO(供 /admin 日志查看器):流已建立即记,latency = 选账号+调上游耗时。
     // 只含 method/model/account/api-key/status/延迟,不含任何 token/密钥/提示词。
@@ -1295,6 +1667,11 @@ pub async fn relay_stream_attributed(
         yield Ok(to_event(stream::message_start(&id, &model, estimated_input)));
 
         let mut dec = StreamDecoder::new();
+        // 预读阶段已经从连接上取走的字节:先喂回解码器,由下面的循环照常消化 ——
+        // 它们本就是这条流的一部分,绝不能凭空丢掉,也不该另起一份处理逻辑。
+        if !preroll.is_empty() {
+            dec.push(&preroll);
+        }
         let mut next_index: u32 = 0;
         let mut open_block: Option<u32> = None; // 当前打开的块 index
         let mut text_index: Option<u32> = None; // 当前文本块 index(关闭后置 None 以便重开)
@@ -1306,7 +1683,11 @@ pub async fn relay_stream_attributed(
         let mut closed_blocks: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut any_tool = false;
         let mut truncation: Option<Truncation> = None; // 首个截断信号(max_tokens / 上下文耗尽)
-        let mut stream_error: Option<StreamException> = None; // 上游中途下发的 exception
+        // 上游中途下发的 exception。预读阶段就被拒、且账号已试尽时在这里种好:
+        // 收尾逻辑只此一份,不为"开局被拒"另写一条下发路径。
+        let mut stream_error: Option<StreamException> = seeded_exception;
+        // 该 exception 是否已在选-调循环里反馈过池(种进来的那种已经反馈过,别记两遍)。
+        let already_reported = stream_error.is_some();
         // 传输层中断(连接重置 / TLS 中断 / 读超时 / chunked 体未收尾)。与上面的 in-band
         // exception 是两回事:那是上游"说"自己出错了,这是连接本身断了。两者都必须以 error
         // 事件收尾——若照常发 message_delta(end_turn)+message_stop,客户端会把半截回答
@@ -1314,9 +1695,8 @@ pub async fn relay_stream_attributed(
         let mut transport_err: Option<(u16, String)> = None;
 
         loop {
-            match resp.chunk().await {
-                Ok(Some(chunk)) => {
-                    dec.push(&chunk);
+            // 先把解码器里已有的帧消化干净(预读喂进来的那批就在这里被处理),再去读新字节。
+            {
                     for frame in dec.drain() {
                         if let Some(t) = crate::kiro::convert::frame_text_delta(&frame) {
                             usage_guard.total_chars += t.chars().count();
@@ -1418,17 +1798,23 @@ pub async fn relay_stream_attributed(
                         }
                         // 忽略其它事件。
                     }
-                    if stream_error.is_some() {
+            }
+            if stream_error.is_some() {
+                break;
+            }
+            // 再从连接上读一段。`resp` 为 None = 账号已试尽(开局就被拒),没有连接可读。
+            match resp.as_mut() {
+                Some(r) => match r.chunk().await {
+                    Ok(Some(chunk)) => dec.push(&chunk),
+                    Ok(None) => break,
+                    Err(e) => {
+                        // 流中断:记下原因,收尾走 error 事件(不可伪装成正常完成)。
+                        let status = if e.is_timeout() { 504 } else { 502 };
+                        transport_err = Some((status, e.to_string()));
                         break;
                     }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    // 流中断:记下原因,收尾走 error 事件(不可伪装成正常完成)。
-                    let status = if e.is_timeout() { 504 } else { 502 };
-                    transport_err = Some((status, e.to_string()));
-                    break;
-                }
+                },
+                None => break,
             }
         }
 
@@ -1490,6 +1876,12 @@ pub async fn relay_stream_attributed(
                 status = status,
                 "上游事件流下发 exception"
             );
+            // 反馈账号池:上游在 200 的流里报错 = 这次它其实没干成。不反馈的话,这个账号在
+            // 池子眼里永远只有"刚刚成功过",坏号一次都不会被惩罚。
+            // (内容已经开始下发,换号已来不及;开局就被拒的那种在选-调循环里换过了。)
+            if !already_reported {
+                report_stream_exception(&feedback_state, &cred_id, credential_id, &e, now_unix).await;
+            }
             yield Ok(to_event(stream_error_event(status, &exception_detail(&e))));
         } else {
             // stop_reason 与非流式 kiro_events_to_anthropic 同口径:tool_use 优先级最高,
@@ -1517,7 +1909,12 @@ pub async fn relay_stream_attributed(
         // meteringEvent 的真实计量,缺项回退估算;credits/缓存同样取末次 meteringEvent。
         // flush 幂等并置 recorded,故随后哨兵 Drop 不会重复落库。若客户端在收尾前断连,
         // 则本行不执行,由 usage_guard 的 Drop 补记同样的累计量(#18)。
-        usage_guard.flush();
+        //
+        // 开局就被拒(账号试尽)那种不落用量:这一轮压根没产出内容,也没有账号可归属,
+        // 记下去只会给 0 号账号平白挂一条空账(与非流式命中 exception 时不记用量同口径)。
+        if !already_reported {
+            usage_guard.flush();
+        }
     };
 
     Ok(Sse::new(body).keep_alive(
@@ -1595,6 +1992,42 @@ pub async fn messages(
     }
 }
 
+/// 把一次 MCP(服务端内置搜索)调用失败反馈账号池 + 统计层。
+///
+/// 分类口径与数据面完全一致([`classify_with_body`]):同一个账号在同一个上游上被拒,
+/// 不该因为这次走的是 `/mcp` 就换一套处置。拿不到 HTTP 应答(传输层错误)时保守落瞬时类。
+/// 写进持久字段的结论(永久禁用 / 额度恢复时刻)当场落盘。
+async fn report_mcp_failure(
+    state: &MessagesState,
+    cred_id: &str,
+    credential_id: u32,
+    err: &LoginError,
+    now_unix: u64,
+) {
+    let (status, body) = match err {
+        LoginError::UpstreamHttp { status, body } => (*status, body.clone()),
+        LoginError::Upstream(msg) => (0u16, msg.clone()),
+        _ => (0u16, String::new()),
+    };
+    let kind = classify_with_body(status, &body);
+    {
+        let mut pool = state.pool.lock().await;
+        pool.report_failure_with_reason(
+            cred_id,
+            kind,
+            crate::kiro::pool::status_reason_from_body(&body),
+            now_unix,
+        );
+    }
+    crate::kiro::ensure_fresh::persist_failure_conclusion(
+        &state.pool,
+        Some(&state.refresh_ctx),
+        kind,
+    )
+    .await;
+    record_classified_failure(&state.stats, credential_id, kind, status, &body, now_unix).await;
+}
+
 /// 处理一条服务端内置搜索请求:调 MCP 拿结果,合成 Anthropic 形状的响应。
 ///
 /// 形状照公开规范:`server_tool_use`(服务端工具调用,input 一次性给全,不走增量)
@@ -1623,9 +2056,31 @@ async fn handle_web_search(
     let Some(cred) = cred else {
         return RelayError::NoAccount.into_response();
     };
+    let cred_id = cred.id.clone();
+    let credential_id = credential_id_num(&cred_id);
 
-    let imp = impersonation_for(&state.cfg, &cred.refresh_token, cred.machine_id.as_deref());
-    let results = ws::search(
+    // 令牌保鲜:这条路和数据面一样是拿账号去打上游,凭据即将过期就必须先换新。
+    // 此前它是全仓唯一一个选完号直接就用的入口 —— 令牌一过期就是一个必然的 401,
+    // 而那 401 还只表现成"搜了但没搜到",谁都看不出真实原因。
+    let cred = match crate::kiro::ensure_fresh::ensure_fresh(
+        &state.pool,
+        &cred_id,
+        // 与数据面同一出口(按该账号自己的代理取),走控制面硬超时客户端。
+        &crate::http::unary_for(&cred),
+        now_unix,
+        REFRESH_MARGIN_SECS,
+        Some(&state.refresh_ctx),
+    )
+    .await
+    {
+        Ok(c) => c,
+        // 保鲜失败时账号池已在 ensure_fresh 内部收到反馈,这里只需把错误回给客户端:
+        // 拿一枚已知过期的令牌去搜,换来的只会是一个说不清原因的空结果。
+        Err(e) => return RelayError::Upstream(format!("ensure_fresh: {e}")).into_response(),
+    };
+
+    let imp = Impersonation::for_credential(&cred, &state.cfg);
+    let outcome = ws::search(
         &crate::http::unary_for(&cred),
         &effective_region(&cred),
         &cred,
@@ -1634,11 +2089,28 @@ async fn handle_web_search(
     )
     .await;
 
+    // 反馈账号池:调用通没通过是这个账号的事,池子必须知道。
+    // 载荷形状不认识(Malformed)不算账号的错 —— 凭据被上游收下了,罚它只会平白削掉一个能用的号。
+    let results = match &outcome {
+        Ok(r) => {
+            state.pool.lock().await.report_success(&cred_id);
+            Some(r)
+        }
+        Err(ws::SearchError::Malformed) => {
+            state.pool.lock().await.report_success(&cred_id);
+            None
+        }
+        Err(ws::SearchError::Call(e)) => {
+            report_mcp_failure(state, &cred_id, credential_id, e, now_unix).await;
+            None
+        }
+    };
+
     let tool_use_id = ws::new_server_tool_use_id();
-    let blocks = ws::to_result_blocks(results.as_ref());
+    let blocks = ws::to_result_blocks(results);
     tracing::info!(
         event = "web_search",
-        account_id = credential_id_num(&cred.id),
+        account_id = credential_id,
         results = blocks.len(),
         "服务端内置搜索已处理"
     );
@@ -2236,6 +2708,72 @@ mod tests {
     }
 
     // ==================== 跨账号重试(cross-account retry)====================
+
+    /// ksk 账号在**数据面**必须各有各的 machineId。
+    ///
+    /// 回归(第三次栽在同一个坑):`impersonation_for` 在本文件里留了一份**同名私有实现**,
+    /// 遮蔽了声称"全项目唯一入口"的 `Impersonation::for_credential`。私有那版走
+    /// `machine_id::resolve_with_config`,对空 `refresh_token` 无条件 `derive("")` —— 而 ksk
+    /// 凭据的 refresh_token 恰恰是空的。于是**所有 ksk 账号在数据面共用同一个 machineId**
+    /// (那个常数 = sha256("KotlinNativeAPI/")),而在余额/模型清单等走共享入口的链路上又
+    /// 各是各的。同一批账号既相互串成一台机器、又前后自相矛盾,这正是最强的关联信号。
+    #[tokio::test]
+    async fn ksk_accounts_get_distinct_machine_ids_on_the_data_plane() {
+        let server = MockServer::start().await;
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+
+        let ksk = |id: &str, key: &str| {
+            let mut c = cred_id(id);
+            c.auth = crate::kiro::credential::AuthMethod::ApiKey;
+            c.kiro_api_key = Some(key.to_string());
+            c.access_token = String::new();
+            c.refresh_token = String::new();
+            c.machine_id = None;
+            c
+        };
+        let st = state(&server.uri(), vec![ksk("1", "ksk_AAA"), ksk("2", "ksk_BBB")]);
+        let app = messages_router(st);
+        let body = r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#;
+        for _ in 0..2 {
+            // 两次请求;粘滞选号下第二次仍是同一个账号,故手动打第二个账号见下。
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/messages")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let reqs = server.received_requests().await.unwrap();
+        assert!(!reqs.is_empty(), "该有数据面请求");
+        let constant = crate::kiro::machine_id::derive("");
+        for r in &reqs {
+            let ua = r.headers["user-agent"].to_str().unwrap();
+            assert!(
+                !ua.contains(&constant),
+                "ksk 账号拿到了空 refresh_token 派生的常数 machineId —— 所有 ksk 会串成同一台机器: {ua}"
+            );
+            // 就是该账号的 ksk 派生出来的那个。
+            let want_a = crate::kiro::machine_id::derive_from_api_key("ksk_AAA");
+            let want_b = crate::kiro::machine_id::derive_from_api_key("ksk_BBB");
+            assert!(
+                ua.contains(&want_a) || ua.contains(&want_b),
+                "machineId 应由该账号自己的 ksk 派生: {ua}"
+            );
+        }
+    }
 
     /// 跨账号重试:第一个账号 502(瞬时),换第二个账号成功 → 整体请求 200。
     /// mock:头一次请求回 502(`up_to_n_times(1)` + 高优先级),之后回带 "pong" 的 200。
@@ -3542,5 +4080,293 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["content"][0]["text"], "pong");
+    }
+
+    // ============ 上游 200 但流内 exception:必须走与真实失败同一条反馈路径 ============
+
+    /// 每个测试各用一份互不打架的凭据文件(同进程内多个测试并行跑,落盘路径不能共用)。
+    fn state_with_own_creds_file(
+        server_uri: &str,
+        creds: Vec<Credential>,
+        tag: &str,
+    ) -> MessagesState {
+        let mut st = state(server_uri, creds);
+        st.refresh_ctx = crate::kiro::ensure_fresh::RefreshCtx::new(
+            std::env::temp_dir()
+                .join(format!(
+                    "kiro2api_handler_persist_{}_{}_{}.json",
+                    tag,
+                    std::process::id(),
+                    crate::kiro::uuid_v4()
+                ))
+                .to_string_lossy()
+                .to_string(),
+        );
+        st
+    }
+
+    /// 非流式:上游 200 但流里是一个限流 exception → 必须当作**账号级失败**换个账号重试,
+    /// 而不是把这次拒绝原样丢给用户。
+    ///
+    /// 回归:200 一到手就 `report_success`,而 exception 是读完体才发现的。于是上游明明
+    /// 拒绝了这次请求,池子却记成成功 —— 坏账号的 strike 永远清零、永远不被惩罚,更不会
+    /// 换号重试,用户直接吃到失败。
+    #[tokio::test]
+    async fn a_200_with_an_exception_retries_on_another_account() {
+        let server = MockServer::start().await;
+        // 头一次:200 + ThrottlingException(高优先级、只生效一次)。
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(exception_frame(
+                "ThrottlingException",
+                br#"{"message":"slow down"}"#,
+            )))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        // 其后:正常的 pong。
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(event_frame("assistantResponseEvent", br#"{"content":"pong"}"#)),
+            )
+            .with_priority(5)
+            .mount(&server)
+            .await;
+
+        let st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+        let pool = st.pool.clone();
+        let (status, bytes) = post_messages(
+            messages_router(st),
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "该换个账号重试,而不是把拒绝丢给用户");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["content"][0]["text"], "pong");
+
+        // 被拒的那个账号必须记到一次失败(否则池子永远学不会谁在被上游拒)。
+        let st_snapshot = pool.lock().await.stats(1000);
+        let failed: u64 = st_snapshot.iter().map(|a| a.failures).sum();
+        assert_eq!(failed, 1, "上游拒了一次就该记一次失败;实际:{st_snapshot:?}");
+        let ok: u64 = st_snapshot.iter().map(|a| a.successes).sum();
+        assert_eq!(ok, 1, "只有真正出内容的那次才算成功");
+    }
+
+    /// 非流式:同一个账号反复被上游以 200 + AccessDeniedException 拒绝 → strike 必须累计,
+    /// 到阈值把它停用,而不是每次都被"200 即成功"把 strike 清零。
+    #[tokio::test]
+    async fn repeated_200_exceptions_eventually_take_the_account_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(exception_frame(
+                "AccessDeniedException",
+                br#"{"message":"nope"}"#,
+            )))
+            .mount(&server)
+            .await;
+
+        // 两个账号:每次请求把两个都试一遍,各记一 strike(AuthAmbiguous 阈值 2)。
+        // 用两个而不是一个,是为了避开"全池都被运行期判停 → 放回一轮重试"的自愈
+        //(见 `Pool::select`),那条路会把 strike 清掉,盖住这里要测的东西。
+        let st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+        let pool = st.pool.clone();
+        let app = messages_router(st);
+        let body = r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#;
+        for _ in 0..2 {
+            let (status, _) = post_messages(app.clone(), body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+
+        let stats = pool.lock().await.stats(1000);
+        let successes: u64 = stats.iter().map(|a| a.successes).sum();
+        assert_eq!(successes, 0, "被上游拒掉的请求一次都不该记成功;实际:{stats:?}");
+        assert_eq!(
+            stats.iter().map(|a| a.failures).sum::<u64>(),
+            4,
+            "两次请求 × 两个账号,每次拒绝都该记一次失败;实际:{stats:?}"
+        );
+        assert!(
+            stats.iter().all(|a| a.disabled),
+            "连续被上游拒绝的账号必须被停用;strike 被'200 即成功'清零的话它们会永远待在池里;实际:{stats:?}"
+        );
+    }
+
+    /// 流式:上游一开口就是 exception(还没出任何内容)→ 换个账号重试,客户端拿到的是
+    /// 正常的流,而不是一个 `event: error`。
+    ///
+    /// 流式是 Claude Code 的主路径,只修非流式等于没修。
+    #[tokio::test]
+    async fn a_streaming_200_with_an_immediate_exception_retries_on_another_account() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(exception_frame(
+                "ThrottlingException",
+                br#"{"message":"slow down"}"#,
+            )))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(event_frame("assistantResponseEvent", br#"{"content":"pong"}"#)),
+            )
+            .with_priority(5)
+            .mount(&server)
+            .await;
+
+        let st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+        let pool = st.pool.clone();
+        let (status, bytes) = post_messages(
+            messages_router(st),
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            !s.contains("event: error"),
+            "一开口就被拒时应换号重试,不该把 error 事件下发给客户端;实际:\n{s}"
+        );
+        assert!(s.contains("pong"), "换号后的正常内容应下发;实际:\n{s}");
+        let stats = pool.lock().await.stats(1000);
+        let failed: u64 = stats.iter().map(|a| a.failures).sum();
+        assert_eq!(failed, 1, "被拒的那个账号该记一次失败;实际:{stats:?}");
+    }
+
+    /// 流式:内容已经开始下发之后上游才报 exception(此时换号已来不及)→ 至少必须把
+    /// 这次拒绝反馈给账号池,否则这个号在池子眼里永远只有"刚刚成功过"。
+    #[tokio::test]
+    async fn a_mid_stream_exception_is_still_reported_to_the_pool() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("assistantResponseEvent", br#"{"content":"po"}"#);
+        body.extend(exception_frame(
+            "AccessDeniedException",
+            br#"{"message":"nope"}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let st = state(&server.uri(), vec![cred()]);
+        let pool = st.pool.clone();
+        let (status, bytes) = post_messages(
+            messages_router(st),
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("event: error"), "流中途出错仍要发 error 事件");
+        let stats = pool.lock().await.stats(1000);
+        assert_eq!(
+            stats[0].failures, 1,
+            "流内 exception 没反馈池:这个号在池子眼里永远只有'刚刚成功过';实际:{stats:?}"
+        );
+    }
+
+    /// 数据面判出的**额度耗尽**必须当场落盘。
+    ///
+    /// 这正是"额度用完的账号不是已经禁用了吗,为什么还会请求到已禁用的账号"的来由:
+    /// 结论只写内存,进程一重启就全丢,又拿用户的额度重新学一遍。
+    #[tokio::test]
+    async fn a_quota_verdict_from_the_data_plane_is_written_to_disk_at_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(402).set_body_string(
+                r#"{"reason":"MONTHLY_REQUEST_COUNT","message":"monthly quota reached"}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let st = state_with_own_creds_file(&server.uri(), vec![cred()], "quota");
+        let path = st.refresh_ctx.credentials_path.clone();
+        let (status, _) = post_messages(
+            messages_router(st),
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        let on_disk = crate::kiro::credential::load(&path).expect("凭据文件应可读");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(on_disk.len(), 1, "额度耗尽的结论根本没落盘");
+        assert!(
+            on_disk[0].quota_reset_unix.is_some(),
+            "额度恢复时刻没落盘:重启后这个空号又会被拿去撞墙"
+        );
+    }
+
+    // ==================== 服务端内置搜索(web_search)====================
+
+    /// 构造一条纯 web_search 请求。
+    fn web_search_req() -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "sonnet",
+            "messages": [{"role": "user", "content": "Perform a web search for the query: rust"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search", "input_schema": {}}]
+        }))
+        .expect("请求应可解析")
+    }
+
+    /// web_search 选完账号必须先保鲜令牌。
+    ///
+    /// 回归:全仓三个 `ensure_fresh` 调用点里没有它 —— 令牌过期就是一个 401,而且失败了
+    /// 池子什么都学不到。这里给一个即将过期的凭据:保鲜必然发生(测试环境到不了上游刷新
+    /// 端点,故它会失败),于是整条请求以错误收场,而不是拿着过期令牌去打一枪必然被拒的 MCP。
+    #[tokio::test]
+    async fn web_search_keeps_the_token_fresh_before_using_the_account() {
+        let server = MockServer::start().await;
+        let mut c = cred();
+        c.expires_at_unix = 1000; // now=1000 → 必然 expires_soon
+        let st = state(&server.uri(), vec![c]);
+        let pool = st.pool.clone();
+
+        let resp = handle_web_search(&st, &web_search_req(), None, 1000).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "令牌保鲜失败时不该假装搜索成功"
+        );
+        let stats = pool.lock().await.stats(1000);
+        assert!(
+            stats[0].failures >= 1,
+            "保鲜失败必须反馈账号池;实际:{stats:?}"
+        );
+    }
+
+    /// web_search 调用失败必须反馈账号池。
+    ///
+    /// 回归:选了号直接就用,失败了池子什么都学不到 —— 一个已经不能用的账号会被
+    /// 一次次挑中去打同一枪。(搜索失败本身仍不让整条请求失败,回空结果集。)
+    #[tokio::test]
+    async fn web_search_failure_teaches_the_pool() {
+        let server = MockServer::start().await;
+        // 令牌远未过期 → 保鲜是空操作,这里单看"调用结果反馈池"这一半。
+        let st = state(&server.uri(), vec![cred()]);
+        let pool = st.pool.clone();
+
+        // MCP 生产端点在测试环境不可达 → 调用必然失败。
+        let resp = handle_web_search(&st, &web_search_req(), None, 1000).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "搜索挂了不该让整条请求失败(客户端至少要拿到一个空结果集)"
+        );
+        let stats = pool.lock().await.stats(1000);
+        assert_eq!(
+            stats[0].failures, 1,
+            "搜索失败没反馈账号池:坏号会被一次次挑中去打同一枪;实际:{stats:?}"
+        );
     }
 }

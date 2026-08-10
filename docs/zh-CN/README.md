@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.16.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.17.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-08-10 | v0.17.0 - 🎯 **专查一件事:每处修复是不是真的落到了全部调用点**——公共函数改好了、某个调用点没用它,或者某个文件留了一份**同名私有实现**把共享实现遮蔽掉,于是全仓搜索时看着像"已统一"。这一轮找出 26 处、修完再复核又抓出 6 处只做了一半,一并修掉。重点:①**所有 ksk 账号在数据面共用同一个 machineId**——数据面那份私有实现按 refresh_token 派生,而 ksk 的 refresh_token 本就是空的,于是全部落到同一常量,在上游看来就是一台机器跑几十个号,同时余额/模型清单又各算各的;②**上游回 200 但流里带 exception 被记成成功**:成败在拿到 200 那一刻就落了,坏号永不被降权、也不换号重试,用户直接吃失败;③**旧启停接口改了池不落盘、正常停机(docker stop)根本不刷盘**——容器每重启一次就把配额/封号/machineId 这些结论忘光,再拿用户额度重学一遍;④令牌续期用了另一套可用性判据,少了"配额耗尽"那档,已被拒的账号仍在按点刷令牌;⑤**超长工具名还原只落在四条流式出口的一条**,另三个协议的客户端会收到自己没声明过的工具名。新增:三个协议可开 extended thinking(响应方向同步剥离思考,只开不切会混进正文)、带会话标识、Gemini 流式保活、CORS、`KIRO_API_KEY` 环境变量 |
 | 2026-08-10 | v0.16.0 - 🔍 **又跑了一轮独立复核,找出 6 处——好几处是此前的修复只落了一半**。①`amz-sdk-invocation-id` 的 UUID 修复**只落了 3/5 个调用点**:balance 与 models_cache 各自私有一份同名旧生成器被局部遮蔽,搜索时看着像"已统一",实际同一枚 Bearer 在数据面发 UUID、在余额发裸 hex;②**登录流对 oidc 主机一个头都不带、连 UA 都没有**——正是 v0.10.0 在刷新链路修过的同一缺陷,而登录打的是**同一台主机的相邻路径**,且注册裸奔、几分钟后同一 clientId 又用完美 SDK 头去刷新,这种前后矛盾比裸请求更易被关联;③**region 三条链路各算各的**(数据面按 profileArn、余额/模型用裸 cred.region)→ 余额恒查不出,且同一枚 Bearer 同时命中两个 region;④history 里的工具名没走缩短,与 tools 列表的短名对不上;⑤**改优先级不触发重新选号**,粘滞档下等于没改;⑥**全池被判停后无自愈**——上游抖一阵把所有号判停,池子就此彻底不可用直到有人重启。另:README 更新历史只留最近 10 条,完整看 CHANGELOG |
 | 2026-08-10 | v0.15.0 - 🔁 **额度耗尽的账号不再每次重启都要重新学一遍**(用户直接问到:"额度用完的号不是已经禁用了吗,为什么还会请求到已禁用的账号?")。是禁用了,但只在**内存**里——v0.10.2 为免一次抖动把账号永久写死,让运行期停用不落盘;而配额恰恰是**有明确恢复时刻**的那类。于是每次发版重启就把"谁没额度"忘光,再拿**用户的请求**去重新发现(实测 13 个耗尽号:前 2 次 502、第 3 次才成)→ 现按恢复时刻落盘,重启仍记得、到点自动回池;恢复时刻优先取上游 `nextResetAt`,没有才按下月一号估。另:**服务端内置搜索 `web_search` 真正接上了** —— 此前只是"容忍"这个工具声明(不再 400),但从不真的搜索,模型照常回段文本、客户端以为搜过了。现在这类请求在进数据面前被截住,调上游 `/mcp` 端点拿结果再合成 `server_tool_use` + `web_search_tool_result` |
 | 2026-08-10 | v0.14.1 - 🔧 **线上验证时当场发现的两件事**。①响应里 `usage.input_tokens` **恒为 0**:v0.13.0 补的输入估算只喂给了计费、没回写客户端 —— 账单里有、响应里没有,而客户端拿它算成本和上下文占用 → 非流式 `usage` 与流式 `message_start` 现在都带同一个值;②**池里有一批耗尽的号时,用户前几次请求会连续失败**:配额耗尽此前与鉴权失败共用 3 次重试预算,实测 13 个耗尽号要连烧 2 次 502、第 3 次才成 → 配额是**确定性**结论(本周期换谁都一样),现与"模型不可用"同归账号级确定性档、按池大小给预算;瞬态/鉴权仍保持 3 次小上限。全池确实耗尽时回 `429` 并说清是额度问题,而不是语焉不详的 502 |
@@ -70,7 +71,6 @@
 | 2026-08-09 | v0.11.1 - 🔬 **线上实测挖出的两件事**。①**工具描述为空时上游拒掉整条请求**(实测:同一工具带描述 200 并正常回 tool_use,去掉描述 → `400 Invalid tool use format / REQUEST_BODY_INVALID`)。v0.11.0 把 null 改成了空串,而上游要的是**非空** → 现用工具名兜底;②`REQUEST_BODY_INVALID` 被当成可重试:它是确定性的,换账号也一样失败,此前一条畸形请求连烧几个账号的重试配额(实测一次打了 4 个号)最后回个语焉不详的 502 → 现归入不重试不罚账号那档,直接回 400 并点明多半是工具规格的问题 |
 | 2026-08-09 | v0.11.0 - 🧰 **修「会让请求被上游拒」的一类**。①Anthropic **服务端内置工具**(web_search 等)没有 `input_schema`,而该字段此前是必填 → 客户端一用官方写法,请求就在我们这层 400;②工具 `description` 会序列化成 **null**(真实客户端恒为字符串);③`input_schema` 原样透传,`properties: null` 这类形状不合法会被上游拒掉**整条请求** → 现统一规范化(只补形状不改语义);④超长工具名不缩短(上游上限 63)、缩短后也无法还原 → 现确定性缩短并把 `短名→原名` 带到出口,流式/非流式都还原,否则客户端收到自己没声明过的工具;⑤`:message-type == "error"` 的框架级错误帧被整个忽略 → 上游报错却还原成 200+空消息;⑥面板缺失资源返回 200+HTML 而非 404 —— **这条会让「用 curl 核对产物是否上线」本身骗人**。另:新增 `POST /api/admin/credentials/{id}/refresh` 强制换发令牌 |
 | 2026-08-09 | v0.10.2 - 🩹 **修:运行期停用被写进磁盘,「重启即复活」形同虚设**。v0.10.0 把额度耗尽/连续鉴权失败改为停止使用并声明只置内存态,但落盘时 `snapshot_credentials()` 拿运行时 `disabled` 覆写了 `cred.disabled` —— 一次配额耗尽或两次 401/403 就把账号**永久**写死在 credentials.json 里,重启也回不来,比修复前更糟(线上真的死过一个号)。现落盘只取持久结论;管理员手工停用与响应体确证的失效本就同时写 `cred.disabled`,不会漏。**若你的 credentials.json 里有你没手工停过的 `"disabled": true`,改回 false 即可恢复** |
-| 2026-08-09 | v0.10.1 - 🔌 **出站代理按账号分流 + 补齐会话身份字段**。①代理三件套此前**收下即丢**、`hasProxy` 还硬编码 false —— 面板显示配好了、实际全程直连;现真正落库生效,优先级 凭据级 > 全局 > 直连(`"direct"` 显式直连),且**同一账号的数据面/刷新/余额/模型清单/后台续期一律同一出口**(数据面走代理而刷新从主 IP 出比不配更糟);②`conversationId` 此前每请求新生成且不是 UUID 形状 → 改为优先取客户端 `metadata.user_id` 里的 session UUID,同会话共用;③此前**根本不发** `agentContinuationId`,已补;④管理面新增的账号不会冻结 machineId(v0.10.0 只覆盖启动时文件里已有的),现入池即冻结;⑤`isCurrent` 硬编码 false,现报真值 |
 
 ---
 
@@ -449,6 +449,7 @@ resp = client.chat.completions.create(
 | `LOAD_BALANCING_MODE` | ❌ | `priority` | 负载均衡：`priority`（等权轮询）/ `balanced`（按 weight 加权） |
 | `MAX_RPM_PER_CREDENTIAL` | ❌ | `0` | 每账号每分钟请求上限，`0` = 无限 |
 | `CREDENTIALS_PATH` | ❌ | `credentials.json`，解析在 `-c` 配置文件所在目录（容器内即 `/app/data/credentials.json`） | 凭据文件路径；被命令行 `--credentials` 覆盖 |
+| `KIRO_API_KEY` | ❌ | 无 | 用一个 Kiro API Key（`ksk_` 开头）直接起服务：启动时并入账号池并落盘，同名 key 不重复导入。挂载卷里没有凭据文件时靠它就能跑 |
 
 **`data/config.json`**（camelCase，均可选；`logCapacity` 仅在此配置）：
 

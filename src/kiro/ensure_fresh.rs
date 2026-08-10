@@ -96,12 +96,40 @@ impl RefreshCtx {
     }
 }
 
+/// 这次失败的结论是否写进了**会落盘的字段**(`cred.disabled` / `cred.quota_reset_unix`)。
+///
+/// 只有这两档写持久字段:永久失效(禁用)与额度耗尽(恢复时刻)。其余(strike / 冷却)
+/// 纯内存态,重启本就该重来 —— 为它们写盘只会把热路径的磁盘写放大一个量级。
+pub(crate) fn failure_kind_is_persistent(kind: FailureKind) -> bool {
+    matches!(kind, FailureKind::AuthInvalid | FailureKind::Quota)
+}
+
+/// 刚反馈给池的失败若写进了持久字段,**当场**把池落盘。
+///
+/// 曾经的后果:这些结论只活在内存里。进程被 kill(升级 / OOM / 重启)时全丢,重启后
+/// 一个已被吊销、或本计费周期额度已用尽的账号又以健康态回到池里,拿用户的请求重新学
+/// 一遍 —— 面板上看到的就是"这号不是已经禁用了吗,怎么还会请求到它"。
+///
+/// best-effort:落盘失败不使调用失败(内存池已更新,本次请求不受影响)。
+pub(crate) async fn persist_failure_conclusion(
+    pool: &Arc<Mutex<Pool>>,
+    ctx: Option<&RefreshCtx>,
+    kind: FailureKind,
+) {
+    if !failure_kind_is_persistent(kind) {
+        return;
+    }
+    if let Some(ctx) = ctx {
+        persist_pool_credentials(pool, ctx).await;
+    }
+}
+
 /// 刷新成功后把活池当前快照原子落盘到 `credentials_path`(修 Bug B)。
 ///
 /// 并发纪律:`persist_lock` 只在"取池快照 + 序列化 + 原子写"这段极短临界区持有,**不跨网络**。
 /// `credential::save` 已做 tmp → rename 原子替换,故进程中途崩溃也不会留半写文件。
 /// 落盘失败**不**使请求失败:内存池已更新,本次调用可用;仅记 warn(不含任何令牌明文)。
-async fn persist_pool_credentials(pool: &Arc<Mutex<Pool>>, ctx: &RefreshCtx) {
+pub(crate) async fn persist_pool_credentials(pool: &Arc<Mutex<Pool>>, ctx: &RefreshCtx) {
     let _guard = ctx.persist_lock.lock().await;
     let (snapshot, next_id) = {
         let pool_lock = pool.lock().await;
@@ -153,11 +181,15 @@ async fn persist_pool_credentials(pool: &Arc<Mutex<Pool>>, ctx: &RefreshCtx) {
 /// 分类走 [`classify_refresh_failure`](token 端点用 400 + invalid_grant 表达授权作废,与数据面
 /// 状态码语义不同):确证作废 → `AuthInvalid`(禁用);5xx/无确证 → 记 strike / 冷却。
 /// 传输层错误(连接超时/DNS 失败,无 HTTP 应答)归瞬时类,并额外落一个"换新令牌未成行"的标记。
+///
+/// `ctx` 有值时,写进持久字段的结论(禁用 / 额度恢复时刻)当场落盘,见
+/// [`persist_failure_conclusion`]。
 async fn report_refresh_failure(
     pool: &Arc<Mutex<Pool>>,
     credential_id: &str,
     err: &LoginError,
     now_unix: u64,
+    ctx: Option<&RefreshCtx>,
 ) {
     // 先把**为什么失败**记下来,再反馈池。
     //
@@ -181,35 +213,22 @@ async fn report_refresh_failure(
         "令牌刷新失败"
     );
 
-    let mut pool_lock = pool.lock().await;
-    match err {
-        LoginError::UpstreamHttp { status, body } => {
-            pool_lock.report_failure_with_reason(
-                credential_id,
-                classify_refresh_failure(*status, body),
-                reason,
-                now_unix,
-            );
-        }
-        LoginError::Upstream(msg) => {
+    let kind = {
+        let mut pool_lock = pool.lock().await;
+        let kind = match err {
+            LoginError::UpstreamHttp { status, body } => classify_refresh_failure(*status, body),
             // 无 HTTP 状态可依,只能据语义短标签判;命不中确证即落瞬时类。
-            pool_lock.report_failure_with_reason(
-                credential_id,
-                classify_refresh_failure(0, msg),
-                reason,
-                now_unix,
-            );
-        }
-        _ => {
-            pool_lock.report_failure_with_reason(
-                credential_id,
-                FailureKind::Transient,
-                reason,
-                now_unix,
-            );
+            LoginError::Upstream(msg) => classify_refresh_failure(0, msg),
+            _ => FailureKind::Transient,
+        };
+        pool_lock.report_failure_with_reason(credential_id, kind, reason, now_unix);
+        if !matches!(err, LoginError::UpstreamHttp { .. } | LoginError::Upstream(_)) {
             pool_lock.note_refresh_transport_failure(credential_id);
         }
-    }
+        kind
+    };
+    // 持久结论(禁用 / 额度恢复时刻)当场落盘:进程随时可能被 kill,只写内存等于没写。
+    persist_failure_conclusion(pool, ctx, kind).await;
 }
 
 /// 强制刷新失败反馈账号池(force 路径)。
@@ -225,19 +244,29 @@ async fn report_force_refresh_failure(
     credential_id: &str,
     err: &LoginError,
     now_unix: u64,
+    ctx: Option<&RefreshCtx>,
 ) {
-    let mut pool_lock = pool.lock().await;
-    match err {
-        LoginError::UpstreamHttp { status, body } => {
-            let kind = classify_refresh_failure(*status, body);
-            if kind == FailureKind::AuthInvalid {
-                pool_lock.report_failure(credential_id, kind, now_unix);
+    let mut reported: Option<FailureKind> = None;
+    {
+        let mut pool_lock = pool.lock().await;
+        match err {
+            LoginError::UpstreamHttp { status, body } => {
+                let kind = classify_refresh_failure(*status, body);
+                if kind == FailureKind::AuthInvalid {
+                    pool_lock.report_failure(credential_id, kind, now_unix);
+                    reported = Some(kind);
+                }
+            }
+            LoginError::Upstream(_) => {}
+            _ => {
+                pool_lock.note_refresh_transport_failure(credential_id);
             }
         }
-        LoginError::Upstream(_) => {}
-        _ => {
-            pool_lock.note_refresh_transport_failure(credential_id);
-        }
+    }
+    // 永久禁用是会落盘的结论,必须当场写盘 —— 只写内存的话,进程一重启这个号又活着回来,
+    // 拿用户的请求把同一件事重新学一遍。
+    if let Some(kind) = reported {
+        persist_failure_conclusion(pool, ctx, kind).await;
     }
 }
 
@@ -356,7 +385,7 @@ pub async fn ensure_fresh(
     let refreshed = match crate::kiro::refresh::refresh(client, &cred_snapshot, now_unix).await {
         Ok(c) => c,
         Err(e) => {
-            report_refresh_failure(pool, credential_id, &e, now_unix).await;
+            report_refresh_failure(pool, credential_id, &e, now_unix, ctx).await;
             return Err(EnsureFreshError::Refresh(e));
         }
     };
@@ -477,7 +506,7 @@ pub async fn force_refresh(
     let refreshed = match crate::kiro::refresh::refresh(client, &cred_snapshot, now_unix).await {
         Ok(c) => c,
         Err(e) => {
-            report_force_refresh_failure(pool, credential_id, &e, now_unix).await;
+            report_force_refresh_failure(pool, credential_id, &e, now_unix, ctx).await;
             return Err(EnsureFreshError::Refresh(e));
         }
     };
@@ -709,7 +738,7 @@ mod tests {
         let refreshed = match attempt {
             Ok(c) => c,
             Err(e) => {
-                report_force_refresh_failure(pool, credential_id, &e, now_unix).await;
+                report_force_refresh_failure(pool, credential_id, &e, now_unix, ctx).await;
                 return Err(EnsureFreshError::Refresh(e));
             }
         };
@@ -794,7 +823,7 @@ mod tests {
         let refreshed = match attempt {
             Ok(c) => c,
             Err(e) => {
-                report_refresh_failure(pool, credential_id, &e, now_unix).await;
+                report_refresh_failure(pool, credential_id, &e, now_unix, ctx).await;
                 return Err(EnsureFreshError::Refresh(e));
             }
         };
@@ -1365,5 +1394,124 @@ mod tests {
             pool.lock().await.snapshot_credentials()[0].refresh_token,
             "fresh-rt"
         );
+    }
+
+    // ==================== 持久结论必须当场落盘 ====================
+
+    /// 每个测试各用一份互不打架的凭据文件(同进程内多个测试并行跑)。
+    fn tmp_creds_path(tag: &str) -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "kiro2api_persist_{}_{}_{}.json",
+                tag,
+                std::process::id(),
+                crate::kiro::uuid_v4()
+            ))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// 保鲜路径判出的**永久失效**必须当场落盘。
+    ///
+    /// 曾经的后果:这个结论只写在内存里。进程被 kill(升级/OOM/重启)就全丢,
+    /// 重启后一个 refresh_token 已被吊销的账号又以健康态回到池里,拿用户的请求
+    /// 重新学一遍——运营者看到的就是"这号不是已经禁用了吗,怎么还在被选中"。
+    #[tokio::test]
+    async fn refresh_path_writes_its_permanent_verdict_to_disk_at_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/refreshToken"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string(r#"{"error":"invalid_grant"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let path = tmp_creds_path("ensure_fresh");
+        let pool = Arc::new(Mutex::new(Pool::new(
+            vec![cred("1", 1000, "us-east-1")],
+            LbMode::Priority,
+        )));
+        let ctx = RefreshCtx::new(path.clone());
+        let base = format!("{}/refreshToken", server.uri());
+        let r = ensure_fresh_with_base(
+            &pool,
+            "1",
+            &reqwest::Client::new(),
+            1000,
+            300,
+            Some(&base),
+            Some(&ctx),
+        )
+        .await;
+        assert!(matches!(r, Err(EnsureFreshError::Refresh(_))));
+        assert!(
+            pool.lock().await.snapshot_credentials()[0].disabled,
+            "内存里该号应已判为永久失效"
+        );
+
+        let on_disk = crate::kiro::credential::load(&path).expect("凭据文件应可读");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(on_disk.len(), 1, "禁用结论根本没落盘");
+        assert!(
+            on_disk[0].disabled,
+            "禁用结论没落盘:重启后这个号会以健康态回到池里被反复选中"
+        );
+    }
+
+    /// 强制换新令牌路径上判出的**永久失效**同样必须当场落盘(与保鲜路径同一条纪律)。
+    #[tokio::test]
+    async fn force_refresh_path_writes_its_permanent_verdict_to_disk_at_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/refreshToken"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string(r#"{"error":"invalid_grant"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let path = tmp_creds_path("force_refresh");
+        let pool = Arc::new(Mutex::new(Pool::new(
+            vec![cred("1", u64::MAX, "us-east-1")],
+            LbMode::Priority,
+        )));
+        let ctx = RefreshCtx::new(path.clone());
+        let base = format!("{}/refreshToken", server.uri());
+        let r = force_refresh_with_base(
+            &pool,
+            "1",
+            &reqwest::Client::new(),
+            1000,
+            None,
+            Some(&base),
+            Some(&ctx),
+        )
+        .await;
+        assert!(matches!(r, Err(EnsureFreshError::Refresh(_))));
+        assert!(pool.lock().await.snapshot_credentials()[0].disabled);
+
+        let on_disk = crate::kiro::credential::load(&path).expect("凭据文件应可读");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(on_disk.len(), 1, "禁用结论根本没落盘");
+        assert!(on_disk[0].disabled, "强制刷新路径的禁用结论没落盘");
+    }
+
+    /// 只有**写进落盘字段**的结论才当场写盘。
+    ///
+    /// 反向也要钉住:strike 与冷却纯属内存态,重启本就该重来。为它们也写盘的话,热路径上
+    /// 每一次瞬时抖动都变成一次全量凭据序列化 + fsync —— 几百个号的池子会被写盘拖垮。
+    #[test]
+    fn only_persistent_verdicts_trigger_a_disk_write() {
+        assert!(failure_kind_is_persistent(FailureKind::AuthInvalid));
+        assert!(failure_kind_is_persistent(FailureKind::Quota));
+        for k in [
+            FailureKind::AuthAmbiguous,
+            FailureKind::Transient,
+            FailureKind::InvalidRequest,
+            FailureKind::ModelUnavailable,
+        ] {
+            assert!(!failure_kind_is_persistent(k), "{k:?} 不写落盘字段,不该触发写盘");
+        }
     }
 }

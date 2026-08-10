@@ -310,23 +310,120 @@ fn map_tool_name(name: &str, map: &mut std::collections::HashMap<String, String>
     short
 }
 
+/// JSON Schema 的标准类型词表(小写)。
+const SCHEMA_TYPE_TOKENS: [&str; 7] = [
+    "object", "array", "string", "number", "integer", "boolean", "null",
+];
+
+/// 单个类型 token 归一成小写标准形态。
+///
+/// 只认得出来的才改:`"OBJECT"`→`"object"`;认不出来的(自定义/未来词汇)原样留着,
+/// 免得把小写化当成一次静默的语义改写。
+fn normalize_type_token(s: &str) -> String {
+    let lower = s.to_ascii_lowercase();
+    if SCHEMA_TYPE_TOKENS.contains(&lower.as_str()) {
+        lower
+    } else {
+        s.to_string()
+    }
+}
+
+/// 归一 `type` 字段:字符串,或 JSON Schema 允许的字符串数组(联合类型)。
+fn normalize_type_field(v: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => Value::String(normalize_type_token(s)),
+        Value::Array(arr) => Value::Array(
+            arr.iter()
+                .map(|x| match x {
+                    Value::String(s) => Value::String(normalize_type_token(s)),
+                    other => other.clone(),
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// 递归把 schema 里的类型方言归一成小写标准形态。
+///
+/// 上游只认小写标准写法,而 Gemini 那套工具声明用的是 `"type":"OBJECT"` / `"STRING"`
+/// 这类大写方言 —— 原样透传的话,上游拒掉的是**整条请求**,客户端只看到一个 400。
+/// 必须**递归**:大写方言在嵌套层同样成立,只改顶层等于没改。这里一个字段都不新增、
+/// 不删除,纯粹改类型 token 的大小写。
+fn normalize_schema_dialect(schema: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let Value::Object(obj) = schema else {
+        return schema.clone();
+    };
+    let mut out = Map::new();
+    for (k, v) in obj {
+        let nv = match k.as_str() {
+            "type" => normalize_type_field(v),
+            // 值本身就是一份子 schema(`items` 另有旧式的"逐位 schema 数组"形态)。
+            "items"
+            | "additionalProperties"
+            | "not"
+            | "if"
+            | "then"
+            | "else"
+            | "contains"
+            | "propertyNames" => match v {
+                Value::Array(arr) => {
+                    Value::Array(arr.iter().map(normalize_schema_dialect).collect())
+                }
+                Value::Object(_) => normalize_schema_dialect(v),
+                other => other.clone(),
+            },
+            // 值是子 schema 数组。
+            "anyOf" | "oneOf" | "allOf" | "prefixItems" => match v {
+                Value::Array(arr) => {
+                    Value::Array(arr.iter().map(normalize_schema_dialect).collect())
+                }
+                other => other.clone(),
+            },
+            // 值是「名字 → 子 schema」的表。
+            "properties" | "patternProperties" | "$defs" | "definitions" => match v {
+                Value::Object(m) => Value::Object(
+                    m.iter()
+                        .map(|(name, s)| (name.clone(), normalize_schema_dialect(s)))
+                        .collect(),
+                ),
+                other => other.clone(),
+            },
+            _ => v.clone(),
+        };
+        out.insert(k.clone(), nv);
+    }
+    Value::Object(out)
+}
+
+/// 上游一定收得下的最小合法 schema(客户端压根没给出对象时的兜底)。
+fn fallback_object_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": true
+    })
+}
+
 /// 把工具的 JSON Schema 规范成上游一定收得下的形状。
 ///
 /// 客户端给的 schema 千奇百怪:`type` 缺失或不是字符串、`properties` 是 null、
-/// `required` 是 null 或混进了非字符串、`additionalProperties` 给了个数字……
-/// 原样透传的话上游直接拒掉**整条请求**,而客户端那边只看到一个语焉不详的 400。
-/// 这里只补形状、不改语义:已经合法的字段一律原样保留。
+/// `required` 是 null 或混进了非字符串、`additionalProperties` 给了个数字、类型写成
+/// 大写方言……原样透传的话上游直接拒掉**整条请求**,而客户端那边只看到一个语焉不详的 400。
+/// 这里只补形状、归一类型大小写,不改语义:已经合法的字段一律原样保留。
 fn normalize_json_schema(schema: &serde_json::Value) -> serde_json::Value {
     use serde_json::{Map, Value};
-    let Some(obj) = schema.as_object() else {
-        return serde_json::json!({
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": true
-        });
+    if !schema.is_object() {
+        return fallback_object_schema();
+    }
+    // 先递归归一类型方言,再在顶层补形状 —— 补形状只对顶层成立(嵌套的
+    // `{"type":"string"}` 不该被硬塞 properties/required/additionalProperties)。
+    let Value::Object(mut obj) = normalize_schema_dialect(schema) else {
+        return fallback_object_schema();
     };
-    let mut obj = obj.clone();
     if !obj
         .get("type")
         .and_then(|v| v.as_str())
@@ -609,6 +706,8 @@ const PREFILL_CONTINUATION: &str = "Continue.";
 /// - 末条消息若是 `assistant`(预填/prefill):整条进 `history` 的
 ///   `assistantResponseMessage`(连同其 `tool_use` 块),`currentMessage` 用
 ///   `PREFILL_CONTINUATION` 续写指令占位——助手文本不能冒充用户输入。
+/// - 切分之前先做一遍消息整型(见 [`normalize_hub_messages`]):剔掉配不上对的工具块、
+///   把相邻同角色消息并成一轮。两件事都放在这里做,四个协议入口才都能吃到。
 /// - 有 `tools` → `agentTaskType="spectask"` 且当前消息上下文带映射后的工具规格;无 tools → `"vibe"`。
 /// - `tool_result` / `tool_use` / `image` 内容块(照契约/观测)分别映射进对应消息的
 ///   `toolResults` / `toolUses` / `images`。
@@ -646,6 +745,158 @@ pub fn anthropic_to_kiro(
     anthropic_to_kiro_full(req, profile_arn).map(|c| c.request)
 }
 
+/// 把 `ContentIn` 归一成块序列;裸字符串 → 单个文本块(空串不产块,免得凭空多出空文本块)。
+fn content_into_blocks(content: ContentIn) -> Vec<Block> {
+    match content {
+        ContentIn::Text(s) if s.is_empty() => Vec::new(),
+        ContentIn::Text(s) => vec![Block::Text { text: s }],
+        ContentIn::Blocks(blocks) => blocks,
+    }
+}
+
+/// 这条消息里是否已有非空文本块(决定合并时要不要补空行分隔)。
+fn blocks_have_text(blocks: &[Block]) -> bool {
+    blocks
+        .iter()
+        .any(|b| matches!(b, Block::Text { text } if !text.is_empty()))
+}
+
+/// 这个块对上行请求体还有没有贡献:纯空白文本、以及无法转发给上游的未知块都算没有。
+fn block_is_inert(b: &Block) -> bool {
+    match b {
+        Block::Text { text } => text.trim().is_empty(),
+        Block::Other => true,
+        Block::ToolUse { .. } | Block::ToolResult { .. } | Block::Image { .. } => false,
+    }
+}
+
+/// 把 `next` 并进相邻的同角色消息 `prev`(块序列顺接,顺序即客户端给的顺序)。
+///
+/// 两边都有文本时,在 `next` 的首个非空文本块前补 `\n\n`:消息文本是无缝 concat,不补分隔
+/// 会把两轮文本粘成一个词(`"hi"+"there"` → `"hithere"`)。工具结果/图片块不参与文本拍平,
+/// 故纯工具结果的合并不会平白多出空行。
+fn merge_into_previous_turn(prev: &mut InMsg, next: InMsg) {
+    let mut blocks = content_into_blocks(std::mem::replace(
+        &mut prev.content,
+        ContentIn::Blocks(Vec::new()),
+    ));
+    let mut incoming = content_into_blocks(next.content);
+    if blocks_have_text(&blocks) {
+        for block in incoming.iter_mut() {
+            if let Block::Text { text } = block
+                && !text.is_empty()
+            {
+                text.insert_str(0, "\n\n");
+                break;
+            }
+        }
+    }
+    blocks.append(&mut incoming);
+    prev.content = ContentIn::Blocks(blocks);
+}
+
+/// 相邻同角色消息并成一轮。
+///
+/// 上游要的是「一问一答严格交替、工具调用与其应答同处相邻两轮」的形状:这里的消息是 1:1
+/// 铺进 Kiro history、末条当 currentMessage 的,连续两条同角色消息一旦原样铺开,history
+/// 就不再交替,而并行工具调用的多个应答还会被拆到两轮里去 —— 上游据此判定"有工具调用没被
+/// 应答",拒掉整条请求。
+///
+/// **幂等**:一趟之后不再有相邻同角色,再过一遍逐条原样入列,产物一模一样;没有相邻同角色
+/// 的输入(绝大多数请求)连块化都不做,形状与不经此步完全一致。
+fn merge_adjacent_same_role(messages: Vec<InMsg>) -> Vec<InMsg> {
+    let mut out: Vec<InMsg> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        match out.last_mut() {
+            Some(prev) if same_turn_side(&prev.role, &msg.role) => merge_into_previous_turn(prev, msg),
+            _ => out.push(msg),
+        }
+    }
+    out
+}
+
+/// 两条消息是否属于同一侧的轮次。
+///
+/// 判据**必须与下游一致**:下游只分「assistant」与「其余」两侧(见 history 构造处的
+/// `msg.role == "assistant"`)。此处若按角色字符串精确相等来判,`system` 紧跟 `user`、
+/// 或 `developer` 紧跟 `user` 就不会被合并 —— 可它们到了下游全都折成用户轮,于是相邻的
+/// 用户轮原封不动送到上游,整条请求被打回。Responses 入口的 role 是裸字符串透传的,
+/// system/developer 能直接进 messages,这条路是活的。
+fn same_turn_side(a: &str, b: &str) -> bool {
+    (a == "assistant") == (b == "assistant")
+}
+
+/// 剔除配不上对的工具块:没有 `tool_result` 应答的 `tool_use`,以及反过来找不到
+/// `tool_use` 的孤立 `tool_result`。
+///
+/// 悬空的工具调用在真实会话里很常见 —— 用户中途打断、上一轮超时、客户端自己裁剪了历史,
+/// 留下的都是"调了工具但没有结果"的一轮。这种历史原样发上去,上游 400 掉的是**整条请求**,
+/// 客户端只看到一次莫名其妙的失败,而这一轮本来完全可以正常作答。
+///
+/// 剔到整条消息只剩空壳时把该消息一并删掉(留着只会变成一轮无意义的占位文本);末条不删 ——
+/// 它决定 currentMessage 的角色与历史切分,删了会改变整个请求的语义。
+fn prune_unpaired_tool_blocks(messages: Vec<InMsg>) -> Vec<InMsg> {
+    let mut use_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in &messages {
+        if let ContentIn::Blocks(blocks) = &m.content {
+            for b in blocks {
+                match b {
+                    Block::ToolUse { id, .. } => {
+                        use_ids.insert(id.clone());
+                    }
+                    Block::ToolResult { tool_use_id, .. } => {
+                        result_ids.insert(tool_use_id.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if use_ids.iter().all(|id| result_ids.contains(id))
+        && result_ids.iter().all(|id| use_ids.contains(id))
+    {
+        return messages;
+    }
+
+    let last = messages.len().saturating_sub(1);
+    let mut out = Vec::with_capacity(messages.len());
+    for (i, msg) in messages.into_iter().enumerate() {
+        let InMsg { role, content } = msg;
+        let ContentIn::Blocks(blocks) = content else {
+            out.push(InMsg { role, content });
+            continue;
+        };
+        let before = blocks.len();
+        let kept: Vec<Block> = blocks
+            .into_iter()
+            .filter(|b| match b {
+                Block::ToolUse { id, .. } => result_ids.contains(id),
+                Block::ToolResult { tool_use_id, .. } => use_ids.contains(tool_use_id),
+                _ => true,
+            })
+            .collect();
+        if kept.len() != before && i != last && kept.iter().all(block_is_inert) {
+            continue;
+        }
+        out.push(InMsg {
+            role,
+            content: ContentIn::Blocks(kept),
+        });
+    }
+    out
+}
+
+/// 中枢侧的消息整型:先剔掉配不上对的工具块,再把相邻同角色消息并成一轮。
+///
+/// 顺序不能反:剔除会整条删掉只剩空壳的轮次,删完才可能露出新的相邻同角色。
+///
+/// 这一步放在中枢而不是某个适配器里 —— 原生 Anthropic、OpenAI、Gemini、Responses 四个入口
+/// 都要经过这里,只在一处适配器上做,另外三条路照样会把上游不接受的形状发出去。
+fn normalize_hub_messages(messages: &[InMsg]) -> Vec<InMsg> {
+    merge_adjacent_same_role(prune_unpaired_tool_blocks(messages.to_vec()))
+}
+
 fn anthropic_to_kiro_inner(
     req: &MessagesRequest,
     profile_arn: Option<&str>,
@@ -654,12 +905,12 @@ fn anthropic_to_kiro_inner(
     let model_id =
         map_model(&req.model).ok_or_else(|| ConvertError::UnknownModel(req.model.clone()))?;
 
-    if req.messages.is_empty() {
+    let messages = normalize_hub_messages(&req.messages);
+    if messages.is_empty() {
         return Err(ConvertError::EmptyMessages);
     }
 
-    let texts: Vec<String> = req
-        .messages
+    let texts: Vec<String> = messages
         .iter()
         .enumerate()
         .map(|(i, msg)| {
@@ -682,12 +933,12 @@ fn anthropic_to_kiro_inner(
 
     // 末条为 assistant 预填 → 它也进 history(助手轮次),当前轮改用续写指令;
     // 否则照旧:末条即本轮用户输入,前面的进 history。
-    let last_msg = &req.messages[req.messages.len() - 1];
+    let last_msg = &messages[messages.len() - 1];
     let is_prefill = last_msg.role == "assistant";
     let history_len = if is_prefill {
-        req.messages.len()
+        messages.len()
     } else {
-        req.messages.len() - 1
+        messages.len() - 1
     };
 
     let (history_msgs, tail) = texts.split_at(history_len);
@@ -696,7 +947,7 @@ fn anthropic_to_kiro_inner(
         None => PREFILL_CONTINUATION.to_string(),
     };
 
-    let history: Vec<HistoryItem> = req.messages[..history_len]
+    let history: Vec<HistoryItem> = messages[..history_len]
         .iter()
         .zip(history_msgs.iter())
         .map(|(msg, text)| {
@@ -754,7 +1005,8 @@ fn anthropic_to_kiro_inner(
     // 只看 `req.tools` 是不够的 —— 历史带工具调用而 tools 为空时,上游会以
     // `TOOL_CONFIG_MISSING` 拒掉整个请求(见 `tool_specs_with_history_fallback`)。
     let declared_tools: &[ToolDef] = req.tools.as_deref().unwrap_or(&[]);
-    let tool_specs = tool_specs_with_history_fallback(declared_tools, &req.messages, tool_name_map);
+    // 用整型后的消息:被剔掉的悬空 tool_use 已经不在请求里,不该再为它补一份工具规格。
+    let tool_specs = tool_specs_with_history_fallback(declared_tools, &messages, tool_name_map);
     let has_tools = !tool_specs.is_empty();
     let agent_task_type = if has_tools { "spectask" } else { "vibe" }.to_string();
 
@@ -1224,6 +1476,22 @@ mod tests {
         }
     }
 
+    /// 一条"发起过 `id` 这次工具调用"的助手轮。
+    ///
+    /// 真实会话里 `tool_result` 永远跟在自己那次 `tool_use` 后面;配不上对的工具块会被剔除
+    /// (悬空工具块的剔除本身另有专门用例),所以凡是构造 `tool_result` 的用例都要把发起
+    /// 调用的那一轮补齐 —— 断言才落在真实会话真正发出去的形状上。
+    fn tool_call_msg(id: &str) -> InMsg {
+        blocks_msg(
+            "assistant",
+            vec![Block::ToolUse {
+                id: id.to_string(),
+                name: "t".to_string(),
+                input: serde_json::json!({}),
+            }],
+        )
+    }
+
     fn base_req(messages: Vec<InMsg>) -> MessagesRequest {
         MessagesRequest {
             thinking: None,
@@ -1339,7 +1607,16 @@ mod tests {
             },
             InMsg {
                 role: "user".into(),
-                content: ContentIn::Text("继续".into()),
+                content: ContentIn::Blocks(vec![
+                    Block::ToolResult {
+                        tool_use_id: "t1".into(),
+                        content: serde_json::json!("a.txt"),
+                        is_error: None,
+                    },
+                    Block::Text {
+                        text: "继续".into(),
+                    },
+                ]),
             },
         ]);
         let kiro = anthropic_to_kiro(&req, None).expect("应转换成功");
@@ -1632,7 +1909,16 @@ mod tests {
             },
             InMsg {
                 role: "user".into(),
-                content: ContentIn::Text("继续".into()),
+                content: ContentIn::Blocks(vec![
+                    Block::ToolResult {
+                        tool_use_id: "t1".into(),
+                        content: serde_json::json!("done"),
+                        is_error: None,
+                    },
+                    Block::Text {
+                        text: "继续".into(),
+                    },
+                ]),
             },
         ]);
         r.tools = Some(vec![ToolDef {
@@ -1988,14 +2274,17 @@ mod tests {
 
     #[test]
     fn tool_result_maps_success_status_and_text() {
-        let req = base_req(vec![blocks_msg(
-            "user",
-            vec![Block::ToolResult {
-                tool_use_id: "tu1".to_string(),
-                content: serde_json::json!("sunny"),
-                is_error: Some(false),
-            }],
-        )]);
+        let req = base_req(vec![
+            tool_call_msg("tu1"),
+            blocks_msg(
+                "user",
+                vec![Block::ToolResult {
+                    tool_use_id: "tu1".to_string(),
+                    content: serde_json::json!("sunny"),
+                    is_error: Some(false),
+                }],
+            ),
+        ]);
 
         let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
 
@@ -2012,14 +2301,17 @@ mod tests {
 
     #[test]
     fn tool_result_is_error_true_maps_error_status() {
-        let req = base_req(vec![blocks_msg(
-            "user",
-            vec![Block::ToolResult {
-                tool_use_id: "tu1".to_string(),
-                content: serde_json::json!("boom"),
-                is_error: Some(true),
-            }],
-        )]);
+        let req = base_req(vec![
+            tool_call_msg("tu1"),
+            blocks_msg(
+                "user",
+                vec![Block::ToolResult {
+                    tool_use_id: "tu1".to_string(),
+                    content: serde_json::json!("boom"),
+                    is_error: Some(true),
+                }],
+            ),
+        ]);
 
         let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
 
@@ -2035,14 +2327,17 @@ mod tests {
 
     #[test]
     fn tool_result_array_content_flattens_text() {
-        let req = base_req(vec![blocks_msg(
-            "user",
-            vec![Block::ToolResult {
-                tool_use_id: "tu1".to_string(),
-                content: serde_json::json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]),
-                is_error: None,
-            }],
-        )]);
+        let req = base_req(vec![
+            tool_call_msg("tu1"),
+            blocks_msg(
+                "user",
+                vec![Block::ToolResult {
+                    tool_use_id: "tu1".to_string(),
+                    content: serde_json::json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]),
+                    is_error: None,
+                }],
+            ),
+        ]);
 
         let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
 
@@ -2059,14 +2354,17 @@ mod tests {
 
     #[test]
     fn tool_result_only_message_falls_back_to_tool_result_above() {
-        let req = base_req(vec![blocks_msg(
-            "user",
-            vec![Block::ToolResult {
-                tool_use_id: "tu1".to_string(),
-                content: serde_json::json!("sunny"),
-                is_error: None,
-            }],
-        )]);
+        let req = base_req(vec![
+            tool_call_msg("tu1"),
+            blocks_msg(
+                "user",
+                vec![Block::ToolResult {
+                    tool_use_id: "tu1".to_string(),
+                    content: serde_json::json!("sunny"),
+                    is_error: None,
+                }],
+            ),
+        ]);
 
         let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
 
@@ -2104,7 +2402,14 @@ mod tests {
                     input: serde_json::json!({"city": "Paris"}),
                 }],
             ),
-            msg("user", "result"),
+            blocks_msg(
+                "user",
+                vec![Block::ToolResult {
+                    tool_use_id: "tu1".to_string(),
+                    content: serde_json::json!("result"),
+                    is_error: None,
+                }],
+            ),
         ]);
 
         let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
@@ -2587,17 +2892,20 @@ mod tests {
 
     #[test]
     fn tool_result_nested_base64_image_goes_to_message_images() {
-        let req = base_req(vec![blocks_msg(
-            "user",
-            vec![Block::ToolResult {
-                tool_use_id: "tu1".to_string(),
-                content: serde_json::json!([
-                    {"type": "text", "text": "shot:"},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
-                ]),
-                is_error: None,
-            }],
-        )]);
+        let req = base_req(vec![
+            tool_call_msg("tu1"),
+            blocks_msg(
+                "user",
+                vec![Block::ToolResult {
+                    tool_use_id: "tu1".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "shot:"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+                    ]),
+                    is_error: None,
+                }],
+            ),
+        ]);
 
         let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
 
@@ -2617,6 +2925,7 @@ mod tests {
     #[test]
     fn tool_result_nested_image_in_history_also_goes_to_images() {
         let req = base_req(vec![
+            tool_call_msg("tu1"),
             blocks_msg(
                 "user",
                 vec![Block::ToolResult {
@@ -2633,7 +2942,7 @@ mod tests {
 
         let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
 
-        match &kiro.conversation_state.history[0] {
+        match &kiro.conversation_state.history[1] {
             HistoryItem::UserInputMessage { user_input_message } => {
                 let images = user_input_message
                     .images
@@ -2642,22 +2951,25 @@ mod tests {
                 assert_eq!(images[0].format, "jpeg");
                 assert_eq!(images[0].source.bytes, "BBBB");
             }
-            other => panic!("首条历史应为 UserInputMessage,实际: {other:?}"),
+            other => panic!("带图片的那条历史应为 UserInputMessage,实际: {other:?}"),
         }
     }
 
     #[test]
     fn tool_result_nested_remote_image_url_errors_not_dropped() {
-        let req = base_req(vec![blocks_msg(
-            "user",
-            vec![Block::ToolResult {
-                tool_use_id: "tu1".to_string(),
-                content: serde_json::json!([
-                    {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}
-                ]),
-                is_error: None,
-            }],
-        )]);
+        let req = base_req(vec![
+            tool_call_msg("tu1"),
+            blocks_msg(
+                "user",
+                vec![Block::ToolResult {
+                    tool_use_id: "tu1".to_string(),
+                    content: serde_json::json!([
+                        {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}
+                    ]),
+                    is_error: None,
+                }],
+            ),
+        ]);
 
         let err = anthropic_to_kiro(&req, None).expect_err("tool_result 内的远程图片也应报错");
         assert_eq!(
@@ -2669,16 +2981,19 @@ mod tests {
     #[test]
     fn tool_result_nested_openai_image_url_block_handled_like_top_level() {
         // data URL → 就地内联;远程 http(s) → 报错(与顶层图片同策略,都不静默丢)。
-        let inline = base_req(vec![blocks_msg(
-            "user",
-            vec![Block::ToolResult {
-                tool_use_id: "tu1".to_string(),
-                content: serde_json::json!([
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,CCCC"}}
-                ]),
-                is_error: None,
-            }],
-        )]);
+        let inline = base_req(vec![
+            tool_call_msg("tu1"),
+            blocks_msg(
+                "user",
+                vec![Block::ToolResult {
+                    tool_use_id: "tu1".to_string(),
+                    content: serde_json::json!([
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,CCCC"}}
+                    ]),
+                    is_error: None,
+                }],
+            ),
+        ]);
         let kiro = anthropic_to_kiro(&inline, None).expect("转换应成功");
         let images = kiro
             .conversation_state
@@ -2690,16 +3005,19 @@ mod tests {
         assert_eq!(images[0].format, "png");
         assert_eq!(images[0].source.bytes, "CCCC");
 
-        let remote = base_req(vec![blocks_msg(
-            "user",
-            vec![Block::ToolResult {
-                tool_use_id: "tu1".to_string(),
-                content: serde_json::json!([
-                    {"type": "image_url", "image_url": {"url": "https://example.com/b.png"}}
-                ]),
-                is_error: None,
-            }],
-        )]);
+        let remote = base_req(vec![
+            tool_call_msg("tu1"),
+            blocks_msg(
+                "user",
+                vec![Block::ToolResult {
+                    tool_use_id: "tu1".to_string(),
+                    content: serde_json::json!([
+                        {"type": "image_url", "image_url": {"url": "https://example.com/b.png"}}
+                    ]),
+                    is_error: None,
+                }],
+            ),
+        ]);
         assert_eq!(
             anthropic_to_kiro(&remote, None).expect_err("远程图片应报错"),
             ConvertError::RemoteImageUrl("https://example.com/b.png".to_string())
@@ -2708,14 +3026,17 @@ mod tests {
 
     #[test]
     fn tool_result_unknown_block_kept_as_json_text() {
-        let req = base_req(vec![blocks_msg(
-            "user",
-            vec![Block::ToolResult {
-                tool_use_id: "tu1".to_string(),
-                content: serde_json::json!([{"type": "json", "data": {"rows": 2}}, "裸串"]),
-                is_error: None,
-            }],
-        )]);
+        let req = base_req(vec![
+            tool_call_msg("tu1"),
+            blocks_msg(
+                "user",
+                vec![Block::ToolResult {
+                    tool_use_id: "tu1".to_string(),
+                    content: serde_json::json!([{"type": "json", "data": {"rows": 2}}, "裸串"]),
+                    is_error: None,
+                }],
+            ),
+        ]);
 
         let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
 
@@ -2733,8 +3054,13 @@ mod tests {
 
     // --- 末条 assistant 预填(prefill)→ 进 history,不当用户输入 ---
 
+    /// 末条 assistant 预填整条进 history,`currentMessage` 只放续写指令。
+    ///
+    /// 预填里那次 `tool_use` **永远配不到 tool_result**(它后面已经没有消息了),带着它发
+    /// 上去,上游按"工具调用没被应答"拒掉整条请求 —— 客户端只看到一次莫名其妙的失败,
+    /// 而这一轮本来可以照常续写。故只保留预填的文本,把配不上对的那次调用剔掉。
     #[test]
-    fn trailing_assistant_prefill_goes_to_history_with_tool_uses() {
+    fn trailing_assistant_prefill_goes_to_history_and_drops_its_dangling_tool_use() {
         let req = base_req(vec![
             msg("user", "q"),
             blocks_msg(
@@ -2760,13 +3086,11 @@ mod tests {
                 assistant_response_message,
             } => {
                 assert_eq!(assistant_response_message.content, "开头");
-                let tool_uses = assistant_response_message
-                    .tool_uses
-                    .as_ref()
-                    .expect("预填里的 tool_use 应保留");
-                assert_eq!(tool_uses[0].tool_use_id, "tu1");
-                assert_eq!(tool_uses[0].name, "get_weather");
-                assert_eq!(tool_uses[0].input["city"], "Paris");
+                assert!(
+                    assistant_response_message.tool_uses.is_none(),
+                    "配不到 tool_result 的调用必须剔除,实得 {:?}",
+                    assistant_response_message.tool_uses
+                );
             }
             other => panic!("末条预填应进 history 的 AssistantResponseMessage,实际: {other:?}"),
         }
@@ -2774,6 +3098,56 @@ mod tests {
         let current = &kiro.conversation_state.current_message.user_input_message;
         assert_eq!(current.content, PREFILL_CONTINUATION);
         assert!(!current.content.contains("开头"));
+    }
+
+    /// 预填里配得上对的工具往返照旧全须全尾地进 history(上一条用例剔的只是配不上的那种)。
+    #[test]
+    fn trailing_assistant_prefill_keeps_answered_tool_uses() {
+        let req = base_req(vec![
+            msg("user", "q"),
+            blocks_msg(
+                "assistant",
+                vec![Block::ToolUse {
+                    id: "tu1".to_string(),
+                    name: "get_weather".to_string(),
+                    input: serde_json::json!({"city": "Paris"}),
+                }],
+            ),
+            blocks_msg(
+                "user",
+                vec![Block::ToolResult {
+                    tool_use_id: "tu1".to_string(),
+                    content: serde_json::json!("sunny"),
+                    is_error: None,
+                }],
+            ),
+            msg("assistant", "巴黎"),
+        ]);
+
+        let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
+        let HistoryItem::AssistantResponseMessage {
+            assistant_response_message,
+        } = &kiro.conversation_state.history[1]
+        else {
+            panic!(
+                "history[1] 应为助手轮:{:?}",
+                kiro.conversation_state.history
+            );
+        };
+        let tool_uses = assistant_response_message
+            .tool_uses
+            .as_ref()
+            .expect("配对齐全的 tool_use 必须保留");
+        assert_eq!(tool_uses[0].tool_use_id, "tu1");
+        assert_eq!(tool_uses[0].name, "get_weather");
+        assert_eq!(tool_uses[0].input["city"], "Paris");
+        assert_eq!(
+            kiro.conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            PREFILL_CONTINUATION
+        );
     }
 
     #[test]
@@ -3044,7 +3418,16 @@ mod tests {
                 },
                 InMsg {
                     role: "user".into(),
-                    content: ContentIn::Text("thanks".into()),
+                    content: ContentIn::Blocks(vec![
+                        Block::ToolResult {
+                            tool_use_id: "c1".into(),
+                            content: serde_json::json!("a.txt"),
+                            is_error: None,
+                        },
+                        Block::Text {
+                            text: "thanks".into(),
+                        },
+                    ]),
                 },
             ],
             max_tokens: Some(32),
@@ -3081,14 +3464,24 @@ mod tests {
             metadata: None,
             model: "claude-sonnet-4.5".into(),
             system: None,
-            messages: vec![InMsg {
-                role: "assistant".into(),
-                content: ContentIn::Blocks(vec![Block::ToolUse {
-                    id: "c1".into(),
-                    name: "shell".into(),
-                    input: serde_json::json!({}),
-                }]),
-            }],
+            messages: vec![
+                InMsg {
+                    role: "assistant".into(),
+                    content: ContentIn::Blocks(vec![Block::ToolUse {
+                        id: "c1".into(),
+                        name: "shell".into(),
+                        input: serde_json::json!({}),
+                    }]),
+                },
+                InMsg {
+                    role: "user".into(),
+                    content: ContentIn::Blocks(vec![Block::ToolResult {
+                        tool_use_id: "c1".into(),
+                        content: serde_json::json!("a.txt"),
+                        is_error: None,
+                    }]),
+                },
+            ],
             max_tokens: Some(32),
             stream: Some(false),
             tools: Some(vec![ToolDef {
@@ -3147,6 +3540,311 @@ mod tests {
         );
         assert_eq!(out.conversation_state.agent_task_type, "vibe");
     }
+
+    // --- 悬空工具块剔除 / 相邻同角色合并 / schema 类型方言 ---
+
+    /// 没有配对 `tool_result` 的 `tool_use`(以及反过来的孤立 `tool_result`)必须在上行
+    /// 请求体里消失。
+    ///
+    /// 用户中断、上一轮超时、客户端自己裁剪历史,都会留下一个悬空的工具调用;原样透传的话
+    /// 上游 400 掉**整条请求**,客户端只看到一次莫名其妙的失败 —— 而这一轮本可以正常作答。
+    /// 断言直接落在序列化后的上行请求体上:那才是真正发出去的字节。
+    #[test]
+    fn unpaired_tool_blocks_are_stripped_from_the_outgoing_body() {
+        let req = base_req(vec![
+            msg("user", "查天气"),
+            blocks_msg(
+                "assistant",
+                vec![
+                    Block::Text {
+                        text: "这就查".to_string(),
+                    },
+                    Block::ToolUse {
+                        id: "dangling".to_string(),
+                        name: "get_weather".to_string(),
+                        input: serde_json::json!({"city": "Paris"}),
+                    },
+                ],
+            ),
+            blocks_msg(
+                "user",
+                vec![
+                    Block::ToolResult {
+                        tool_use_id: "never_called".to_string(),
+                        content: serde_json::json!("sunny"),
+                        is_error: None,
+                    },
+                    Block::Text {
+                        text: "接着说".to_string(),
+                    },
+                ],
+            ),
+        ]);
+
+        let body = serde_json::to_value(anthropic_to_kiro(&req, None).expect("转换应成功"))
+            .expect("序列化应成功");
+        let wire = body.to_string();
+        assert!(
+            !wire.contains("dangling"),
+            "没有 tool_result 配对的 tool_use 必须剔除:{wire}"
+        );
+        assert!(
+            !wire.contains("never_called"),
+            "没有 tool_use 配对的 tool_result 必须剔除:{wire}"
+        );
+        // 剔掉的只该是配不上的那一块:同轮的文本一个字都不能少。
+        assert!(wire.contains("这就查"), "助手轮的文本不得连坐:{wire}");
+        assert_eq!(
+            body["conversationState"]["currentMessage"]["userInputMessage"]["content"],
+            "接着说"
+        );
+    }
+
+    /// 配对齐全的工具往返一块都不许动 —— 剔除逻辑不能顺手把正常请求也削了。
+    #[test]
+    fn paired_tool_blocks_survive_the_pruning() {
+        let req = base_req(vec![
+            msg("user", "查天气"),
+            blocks_msg(
+                "assistant",
+                vec![Block::ToolUse {
+                    id: "tu1".to_string(),
+                    name: "get_weather".to_string(),
+                    input: serde_json::json!({"city": "Paris"}),
+                }],
+            ),
+            blocks_msg(
+                "user",
+                vec![Block::ToolResult {
+                    tool_use_id: "tu1".to_string(),
+                    content: serde_json::json!("sunny"),
+                    is_error: None,
+                }],
+            ),
+        ]);
+
+        let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
+        let HistoryItem::AssistantResponseMessage {
+            assistant_response_message,
+        } = &kiro.conversation_state.history[1]
+        else {
+            panic!(
+                "history[1] 应为助手轮:{:?}",
+                kiro.conversation_state.history
+            );
+        };
+        assert_eq!(
+            assistant_response_message.tool_uses.as_ref().unwrap()[0].tool_use_id,
+            "tu1"
+        );
+        assert_eq!(
+            kiro.conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tool_results
+                .as_ref()
+                .expect("配对的 tool_result 必须留下")[0]
+                .tool_use_id,
+            "tu1"
+        );
+    }
+
+    /// 相邻同角色消息必须在**中枢**并成一轮 —— 中枢是四个入口(原生 Anthropic / OpenAI /
+    /// Gemini / Responses)的必经之路,只在某一个适配器里合并,另外三条路照样会构造出
+    /// 上游不接受的形状(history 角色不交替、工具调用与其应答被拆到两轮里)。
+    ///
+    /// 合并的判据必须与下游的「assistant / 其余」二元折叠一致。
+    ///
+    /// 回归:此前按角色字符串精确相等判,于是 `system` 紧跟 `user` 不合并 —— 可它们到下游
+    /// 全折成用户轮,相邻用户轮照样送上去被打回。Responses 入口 role 是裸串透传,
+    /// system/developer 能直接进 messages,这条路是活的。
+    #[test]
+    fn non_assistant_roles_count_as_one_side_when_merging() {
+        let msgs = vec![
+            InMsg { role: "system".into(), content: ContentIn::Text("S".into()) },
+            InMsg { role: "user".into(), content: ContentIn::Text("U".into()) },
+            InMsg { role: "assistant".into(), content: ContentIn::Text("A".into()) },
+            InMsg { role: "developer".into(), content: ContentIn::Text("D".into()) },
+            InMsg { role: "user".into(), content: ContentIn::Text("U2".into()) },
+        ];
+        let out = merge_adjacent_same_role(msgs);
+        assert_eq!(out.len(), 3, "非 assistant 的连续几条应合成一轮: {out:?}");
+        assert_eq!(out[0].role, "system");
+        assert_eq!(out[1].role, "assistant");
+        assert_eq!(out[2].role, "developer");
+        // 幂等:再过一遍不变。
+        let again = merge_adjacent_same_role(out.clone());
+        assert_eq!(again.len(), out.len());
+    }
+
+    #[test]
+    fn adjacent_same_role_messages_are_merged_into_one_turn() {
+        let split = base_req(vec![
+            msg("user", "前半句"),
+            msg("user", "后半句"),
+            msg("assistant", "答一"),
+            msg("assistant", "答二"),
+            msg("user", "再问"),
+        ]);
+        let k = anthropic_to_kiro(&split, None).expect("转换应成功");
+
+        assert_eq!(
+            k.conversation_state.history.len(),
+            2,
+            "五条消息应并成两轮历史 + 当前轮,实得 {:?}",
+            k.conversation_state.history
+        );
+        match &k.conversation_state.history[0] {
+            HistoryItem::UserInputMessage { user_input_message } => {
+                assert_eq!(user_input_message.content, "前半句\n\n后半句");
+            }
+            other => panic!("history[0] 应为用户轮:{other:?}"),
+        }
+        match &k.conversation_state.history[1] {
+            HistoryItem::AssistantResponseMessage {
+                assistant_response_message,
+            } => assert_eq!(assistant_response_message.content, "答一\n\n答二"),
+            other => panic!("history[1] 应为助手轮:{other:?}"),
+        }
+
+        // 幂等:把已经合并好的形状再喂一遍,产物必须逐字节一致。
+        let merged = base_req(vec![
+            msg("user", "前半句\n\n后半句"),
+            msg("assistant", "答一\n\n答二"),
+            msg("user", "再问"),
+        ]);
+        let m = anthropic_to_kiro(&merged, None).expect("转换应成功");
+        assert_eq!(
+            k.conversation_state.history, m.conversation_state.history,
+            "合并必须幂等"
+        );
+        assert_eq!(
+            k.conversation_state.current_message,
+            m.conversation_state.current_message
+        );
+    }
+
+    /// 并行工具结果被客户端拆成两条 user 消息时,必须并回同一轮:
+    /// 否则声明了两个 toolUses 的助手轮后面只跟着一个 toolResult,另一个被挤到当前轮,
+    /// 配对被拆散,上游当成"工具调用没被应答"。
+    #[test]
+    fn split_tool_results_merge_back_into_one_turn() {
+        let req = base_req(vec![
+            msg("user", "两地天气"),
+            blocks_msg(
+                "assistant",
+                vec![
+                    Block::ToolUse {
+                        id: "c1".to_string(),
+                        name: "get_weather".to_string(),
+                        input: serde_json::json!({"city": "Paris"}),
+                    },
+                    Block::ToolUse {
+                        id: "c2".to_string(),
+                        name: "get_weather".to_string(),
+                        input: serde_json::json!({"city": "Tokyo"}),
+                    },
+                ],
+            ),
+            blocks_msg(
+                "user",
+                vec![Block::ToolResult {
+                    tool_use_id: "c1".to_string(),
+                    content: serde_json::json!("sunny"),
+                    is_error: None,
+                }],
+            ),
+            blocks_msg(
+                "user",
+                vec![Block::ToolResult {
+                    tool_use_id: "c2".to_string(),
+                    content: serde_json::json!("rainy"),
+                    is_error: None,
+                }],
+            ),
+        ]);
+
+        let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
+        assert_eq!(
+            kiro.conversation_state.history.len(),
+            2,
+            "history 应为 [用户轮, 助手轮] 并以助手轮收尾:{:?}",
+            kiro.conversation_state.history
+        );
+        let results = kiro
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+            .as_ref()
+            .expect("当前轮应带 toolResults");
+        assert_eq!(
+            results.len(),
+            2,
+            "两个 toolUses 必须由同一轮里的两个 toolResults 应答"
+        );
+        assert_eq!(results[0].tool_use_id, "c1");
+        assert_eq!(results[1].tool_use_id, "c2");
+    }
+
+    /// 大写类型方言(`"type":"OBJECT"` / `"STRING"`,Gemini 入口的工具声明就是这个形状)
+    /// 必须统一成小写标准形态,且**递归**覆盖嵌套 schema —— 只改顶层等于没改。
+    #[test]
+    fn uppercase_schema_type_dialect_is_lowercased_recursively() {
+        let mut req = base_req(vec![msg("user", "hi")]);
+        req.tools = Some(vec![ToolDef {
+            tool_type: None,
+            name: "get_weather".to_string(),
+            description: Some("d".to_string()),
+            input_schema: serde_json::json!({
+                "type": "OBJECT",
+                "properties": {
+                    "city": {"type": "STRING"},
+                    "tags": {"type": "ARRAY", "items": {"type": "STRING"}},
+                    "nested": {
+                        "type": "OBJECT",
+                        "properties": {"n": {"type": "INTEGER"}}
+                    },
+                    "either": {"anyOf": [{"type": "STRING"}, {"type": "NUMBER"}]},
+                    "pair": {"type": ["STRING", "NULL"]}
+                },
+                "required": ["city"]
+            }),
+        }]);
+
+        let kiro = anthropic_to_kiro(&req, None).expect("转换应成功");
+        let schema = &kiro
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools
+            .as_ref()
+            .expect("应带工具")[0]
+            .tool_specification
+            .input_schema
+            .json;
+
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["city"]["type"], "string");
+        assert_eq!(schema["properties"]["tags"]["type"], "array");
+        assert_eq!(schema["properties"]["tags"]["items"]["type"], "string");
+        assert_eq!(schema["properties"]["nested"]["type"], "object");
+        assert_eq!(
+            schema["properties"]["nested"]["properties"]["n"]["type"],
+            "integer"
+        );
+        assert_eq!(schema["properties"]["either"]["anyOf"][0]["type"], "string");
+        assert_eq!(schema["properties"]["either"]["anyOf"][1]["type"], "number");
+        assert_eq!(
+            schema["properties"]["pair"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        // 语义一个字都不能改:required 与其它字段照旧。
+        assert_eq!(schema["required"], serde_json::json!(["city"]));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3176,7 +3874,7 @@ const THINK_CLOSE: &str = "</thinking>";
 /// 再判定。没有这一步,一个恰好被切成 `<think` + `ing>` 的标签就会被当成正文吐出去。
 ///
 /// 模型在思考里**提到**标签(通常写成 `` `</thinking>` ``)不算结束:被反引号或引号紧贴
-/// 包裹的一律跳过。这条是照参照实现的做法 —— 少了它,一段讨论标签本身的思考会被从中间截断。
+/// 包裹的一律跳过 —— 少了这一条,一段讨论标签本身的思考会被从中间截断,后半段当正文吐出去。
 #[derive(Debug, Default)]
 pub struct ThinkingSplitter {
     buf: String,

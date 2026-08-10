@@ -313,6 +313,22 @@ fn frame_out(wire: WireFormat, first: &mut bool, json: &str) -> Bytes {
     }
 }
 
+/// 上游静默多久就补一帧保活字节。
+///
+/// 25 秒低于常见的 30/60 秒空闲阈值,与另外三个协议(走 axum `Sse::keep_alive` 的那几条)同值。
+const STREAM_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// 一帧保活字节。两种线格式各有各的"合法空转":
+/// - SSE:`:` 开头的注释行,规范明确要求客户端忽略;
+/// - JSON 数组:元素之间的空白符在 JSON 里没有意义,整份文档仍然合法可解析(数组还没开头时
+///   它就是文档前导空白,同样合法)。
+fn keepalive_frame(wire: WireFormat) -> Bytes {
+    match wire {
+        WireFormat::Sse => Bytes::from_static(b": keep-alive\n\n"),
+        WireFormat::JsonArray => Bytes::from_static(b"\n"),
+    }
+}
+
 /// 序列化一个 chunk;序列化失败(理论上不会)退化成空串,不 panic。
 fn chunk_json(resp: &GenerateContentResponse) -> String {
     serde_json::to_string(resp).unwrap_or_default()
@@ -328,8 +344,7 @@ fn text_chunk(t: String) -> GenerateContentResponse {
                     text: Some(t),
                     inline_data: None,
                     function_call: None,
-                    function_response: None,
-                }],
+                    function_response: None, ..Default::default() }],
             },
             finish_reason: None,
             index: 0,
@@ -368,8 +383,14 @@ pub async fn stream_generate_content(
     let crate::protocol::anthropic::handler::CallOutcome {
         mut resp,
         credential_id,
-        tool_name_map: _,
+        // 超长工具名在上行时被缩短了,上游回来的 `toolUseEvent` 用的就是短名。这张表必须一路
+        // 带进读循环:丢掉它,客户端会在 `functionCall.name` 里看到一个**它自己没声明过**的
+        // 函数名,那一轮工具调用直接作废。非流式那条走中枢内核,早已还原。
+        tool_name_map,
+        cred_id,
     } = select_and_call_with_retry(&state, &hub_req, now_unix, bound.as_ref()).await?;
+    // 流里报错时要反馈账号池,而 state 会被移进 stream! —— 先留一份。
+    let feedback_state = state.clone();
     // 统计层用量句柄(Arc,移入哨兵);记账经 Drop 哨兵在流**任意方式结束**时都落一条(#8/#9/#15)。
     let usage_handle = state.stats.usage.clone();
     let record_model = hub_req.model.clone();
@@ -400,16 +421,41 @@ pub async fn stream_generate_content(
         // 传输层中断(连接重置 / 读超时 / chunked 体未收尾):与 in-band exception 一样
         // 必须发错误块收尾,**绝不能报 STOP**——否则客户端把"内容缺失"当成正常完成。
         let mut transport_err: Option<(u16, String)> = None;
+        // 思考切分器:必须活到整条流结束(跨帧的半截标签由它兜住)。
+        let mut splitter = crate::kiro::convert::ThinkingSplitter::new();
 
         'read: loop {
-            match resp.chunk().await {
+            // 上游"想"得久时(长推理、长工具链)会几十秒一个字节都不出。另外三个协议的流式出口
+            // 走 axum 的 `Sse::keep_alive` 自动补注释帧,而这条是裸 `Body::from_stream`
+            //(要同时兼顾 SSE 与 JSON 数组两种线格式),拿不到那个包装。不自己补的话,中间的
+            // CDN / 反代会按空闲超时把这条静默的连接掐掉,用户看到的是无端断流。
+            let next = match tokio::time::timeout(STREAM_KEEPALIVE_INTERVAL, resp.chunk()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    yield Ok::<Bytes, std::io::Error>(keepalive_frame(wire));
+                    continue;
+                }
+            };
+            match next {
                 Ok(Some(chunk)) => {
                     dec.push(&chunk);
                     for frame in dec.drain() {
                         if let Some(t) = crate::kiro::convert::frame_text_delta(&frame) {
                             usage_guard.total_chars += t.chars().count();
-                            let json = chunk_json(&text_chunk(t));
-                            yield Ok::<Bytes, std::io::Error>(frame_out(wire, &mut first, &json));
+                            // 先切出 thinking(见 openai/responses 同处说明):不切的话客户端把
+                            // 整段思考当正文显示,而本协议刚支持了开启 extended thinking。
+                            for piece in splitter.feed(&t) {
+                                let (txt, is_thought) = match piece {
+                                    crate::kiro::convert::Piece::Text(x) => (x, None),
+                                    crate::kiro::convert::Piece::Thinking(x) => (x, Some(true)),
+                                };
+                                let mut c = text_chunk(txt);
+                                if let Some(p0) = c.candidates.first_mut().and_then(|c| c.content.parts.first_mut()) {
+                                    p0.thought = is_thought;
+                                }
+                                let json = chunk_json(&c);
+                                yield Ok::<Bytes, std::io::Error>(frame_out(wire, &mut first, &json));
+                            }
                             continue;
                         }
                         if let Some(m) = crate::kiro::convert::metering_frame(&frame) {
@@ -425,12 +471,26 @@ pub async fn stream_generate_content(
                         }
                         if let Some(e) = crate::kiro::convert::frame_exception(&frame) {
                             // 上游中途报错:响应头已发出,改不了状态码,只能发流内错误块后终止。
+                            // 反馈账号池:上游在 200 的流里报错 = 这次它其实没干成。不反馈的话,
+                            // 这个账号在池子眼里永远只有"刚刚成功过",坏号一次都不会被惩罚 ——
+                            // 此前只有原生 Anthropic 那条出口做了,另外三个协议全漏。
+                            crate::protocol::anthropic::handler::report_stream_exception(
+                                &feedback_state,
+                                &cred_id,
+                                credential_id,
+                                &e,
+                                now_unix,
+                            )
+                            .await;
                             exception = Some(e);
                             break 'read;
                         }
                         if let Some(v) = crate::kiro::convert::tool_use_frame(&frame) {
                             let Some(tool_use_id) = v["toolUseId"].as_str() else { continue };
                             if let Some(name) = v["name"].as_str() {
+                                // 还原成客户端认识的原名(见上面 tool_name_map 的说明)。
+                                // 名字都没超长时该表为空,`get` 直接落空、零开销。
+                                let name = tool_name_map.get(name).map(String::as_str).unwrap_or(name);
                                 tool_names.insert(tool_use_id.to_string(), name.to_string());
                             }
                             if let Some(inp) = v["input"].as_str() {
@@ -453,8 +513,7 @@ pub async fn stream_generate_content(
                                                     name,
                                                     args,
                                                 }),
-                                                function_response: None,
-                                            }],
+                                                function_response: None, ..Default::default() }],
                                         },
                                         finish_reason: None,
                                         index: 0,
@@ -1845,5 +1904,390 @@ mod tests {
         }
         assert!(ok, "流式用量应归属到 api_key_id=11");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 取一个超长工具名经中枢缩短后的短名。
+    ///
+    /// 刻意走**上行时真正用的那一份**实现(`anthropic_to_kiro_full`),不在测试里另抄一遍缩短
+    /// 算法:抄的那份会随算法一起变,这个用例也就再也测不出东西。
+    fn shortened_tool_name(long: &str) -> String {
+        use crate::protocol::anthropic::types::{ContentIn, InMsg, MessagesRequest, ToolDef};
+        let hub = MessagesRequest {
+            model: "sonnet".to_string(),
+            system: None,
+            messages: vec![InMsg {
+                role: "user".to_string(),
+                content: ContentIn::Text("hi".to_string()),
+            }],
+            max_tokens: None,
+            stream: None,
+            tools: Some(vec![ToolDef {
+                tool_type: None,
+                name: long.to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+            }]),
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+        };
+        crate::kiro::convert::anthropic_to_kiro_full(&hub, None)
+            .expect("转换应成功")
+            .tool_name_map
+            .keys()
+            .next()
+            .cloned()
+            .expect("超长工具名必须被缩短并登记进还原表")
+    }
+
+    /// 从 mock 收到的**上行请求体**里取 `currentMessage` 的文本(拼给上游的那一份)。
+    fn upstream_current_text(req: &wiremock::Request) -> String {
+        let v: serde_json::Value = serde_json::from_slice(&req.body).expect("上行体应是 JSON");
+        v["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// 从 mock 收到的上行请求体里取 `conversationId`。
+    fn upstream_conversation_id(req: &wiremock::Request) -> String {
+        let v: serde_json::Value = serde_json::from_slice(&req.body).expect("上行体应是 JSON");
+        v["conversationState"]["conversationId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// F1 回归:超长工具名上行前被缩短,上游回来的 `toolUseEvent` 用的就是短名。流式出口不还原
+    /// 的话,客户端会在 `functionCall.name` 里看到一个**它自己没声明过**的函数名,那一轮工具
+    /// 调用直接作废。非流式出口走中枢 `relay_core_outcome`,那条早已还原;流式这条是自写的。
+    #[tokio::test]
+    async fn stream_restores_shortened_tool_name() {
+        let long =
+            "get_weather_for_a_city_with_an_absurdly_long_but_perfectly_legal_client_side_name";
+        assert!(long.len() > 63, "用例前提:工具名必须超过上游长度上限");
+        let short = shortened_tool_name(long);
+
+        let server = MockServer::start().await;
+        let mut body = event_frame(
+            "toolUseEvent",
+            format!(r#"{{"name":"{short}","toolUseId":"tu1"}}"#).as_bytes(),
+        );
+        body.extend(event_frame(
+            "toolUseEvent",
+            format!(r#"{{"input":"{{}}","name":"{short}","toolUseId":"tu1"}}"#).as_bytes(),
+        ));
+        body.extend(event_frame(
+            "toolUseEvent",
+            format!(r#"{{"name":"{short}","stop":true,"toolUseId":"tu1"}}"#).as_bytes(),
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let req_body = format!(
+            r#"{{"contents":[{{"role":"user","parts":[{{"text":"weather?"}}]}}],"tools":[{{"functionDeclarations":[{{"name":"{long}","parameters":{{"type":"object"}}}}]}}]}}"#
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:streamGenerateContent?alt=sse")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains(&format!("\"name\":\"{long}\"")),
+            "客户端应收到它自己声明的函数名;实际:\n{s}"
+        );
+        assert!(
+            !s.contains(&short),
+            "缩短后的内部名不该外泄给客户端;实际:\n{s}"
+        );
+
+        // 非流式那条走中枢内核,还原早就有了;一并钉住,免得哪天两条出口又各走各的。
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:generateContent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let parts = v["candidates"][0]["content"]["parts"]
+            .as_array()
+            .expect("应有 parts");
+        assert!(
+            parts
+                .iter()
+                .any(|p| p["functionCall"]["name"] == long),
+            "非流式出口同样要回客户端声明的原名;实际:{v}"
+        );
+    }
+
+    /// F2 回归:`generationConfig.thinkingConfig` 必须真的开出 extended thinking。
+    ///
+    /// 断言的是**上行请求体**:上游认的是写在正文最前面的 `<thinking_mode>` 指令,
+    /// 此前这个协议入口恒传 thinking=None,于是无论客户端怎么配 thinkingConfig 都开不出来。
+    /// `thinkingBudget: 0` 是 Gemini 明确的"关掉思考",不该平白加指令。
+    #[tokio::test]
+    async fn thinking_config_turns_on_extended_thinking() {
+        let server = MockServer::start().await;
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+
+        for body in [
+            r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingBudget":2048}}}"#,
+            r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":0}}}"#,
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1beta/models/claude-sonnet-4.5:generateContent")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2, "该有两次上行请求");
+        let with_budget = upstream_current_text(&reqs[0]);
+        assert!(
+            with_budget.starts_with(
+                "<thinking_mode>enabled</thinking_mode><max_thinking_length>2048</max_thinking_length>"
+            ),
+            "thinkingBudget 应原样成为思考预算;实际上行正文:{with_budget}"
+        );
+        let disabled = upstream_current_text(&reqs[1]);
+        assert!(
+            !disabled.contains("<thinking_mode>"),
+            "thinkingBudget=0 是明确关掉思考,不该加指令;实际上行正文:{disabled}"
+        );
+    }
+
+    /// F3 回归:同一场多轮对话的每一轮,上行 `conversationId` 必须是同一个。
+    ///
+    /// 恒传 metadata=None 时中枢会给每个请求新生成一个 —— 上游看到的是"同一个账号每分钟开
+    /// 几十段全新会话",既丢了会话连续性,这个形状本身也不正常。
+    #[tokio::test]
+    async fn multi_turn_conversation_keeps_one_conversation_id() {
+        let server = MockServer::start().await;
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+
+        for body in [
+            // 同一场对话的第一轮与第二轮(第二轮把历史整段重发,这是所有客户端的做法)。
+            r#"{"contents":[{"role":"user","parts":[{"text":"讲讲 Rust"}]}]}"#,
+            r#"{"contents":[{"role":"user","parts":[{"text":"讲讲 Rust"}]},{"role":"model","parts":[{"text":"好"}]},{"role":"user","parts":[{"text":"再多说点"}]}]}"#,
+            // 另一场对话。
+            r#"{"contents":[{"role":"user","parts":[{"text":"帮我写个正则"}]}]}"#,
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1beta/models/claude-sonnet-4.5:generateContent")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 3, "该有三次上行请求");
+        let first = upstream_conversation_id(&reqs[0]);
+        let second = upstream_conversation_id(&reqs[1]);
+        let other = upstream_conversation_id(&reqs[2]);
+        assert!(
+            crate::kiro::is_uuid(&first),
+            "conversationId 必须是标准 UUID 写法;实际:{first}"
+        );
+        assert_eq!(first, second, "同一场对话的两轮应共用一个 conversationId");
+        assert_ne!(first, other, "两场不同的对话不该被并成同一段会话");
+    }
+
+    /// 一个"响应头很快、首字节很慢"的上游:先把 200 + chunked 响应头发出去,静默 `silence`
+    /// 之后才吐事件流。
+    ///
+    /// 为什么不能用 wiremock 的 `set_delay`:它延迟的是**整个响应**(响应头一起压着不发),
+    /// 那对应的是"上游迟迟不接活",压根走不到流式读循环。现实里上游是立刻回 200 + chunked、
+    /// 然后模型想很久才出第一个字节 —— 保活要治的正是后者,故这里自搭一个裸 TCP 上游复现它。
+    async fn slow_first_byte_upstream(body: Vec<u8>, silence: std::time::Duration) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定回环端口");
+        let addr = listener.local_addr().expect("取本地地址");
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            // 先把请求整条读完(头 + content-length 长度的体)再应答:客户端还在写请求体时
+            // 就抢着应答,它可能拿到 broken pipe,测的就不是保活而是连接被打断了。
+            let mut buf = vec![0u8; 8192];
+            let mut seen: Vec<u8> = Vec::new();
+            let mut need: Option<usize> = None;
+            loop {
+                let n = match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                seen.extend_from_slice(&buf[..n]);
+                if need.is_none()
+                    && let Some(pos) = seen.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let head = String::from_utf8_lossy(&seen[..pos]).to_ascii_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    need = Some(pos + 4 + len);
+                }
+                if need.is_some_and(|need| seen.len() >= need) {
+                    break;
+                }
+            }
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      content-type: application/vnd.amazon.eventstream\r\n\
+                      transfer-encoding: chunked\r\n\r\n",
+                )
+                .await;
+            let _ = sock.flush().await;
+            tokio::time::sleep(silence).await;
+            let _ = sock
+                .write_all(format!("{:x}\r\n", body.len()).as_bytes())
+                .await;
+            let _ = sock.write_all(&body).await;
+            let _ = sock.write_all(b"\r\n0\r\n\r\n").await;
+            let _ = sock.flush().await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// F4 回归:上游首字节慢时,这条流必须自己往外吐保活字节。
+    ///
+    /// 另外三个协议走 axum 的 `Sse::keep_alive` 自动补;Gemini 这条是裸 `Body::from_stream`
+    /// (要同时兼顾 SSE 与 JSON 数组两种线格式),拿不到那个包装。不补的话,上游"想"得久时
+    /// 整条连接几十秒一个字节都不出,中间的 CDN / 反代按空闲超时把它掐掉,用户看到的是无端断流。
+    ///
+    /// 本用例会**真等**二十多秒:保活间隔就是 25 秒,而暂停 tokio 时钟需要 `test-util` 特性,
+    /// 本仓没开。与其把间隔改小去迁就用例(那等于测的不是线上那条路),不如实等。
+    #[tokio::test]
+    async fn stream_emits_keepalive_while_upstream_is_silent() {
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        // 静默 27 秒 > 25 秒保活间隔。
+        let uri = slow_first_byte_upstream(frame, std::time::Duration::from_secs(27)).await;
+
+        let app = gemini_router(state(&uri, vec![cred()]));
+        let req_body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:streamGenerateContent?alt=sse")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains(": keep-alive"),
+            "上游静默期间应发 SSE 注释帧保活;实际:\n{s}"
+        );
+        // 保活只能出现在真正的内容之前,且不能污染内容本身。
+        let ka = s.find(": keep-alive").expect("上面已断言存在");
+        let text = s.find("\"text\":\"pong\"").expect("内容仍应照常下发");
+        assert!(ka < text, "保活应发生在首字节之前;实际:\n{s}");
+    }
+
+    /// 同上,但走**默认线格式**(JSON 数组)。这条比 SSE 那条更险:数组里塞不进注释,保活只能
+    /// 用空白符,而空白符必须落在不破坏 JSON 语法的位置 —— 故除了"发出来了"还要断言整份文档
+    /// 仍然解析得动。
+    #[tokio::test]
+    async fn stream_json_array_keepalive_keeps_document_parseable() {
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        let uri = slow_first_byte_upstream(frame, std::time::Duration::from_secs(27)).await;
+
+        let app = gemini_router(state(&uri, vec![cred()]));
+        let req_body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:streamGenerateContent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.starts_with('\n'),
+            "首字节到来之前应先发过保活空白符;实际:\n{s}"
+        );
+        let elems = stream_elements(&s, WireFormat::JsonArray);
+        assert!(
+            elems
+                .iter()
+                .any(|e| e["candidates"][0]["content"]["parts"][0]["text"] == "pong"),
+            "保活不能挤掉内容;实际:{elems:?}"
+        );
     }
 }

@@ -304,8 +304,14 @@ pub async fn chat_completions_stream(
     let crate::protocol::anthropic::handler::CallOutcome {
         mut resp,
         credential_id,
-        tool_name_map: _,
+        // 超长工具名在上行时被缩短了,上游回来的 `toolUseEvent` 用的就是短名。这张表必须一路
+        // 带进读循环:丢掉它,客户端会收到一个**它自己没声明过**的工具名,那一轮工具调用直接
+        // 作废(客户端按名字查不到对应实现)。非流式那条走中枢内核,早已还原。
+        tool_name_map,
+        cred_id,
     } = select_and_call_with_retry(&state, &hub_req, now_unix, bound.as_ref()).await?;
+    // 流里报错时要反馈账号池,而 state 会被移进 stream! —— 先留一份。
+    let feedback_state = state.clone();
     // 统计层用量句柄(Arc,移入哨兵);记账经 Drop 哨兵在流**任意方式结束**时都落一条(#8/#9/#15)。
     let usage_handle = state.stats.usage.clone();
     let model = hub_req.model.clone();
@@ -335,7 +341,7 @@ pub async fn chat_completions_stream(
         // 首个 chunk:仅 role,无 content/tool_calls。
         yield Ok(make(ChunkChoice {
             index: 0,
-            delta: Delta { role: Some("assistant".to_string()), content: None, tool_calls: None },
+            delta: Delta { role: Some("assistant".to_string()), content: None, tool_calls: None, ..Default::default() },
             finish_reason: None,
         }));
 
@@ -350,6 +356,8 @@ pub async fn chat_completions_stream(
         // 传输层中断(连接重置 / 读超时 / chunked 体未收尾):与 in-band exception 一样
         // 必须以错误 chunk 收尾且**不发 [DONE]**,否则客户端把半截回答当正常完成。
         let mut transport_err: Option<(u16, String)> = None;
+        // 思考切分器:必须活到整条流结束(跨帧的半截标签由它兜住)。
+        let mut splitter = crate::kiro::convert::ThinkingSplitter::new();
 
         'read: loop {
             match resp.chunk().await {
@@ -358,11 +366,21 @@ pub async fn chat_completions_stream(
                     for frame in dec.drain() {
                         if let Some(t) = crate::kiro::convert::frame_text_delta(&frame) {
                             usage_guard.total_chars += t.chars().count();
-                            yield Ok(make(ChunkChoice {
-                                index: 0,
-                                delta: Delta { role: None, content: Some(t), tool_calls: None },
-                                finish_reason: None,
-                            }));
+                            // 先切出 thinking:上游把思考过程用 `<thinking>…</thinking>` 包在普通
+                            // 文本里下发。不切的话客户端把整段思考当正文显示 —— 而这三个协议刚
+                            // 支持了开启 extended thinking,不切等于把问题放大。切分器是增量的,
+                            // 跨块的半截标签由它自己兜住。
+                            for piece in splitter.feed(&t) {
+                                let (content, reasoning) = match piece {
+                                    crate::kiro::convert::Piece::Text(x) => (Some(x), None),
+                                    crate::kiro::convert::Piece::Thinking(x) => (None, Some(x)),
+                                };
+                                yield Ok(make(ChunkChoice {
+                                    index: 0,
+                                    delta: Delta { role: None, content, tool_calls: None, reasoning_content: reasoning },
+                                    finish_reason: None,
+                                }));
+                            }
                         } else if let Some(v) = crate::kiro::convert::tool_use_frame(&frame) {
                             let Some(tool_use_id) = v["toolUseId"].as_str() else { continue };
                             let is_new = !tool_index.contains_key(tool_use_id);
@@ -371,7 +389,10 @@ pub async fn chat_completions_stream(
                                 next_tool_index += 1;
                                 tool_index.insert(tool_use_id.to_string(), idx);
                                 any_tool = true;
-                                let name = v["name"].as_str().unwrap_or("");
+                                let raw_name = v["name"].as_str().unwrap_or("");
+                                // 还原成客户端认识的原名(见上面 tool_name_map 的说明)。
+                                // 名字都没超长时该表为空,`get` 直接落空、零开销。
+                                let name = tool_name_map.get(raw_name).map(String::as_str).unwrap_or(raw_name);
                                 yield Ok(make(ChunkChoice {
                                     index: 0,
                                     delta: Delta {
@@ -382,8 +403,7 @@ pub async fn chat_completions_stream(
                                             id: Some(tool_use_id.to_string()),
                                             kind: Some("function".to_string()),
                                             function: ToolCallFunctionChunk { name: Some(name.to_string()), arguments: None },
-                                        }]),
-                                    },
+                                        }]), ..Default::default() },
                                     finish_reason: None,
                                 }));
                             }
@@ -399,8 +419,7 @@ pub async fn chat_completions_stream(
                                             id: None,
                                             kind: None,
                                             function: ToolCallFunctionChunk { name: None, arguments: Some(inp.to_string()) },
-                                        }]),
-                                    },
+                                        }]), ..Default::default() },
                                     finish_reason: None,
                                 }));
                             }
@@ -413,6 +432,17 @@ pub async fn chat_completions_stream(
                             truncation = Some(tr);
                         } else if let Some(e) = crate::kiro::convert::frame_exception(&frame) {
                             // 非截断 exception:后续帧再无意义,停读并走错误收尾。
+                            // 反馈账号池:上游在 200 的流里报错 = 这次它其实没干成。不反馈的话,
+                            // 这个账号在池子眼里永远只有"刚刚成功过",坏号一次都不会被惩罚 ——
+                            // 此前只有原生 Anthropic 那条出口做了,另外三个协议全漏。
+                            crate::protocol::anthropic::handler::report_stream_exception(
+                                &feedback_state,
+                                &cred_id,
+                                credential_id,
+                                &e,
+                                now_unix,
+                            )
+                            .await;
                             upstream_error = Some(e);
                             break 'read;
                         }
@@ -1487,5 +1517,241 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "overloaded_error");
         assert!(v["error"]["message"].is_string());
+    }
+
+    /// 取一个超长工具名经中枢缩短后的短名。
+    ///
+    /// 刻意走**上行时真正用的那一份**实现(`anthropic_to_kiro_full`),不在测试里另抄一遍缩短
+    /// 算法:抄的那份会随算法一起变,这个用例也就再也测不出东西。
+    fn shortened_tool_name(long: &str) -> String {
+        use crate::protocol::anthropic::types::{ContentIn, InMsg, MessagesRequest, ToolDef};
+        let hub = MessagesRequest {
+            model: "sonnet".to_string(),
+            system: None,
+            messages: vec![InMsg {
+                role: "user".to_string(),
+                content: ContentIn::Text("hi".to_string()),
+            }],
+            max_tokens: None,
+            stream: None,
+            tools: Some(vec![ToolDef {
+                tool_type: None,
+                name: long.to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+            }]),
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+        };
+        crate::kiro::convert::anthropic_to_kiro_full(&hub, None)
+            .expect("转换应成功")
+            .tool_name_map
+            .keys()
+            .next()
+            .cloned()
+            .expect("超长工具名必须被缩短并登记进还原表")
+    }
+
+    /// 从 mock 收到的**上行请求体**里取 `currentMessage` 的文本(拼给上游的那一份)。
+    fn upstream_current_text(req: &wiremock::Request) -> String {
+        let v: serde_json::Value = serde_json::from_slice(&req.body).expect("上行体应是 JSON");
+        v["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// 从 mock 收到的上行请求体里取 `conversationId`。
+    fn upstream_conversation_id(req: &wiremock::Request) -> String {
+        let v: serde_json::Value = serde_json::from_slice(&req.body).expect("上行体应是 JSON");
+        v["conversationState"]["conversationId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// F1 回归:超长工具名上行前被缩短,上游回来的 `tool_use` 用的就是短名。流式出口不还原的话,
+    /// 客户端会收到一个**它自己没声明过**的工具名,那一轮工具调用直接作废(客户端按名字查不到
+    /// 对应的本地实现)。非流式出口走中枢 `relay_core_outcome`,那条早已还原;流式这条是自写的。
+    #[tokio::test]
+    async fn stream_restores_shortened_tool_name() {
+        let long =
+            "get_weather_for_a_city_with_an_absurdly_long_but_perfectly_legal_client_side_name";
+        assert!(long.len() > 63, "用例前提:工具名必须超过上游长度上限");
+        let short = shortened_tool_name(long);
+
+        let server = MockServer::start().await;
+        let mut body = event_frame(
+            "toolUseEvent",
+            format!(r#"{{"name":"{short}","toolUseId":"tu1"}}"#).as_bytes(),
+        );
+        body.extend(event_frame(
+            "toolUseEvent",
+            format!(r#"{{"input":"{{}}","name":"{short}","toolUseId":"tu1"}}"#).as_bytes(),
+        ));
+        body.extend(event_frame(
+            "toolUseEvent",
+            format!(r#"{{"name":"{short}","stop":true,"toolUseId":"tu1"}}"#).as_bytes(),
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = openai_router(state(&server.uri(), vec![cred()]));
+        let req_body = format!(
+            r#"{{"model":"sonnet","messages":[{{"role":"user","content":"weather?"}}],"tools":[{{"type":"function","function":{{"name":"{long}","parameters":{{"type":"object"}}}}}}],"stream":true}}"#
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains(&format!("\"name\":\"{long}\"")),
+            "客户端应收到它自己声明的工具名;实际:\n{s}"
+        );
+        assert!(
+            !s.contains(&short),
+            "缩短后的内部名不该外泄给客户端;实际:\n{s}"
+        );
+
+        // 非流式那条走中枢内核,还原早就有了;一并钉住,免得哪天两条出口又各走各的。
+        let req_body = format!(
+            r#"{{"model":"sonnet","messages":[{{"role":"user","content":"weather?"}}],"tools":[{{"type":"function","function":{{"name":"{long}","parameters":{{"type":"object"}}}}}}]}}"#
+        );
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["choices"][0]["message"]["tool_calls"][0]["function"]["name"], long,
+            "非流式出口同样要回客户端声明的原名;实际:{v}"
+        );
+    }
+
+    /// F2 回归:`reasoning_effort` 必须真的开出 extended thinking。
+    ///
+    /// 断言的是**上行请求体**:上游认的是写在正文最前面的 `<thinking_mode>` 指令,
+    /// 此前这个协议入口恒传 thinking=None,于是无论客户端怎么要求推理都开不出来。
+    #[tokio::test]
+    async fn reasoning_effort_turns_on_extended_thinking() {
+        let server = MockServer::start().await;
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+        let app = openai_router(state(&server.uri(), vec![cred()]));
+
+        for body in [
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}"#,
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2, "该有两次上行请求");
+        let with_effort = upstream_current_text(&reqs[0]);
+        assert!(
+            with_effort.starts_with("<thinking_mode>enabled</thinking_mode><max_thinking_length>"),
+            "reasoning_effort 应开出 thinking 指令;实际上行正文:{with_effort}"
+        );
+        let without = upstream_current_text(&reqs[1]);
+        assert!(
+            !without.contains("<thinking_mode>"),
+            "没要求推理时不该平白加指令;实际上行正文:{without}"
+        );
+    }
+
+    /// F3 回归:同一场多轮对话的每一轮,上行 `conversationId` 必须是同一个。
+    ///
+    /// 恒传 metadata=None 时中枢会给每个请求新生成一个 —— 上游看到的是"同一个账号每分钟开
+    /// 几十段全新会话",既丢了会话连续性,这个形状本身也不正常。
+    #[tokio::test]
+    async fn multi_turn_conversation_keeps_one_conversation_id() {
+        let server = MockServer::start().await;
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"pong"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+        let app = openai_router(state(&server.uri(), vec![cred()]));
+
+        for body in [
+            // 同一场对话的第一轮与第二轮(第二轮把历史整段重发,这是所有客户端的做法)。
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"讲讲 Rust"}]}"#,
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"讲讲 Rust"},{"role":"assistant","content":"好"},{"role":"user","content":"再多说点"}]}"#,
+            // 另一场对话。
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"帮我写个正则"}]}"#,
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 3, "该有三次上行请求");
+        let first = upstream_conversation_id(&reqs[0]);
+        let second = upstream_conversation_id(&reqs[1]);
+        let other = upstream_conversation_id(&reqs[2]);
+        assert!(
+            crate::kiro::is_uuid(&first),
+            "conversationId 必须是标准 UUID 写法;实际:{first}"
+        );
+        assert_eq!(first, second, "同一场对话的两轮应共用一个 conversationId");
+        assert_ne!(first, other, "两场不同的对话不该被并成同一段会话");
     }
 }
