@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.14.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.15.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 날짜 | 업데이트 내용 |
 |------|----------|
+| 2026-08-10 | v0.15.0 - 🔁 **Quota-exhausted accounts no longer have to be relearned after every restart.** The user asked directly: "aren't exhausted accounts already disabled — why do requests still reach them?" They were disabled, but **only in memory**: v0.10.2 deliberately kept runtime verdicts off disk so one permission blip could not write an account off permanently — but quota is precisely the kind that has a **known recovery time**. So every deploy wiped the knowledge and the pool rediscovered it using **the user's requests** (measured: 13 exhausted accounts meant two 502s before the third request succeeded). It is now persisted with its reset time, survives restarts and returns to the pool automatically; the time comes from upstream's `nextResetAt` when available, falling back to the first of next month. Also: **the server-side `web_search` tool actually works now** — it used to be merely tolerated (no longer a 400 since v0.11.0) while never searching, so the model answered with ordinary text and the client believed a search had happened. Such requests are now intercepted before the data plane, sent to the upstream `/mcp` endpoint, and returned as `server_tool_use` + `web_search_tool_result` |
 | 2026-08-10 | v0.14.1 - 🔧 **Two things found while verifying the previous releases in production.** ① `usage.input_tokens` was **always 0** in responses: the estimate added in v0.13.0 only fed billing and was never written back, so the number existed in the invoice but not in the reply the client uses to compute cost and context usage — both the non-streaming `usage` and the streaming `message_start` now carry it. ② **With a batch of quota-exhausted accounts in the pool, a user's first few requests failed in a row**: quota exhaustion shared the 3-attempt budget with auth failures, and with 13 exhausted accounts two requests returned 502 before the third succeeded (each request burned three accounts before disabling them). Quota exhaustion is **deterministic** for the billing period, so it now shares the account-level deterministic class with "model unavailable" and gets an allowance sized to the pool, while transient and auth failures keep their small cap of 3. When the pool really is exhausted the answer is a `429` that says so, instead of an unhelpful 502 |
 | 2026-08-10 | v0.14.0 - 🧩 **비교 마무리**. ① 히스토리의 어시스턴트 턴 `content`가 **빈 문자열**이 될 수 있어 업스트림이 요청 전체를 거부했습니다(도구 호출만 있는 턴에는 텍스트가 없는데, 사용자 턴에는 오래전부터 비어 있지 않도록 처리가 있었지만 어시스턴트 턴에는 없었습니다) → 공백 하나로 대체. ② **경계가 이미 알려진 손상 프레임을 1바이트씩 다시 스캔**했습니다(prelude CRC가 통과하면 `total_len`은 신뢰할 수 있습니다) → 프레임 단위로 건너뜁니다. ③ **`tlsBackend`를 런타임에 전환 가능**하게 했습니다(이전에는 컴파일 타임 선택이라 이미지를 다시 만들어야 했습니다) — 자체 서명 CA 프록시 뒤에서는 보통 한쪽만 핸드셰이크에 성공하며, 증상은 「토큰 갱신 불가/연결 불가」로 겉보기에 TLS와 무관해 보입니다 |
 | 2026-08-09 | v0.13.0 - 🧠 **확장 사고(thinking)를 완전히 연결**했습니다(이전에는 기능 자체가 없었습니다). 요청 측에서 `thinking` 필드가 조용히 버려져 업스트림에 지시가 전달되지 않았고, 응답 측에서는 업스트림이 `<thinking>…</thinking>`로 감싸 보낸 사고 과정을 그대로 통과시켜 클라이언트가 사고 전체를 본문으로 표시했습니다. 이제 enabled/adaptive 지시를 system 맨 앞에 주입하고 독립적인 `thinking` 블록으로 분리합니다(스트리밍은 `thinking_delta`). 일반 텍스트는 **추가 지연 없이** 통과합니다. 그 외 **토큰 추정이 중국어를 약 3배 과소평가**하던 문제, **스트리밍 입력 토큰이 항상 0**이던 문제, **컨텍스트 윈도가 모든 모델에서 200K로 고정**(업스트림 `maxInputTokens`를 파싱 후 폐기)되던 문제를 수정 |
@@ -248,7 +249,7 @@ docker compose logs -f
 ```bash
 # 헬스 체크
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.14.1"}
+# {"service":"kiro2api","status":"ok","version":"0.15.0"}
 
 # 프로토콜 고정 모델 목록 조회
 curl http://localhost:8080/v1/models \

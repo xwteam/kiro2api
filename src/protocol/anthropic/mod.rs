@@ -2,3 +2,4 @@
 pub mod handler;
 pub mod stream;
 pub mod types;
+pub mod websearch;

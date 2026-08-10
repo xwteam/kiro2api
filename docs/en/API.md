@@ -624,6 +624,17 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.15.0: two behavioural changes**
+> - **Quota exhaustion is persisted with its reset time** (credentials gain `quotaResetUnix`). It
+>   used to live only in memory, so every restart forgot it and rediscovered it using real user
+>   requests, which failed in the meantime. It now survives restarts and **returns to the pool
+>   automatically** at the reset time, with no manual action. The time comes from the balance
+>   API's `nextResetAt` when available. The admin "reset" control clears the marker.
+> - **The server-side `web_search` tool is now actually implemented.** When it is the only tool
+>   declared, the request is intercepted, sent to the upstream MCP endpoint, and answered with
+>   `server_tool_use` and `web_search_tool_result` content blocks. Requests that mix it with other
+>   tools are not intercepted — there the model decides which tool to call. A failed search
+>   returns an empty result set rather than a 5xx.
 > **v0.14.0: `tlsBackend` is configurable.** Set `"tlsBackend": "native-tls"` (default) or
 > `"rustls"`; the change takes effect on restart. The two differ in trust handling — native-tls
 > uses the system store, rustls carries its own roots — and behind a **self-signed-CA proxy**
@@ -1275,7 +1286,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.14.1",
+  "version": "0.15.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1491,7 +1502,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.14.1"
+  "version": "0.15.0"
 }
 ```
 

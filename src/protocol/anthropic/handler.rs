@@ -1579,6 +1579,14 @@ pub async fn messages(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // 服务端内置搜索:在进数据面**之前**截住。
+    //
+    // 这个能力上游放在 `/mcp` 端点(JSON-RPC),不在数据面上;把它当普通请求发下去,
+    // 模型只会照常回一段文本 —— 客户端以为搜过了,其实一次都没搜。
+    if crate::protocol::anthropic::websearch::is_web_search_request(&req) {
+        return handle_web_search(&state, &req, bound.as_ref(), now_unix).await;
+    }
+
     if req.stream == Some(true) {
         match relay_stream_attributed(&state, req, api_key_id, client_ip, bound, now_unix).await {
             Ok(sse) => sse.into_response(),
@@ -1594,6 +1602,82 @@ pub async fn messages(
             Err(e) => e.into_response(),
         }
     }
+}
+
+/// 处理一条服务端内置搜索请求:调 MCP 拿结果,合成 Anthropic 形状的响应。
+///
+/// 形状照公开规范:`server_tool_use`(服务端工具调用,input 一次性给全,不走增量)
+/// 后跟 `web_search_tool_result`(结果数组)。搜索失败**不让整条请求失败** ——
+/// 回一个空结果集,客户端至少知道"搜了但没结果",而不是一个语焉不详的 5xx。
+async fn handle_web_search(
+    state: &MessagesState,
+    req: &MessagesRequest,
+    bound: Option<&BoundCredentialIds>,
+    now_unix: u64,
+) -> Response {
+    use crate::protocol::anthropic::websearch as ws;
+
+    let Some(query) = ws::extract_query(req) else {
+        return anthropic_error_response(
+            StatusCode::BAD_REQUEST.as_u16(),
+            "web_search 请求里没有可用的搜索词",
+        );
+    };
+
+    // 选一个账号(MCP 也要凭据)。选不出就照常回 503,与数据面同一口径。
+    let cred = {
+        let mut pool = state.pool.lock().await;
+        pool.select_for_model(now_unix, &std::collections::HashSet::new(), bound, None)
+    };
+    let Some(cred) = cred else {
+        return RelayError::NoAccount.into_response();
+    };
+
+    let imp = impersonation_for(&state.cfg, &cred.refresh_token, cred.machine_id.as_deref());
+    let results = ws::search(
+        &crate::http::unary_for(&cred),
+        &effective_region(&cred),
+        &cred,
+        &imp,
+        &query,
+    )
+    .await;
+
+    let tool_use_id = ws::new_server_tool_use_id();
+    let blocks = ws::to_result_blocks(results.as_ref());
+    tracing::info!(
+        event = "web_search",
+        account_id = credential_id_num(&cred.id),
+        results = blocks.len(),
+        "服务端内置搜索已处理"
+    );
+
+    let body = serde_json::json!({
+        "id": crate::kiro::convert::new_message_id(),
+        "type": "message",
+        "role": "assistant",
+        "model": req.model,
+        "content": [
+            {
+                "type": "server_tool_use",
+                "id": tool_use_id,
+                "name": "web_search",
+                "input": { "query": query }
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": tool_use_id,
+                "content": blocks
+            }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": estimate_request_input_tokens_weighted(req),
+            "output_tokens": 0
+        }
+    });
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// `created_at` 固定串(非官方数据,仅用于形状对齐 Anthropic 公开模型列表响应)。
@@ -2098,6 +2182,7 @@ mod tests {
 
     fn cred() -> Credential {
         Credential {
+            quota_reset_unix: None,
             priority: 999,
             proxy_url: None,
             proxy_username: None,

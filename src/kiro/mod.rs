@@ -7,6 +7,7 @@ pub mod eventstream;
 pub mod keepalive;
 pub mod login;
 pub mod machine_id;
+pub mod mcp;
 pub mod pool;
 pub mod provider;
 pub mod refresh;

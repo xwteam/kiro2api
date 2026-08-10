@@ -520,6 +520,7 @@ mod tests {
 
     fn cred(id: &str, expires_at_unix: u64, region: &str) -> Credential {
         Credential {
+            quota_reset_unix: None,
             priority: 999,
             proxy_url: None,
             proxy_username: None,

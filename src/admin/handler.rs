@@ -2004,6 +2004,20 @@ pub async fn credential_balance(
     {
         Ok(resp) => {
             let snap = crate::balance::BalanceSnapshot::from_response(&resp, now);
+            // 顺手把上游给的**真实**配额恢复时刻记进池并落盘:比按月估的准。
+            // 额度已用尽时才记 —— 还有额度的账号不该被打上"等到某时才可用"的标记。
+            if snap.remaining <= 0.0
+                && let Some(reset) = snap.next_reset_at
+                && reset > now as i64
+            {
+                {
+                    let mut pool = state.pool.lock().await;
+                    pool.set_quota_reset(&id, reset as u64);
+                }
+                if let Err(e) = persist_pool_credentials(&state).await {
+                    tracing::warn!(error = %e, "配额恢复时刻落盘失败");
+                }
+            }
             state.balance.put(id.clone(), snap.clone()).await;
             Json(BalanceView::from_snapshot(&id, &snap)).into_response()
         }
@@ -2625,6 +2639,7 @@ pub async fn add_credential(
         .unwrap_or(1);
 
     let cred = Credential {
+        quota_reset_unix: None,
         id: String::new(), // 池分配
         access_token: String::new(),
         refresh_token: req.refresh_token,
@@ -3092,6 +3107,7 @@ pub async fn import_credentials_batch(
             .unwrap_or(1);
 
         let cred = Credential {
+            quota_reset_unix: None,
             priority: crate::kiro::credential::DEFAULT_PRIORITY,
             id: String::new(),
             access_token: String::new(),
@@ -3200,6 +3216,7 @@ fn minted_to_credential(m: MintedCredential, now: u64) -> Credential {
         now.saturating_add(m.expires_in_secs)
     };
     Credential {
+        quota_reset_unix: None,
         priority: crate::kiro::credential::DEFAULT_PRIORITY,
         id: String::new(),
         access_token: m.access_token,
@@ -3677,6 +3694,7 @@ mod tests {
 
     fn cred(id: &str) -> Credential {
         Credential {
+            quota_reset_unix: None,
             priority: 999,
             id: id.into(),
             access_token: "SEKRET-AT".into(),

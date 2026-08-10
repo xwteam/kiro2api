@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.14.1-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.15.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-08-10 | v0.15.0 - 🔁 **额度耗尽的账号不再每次重启都要重新学一遍**(用户直接问到:"额度用完的号不是已经禁用了吗,为什么还会请求到已禁用的账号?")。是禁用了,但只在**内存**里——v0.10.2 为免一次抖动把账号永久写死,让运行期停用不落盘;而配额恰恰是**有明确恢复时刻**的那类。于是每次发版重启就把"谁没额度"忘光,再拿**用户的请求**去重新发现(实测 13 个耗尽号:前 2 次 502、第 3 次才成)→ 现按恢复时刻落盘,重启仍记得、到点自动回池;恢复时刻优先取上游 `nextResetAt`,没有才按下月一号估。另:**服务端内置搜索 `web_search` 真正接上了** —— 此前只是"容忍"这个工具声明(不再 400),但从不真的搜索,模型照常回段文本、客户端以为搜过了。现在这类请求在进数据面前被截住,调上游 `/mcp` 端点拿结果再合成 `server_tool_use` + `web_search_tool_result` |
 | 2026-08-10 | v0.14.1 - 🔧 **线上验证时当场发现的两件事**。①响应里 `usage.input_tokens` **恒为 0**:v0.13.0 补的输入估算只喂给了计费、没回写客户端 —— 账单里有、响应里没有,而客户端拿它算成本和上下文占用 → 非流式 `usage` 与流式 `message_start` 现在都带同一个值;②**池里有一批耗尽的号时,用户前几次请求会连续失败**:配额耗尽此前与鉴权失败共用 3 次重试预算,实测 13 个耗尽号要连烧 2 次 502、第 3 次才成 → 配额是**确定性**结论(本周期换谁都一样),现与"模型不可用"同归账号级确定性档、按池大小给预算;瞬态/鉴权仍保持 3 次小上限。全池确实耗尽时回 `429` 并说清是额度问题,而不是语焉不详的 502 |
 | 2026-08-10 | v0.14.0 - 🧩 **對照收尾**。①歷史裡助手輪 `content` 可能是**空串**,上游據此拒掉整條請求(純工具呼叫那一輪就是空,使用者輪早有兜底、助手輪一直漏著)→ 用單個空格佔位;②**損壞幀被逐位元組重掃,而它的邊界本來已知**(prelude CRC 通過則 `total_len` 可信)→ 整幀跳過;③**`tlsBackend` 改為執行時可切**(此前編譯期二選一)——走自簽 CA 代理時往往只有一個後端握得上手 |
 | 2026-08-09 | v0.13.0 - 🧠 **擴展思考(thinking)完整接上**,此前整個功能缺失:請求側 `thinking` 欄位被靜默丟棄,回應側上游把思考用 `<thinking>…</thinking>` 包在普通文字裡下發、我們原樣透傳 → 客戶端把整段思考當正文顯示。現按 enabled/adaptive 生成指令注入 system 最前,並切成獨立 `thinking` 區塊,串流與非串流共用同一份增量切分器;**普通文字零延遲透傳**。另修:**token 估算對中文低估約三倍**;**串流記帳 input token 恆為 0**;**上下文視窗全表釘死 200K**(上游 `maxInputTokens` 解析了又丟)→ 拆成兩個欄位 |
@@ -251,7 +252,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.14.1"}
+# {"service":"kiro2api","status":"ok","version":"0.15.0"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \

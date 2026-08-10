@@ -70,6 +70,29 @@ pub enum FailureKind {
     ModelUnavailable,
 }
 
+/// 下个自然月的 1 号 00:00 UTC(unix 秒)。
+///
+/// 配额耗尽时若拿不到上游给的真实 `nextResetAt`,用它兜底 —— 上游的计费周期就是月度
+/// (实测 `nextResetAt` 正是月初零点)。估错方向也只会让账号早一点点回来试一次,
+/// 而不是被写死在池外。
+fn next_month_start(now_unix: u64) -> u64 {
+    use chrono::Datelike;
+    let now = chrono::DateTime::from_timestamp(now_unix as i64, 0)
+        .unwrap_or_else(chrono::Utc::now)
+        .naive_utc()
+        .date();
+    let (y, m) = if now.month() == 12 {
+        (now.year() + 1, 1)
+    } else {
+        (now.year(), now.month() + 1)
+    };
+    chrono::NaiveDate::from_ymd_opt(y, m, 1)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.and_utc().timestamp() as u64)
+        // 极端情况(日期构造失败)回落"从现在起 30 天",绝不返回 0 —— 那会让账号立刻回池。
+        .unwrap_or_else(|| now_unix.saturating_add(30 * 24 * 3600))
+}
+
 /// 自设冷却时长(秒)。
 const TRANSIENT_COOLDOWN: u64 = 90; // 瞬时类:90 秒
 /// 瞬时错误连续多少次才冷却(自设)。
@@ -594,7 +617,17 @@ impl Pool {
     /// 封禁账号因此不再被选中,也不计入可用数;它不会自己恢复,出口是面板的「重置」
     /// ([`reset_failures`](Self::reset_failures),会一并清掉该结论)。
     fn is_active(e: &Entry, now_unix: u64) -> bool {
-        !e.disabled && e.cooldown_until <= now_unix && e.status_reason != StatusReason::Banned
+        !e.disabled
+            && e.cooldown_until <= now_unix
+            && e.status_reason != StatusReason::Banned
+            // 配额未到恢复时刻 → 不可选。这条**落盘**,故重启后不必重新学一遍
+            // (学的代价是用户的前几次请求连续失败);到点自动回池,不用手工重置。
+            && !Self::quota_still_exhausted(e, now_unix)
+    }
+
+    /// 该账号是否仍处在配额耗尽期内(有恢复时刻且尚未到)。
+    fn quota_still_exhausted(e: &Entry, now_unix: u64) -> bool {
+        e.cred.quota_reset_unix.is_some_and(|t| t > now_unix)
     }
 
     /// 窗口内计数:近 RPM_WINDOW_SECS 秒(即 now_unix 起回溯的滑动窗口)内
@@ -672,6 +705,15 @@ impl Pool {
     /// `allowed` 为本次请求的 store-key 绑定白名单(鉴权闸从命中的那条 key 上解析,经请求
     /// 扩展下传;`None` = 不受限)。**这是绑定唯一的执行点**:成员判定一律委托
     /// [`BoundCredentialIds::allows`],不在此处另写一份 id 解析,以免两处口径漂移。
+    /// 记下上游给的**真实**配额恢复时刻(来自余额接口的 `nextResetAt`)。
+    ///
+    /// 比按月估的兜底准:上游怎么说就怎么记,到点自动回池。
+    pub fn set_quota_reset(&mut self, id: &str, reset_unix: u64) {
+        if let Some(e) = self.find(id) {
+            e.cred.quota_reset_unix = Some(reset_unix);
+        }
+    }
+
     /// 记下"这个账号不支持这个模型"。见 [`Entry::unsupported_models`]。
     pub fn mark_model_unsupported(&mut self, id: &str, model: &str) {
         if let Some(e) = self.find(id) {
@@ -1014,6 +1056,9 @@ impl Pool {
             // 的判断,重置就是推翻它。但**不**动持久化的 disabled:那是管理员或配置文件明确
             // 关掉的账号,重置按钮不该把它偷偷打开。回落到盘上的值,两者各归各位。
             e.disabled = e.cred.disabled;
+            // 配额标记也要清:「重置」就是运营者在说"再试试这个号"。留着的话按钮对
+            // 配额耗尽的账号是个空操作(它会被 `is_active` 一直挡在池外)。
+            e.cred.quota_reset_unix = None;
             // 结论也要清。封禁账号被 `is_active` 挡在池外、永远轮不到成功来清标签,
             // 「重置」是它唯一的出口;只清计时器不清结论,这个按钮对封禁号就是个空操作。
             e.set_status_reason(StatusReason::None);
@@ -1056,6 +1101,9 @@ impl Pool {
     pub fn report_success(&mut self, id: &str) {
         if let Some(e) = self.find(id) {
             e.strikes = 0;
+            // 一次成功即说明额度回来了:清掉恢复时刻,免得一个已经能用的账号
+            // 还挂着过期的配额标记(面板上看着像坏的)。
+            e.cred.quota_reset_unix = None;
             e.unconfirmed_refresh = false;
             e.successes += 1;
             // 一次成功即说明上次那个原因(封禁/限流/过期…)已经过去,标签必须跟着清,
@@ -1119,8 +1167,16 @@ impl Pool {
                 // 背景流 —— 那正是"批量凭据校验"的形状。这里只置内存态 disabled,**不**写
                 // `cred.disabled`:重启或管理员重置即复活,下个计费周期不必手工捞回来。
                 FailureKind::Quota => {
+                    // 内存态停用照旧(本进程内立刻不再选它)。
                     e.disabled = true;
                     e.strikes = 0;
+                    // 再记一个**落盘**的恢复时刻:重启后不必重新学"谁没额度",
+                    // 到点自动回池。恢复时刻优先用上游给的真值(见 `set_quota_reset`),
+                    // 这里没有真值可用时按"下月一号 00:00 UTC"估 —— 上游的计费周期就是月度,
+                    // 估错方向也只会让账号早一点点回来试,而不是被写死。
+                    if e.cred.quota_reset_unix.is_none_or(|t| t <= now_unix) {
+                        e.cred.quota_reset_unix = Some(next_month_start(now_unix));
+                    }
                 }
                 // 401/403 但响应体没有明确失效信号(上游的封停响应正落在这一档)→
                 // 连续 AUTH_AMBIGUOUS_STRIKES 次后同样停止使用,不再"冷却 5 分钟又回池"。
@@ -1202,6 +1258,7 @@ mod tests {
 
     fn cred(id: &str, weight: u32) -> Credential {
         Credential {
+            quota_reset_unix: None,
             priority: 999,
             proxy_url: None,
             proxy_username: None,
@@ -1615,6 +1672,51 @@ mod tests {
         // 全池都不支持 → 选不出来,由上层收口成一句说得清的 400
         p.mark_model_unsupported("power", "opus");
         assert!(p.select_for_model(0, &none, None, Some("opus")).is_none());
+    }
+
+    /// 配额耗尽要**按恢复时刻落盘**,重启后不必重新学一遍;到点自动回池。
+    ///
+    /// 回归:此前只置内存态 `disabled`,于是每次重启/部署都把"谁没额度"忘光。而"学"的代价
+    /// 是用户的**前几次请求连续失败** —— 线上实测 13 个耗尽号要连烧 2 次 502 才收敛,
+    /// 发版频繁时几乎每次都要重来一遍。
+    ///
+    /// 与封禁的区别在于**它会自愈**:配额有明确的恢复时刻,故落盘也不怕把账号写死。
+    #[test]
+    fn quota_exhaustion_persists_with_a_reset_time_and_self_heals() {
+        let now = 1_700_000_000u64;
+        let mut p = Pool::new(vec![cred("a", 1)], LbMode::Priority);
+        p.report_failure("a", FailureKind::Quota, now);
+
+        // 恢复时刻已写进**落盘快照**(而不是只在内存里)
+        let snap = p.snapshot_credentials();
+        let reset = snap[0].quota_reset_unix.expect("必须记下恢复时刻");
+        assert!(reset > now, "恢复时刻应在将来");
+
+        // 用这份快照重建池(等价于重启)——账号仍不可选,不必重新学
+        let mut restarted = Pool::new(snap.clone(), LbMode::Priority);
+        assert!(
+            restarted.select(now + 60).is_none(),
+            "重启后仍应记得它没额度"
+        );
+
+        // 到点自动回池,不用手工重置
+        assert!(
+            restarted.select(reset + 1).is_some(),
+            "过了恢复时刻应自动可用"
+        );
+
+        // 上游给了真实恢复时刻就用真的
+        let mut p2 = Pool::new(vec![cred("b", 1)], LbMode::Priority);
+        p2.report_failure("b", FailureKind::Quota, now);
+        p2.set_quota_reset("b", now + 12345);
+        assert_eq!(
+            p2.snapshot_credentials()[0].quota_reset_unix,
+            Some(now + 12345)
+        );
+
+        // 一次成功即清掉标记(额度回来了,别让面板一直挂着)
+        p2.report_success("b");
+        assert_eq!(p2.snapshot_credentials()[0].quota_reset_unix, None);
     }
 
     /// 运行期的"停止使用"**绝不能**落盘,否则"重启即复活"是句空话。

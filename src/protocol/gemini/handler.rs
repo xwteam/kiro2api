@@ -749,6 +749,7 @@ mod tests {
 
     fn cred() -> Credential {
         Credential {
+            quota_reset_unix: None,
             priority: 999,
             proxy_url: None,
             proxy_username: None,

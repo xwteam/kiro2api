@@ -153,6 +153,16 @@ pub struct Credential {
     pub proxy_username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
+    /// 配额恢复时刻(unix 秒)。**落盘**。
+    ///
+    /// 配额耗尽此前只置内存态 `disabled`,于是**每次重启/部署都把"谁没额度"忘光**、
+    /// 重新学一遍 —— 而学的代价是用户的前几次请求连续失败(实测 13 个耗尽号要连烧 2 次
+    /// 502 才收敛)。发版频繁时这几乎每次都要重来一遍。
+    ///
+    /// 配额和封禁不同:它有**明确的恢复时刻**(上游 `nextResetAt`)。既然知道什么时候好,
+    /// 就该按时间记下来 —— 到点自动回池,不必手工重置,也不怕落盘把一个会自愈的账号写死。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_reset_unix: Option<u64>,
 }
 
 #[cfg(test)]
@@ -176,6 +186,7 @@ pub(crate) fn tests_support_cred() -> Credential {
         disabled: false,
         priority: DEFAULT_PRIORITY,
         status_reason: None,
+        quota_reset_unix: None,
         proxy_url: None,
         proxy_username: None,
         proxy_password: None,
@@ -584,6 +595,7 @@ mod tests {
 
     fn sample() -> Credential {
         Credential {
+            quota_reset_unix: None,
             priority: 999,
             proxy_url: None,
             proxy_username: None,

@@ -106,6 +106,13 @@ cat data/config.json | grep apiKey
 | 422 | 请求体反序列化失败（缺必填字段 / 类型不符），axum 默认拒收，`text/plain` 纯文本。出现在带 body 提取器的端点上：`/api/admin/*` 与 `POST /api/user/login`（四个协议对话端点与 `/v1/messages/count_tokens` 已自行接管拒收、改回各自形状的 `400`）（`/api/user/*` 的其余端点只收 query，参数类型不符是 `400` 而非 `422`） |
 
 
+> **v0.15.0:两处行为变化**
+> - **额度耗尽按恢复时刻落盘**(凭据新增 `quotaResetUnix`)。此前只置内存态,每次重启就
+>   忘光、再拿用户的请求去重新发现(前几次会失败)。现在重启仍记得,**到点自动回池**,
+>   不必手工重置。恢复时刻优先取余额接口的 `nextResetAt`。管理面「重置」会清掉该标记。
+> - **服务端内置搜索 `web_search` 已真正实现**。只声明这一个工具时,本服务会截住请求、
+>   调上游 MCP 端点,并返回 `server_tool_use` + `web_search_tool_result` 两个内容块。
+>   混着其它工具时不接管(那种请求由模型决定调哪个)。搜索失败返回空结果集而非 5xx。
 > **v0.14.0:`tlsBackend` 可在配置里切换**
 > `"tlsBackend": "native-tls"`(默认)或 `"rustls"`,改配置重启即生效。两者的 CA 处理不同:
 > native-tls 用系统证书库,rustls 用内置根证书 —— 走**自签 CA 的代理**(企业出口、自建
@@ -1279,7 +1286,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.14.1",
+  "version": "0.15.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1467,7 +1474,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.14.1"
+  "version": "0.15.0"
 }
 ```
 
