@@ -21,6 +21,22 @@ pub struct MessagesRequest {
     /// 此前完全不解析该字段,于是每个请求都是一段全新的"对话",与真实客户端形态不符。
     #[serde(default)]
     pub metadata: Option<RequestMetadata>,
+    /// 扩展思考(extended thinking)配置。
+    ///
+    /// 此前该字段被静默丢弃:客户端开了 thinking,上游根本收不到指令,于是既没有思考过程、
+    /// 客户端也拿不到 `thinking` 内容块。上游认的是**放在 system 里的标签**(见 convert)。
+    #[serde(default)]
+    pub thinking: Option<ThinkingConfig>,
+}
+
+/// `thinking` 配置。`type` 取 `enabled` / `adaptive`(其余按未开启处理)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThinkingConfig {
+    #[serde(rename = "type", default)]
+    pub thinking_type: String,
+    /// `enabled` 模式下的思考预算(token)。
+    #[serde(default)]
+    pub budget_tokens: u32,
 }
 
 /// `metadata` 对象。除 `user_id` 外的键由 serde 忽略。
@@ -167,6 +183,13 @@ pub struct MessagesResponse {
 pub enum OutBlock {
     Text {
         text: String,
+    },
+    /// 扩展思考内容块(照 Anthropic 公开规范)。
+    ///
+    /// 上游把思考过程用 `<thinking>…</thinking>` 包在**普通文本里**下发;此前我们原样透传,
+    /// 客户端于是把整段思考当正文显示。现在切出来还原成独立块。
+    Thinking {
+        thinking: String,
     },
     ToolUse {
         id: String,

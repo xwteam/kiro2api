@@ -212,6 +212,9 @@ pub struct ModelItem {
     #[serde(rename = "type")]
     pub kind: String,
     pub max_tokens: u32,
+    /// 上下文窗口(能读多少)。与 `max_tokens`(能写多少)是两回事。
+    /// 上游给了就用真值,没给才回落静态目录 —— 此前一律按 200K 报,1M 的模型被低报五倍。
+    pub context_window: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_multiplier: Option<f64>,
 }
@@ -241,6 +244,14 @@ fn model_item_from_info(m: &crate::models_cache::ModelInfo) -> ModelItem {
         } else {
             m.max_tokens
         },
+        // 上游给了就用它的真值;没给才回落静态目录里该模型的窗口(再没有则 200K)。
+        context_window: m.context_window.unwrap_or_else(|| {
+            crate::models_catalog::CATALOG
+                .iter()
+                .find(|e| e.id == m.id)
+                .map(|e| e.max_tokens)
+                .unwrap_or(200_000)
+        }),
         rate_multiplier: m.rate_multiplier,
     }
 }
@@ -261,6 +272,7 @@ fn build_static_model_list() -> Vec<ModelItem> {
             display_name: e.display_name.to_string(),
             kind: "chat".to_string(),
             max_tokens: e.max_tokens,
+            context_window: e.max_tokens,
             rate_multiplier: None,
         })
         .collect()
@@ -4142,6 +4154,7 @@ mod tests {
                 "a",
                 vec![
                     crate::models_cache::ModelInfo {
+                        context_window: None,
                         id: "auto".into(),
                         display_name: "Auto".into(),
                         owned_by: "kiro".into(),
@@ -4149,6 +4162,7 @@ mod tests {
                         rate_multiplier: None,
                     },
                     crate::models_cache::ModelInfo {
+                        context_window: None,
                         id: "claude-sonnet-5".into(),
                         display_name: "Claude Sonnet 5".into(),
                         owned_by: "anthropic".into(),
@@ -4164,6 +4178,7 @@ mod tests {
             .put(
                 "b",
                 vec![crate::models_cache::ModelInfo {
+                    context_window: None,
                     id: "gpt-5.6-sol".into(),
                     display_name: "GPT-5.6 Sol".into(),
                     owned_by: "openai".into(),
@@ -4246,6 +4261,7 @@ mod tests {
                 .put(
                     i.to_string(),
                     vec![crate::models_cache::ModelInfo {
+                        context_window: None,
                         id: format!("m-{i}"),
                         display_name: "m".into(),
                         owned_by: "kiro".into(),
@@ -6298,6 +6314,7 @@ mod tests {
             .put(
                 "77991",
                 vec![crate::models_cache::ModelInfo {
+                    context_window: None,
                     id: "claude-sonnet-4".into(),
                     display_name: "Claude Sonnet 4".into(),
                     owned_by: "anthropic".into(),

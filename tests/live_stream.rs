@@ -75,6 +75,7 @@ async fn live_stream_one_ping() {
     };
 
     let req = MessagesRequest {
+        thinking: None,
         metadata: None,
         model: "sonnet".to_string(),
         system: None,

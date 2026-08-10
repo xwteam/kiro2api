@@ -50,6 +50,30 @@ pub fn text_delta(index: u32, text: &str) -> SseEvent {
 }
 
 /// `content_block_start`:`tool_use` 块起始(带 `id`/`name`,`input` 初始为空对象)。
+/// `content_block_start`:thinking 块起始(照 Anthropic 公开规范)。
+pub fn thinking_start(index: u32) -> SseEvent {
+    SseEvent::new(
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": { "type": "thinking", "thinking": "" }
+        }),
+    )
+}
+
+/// `content_block_delta`:thinking 增量。
+pub fn thinking_delta(index: u32, text: &str) -> SseEvent {
+    SseEvent::new(
+        "content_block_delta",
+        json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": { "type": "thinking_delta", "thinking": text }
+        }),
+    )
+}
+
 pub fn tool_use_start(index: u32, id: &str, name: &str) -> SseEvent {
     SseEvent::new(
         "content_block_start",

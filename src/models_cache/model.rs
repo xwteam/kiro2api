@@ -52,7 +52,14 @@ pub struct ModelInfo {
     /// 归属方(由 id 前缀推断)。
     pub owned_by: String,
     /// 最大输出 token;上游无则 0(调用方按需回落)。
+    /// **输出**上限(上游 `tokenLimits.maxOutputTokens`)。缺省 0。
     pub max_tokens: u32,
+    /// **上下文窗口**(上游 `tokenLimits.maxInputTokens`)。
+    ///
+    /// 此前它被解析出来就扔了,对外一律按静态表的 200K 报 —— 于是 1M 上下文的模型被低报
+    /// 五倍,而使用者据此裁剪上下文,白白浪费了能用的额度。它和 `max_tokens` 是两回事:
+    /// 一个是"能读多少",一个是"能写多少",此前被混成一个字段。
+    pub context_window: Option<u32>,
     /// 费率倍率;上游无则 None。
     pub rate_multiplier: Option<f64>,
 }
@@ -79,11 +86,17 @@ impl AvailableModelsResponse {
                 .as_ref()
                 .and_then(|t| t.max_output_tokens)
                 .unwrap_or(0);
+            let context_window = m
+                .token_limits
+                .as_ref()
+                .and_then(|t| t.max_input_tokens)
+                .filter(|n| *n > 0);
             out.push(ModelInfo {
                 owned_by: guess_owned_by(&id),
                 id,
                 display_name,
                 max_tokens,
+                context_window,
                 rate_multiplier: m.rate_multiplier,
             });
         }
@@ -121,6 +134,33 @@ pub fn guess_owned_by(id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// 上下文窗口(能读多少)必须取上游真值,不能和输出上限混成一个数。
+    ///
+    /// 回归:`maxInputTokens` 此前解析出来就扔了,对外一律按 200K 报 —— 1M 上下文的模型
+    /// 被低报五倍,使用者据此裁剪上下文,白白浪费能用的额度。
+    #[test]
+    fn context_window_comes_from_max_input_tokens() {
+        let raw = serde_json::json!({"models": [
+            { "modelId": "big", "modelName": "Big",
+              "tokenLimits": { "maxInputTokens": 1000000, "maxOutputTokens": 64000 } },
+            { "modelId": "nolimits", "modelName": "NoLimits" }
+        ]});
+        let resp: AvailableModelsResponse = serde_json::from_value(raw).unwrap();
+        let infos = resp.to_model_infos();
+        let big = infos.iter().find(|i| i.id == "big").unwrap();
+        assert_eq!(
+            big.context_window,
+            Some(1_000_000),
+            "上下文窗口取 maxInputTokens"
+        );
+        assert_eq!(
+            big.max_tokens, 64000,
+            "输出上限取 maxOutputTokens,两者不得混淆"
+        );
+        let none = infos.iter().find(|i| i.id == "nolimits").unwrap();
+        assert_eq!(none.context_window, None, "上游没给就是 None,由调用方回落");
+    }
     use super::*;
 
     #[test]

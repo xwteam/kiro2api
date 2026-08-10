@@ -167,6 +167,7 @@ pub fn responses_to_hub(req: ResponsesRequest) -> Result<MessagesRequest, Respon
     });
 
     Ok(MessagesRequest {
+        thinking: None,
         metadata: None,
         model: req.model,
         system: req.instructions.map(SystemPrompt::Text),
@@ -199,7 +200,8 @@ pub fn hub_to_responses(resp: MessagesResponse, created_at: u64) -> ResponseObje
 
     for block in &resp.content {
         match block {
-            OutBlock::Text { text: t } => text.push_str(t),
+            // Responses 侧同样没有独立思考块,并入正文——不丢弃。
+            OutBlock::Text { text: t } | OutBlock::Thinking { thinking: t } => text.push_str(t),
             OutBlock::ToolUse { id, name, input } => {
                 let arguments = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
                 output.push(OutputItem::FunctionCall {

@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.12.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.13.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日付 | 更新内容 |
 |------|----------|
+| 2026-08-09 | v0.13.0 - 🧠 **拡張思考(thinking)を完全に接続**しました(従来は機能自体が欠落)。リクエスト側では `thinking` フィールドが黙って捨てられ、上流には指示が届いていませんでした。レスポンス側では上流が `<thinking>…</thinking>` で思考を通常テキスト内に包んで送るのを素通しし、クライアントは思考全体を本文として表示していました。現在は enabled/adaptive の指示を system 冒頭へ注入し、独立した `thinking` ブロックへ分離します(ストリーミングでは `thinking_delta`)。通常テキストは**追加遅延ゼロ**で透過します。ほかに **token 推定が中国語を約 3 倍過小評価**していた点、**ストリーミングの入力トークンが常に 0** だった点、**コンテキストウィンドウが全モデル 200K 固定**(上流の `maxInputTokens` を解析後に破棄)だった点を修正 |
 | 2026-08-09 | v0.12.0 - 🎚️ **異なるサブスクリプション階層のアカウントがようやく共存できます**(ユーザーが調査用に提供した実物の API キーで再現・検証)。原因は 2 つ:① `INVALID_MODEL_ID` を*リクエスト級*の誤りとして即 400 にしていましたが、実際は*アカウント級*です — 利用可能モデルは階層で決まる一方、本サービスがクライアントへ見せるのは全アカウントの**和集合**であり、和集合中のモデルが非対応アカウントに当たれば必ず失敗します → `ModelUnavailable` として分離し、アカウントは罰さず別のアカウントで再試行。② 別アカウントへの再試行枠は 3 回でしたが、対応アカウントが 14 番目ということもあります → モデル非対応はアカウント障害の枠を消費しません。ほかに「どのアカウントがどのモデルに非対応か」を記憶(同一モデルの 2 回目は 1 アカウントのみ、1 回目は 14)、**`priority` は `weight` の別名にすぎず選択に一切影響していなかった** → 数字が小さいほど優先、インポートは一律 999、us-east-1 以外でのモデル更新失敗を `q.{region}` へフォールバック |
 | 2026-08-09 | v0.11.1 - 🔬 **本番での実測で判明した 2 点。** ① **ツールの説明が空だと上流がリクエスト全体を拒否**します(実測:同じツールで説明ありは 200 かつ `tool_use` が正常に返り、説明を外すと `400 Invalid tool use format / REQUEST_BODY_INVALID`)。v0.11.0 で `null` を空文字にしましたが、上流が求めるのは**非空**でした → ツール名でフォールバック。② `REQUEST_BODY_INVALID` を再試行可能として扱っていました。これは決定的な誤りでどのアカウントでも同じく失敗するため、不正な 1 リクエストが複数アカウントの再試行枠を消費し(実測で 4 件)、最後に要領を得ない 502 を返していました → 再試行なし・アカウント無罰のクラスに変更し、ツール仕様を指す 400 を返します |
 | 2026-08-09 | v0.11.0 - 🧰 **「上流にリクエストを拒否させる」種類の不具合をまとめて修正。** ① サーバー側組み込みツール(web_search 等)は `input_schema` を持たないのに同フィールドが必須だったため、公式の書き方を使うだけで当方の層で 400。② ツールの `description` が **null** として送られることがあった(実クライアントは常に文字列)。③ `input_schema` を素通ししていたため `properties: null` のような形で**リクエスト全体**が拒否された → 形だけを整える正規化を追加(意味は変更しません)。④ 長すぎるツール名を短縮せず(上流の上限は 63)、復元もできなかった → 決定的に短縮し、`短縮名→元名` を出口まで持ち回して復元。⑤ `:message-type == "error"` のフレームを完全に無視しており、上流のエラーが 200＋空メッセージになっていた。⑥ 管理画面の存在しないアセットが 404 ではなく 200＋HTML を返していた。ほかに `POST /api/admin/credentials/{id}/refresh` を追加 |
@@ -249,7 +250,7 @@ docker compose logs -f
 ```bash
 # ヘルスチェック
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.12.0"}
+# {"service":"kiro2api","status":"ok","version":"0.13.0"}
 
 # 利用可能なモデルを表示
 curl http://localhost:8080/v1/models \

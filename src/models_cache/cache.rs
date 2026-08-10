@@ -116,6 +116,7 @@ mod tests {
 
     fn info(id: &str, owner: &str, max: u32) -> ModelInfo {
         ModelInfo {
+            context_window: None,
             id: id.into(),
             display_name: id.into(),
             owned_by: owner.into(),

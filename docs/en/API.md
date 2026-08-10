@@ -624,6 +624,21 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.13.0: extended thinking, token accounting and context windows**
+> - **`thinking` now actually works.** Both `{"type":"enabled","budget_tokens":N}` and
+>   `{"type":"adaptive"}` are translated into the directive upstream understands, and the
+>   reasoning comes back as proper `thinking` content blocks (`thinking_delta` when streaming).
+>   The field used to be dropped silently, and upstream's reasoning text was passed through as if
+>   it were the answer. On the other three protocols (OpenAI / Gemini / Responses) there is no
+>   thinking block, so the reasoning is **folded into the text** rather than discarded.
+> - **Token estimation is script-weighted** — roughly 1.5 characters per token for CJK against 4
+>   for Latin. The previous global chars/4 under-counted Chinese about threefold, which fed both
+>   usage statistics and USD-denominated limits. Streaming used to report **0 input tokens**; it
+>   now uses the same estimate.
+> - The model list gained **`context_window`** (how much it can read), separate from `max_tokens`
+>   (how much it can write). Upstream's `maxInputTokens` is used when present; the static catalog
+>   is only a fallback. Everything used to be reported as 200K, under-reporting a 1M-context model
+>   fivefold.
 > **v0.12.0: selection priority and mixed-tier pools**
 > - `priority` (lower number wins) **now actually drives selection**. In the Priority mode the
 >   relay switches to the eligible account with the smallest priority. It used to be a mere alias
@@ -1254,7 +1269,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1470,7 +1485,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.12.0"
+  "version": "0.13.0"
 }
 ```
 

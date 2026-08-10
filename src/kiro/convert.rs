@@ -48,6 +48,23 @@ impl fmt::Display for ConvertError {
 impl std::error::Error for ConvertError {}
 
 /// 生成一个随机十六进制 id(16 字节 CSPRNG),用于 conversationId / 响应 id。
+/// 由 `thinking` 配置生成上游认的指令前缀。
+///
+/// 上游不认 Anthropic 的 `thinking` 字段,它认的是**写在 system 文本最前面的标签**
+/// (照观测)。`enabled` 带预算上限,`adaptive` 让模型自行决定深浅。
+/// 未开启 thinking 时返回 None —— 绝不无故给 system 加东西。
+fn thinking_directive(req: &MessagesRequest) -> Option<String> {
+    let t = req.thinking.as_ref()?;
+    match t.thinking_type.as_str() {
+        "enabled" => Some(format!(
+            "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
+            t.budget_tokens
+        )),
+        "adaptive" => Some("<thinking_mode>adaptive</thinking_mode>".to_string()),
+        _ => None,
+    }
+}
+
 /// 定出本次请求的 `conversationId`。
 ///
 /// 优先从客户端 `metadata.user_id` 里提取 session UUID —— 真实客户端(Claude Code)会把
@@ -226,6 +243,40 @@ fn tool_specs_with_history_fallback(
         }
     }
     specs
+}
+
+/// 按字符类别加权估算 token 数。
+///
+/// 全局 `字符数 / 4` 对中文严重低估:CJK 大约 **1.5 字/token**,而英文才 4 字符/token ——
+/// 一段纯中文按 /4 算,估出来只有真实值的三分之一强。这个偏差直接落到用量统计与按 USD
+/// 设的限额上:同样的钱,中文用户能超支两三倍而限额毫无察觉。
+///
+/// 权重:CJK 统一表意文字按 2/3 token 每字,其余按 1/4。全项目**只有这一处**口径,
+/// 输入估算、输出估算、`/v1/messages/count_tokens` 三条路都走它 —— 各写一套必然各说各话。
+pub fn estimate_tokens(text: &str) -> usize {
+    let (cjk, other) = text.chars().fold((0usize, 0usize), |(c, o), ch| {
+        if is_cjk_char(ch) {
+            (c + 1, o)
+        } else {
+            (c, o + 1)
+        }
+    });
+    // (cjk * 2 + 2) / 3 与 (other + 3) / 4 都是向上取整,避免短文本被抹成 0。
+    (cjk * 2).div_ceil(3) + other.div_ceil(4)
+}
+
+/// 是否 CJK 字符(统一表意文字 + 扩展 A + 兼容表意 + 假名 + 谚文)。
+///
+/// 这些书写系统的分词密度都远高于拉丁文,按同一档加权即可 —— 再细分收益很小,
+/// 而估算本来就只是估算。
+pub fn is_cjk_char(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x30FF   // 平假名 / 片假名
+        | 0x3400..=0x4DBF // 扩展 A
+        | 0x4E00..=0x9FFF // 统一表意文字
+        | 0xAC00..=0xD7AF // 谚文音节
+        | 0xF900..=0xFAFF // 兼容表意文字
+    )
 }
 
 /// 工具名长度上限(照观测的上游约束)。
@@ -606,9 +657,14 @@ fn anthropic_to_kiro_inner(
         .map(|(i, msg)| {
             let text = msg.text();
             if i == 0 {
-                match req.system.as_ref().map(|s| s.text()) {
-                    Some(sys) if !sys.is_empty() => format!("{sys}\n\n{text}"),
-                    _ => text,
+                // thinking 指令必须排在 system 最前面(照观测:上游按前缀识别)。
+                // 未开 thinking 时 `directive` 为 None,一个字符都不加。
+                let sys = req.system.as_ref().map(|s| s.text()).unwrap_or_default();
+                match (thinking_directive(req), sys.is_empty()) {
+                    (Some(d), true) => format!("{d}\n\n{text}"),
+                    (Some(d), false) => format!("{d}\n{sys}\n\n{text}"),
+                    (None, true) => text,
+                    (None, false) => format!("{sys}\n\n{text}"),
                 }
             } else {
                 text
@@ -1080,12 +1136,23 @@ pub fn kiro_events_to_anthropic(frames: &[Message], model: &str) -> MessagesResp
     let output_tokens = metering
         .as_ref()
         .and_then(|m| m.output_tokens)
-        .unwrap_or_else(|| (full_text.chars().count() / 4) as u32);
+        // 按字符类别加权,而不是全局 /4:后者对中文低估约三倍(见 `estimate_tokens`)。
+        .unwrap_or_else(|| estimate_tokens(&full_text) as u32);
 
     let has_tools = !tools.order.is_empty();
     let mut content: Vec<OutBlock> = Vec::new();
     if !full_text.is_empty() {
-        content.push(OutBlock::Text { text: full_text });
+        // 把 `<thinking>…</thinking>` 切成独立的 thinking 块,其余按文本。
+        // 没有标签时 `split_thinking` 原样返回一段 Text,与此前行为一致。
+        for piece in split_thinking(&full_text) {
+            match piece {
+                Piece::Thinking(t) if !t.is_empty() => {
+                    content.push(OutBlock::Thinking { thinking: t })
+                }
+                Piece::Text(t) if !t.is_empty() => content.push(OutBlock::Text { text: t }),
+                _ => {}
+            }
+        }
     }
     content.extend(tools.into_blocks());
     if content.is_empty() {
@@ -1140,6 +1207,7 @@ mod tests {
 
     fn base_req(messages: Vec<InMsg>) -> MessagesRequest {
         MessagesRequest {
+            thinking: None,
             metadata: None,
             model: "sonnet".to_string(),
             system: None,
@@ -1232,6 +1300,99 @@ mod tests {
     #[test]
     fn maps_fable() {
         assert_eq!(map_model("Fable"), Some("claude-fable-5".to_string()));
+    }
+
+    /// 开启 thinking 时,上游认的指令必须排在 system 最前面;不开则一个字符都不加。
+    ///
+    /// 回归:`thinking` 字段此前被静默丢弃 —— 客户端开了扩展思考,上游根本收不到指令,
+    /// 于是既没有思考过程,客户端也拿不到 `thinking` 内容块。
+    #[test]
+    fn thinking_config_becomes_a_system_directive() {
+        use crate::protocol::anthropic::types::ThinkingConfig;
+        let first_text = |r: &MessagesRequest| {
+            anthropic_to_kiro(r, None)
+                .unwrap()
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content
+        };
+
+        // 不开 thinking:内容不含任何指令
+        let plain = base_req(vec![msg("user", "hi")]);
+        assert!(!first_text(&plain).contains("thinking_mode"));
+
+        // enabled:带预算上限
+        let mut on = base_req(vec![msg("user", "hi")]);
+        on.thinking = Some(ThinkingConfig {
+            thinking_type: "enabled".into(),
+            budget_tokens: 4096,
+        });
+        let t = first_text(&on);
+        assert!(
+            t.starts_with("<thinking_mode>enabled</thinking_mode>"),
+            "指令必须在最前:{t}"
+        );
+        assert!(t.contains("<max_thinking_length>4096</max_thinking_length>"));
+
+        // adaptive:让模型自行决定深浅
+        let mut ad = base_req(vec![msg("user", "hi")]);
+        ad.thinking = Some(ThinkingConfig {
+            thinking_type: "adaptive".into(),
+            budget_tokens: 0,
+        });
+        assert!(first_text(&ad).starts_with("<thinking_mode>adaptive</thinking_mode>"));
+
+        // 未知取值按未开启处理,不瞎加东西
+        let mut bad = base_req(vec![msg("user", "hi")]);
+        bad.thinking = Some(ThinkingConfig {
+            thinking_type: "whatever".into(),
+            budget_tokens: 0,
+        });
+        assert!(!first_text(&bad).contains("thinking_mode"));
+
+        // 有 system 时:指令在 system 之前,且 system 原文保留
+        let mut with_sys = base_req(vec![msg("user", "hi")]);
+        with_sys.system = Some(crate::protocol::anthropic::types::SystemPrompt::Text(
+            "你是助手".into(),
+        ));
+        with_sys.thinking = Some(ThinkingConfig {
+            thinking_type: "enabled".into(),
+            budget_tokens: 1024,
+        });
+        let t2 = first_text(&with_sys);
+        assert!(t2.starts_with("<thinking_mode>"), "{t2}");
+        assert!(t2.contains("你是助手"), "system 原文不得丢:{t2}");
+    }
+
+    /// token 估算必须按字符类别加权:中文约 1.5 字/token,英文约 4 字符/token。
+    ///
+    /// 回归:此前全局 `字符数 / 4`,一段纯中文估出来只有真实值的三分之一强。这个偏差直接
+    /// 落到用量统计和按 USD 设的限额上 —— 同样的钱,中文用户能超支两三倍而限额毫无察觉。
+    #[test]
+    fn token_estimation_is_weighted_by_script() {
+        // 30 个汉字:按 1.5 字/token 约 20;旧口径 30/4 = 7,差了近 3 倍
+        let zh = "中".repeat(30);
+        let t = estimate_tokens(&zh);
+        assert!((18..=22).contains(&t), "30 个汉字应约 20 token,实得 {t}");
+        assert!(t > 30 / 4 * 2, "必须显著高于旧的 /4 口径");
+
+        // 40 个 ASCII:约 10
+        let en = "a".repeat(40);
+        assert_eq!(estimate_tokens(&en), 10);
+
+        // 混排:两部分之和
+        let mixed = format!("{zh}{en}");
+        assert_eq!(estimate_tokens(&mixed), t + 10);
+
+        // 短文本不得被抹成 0(向上取整)
+        assert_eq!(estimate_tokens("a"), 1);
+        assert_eq!(estimate_tokens("中"), 1);
+        assert_eq!(estimate_tokens(""), 0);
+
+        // 日文假名 / 韩文同档加权(它们的分词密度同样远高于拉丁文)
+        assert!(estimate_tokens(&"あ".repeat(30)) > 10);
+        assert!(estimate_tokens(&"한".repeat(30)) > 10);
     }
 
     /// `description` 恒为字符串,**绝不为 null**。
@@ -1558,6 +1719,7 @@ mod tests {
     #[test]
     fn converts_request_with_system_and_history() {
         let req = MessagesRequest {
+            thinking: None,
             metadata: None,
             model: "sonnet".to_string(),
             system: Some(SystemPrompt::Text("S".to_string())),
@@ -1609,6 +1771,7 @@ mod tests {
     #[test]
     fn unknown_model_errors() {
         let req = MessagesRequest {
+            thinking: None,
             metadata: None,
             model: "gpt-4o".to_string(),
             system: None,
@@ -1627,6 +1790,7 @@ mod tests {
     #[test]
     fn empty_messages_errors() {
         let req = MessagesRequest {
+            thinking: None,
             metadata: None,
             model: "sonnet".to_string(),
             system: None,
@@ -1645,6 +1809,7 @@ mod tests {
     #[test]
     fn passes_through_profile_arn() {
         let req = MessagesRequest {
+            thinking: None,
             metadata: None,
             model: "sonnet".to_string(),
             system: None,
@@ -2742,6 +2907,7 @@ mod tests {
     #[test]
     fn history_tool_calls_force_a_tool_config_even_when_tools_were_dropped() {
         let req = MessagesRequest {
+            thinking: None,
             metadata: None,
             model: "claude-sonnet-4.5".into(),
             system: None,
@@ -2789,6 +2955,7 @@ mod tests {
     #[test]
     fn declared_tools_are_not_duplicated_by_history_fallback() {
         let req = MessagesRequest {
+            thinking: None,
             metadata: None,
             model: "claude-sonnet-4.5".into(),
             system: None,
@@ -2834,6 +3001,7 @@ mod tests {
     #[test]
     fn plain_chat_still_sends_no_tool_config() {
         let req = MessagesRequest {
+            thinking: None,
             metadata: None,
             model: "claude-sonnet-4.5".into(),
             system: None,
@@ -2856,5 +3024,328 @@ mod tests {
                 .is_none()
         );
         assert_eq!(out.conversation_state.agent_task_type, "vibe");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// thinking 切分
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 切出来的一段内容。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Piece {
+    /// 普通文本。
+    Text(String),
+    /// 思考内容(来自 `<thinking>…</thinking>`)。
+    Thinking(String),
+}
+
+const THINK_OPEN: &str = "<thinking>";
+const THINK_CLOSE: &str = "</thinking>";
+
+/// 把上游下发的文本切成「普通文本」与「思考内容」两类。
+///
+/// 上游把思考过程用 `<thinking>…</thinking>` 包在**普通文本里**下发。此前我们原样透传,
+/// 于是客户端把整段思考当成正文显示 —— Anthropic 协议里它本该是独立的 `thinking` 内容块。
+///
+/// **增量式**:流式逐块喂进来,非流式一次喂完整文本,两条路共用同一份实现,不会各切各的。
+///
+/// 跨块的半截标签靠"尾部保留"处理:输出时最多留下 `</thinking>` 的长度不发,等下一块到齐
+/// 再判定。没有这一步,一个恰好被切成 `<think` + `ing>` 的标签就会被当成正文吐出去。
+///
+/// 模型在思考里**提到**标签(通常写成 `` `</thinking>` ``)不算结束:被反引号或引号紧贴
+/// 包裹的一律跳过。这条是照参照实现的做法 —— 少了它,一段讨论标签本身的思考会被从中间截断。
+#[derive(Debug, Default)]
+pub struct ThinkingSplitter {
+    buf: String,
+    in_thinking: bool,
+}
+
+impl ThinkingSplitter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 喂一段新内容,拿到此刻能确定的所有片段。
+    pub fn feed(&mut self, chunk: &str) -> Vec<Piece> {
+        self.buf.push_str(chunk);
+        self.drain(false)
+    }
+
+    /// 流结束:把缓冲区里剩下的全部吐出去(半截标签按普通文本处理)。
+    pub fn finish(&mut self) -> Vec<Piece> {
+        self.drain(true)
+    }
+
+    fn drain(&mut self, eof: bool) -> Vec<Piece> {
+        let mut out = Vec::new();
+        loop {
+            if self.in_thinking {
+                match find_tag(&self.buf, THINK_CLOSE) {
+                    Some(i) => {
+                        let inner = self.buf[..i].to_string();
+                        if !inner.is_empty() {
+                            out.push(Piece::Thinking(inner));
+                        }
+                        self.buf = self.buf[i + THINK_CLOSE.len()..].to_string();
+                        self.in_thinking = false;
+                    }
+                    None => {
+                        // 结束标签还没到:先吐出"绝对不可能是半截标签"的那部分。
+                        let keep = if eof {
+                            0
+                        } else {
+                            holdback(&self.buf, THINK_CLOSE)
+                        };
+                        let cut = safe_cut(&self.buf, keep);
+                        if cut > 0 {
+                            let s: String = self.buf.drain(..cut).collect();
+                            out.push(Piece::Thinking(s));
+                        }
+                        if eof && !self.buf.is_empty() {
+                            out.push(Piece::Thinking(std::mem::take(&mut self.buf)));
+                        }
+                        break;
+                    }
+                }
+            } else {
+                match find_tag(&self.buf, THINK_OPEN) {
+                    Some(i) => {
+                        if i > 0 {
+                            out.push(Piece::Text(self.buf[..i].to_string()));
+                        }
+                        self.buf = self.buf[i + THINK_OPEN.len()..].to_string();
+                        // 开标签后紧跟的那个换行是格式,不是思考内容。
+                        if let Some(rest) = self.buf.strip_prefix('\n') {
+                            self.buf = rest.to_string();
+                        }
+                        self.in_thinking = true;
+                    }
+                    None => {
+                        let keep = if eof {
+                            0
+                        } else {
+                            holdback(&self.buf, THINK_OPEN)
+                        };
+                        let cut = safe_cut(&self.buf, keep);
+                        if cut > 0 {
+                            let s: String = self.buf.drain(..cut).collect();
+                            out.push(Piece::Text(s));
+                        }
+                        if eof && !self.buf.is_empty() {
+                            out.push(Piece::Text(std::mem::take(&mut self.buf)));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// 把相邻的同类片段合并成一条。
+///
+/// 增量切分天然会把一段文本拆成多条(尾部保留的缘故),流式正需要这样逐条发;
+/// 非流式则要的是"整段",故在这里合并。
+pub fn merge_pieces(pieces: Vec<Piece>) -> Vec<Piece> {
+    let mut out: Vec<Piece> = Vec::new();
+    for p in pieces {
+        match (out.last_mut(), &p) {
+            (Some(Piece::Text(a)), Piece::Text(b)) => a.push_str(b),
+            (Some(Piece::Thinking(a)), Piece::Thinking(b)) => a.push_str(b),
+            _ => out.push(p),
+        }
+    }
+    out
+}
+
+/// 一次性切分整段文本(非流式路径)。相邻同类已合并。
+pub fn split_thinking(text: &str) -> Vec<Piece> {
+    let mut sp = ThinkingSplitter::new();
+    let mut v = sp.feed(text);
+    v.extend(sp.finish());
+    merge_pieces(v)
+}
+
+/// 找到**真正的**标签位置:被反引号/引号紧贴包裹的当作正文里的引用,跳过。
+fn find_tag(hay: &str, tag: &str) -> Option<usize> {
+    let mut from = 0usize;
+    while let Some(rel) = hay[from..].find(tag) {
+        let at = from + rel;
+        let before = hay[..at].chars().next_back();
+        let after = hay[at + tag.len()..].chars().next();
+        let quoted = matches!(before, Some('`' | '"' | '\'' | '‘' | '“'))
+            || matches!(after, Some('`' | '"' | '\'' | '’' | '”'));
+        if !quoted {
+            return Some(at);
+        }
+        from = at + tag.len();
+    }
+    None
+}
+
+/// 末尾需要压住多少字节,才不会把一个半截标签当正文吐出去。
+///
+/// 关键是**别无脑压固定长度**:标签必以 `<` 开头,所以只有从最后一个 `<` 起算的那一小段
+/// 才可能是半截标签,其余可以立刻发走。一段不含 `<` 的普通文本因此**零延迟**透传 ——
+/// 无脑压 `标签长度-1` 会让每一块下行文本都滞后近十个字节,客户端看着就是"字在卡"。
+fn holdback(buf: &str, tag: &str) -> usize {
+    match buf.rfind('<') {
+        // 从这个 `<` 到结尾还不足一个完整标签 → 它可能是半截,压住。
+        Some(i) if buf.len() - i < tag.len() => buf.len() - i,
+        _ => 0,
+    }
+}
+
+/// 从末尾保留 `keep` 字节后,可安全切出的字节数(落在字符边界上)。
+fn safe_cut(s: &str, keep: usize) -> usize {
+    let target = s.len().saturating_sub(keep);
+    let mut i = target.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+#[cfg(test)]
+mod thinking_tests {
+    use super::*;
+
+    /// 按块喂入后**合并同类**再比较:增量切分天然会把一段拆成多条(尾部保留的缘故),
+    /// 流式正需要那样逐条发,而这些用例关心的是切分结果本身。
+    fn all(chunks: &[&str]) -> Vec<Piece> {
+        let mut sp = ThinkingSplitter::new();
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend(sp.feed(c));
+        }
+        out.extend(sp.finish());
+        merge_pieces(out)
+    }
+
+    /// 一次喂完整文本(非流式路径)。
+    #[test]
+    fn splits_thinking_from_text_in_one_shot() {
+        let v = all(&["前言<thinking>\n我在想事情</thinking>结论"]);
+        assert_eq!(
+            v,
+            vec![
+                Piece::Text("前言".into()),
+                Piece::Thinking("我在想事情".into()),
+                Piece::Text("结论".into()),
+            ]
+        );
+    }
+
+    /// **标签被切成两半**(流式最容易错的地方)。
+    ///
+    /// 没有"尾部保留"的话,`<think` 会被当成正文先吐出去,客户端就看到一段裸标签。
+    #[test]
+    fn tags_split_across_chunks_are_not_leaked_as_text() {
+        let v = all(&["前言<think", "ing>思考中</think", "ing>结论"]);
+        assert_eq!(
+            v,
+            vec![
+                Piece::Text("前言".into()),
+                Piece::Thinking("思考中".into()),
+                Piece::Text("结论".into()),
+            ]
+        );
+        // 逐字符喂同样要对
+        let one_by_one: Vec<&str> = vec![
+            "a", "<", "t", "h", "i", "n", "k", "i", "n", "g", ">", "x", "<", "/", "t", "h", "i",
+            "n", "k", "i", "n", "g", ">", "b",
+        ];
+        let v2 = all(&one_by_one);
+        let think: String = v2
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Thinking(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        let text: String = v2
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Text(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(think, "x");
+        assert_eq!(text, "ab");
+    }
+
+    /// 模型在思考里**提到**结束标签(用反引号包着)不算结束。
+    ///
+    /// 少了这条,一段讨论标签本身的思考会被从中间截断,后半截漏成正文。
+    #[test]
+    fn quoted_tags_inside_thinking_do_not_end_the_block() {
+        let v = all(&["<thinking>要输出 `</thinking>` 这个标签</thinking>done"]);
+        assert_eq!(
+            v,
+            vec![
+                Piece::Thinking("要输出 `</thinking>` 这个标签".into()),
+                Piece::Text("done".into()),
+            ]
+        );
+    }
+
+    /// 不含 `<` 的普通文本必须**当场发走**,不许压在缓冲区里。
+    ///
+    /// 回归:切分器最初无脑压住"标签长度 - 1"个字节,于是每一块下行文本都滞后近十个字节,
+    /// 客户端看着就是"字在卡"。标签必以 `<` 开头,故只有从最后一个 `<` 起算的那一小段
+    /// 才可能是半截标签。
+    #[test]
+    fn ordinary_text_is_emitted_immediately_without_holdback() {
+        let mut sp = ThinkingSplitter::new();
+        assert_eq!(
+            sp.feed("po"),
+            vec![Piece::Text("po".into())],
+            "第一块就该发出去"
+        );
+        assert_eq!(sp.feed("ng"), vec![Piece::Text("ng".into())]);
+        assert!(sp.finish().is_empty(), "收尾时不该还压着东西");
+
+        // 出现 `<` 之后才压,且只压那一小段
+        let mut sp2 = ThinkingSplitter::new();
+        assert_eq!(
+            sp2.feed("abc<th"),
+            vec![Piece::Text("abc".into())],
+            "`<` 之前的照发"
+        );
+        // 补齐成开标签 → 前面的文本已发过,这里进入 thinking
+        let out = sp2.feed("inking>x</thinking>");
+        assert_eq!(out, vec![Piece::Thinking("x".into())]);
+    }
+
+    /// 没有 thinking 标签时原样透传,不得改动内容。
+    #[test]
+    fn plain_text_passes_through_unchanged() {
+        assert_eq!(
+            all(&["hello ", "world"]),
+            vec![Piece::Text("hello world".into())]
+        );
+        assert!(all(&[""]).is_empty());
+    }
+
+    /// 流在 thinking 中途结束:剩余内容按思考内容吐出,不吞。
+    #[test]
+    fn unterminated_thinking_is_flushed_as_thinking() {
+        let v = all(&["<thinking>没写完就断了"]);
+        assert_eq!(v, vec![Piece::Thinking("没写完就断了".into())]);
+    }
+
+    /// 多字节字符**不得**被从中间切开。
+    #[test]
+    fn multibyte_characters_are_never_split() {
+        let v = all(&["中文很长的一段话没有标签"]);
+        let text: String = v
+            .iter()
+            .map(|p| match p {
+                Piece::Text(s) | Piece::Thinking(s) => s.as_str(),
+            })
+            .collect();
+        assert_eq!(text, "中文很长的一段话没有标签");
     }
 }

@@ -676,6 +676,11 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.13.0**:`thinking` が実際に機能するようになりました(上流が解する指示へ変換し、応答では
+> 独立した `thinking` ブロックとして返します。ストリーミングは `thinking_delta`。他の 3 プロトコル
+> では思考内容を本文へ統合し、破棄しません)。token 推定は文字種別で重み付けするようになり
+> (従来は中国語を約 3 倍過小評価)、ストリーミングの入力トークンも従来の **0 固定**から推定値へ。
+> モデル一覧に **`context_window`** を追加し、`max_tokens` と分離しました。
 > **v0.12.0:選択の優先度と、異なる階層の混在** —— `priority`(小さいほど優先)が**実際に
 > 選択へ影響するようになりました**(従来は `weight` の別名で無効)。**インポートしたアカウント
 > は一律 `999`**(最低)、必要なら手動で設定します。階層が混在する場合、`/v1/models` は全
@@ -1225,7 +1230,7 @@ curl -X PUT http://localhost:8080/api/admin/config/auth-keys \
 ```json
 {
   "masterApiKey": "sk-マスターキーの平文",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1453,7 +1458,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.12.0"
+  "version": "0.13.0"
 }
 ```
 

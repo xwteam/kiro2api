@@ -1025,7 +1025,7 @@ pub async fn relay_core_outcome(
     // input 为 0 不是"没有输入",是解码器看不到请求;而这里请求就在手边,故补上估算——
     // 否则 USD 少算了成本里通常更大的一半,按 USD 设的上限会系统性偏松。
     let input_tokens = if out.usage.input_tokens == 0 {
-        estimate_request_input_tokens(&req)
+        estimate_request_input_tokens_weighted(&req)
     } else {
         out.usage.input_tokens
     };
@@ -1073,6 +1073,19 @@ struct StreamUsageGuard {
     now_unix: i64,
     /// 累计输出字符数(收尾按 ÷4 估算 output_tokens);随流增量更新。
     total_chars: usize,
+    /// 按字符类别分开累计,末尾一次性换算成 token。
+    ///
+    /// 不逐块换算:每块各自向上取整会把一个长回答的估算抬高一大截(几百块就是几百次进位)。
+    /// 也不再用全局 `字符数 / 4` —— 那对中文低估约三倍,直接把用量统计和按 USD 设的限额
+    /// 一起带偏(见 `crate::kiro::convert::estimate_tokens`)。
+    cjk_chars: usize,
+    other_chars: usize,
+    /// 由请求估算出的输入 token(加权口径)。
+    ///
+    /// 上游 meteringEvent 只回报 credits、不含 token 计量,故此前流式记账的 input **恒为 0**——
+    /// 等于把成本里通常更大的那一半整个抹掉,按 USD 设的上限因此系统性偏松。非流式那条路
+    /// 早就补了估算,流式却一直没有,两条路的账对不上。
+    estimated_input_tokens: u32,
     /// 末次 meteringEvent 的真实计费(有则优先于字符估算)。
     metering: Option<crate::kiro::convert::MeteringUsage>,
     /// 已记账标记:避免正常收尾 + Drop 双写。
@@ -1091,6 +1104,22 @@ impl StreamUsageGuard {
         self.total_chars >= CHARS_PER_TOKEN || self.metering.is_some()
     }
 
+    /// 累进一段下行文本(按字符类别分桶,末尾一次换算)。
+    fn add_text(&mut self, t: &str) {
+        for c in t.chars() {
+            if crate::kiro::convert::is_cjk_char(c) {
+                self.cjk_chars += 1;
+            } else {
+                self.other_chars += 1;
+            }
+        }
+    }
+
+    /// 估算的输出 token(仅在上游没给真实计量时使用)。
+    fn estimated_output_tokens(&self) -> usize {
+        (self.cjk_chars * 2).div_ceil(3) + self.other_chars.div_ceil(4)
+    }
+
     /// 把当前累计量落一条用量(同步组装参数,异步写库经 `tokio::spawn`)。幂等:仅首次生效。
     fn flush(&mut self) {
         if self.recorded {
@@ -1104,13 +1133,14 @@ impl StreamUsageGuard {
             .metering
             .as_ref()
             .and_then(|m| m.input_tokens)
-            .unwrap_or(0) as i32;
+            // 上游没给就用请求估算,而不是 0(见 `estimated_input_tokens`)。
+            .unwrap_or(self.estimated_input_tokens) as i32;
         let output_tokens = self
             .metering
             .as_ref()
             .and_then(|m| m.output_tokens)
             .map(|n| n as i32)
-            .unwrap_or((self.total_chars / CHARS_PER_TOKEN) as i32);
+            .unwrap_or(self.estimated_output_tokens() as i32);
         let credits = self.metering.as_ref().map(|m| m.credits);
         let cache_read = self
             .metering
@@ -1216,6 +1246,9 @@ pub async fn relay_stream_attributed(
     // 统计层用量句柄(Arc,移入哨兵);记账经 Drop 哨兵在流**任意方式结束**时都落一条(#18)。
     let usage_handle = state.stats.usage.clone();
     let record_model = req.model.clone();
+    // 输入 token 估算必须在这里算:req 随后被移进流闭包,之后就取不到了。
+    // 上游只回 credits 不回 token 计量,故 input 全靠这一份估算——不算就恒为 0。
+    let estimated_input = estimate_request_input_tokens_weighted(&req);
 
     // 块索引状态机(照 Anthropic 公开流式规范;Kiro toolUseEvent 帧序照真机观测):
     // 不变量 = 同一时刻至多一个内容块打开(先关后开);每块分配唯一递增 index;
@@ -1238,6 +1271,9 @@ pub async fn relay_stream_attributed(
             model: record_model,
             now_unix: now_unix as i64,
             total_chars: 0,
+            cjk_chars: 0,
+            other_chars: 0,
+            estimated_input_tokens: estimated_input,
             metering: None,
             recorded: false,
             latency_ms: Some(latency_ms),
@@ -1249,6 +1285,10 @@ pub async fn relay_stream_attributed(
         let mut next_index: u32 = 0;
         let mut open_block: Option<u32> = None; // 当前打开的块 index
         let mut text_index: Option<u32> = None; // 当前文本块 index(关闭后置 None 以便重开)
+        // 当前 thinking 块 index;思考结束(或流收尾)时关掉。
+        let mut thinking_index: Option<u32> = None;
+        // thinking 切分器:与非流式共用同一份实现,跨块的半截标签由它兜住。
+        let mut splitter = crate::kiro::convert::ThinkingSplitter::new();
         let mut tool_index: HashMap<String, u32> = HashMap::new(); // toolUseId → 块 index
         let mut closed_blocks: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut any_tool = false;
@@ -1266,20 +1306,49 @@ pub async fn relay_stream_attributed(
                     dec.push(&chunk);
                     for frame in dec.drain() {
                         if let Some(t) = crate::kiro::convert::frame_text_delta(&frame) {
-                            // assistantResponseEvent:懒开文本块,再发 text_delta。
-                            if text_index.is_none() {
-                                // 关闭当前工具块(若有);随后无条件开新文本块,故此处不必显式置 None。
-                                if let Some(oi) = open_block && closed_blocks.insert(oi) {
-                                    yield Ok(to_event(stream::content_block_stop(oi)));
-                                }
-                                let idx = next_index;
-                                next_index += 1;
-                                text_index = Some(idx);
-                                yield Ok(to_event(stream::content_block_start(idx)));
-                                open_block = Some(idx);
-                            }
                             usage_guard.total_chars += t.chars().count();
-                            yield Ok(to_event(stream::text_delta(text_index.unwrap(), &t)));
+                            usage_guard.add_text(&t);
+                            // 先切出 thinking:上游把思考过程用 `<thinking>…</thinking>` 包在
+                            // 普通文本里下发。不切的话客户端把整段思考当正文显示,而协议里
+                            // 它本该是独立的 thinking 块。切分器是增量的,跨块的半截标签
+                            // 由它自己兜住(见 `ThinkingSplitter`)。
+                            for piece in splitter.feed(&t) {
+                                match piece {
+                                    crate::kiro::convert::Piece::Thinking(tt) => {
+                                        if thinking_index.is_none() {
+                                            if let Some(oi) = open_block && closed_blocks.insert(oi) {
+                                                yield Ok(to_event(stream::content_block_stop(oi)));
+                                            }
+                                            if text_index.is_some() { text_index = None; }
+                                            let idx = next_index;
+                                            next_index += 1;
+                                            thinking_index = Some(idx);
+                                            yield Ok(to_event(stream::thinking_start(idx)));
+                                            open_block = Some(idx);
+                                        }
+                                        yield Ok(to_event(stream::thinking_delta(thinking_index.unwrap(), &tt)));
+                                    }
+                                    crate::kiro::convert::Piece::Text(tt) => {
+                                        // 思考结束、开始出正文:先把 thinking 块收掉。
+                                        if let Some(ti) = thinking_index.take()
+                                            && closed_blocks.insert(ti)
+                                        {
+                                            yield Ok(to_event(stream::content_block_stop(ti)));
+                                        }
+                                        if text_index.is_none() {
+                                            if let Some(oi) = open_block && closed_blocks.insert(oi) {
+                                                yield Ok(to_event(stream::content_block_stop(oi)));
+                                            }
+                                            let idx = next_index;
+                                            next_index += 1;
+                                            text_index = Some(idx);
+                                            yield Ok(to_event(stream::content_block_start(idx)));
+                                            open_block = Some(idx);
+                                        }
+                                        yield Ok(to_event(stream::text_delta(text_index.unwrap(), &tt)));
+                                    }
+                                }
+                            }
                         } else if let Some(v) = crate::kiro::convert::tool_use_frame(&frame) {
                             // toolUseEvent:open 帧开新工具块、input 帧发 input_json_delta、stop 帧关块。
                             let Some(id) = v["toolUseId"].as_str() else { continue };
@@ -1350,6 +1419,35 @@ pub async fn relay_stream_attributed(
             }
         }
 
+        // 收尾:把切分器里还压着的内容吐干净(半截标签按普通内容处理),绝不吞。
+        for piece in splitter.finish() {
+            match piece {
+                crate::kiro::convert::Piece::Thinking(tt) => {
+                    if let Some(ti) = thinking_index {
+                        yield Ok(to_event(stream::thinking_delta(ti, &tt)));
+                    }
+                }
+                crate::kiro::convert::Piece::Text(tt) => {
+                    if let Some(ti) = thinking_index.take()
+                        && closed_blocks.insert(ti)
+                    {
+                        yield Ok(to_event(stream::content_block_stop(ti)));
+                    }
+                    if text_index.is_none() {
+                        let idx = next_index;
+                        next_index += 1;
+                        text_index = Some(idx);
+                        yield Ok(to_event(stream::content_block_start(idx)));
+                        open_block = Some(idx);
+                    }
+                    yield Ok(to_event(stream::text_delta(text_index.unwrap(), &tt)));
+                }
+            }
+        }
+        if let Some(ti) = thinking_index.take() && closed_blocks.insert(ti) {
+            yield Ok(to_event(stream::content_block_stop(ti)));
+        }
+
         if let Some(oi) = open_block && closed_blocks.insert(oi) {
             yield Ok(to_event(stream::content_block_stop(oi)));
         }
@@ -1397,7 +1495,7 @@ pub async fn relay_stream_attributed(
                 .metering
                 .as_ref()
                 .and_then(|m| m.output_tokens)
-                .unwrap_or((usage_guard.total_chars / CHARS_PER_TOKEN) as u32);
+                .unwrap_or(usage_guard.estimated_output_tokens() as u32);
             yield Ok(to_event(stream::message_delta(stop_reason, output_tokens)));
             yield Ok(to_event(stream::message_stop()));
         }
@@ -1559,6 +1657,62 @@ pub fn estimate_request_input_tokens(req: &MessagesRequest) -> u32 {
         }
     }
     (chars / CHARS_PER_TOKEN + images * IMAGE_TOKEN_ESTIMATE).max(1) as u32
+}
+
+/// 由请求估算输入 token,**按字符类别加权**(中文不再被低估约三倍)。
+///
+/// 与 [`estimate_request_input_tokens`] 的区别只在权重:那一版是 `字符数 / 4` 的旧口径,
+/// 保留是因为 `/v1/messages/count_tokens` 对外承诺过那个数值口径,改它属于契约变更。
+/// **记账走这一版** —— 用量统计与按 USD 设的限额必须尽量贴近真实,否则中文用户能超支
+/// 两三倍而限额毫无察觉。
+pub fn estimate_request_input_tokens_weighted(req: &MessagesRequest) -> u32 {
+    use crate::kiro::convert::estimate_tokens;
+    let mut tokens = req
+        .system
+        .as_ref()
+        .map(|s| estimate_tokens(&s.text()))
+        .unwrap_or(0);
+    let mut images = 0usize;
+    for m in &req.messages {
+        let (t, i) = weigh_content(&m.content);
+        tokens += t;
+        images += i;
+    }
+    if let Some(tools) = &req.tools {
+        for t in tools {
+            tokens += estimate_tokens(&t.name);
+            tokens += t.description.as_deref().map(estimate_tokens).unwrap_or(0);
+            tokens += serde_json::to_string(&t.input_schema)
+                .map(|s| estimate_tokens(&s))
+                .unwrap_or(0);
+        }
+    }
+    (tokens + images * IMAGE_TOKEN_ESTIMATE).max(1) as u32
+}
+
+/// 同 `count_content_chars`,但返回**加权 token 数**而非字符数。
+fn weigh_content(content: &crate::protocol::anthropic::types::ContentIn) -> (usize, usize) {
+    use crate::kiro::convert::estimate_tokens;
+    use crate::protocol::anthropic::types::{Block, ContentIn};
+    match content {
+        ContentIn::Text(s) => (estimate_tokens(s), 0),
+        ContentIn::Blocks(blocks) => {
+            let mut tokens = 0usize;
+            let mut images = 0usize;
+            for b in blocks {
+                match b {
+                    Block::Text { text } => tokens += estimate_tokens(text),
+                    Block::Image { .. } => images += 1,
+                    other => {
+                        tokens += serde_json::to_string(other)
+                            .map(|s| estimate_tokens(&s))
+                            .unwrap_or(0)
+                    }
+                }
+            }
+            (tokens, images)
+        }
+    }
 }
 
 pub async fn count_tokens(

@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.12.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.13.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 날짜 | 업데이트 내용 |
 |------|----------|
+| 2026-08-09 | v0.13.0 - 🧠 **확장 사고(thinking)를 완전히 연결**했습니다(이전에는 기능 자체가 없었습니다). 요청 측에서 `thinking` 필드가 조용히 버려져 업스트림에 지시가 전달되지 않았고, 응답 측에서는 업스트림이 `<thinking>…</thinking>`로 감싸 보낸 사고 과정을 그대로 통과시켜 클라이언트가 사고 전체를 본문으로 표시했습니다. 이제 enabled/adaptive 지시를 system 맨 앞에 주입하고 독립적인 `thinking` 블록으로 분리합니다(스트리밍은 `thinking_delta`). 일반 텍스트는 **추가 지연 없이** 통과합니다. 그 외 **토큰 추정이 중국어를 약 3배 과소평가**하던 문제, **스트리밍 입력 토큰이 항상 0**이던 문제, **컨텍스트 윈도가 모든 모델에서 200K로 고정**(업스트림 `maxInputTokens`를 파싱 후 폐기)되던 문제를 수정 |
 | 2026-08-09 | v0.12.0 - 🎚️ **서로 다른 구독 등급의 계정이 드디어 공존합니다**(사용자가 조사용으로 제공한 실제 API 키로 재현·검증). 원인 두 가지: ① `INVALID_MODEL_ID`를 *요청 수준* 오류로 분류해 즉시 400을 반환했지만 실제로는 *계정 수준*입니다 — 사용 가능한 모델은 등급에 따라 다른데, 이 릴레이가 클라이언트에 노출하는 것은 전체 계정의 **합집합**이라 합집합의 모델이 지원하지 않는 계정에 걸리면 반드시 실패합니다 → `ModelUnavailable`로 분리해 계정에 불이익 없이 다른 계정으로 재시도. ② 계정 간 재시도 예산이 3회였는데 해당 모델을 지원하는 계정이 14번째일 수 있습니다 → 모델 미지원은 계정 장애 예산을 소비하지 않습니다. 그 외 어느 계정이 어느 모델을 지원하지 않는지 기억(같은 모델 두 번째 요청은 계정 1개, 첫 번째는 14개), **`priority`가 `weight`의 별칭일 뿐 선택에 전혀 관여하지 않았음** → 숫자가 작을수록 우선, 가져오기는 일괄 999, us-east-1 외 지역의 모델 새로고침 실패를 `q.{region}`으로 폴백 |
 | 2026-08-09 | v0.11.1 - 🔬 **운영 환경 실측으로 드러난 두 가지.** ① **도구 설명이 비어 있으면 업스트림이 요청 전체를 거부**합니다(실측: 같은 도구에 설명이 있으면 200과 정상 `tool_use`, 설명을 빼면 `400 Invalid tool use format / REQUEST_BODY_INVALID`). v0.11.0에서 `null`을 빈 문자열로 바꿨지만 업스트림이 원하는 것은 **비어 있지 않은** 값이었습니다 → 도구 이름으로 대체. ② `REQUEST_BODY_INVALID`를 재시도 가능으로 처리했습니다. 이는 결정적이어서 어떤 계정으로도 똑같이 실패하는데, 잘못된 요청 하나가 여러 계정의 재시도 예산을 소모하고(실측 4개) 결국 모호한 502를 반환했습니다 → 재시도 없음·계정 무벌점 등급으로 옮기고 도구 명세를 지목하는 400을 반환합니다 |
 | 2026-08-09 | v0.11.0 - 🧰 **「업스트림이 요청을 거부하게 만드는」 부류의 버그 수정.** ① 서버 측 내장 도구(web_search 등)는 `input_schema`가 없는데 해당 필드가 필수여서, 공식 표기를 쓰기만 해도 우리 계층에서 400. ② 도구 `description`이 **null**로 직렬화될 수 있었습니다(실제 클라이언트는 항상 문자열). ③ `input_schema`를 그대로 전달해 `properties: null` 같은 형태에서 **요청 전체**가 거부됐습니다 → 형태만 정규화(의미는 변경하지 않음). ④ 너무 긴 도구 이름을 줄이지 않았고(업스트림 상한 63) 복원도 불가능했습니다 → 결정적으로 축약하고 `축약명→원본명`을 출구까지 전달해 복원. ⑤ `:message-type == "error"` 프레임을 완전히 무시해 업스트림 오류가 200+빈 메시지가 됐습니다. ⑥ 패널의 없는 자산이 404가 아니라 200+HTML을 반환했습니다. 그 외 `POST /api/admin/credentials/{id}/refresh` 추가 |
@@ -245,7 +246,7 @@ docker compose logs -f
 ```bash
 # 헬스 체크
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.12.0"}
+# {"service":"kiro2api","status":"ok","version":"0.13.0"}
 
 # 프로토콜 고정 모델 목록 조회
 curl http://localhost:8080/v1/models \

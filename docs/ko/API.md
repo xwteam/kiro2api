@@ -645,6 +645,11 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.13.0**: `thinking`이 실제로 동작합니다(업스트림이 이해하는 지시로 변환하고, 응답에서는
+> 독립적인 `thinking` 블록으로 반환합니다. 스트리밍은 `thinking_delta`. 다른 세 프로토콜에서는
+> 사고 내용을 본문에 통합하며 버리지 않습니다). 토큰 추정은 문자 종류별 가중치를 적용하며
+> (이전에는 중국어를 약 3배 과소평가), 스트리밍 입력 토큰도 기존의 **0 고정**에서 추정값으로
+> 바뀌었습니다. 모델 목록에 **`context_window`**를 추가해 `max_tokens`와 분리했습니다.
 > **v0.12.0: 선택 우선순위와 혼합 등급 풀** —— `priority`(숫자가 작을수록 우선)가 **실제로
 > 선택에 반영됩니다**(이전에는 `weight`의 별칭이라 무효). **가져온 계정은 일괄 `999`**(최저)
 > 이며 필요하면 수동으로 설정합니다. 등급이 섞인 경우 `/v1/models`는 전체 계정의 **합집합**을
@@ -1493,7 +1498,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.12.0"}
+{"service":"kiro2api","status":"ok","version":"0.13.0"}
 ```
 
 ### GET /v1/ping

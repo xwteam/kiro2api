@@ -106,6 +106,17 @@ cat data/config.json | grep apiKey
 | 422 | 请求体反序列化失败（缺必填字段 / 类型不符），axum 默认拒收，`text/plain` 纯文本。出现在带 body 提取器的端点上：`/api/admin/*` 与 `POST /api/user/login`（四个协议对话端点与 `/v1/messages/count_tokens` 已自行接管拒收、改回各自形状的 `400`）（`/api/user/*` 的其余端点只收 query，参数类型不符是 `400` 而非 `422`） |
 
 
+> **v0.13.0:扩展思考、token 计量与上下文窗口**
+> - **`thinking` 现在真正生效**:`{"type":"enabled","budget_tokens":N}` 与 `{"type":"adaptive"}`
+>   都会被翻译成上游认的指令。响应里思考内容作为独立的 `thinking` 内容块返回,流式为
+>   `thinking_delta`。此前该字段被静默丢弃,且上游的思考文本被当作正文原样透传。
+>   其余三个协议(OpenAI / Gemini / Responses)没有思考块,思考内容**并入正文**而非丢弃。
+> - **token 估算按字符类别加权**:中文约 1.5 字/token、英文约 4 字符/token。此前全局
+>   `字符数 / 4`,对中文低估约三倍 —— 用量统计与按 USD 设的限额都受影响。流式的输入
+>   token 此前**恒为 0**,现同样走估算。
+> - 模型列表新增 **`context_window`**(能读多少),与 `max_tokens`(能写多少)分开。
+>   上游给了 `maxInputTokens` 就用真值,没给才回落静态目录。此前一律按 200K 报,
+>   1M 上下文的模型被低报五倍。
 > **v0.12.0:选号优先级与多档位共存**
 > - `priority`(数字越小越优先)**现在真正参与选号**:Priority 档换号时取优先级最小的可用账号。
 >   此前它只是 `weight` 的别名、从不参与,「设置优先级」在默认档位下是空操作。
@@ -1263,7 +1274,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "kiroVersion": "0.11.107",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
@@ -1451,7 +1462,7 @@ curl http://localhost:8080/health
 {
   "service": "kiro2api",
   "status": "ok",
-  "version": "0.12.0"
+  "version": "0.13.0"
 }
 ```
 

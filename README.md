@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.12.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.13.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-08-09 | v0.13.0 - 🧠 **扩展思考(thinking)完整接上**,此前整个功能缺失:请求侧 `thinking` 字段被静默丢弃(上游根本收不到指令),响应侧上游把思考用 `<thinking>…</thinking>` 包在普通文本里下发、我们原样透传 → 客户端把整段思考当正文显示。现按 enabled/adaptive 生成指令注入 system 最前,并切成独立 `thinking` 块(流式发 `thinking_delta`),流式与非流式共用同一份增量切分器;**普通文本零延迟透传**(只压最后一个 `<` 起的那一小段,无脑压标签长度会让下行文本卡顿——实现时真踩到过,被测试挡下)。另修:**token 估算对中文低估约三倍**(全局 chars/4 → 按字符类别加权,直接影响用量统计与 USD 限额);**流式记账 input token 恒为 0**(非流式早有估算、流式一直没有,两条路的账对不上);**上下文窗口全表钉死 200K**(上游 `maxInputTokens` 解析了又丢,1M 的模型被低报五倍;且 `max_tokens` 装的其实是输出上限,与静态表的窗口含义打架)→ 拆成两个字段 |
 | 2026-08-09 | v0.12.0 - 🎚️ **不同订阅档位的账号终于能共存**(用户提供的真实 ksk 实测复现并验证)。两个半根因:①`INVALID_MODEL_ID` 被归为**请求级**错误直接回 400,而它其实是**账号级**的——可用模型由档位决定,而我们对客户端暴露的是全池**并集**,并集里的模型落到不支持它的账号上就必错 → 拆出 `ModelUnavailable`,不罚账号但换号再试;②换号预算只有 3 次,而支持该模型的号可能排第 14 → 模型不可用**不占**账号故障预算。另:记住「谁不支持哪个模型」(第 2 次同模型请求只选 1 个号,第 1 次是 14 个);**`priority` 此前只是 `weight` 的别名、从不参与选号** → 现数字越小越优先,导入一律 999,手工可调;非 us-east-1 账号刷新模型必然失败(`codewhisperer.{region}` 在该区不存在,DNS 都解析不了)→ 回落 `q.{region}` |
 | 2026-08-09 | v0.11.1 - 🔬 **线上实测挖出的两件事**。①**工具描述为空时上游拒掉整条请求**(实测:同一工具带描述 200 并正常回 tool_use,去掉描述 → `400 Invalid tool use format / REQUEST_BODY_INVALID`)。v0.11.0 把 null 改成了空串,而上游要的是**非空** → 现用工具名兜底;②`REQUEST_BODY_INVALID` 被当成可重试:它是确定性的,换账号也一样失败,此前一条畸形请求连烧几个账号的重试配额(实测一次打了 4 个号)最后回个语焉不详的 502 → 现归入不重试不罚账号那档,直接回 400 并点明多半是工具规格的问题 |
 | 2026-08-09 | v0.11.0 - 🧰 **修「会让请求被上游拒」的一类**。①Anthropic **服务端内置工具**(web_search 等)没有 `input_schema`,而该字段此前是必填 → 客户端一用官方写法,请求就在我们这层 400;②工具 `description` 会序列化成 **null**(真实客户端恒为字符串);③`input_schema` 原样透传,`properties: null` 这类形状不合法会被上游拒掉**整条请求** → 现统一规范化(只补形状不改语义);④超长工具名不缩短(上游上限 63)、缩短后也无法还原 → 现确定性缩短并把 `短名→原名` 带到出口,流式/非流式都还原,否则客户端收到自己没声明过的工具;⑤`:message-type == "error"` 的框架级错误帧被整个忽略 → 上游报错却还原成 200+空消息;⑥面板缺失资源返回 200+HTML 而非 404 —— **这条会让「用 curl 核对产物是否上线」本身骗人**。另:新增 `POST /api/admin/credentials/{id}/refresh` 强制换发令牌 |
@@ -290,7 +291,7 @@ docker compose logs -f
 ```bash
 # 健康检查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.12.0"}
+# {"service":"kiro2api","status":"ok","version":"0.13.0"}
 
 # 查看可用模型
 curl http://localhost:8080/v1/models \

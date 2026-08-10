@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.12.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.13.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-08-09 | v0.13.0 - 🧠 **擴展思考(thinking)完整接上**,此前整個功能缺失:請求側 `thinking` 欄位被靜默丟棄,回應側上游把思考用 `<thinking>…</thinking>` 包在普通文字裡下發、我們原樣透傳 → 客戶端把整段思考當正文顯示。現按 enabled/adaptive 生成指令注入 system 最前,並切成獨立 `thinking` 區塊,串流與非串流共用同一份增量切分器;**普通文字零延遲透傳**。另修:**token 估算對中文低估約三倍**;**串流記帳 input token 恆為 0**;**上下文視窗全表釘死 200K**(上游 `maxInputTokens` 解析了又丟)→ 拆成兩個欄位 |
 | 2026-08-09 | v0.12.0 - 🎚️ **不同訂閱檔位的帳號終於能共存**(使用者提供的真實 ksk 實測驗證)。①`INVALID_MODEL_ID` 被歸為**請求級**錯誤直接回 400,而它其實是**帳號級**的——可用模型由檔位決定,而我們對客戶端暴露的是全池**並集** → 拆出 `ModelUnavailable`,不罰帳號但換號再試;②換號預算只有 3 次,而支援該模型的號可能排第 14 → 模型不可用**不佔**帳號故障預算。另:記住「誰不支援哪個模型」;**`priority` 此前只是 `weight` 的別名、從不參與選號** → 現數字越小越優先,匯入一律 999;非 us-east-1 帳號重新整理模型必然失敗 → 回落 `q.{region}` |
 | 2026-08-09 | v0.11.1 - 🔬 **線上實測挖出的兩件事**。①**工具描述為空時上游拒掉整條請求**(實測:同一工具帶描述 200,去掉描述 → `400 Invalid tool use format / REQUEST_BODY_INVALID`)。v0.11.0 把 null 改成空串,而上游要的是**非空** → 現用工具名兜底;②`REQUEST_BODY_INVALID` 被當成可重試:它是確定性的,此前一條畸形請求連燒幾個帳號的重試配額最後回個 502 → 現直接回 400 並點明多半是工具規格的問題 |
 | 2026-08-09 | v0.11.0 - 🧰 **修「會讓請求被上游拒」的一類**。①服務端內建工具(web_search 等)沒有 `input_schema`,而該欄位此前是必填 → 客戶端一用官方寫法,請求就在我們這層 400;②工具 `description` 會序列化成 **null**;③`input_schema` 原樣透傳,形狀不合法會被上游拒掉**整條請求** → 現統一規範化;④超長工具名不縮短(上游上限 63)、縮短後也無法還原 → 現確定性縮短並把 `短名→原名` 帶到出口;⑤`:message-type == "error"` 的框架級錯誤幀被整個忽略 → 上游報錯卻還原成 200+空訊息;⑥面板缺失資源返回 200+HTML 而非 404。另:新增 `POST /api/admin/credentials/{id}/refresh` |
@@ -248,7 +249,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.12.0"}
+# {"service":"kiro2api","status":"ok","version":"0.13.0"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \

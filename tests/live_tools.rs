@@ -72,6 +72,7 @@ async fn live_tools_get_weather_round_trip() {
     };
 
     let req = MessagesRequest {
+        thinking: None,
         metadata: None,
         model: "sonnet".to_string(),
         system: None,

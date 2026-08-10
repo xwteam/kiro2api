@@ -222,6 +222,7 @@ pub fn openai_to_hub(req: ChatCompletionRequest) -> MessagesRequest {
     });
 
     MessagesRequest {
+        thinking: None,
         metadata: None,
         model: req.model,
         system: system.map(SystemPrompt::Text),
@@ -258,7 +259,8 @@ pub fn hub_to_openai(resp: MessagesResponse, created: u64) -> ChatCompletion {
 
     for block in &resp.content {
         match block {
-            OutBlock::Text { text: t } => text.push_str(t),
+            // OpenAI Chat Completions 没有思考块,思考内容并入正文——不丢弃。
+            OutBlock::Text { text: t } | OutBlock::Thinking { thinking: t } => text.push_str(t),
             OutBlock::ToolUse { id, name, input } => {
                 let arguments = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
                 tool_calls.push(ToolCall {

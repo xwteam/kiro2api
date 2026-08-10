@@ -73,6 +73,7 @@ async fn live_relay_one_ping() {
     };
 
     let req = MessagesRequest {
+        thinking: None,
         metadata: None,
         model: "sonnet".to_string(),
         system: None,
@@ -91,6 +92,8 @@ async fn live_relay_one_ping() {
         Ok(resp) => {
             let text = match &resp.content[0] {
                 OutBlock::Text { text } => text.clone(),
+                // 开了 thinking 时首块可能是思考内容,同样算有效输出。
+                OutBlock::Thinking { thinking } => thinking.clone(),
                 OutBlock::ToolUse { .. } => String::new(),
             };
             // 不打印令牌;只报告文本长度与是否非空。

@@ -598,6 +598,10 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.13.0**:`thinking` 現在真正生效(翻譯成上游認的指令,回應裡作為獨立 `thinking` 區塊,
+> 串流為 `thinking_delta`;其餘協議並入正文而非丟棄)。token 估算改為按字元類別加權
+> (此前對中文低估約三倍),串流的輸入 token 此前**恆為 0**、現同樣走估算。
+> 模型列表新增 **`context_window`**,與 `max_tokens` 分開。
 > **v0.12.0:選號優先級與多檔位共存** —— `priority`(數字越小越優先)現在真正參與選號
 > (此前只是 `weight` 的別名);**匯入的帳號一律 999**,要更高請手工設定。池裡混著不同訂閱
 > 檔位時,`/v1/models` 回的是全池**並集**,本服務會自動跳過不支援該模型的帳號,全池都不
@@ -1243,7 +1247,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.12.0"}
+{"service":"kiro2api","status":"ok","version":"0.13.0"}
 ```
 
 ### GET /v1/ping

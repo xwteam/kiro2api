@@ -254,6 +254,7 @@ pub fn gemini_to_hub(
         .and_then(|g| g.max_output_tokens);
 
     Ok(MessagesRequest {
+        thinking: None,
         metadata: None,
         model,
         system: system.map(SystemPrompt::Text),
@@ -301,7 +302,9 @@ pub fn hub_to_gemini(resp: MessagesResponse) -> GenerateContentResponse {
         .content
         .iter()
         .map(|block| match block {
-            OutBlock::Text { text } => Part {
+            // Gemini 侧没有独立的思考块,故思考内容按普通文本呈现——**不丢弃**。
+            // 丢掉的话,一个开了 thinking 的请求在 Gemini 客户端看来会莫名其妙少一大段内容。
+            OutBlock::Text { text } | OutBlock::Thinking { thinking: text } => Part {
                 text: Some(text.clone()),
                 inline_data: None,
                 function_call: None,
