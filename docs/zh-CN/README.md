@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.14.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.14.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-08-10 | v0.14.1 - 🔧 **线上验证时当场发现的两件事**。①响应里 `usage.input_tokens` **恒为 0**:v0.13.0 补的输入估算只喂给了计费、没回写客户端 —— 账单里有、响应里没有,而客户端拿它算成本和上下文占用 → 非流式 `usage` 与流式 `message_start` 现在都带同一个值;②**池里有一批耗尽的号时,用户前几次请求会连续失败**:配额耗尽此前与鉴权失败共用 3 次重试预算,实测 13 个耗尽号要连烧 2 次 502、第 3 次才成 → 配额是**确定性**结论(本周期换谁都一样),现与"模型不可用"同归账号级确定性档、按池大小给预算;瞬态/鉴权仍保持 3 次小上限。全池确实耗尽时回 `429` 并说清是额度问题,而不是语焉不详的 502 |
 | 2026-08-10 | v0.14.0 - 🧩 **对照收尾**。①历史里助手轮 `content` 可能是**空串**,上游据此拒掉整条请求——纯工具调用那一轮(只有 tool_use、没文本)就是空,用户轮早有兜底、助手轮一直漏着,于是"上一轮只调了工具没说话"的对话再发一次就必挂,而那正是工具链里最常见的形态 → 用单个空格占位;②**损坏帧被逐字节重扫,而它的边界本来已知**:prelude CRC 一旦通过 `total_len` 就可信,此前不分情况逐字节再同步,于是一个 message-CRC 失败的帧会把整段 payload 当噪声重扫,既慢又可能从 payload 里凑出假帧头、解出根本不存在的消息 → 边界已知的坏帧整帧跳过;③**`tlsBackend` 改为运行时可切**(此前编译期二选一,换后端要重出镜像)——native-tls 用系统证书库、rustls 用内置根证书,走自签 CA 代理时往往只有一个握得上手,而现象是"刷不出令牌/连不上",与 TLS 毫无字面关系 |
 | 2026-08-09 | v0.13.0 - 🧠 **扩展思考(thinking)完整接上**,此前整个功能缺失:请求侧 `thinking` 字段被静默丢弃(上游根本收不到指令),响应侧上游把思考用 `<thinking>…</thinking>` 包在普通文本里下发、我们原样透传 → 客户端把整段思考当正文显示。现按 enabled/adaptive 生成指令注入 system 最前,并切成独立 `thinking` 块(流式发 `thinking_delta`),流式与非流式共用同一份增量切分器;**普通文本零延迟透传**(只压最后一个 `<` 起的那一小段,无脑压标签长度会让下行文本卡顿——实现时真踩到过,被测试挡下)。另修:**token 估算对中文低估约三倍**(全局 chars/4 → 按字符类别加权,直接影响用量统计与 USD 限额);**流式记账 input token 恒为 0**(非流式早有估算、流式一直没有,两条路的账对不上);**上下文窗口全表钉死 200K**(上游 `maxInputTokens` 解析了又丢,1M 的模型被低报五倍;且 `max_tokens` 装的其实是输出上限,与静态表的窗口含义打架)→ 拆成两个字段 |
 | 2026-08-09 | v0.12.0 - 🎚️ **不同订阅档位的账号终于能共存**(用户提供的真实 ksk 实测复现并验证)。两个半根因:①`INVALID_MODEL_ID` 被归为**请求级**错误直接回 400,而它其实是**账号级**的——可用模型由档位决定,而我们对客户端暴露的是全池**并集**,并集里的模型落到不支持它的账号上就必错 → 拆出 `ModelUnavailable`,不罚账号但换号再试;②换号预算只有 3 次,而支持该模型的号可能排第 14 → 模型不可用**不占**账号故障预算。另:记住「谁不支持哪个模型」(第 2 次同模型请求只选 1 个号,第 1 次是 14 个);**`priority` 此前只是 `weight` 的别名、从不参与选号** → 现数字越小越优先,导入一律 999,手工可调;非 us-east-1 账号刷新模型必然失败(`codewhisperer.{region}` 在该区不存在,DNS 都解析不了)→ 回落 `q.{region}` |
@@ -275,7 +276,7 @@ kiro2api 内置令牌自愈机制：token 到期**自动内存刷新**（单飞�
 ```bash
 # 健康检查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.14.0"}
+# {"service":"kiro2api","status":"ok","version":"0.14.1"}
 
 # 查看协议侧模型清单（固定短清单，不代表账号档位真的授权）
 curl http://localhost:8080/v1/models \

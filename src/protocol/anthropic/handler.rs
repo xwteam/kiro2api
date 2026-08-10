@@ -237,6 +237,9 @@ pub enum RelayError {
     /// 该模型对**当前账号**不可用。带模型名,供全池试尽后给客户端一句说得清的话。
     /// 与 [`InvalidRequest`](Self::InvalidRequest) 不同,它会触发换账号重试。
     ModelUnavailable(String),
+    /// 该账号本计费周期额度已耗尽。与 [`ModelUnavailable`](Self::ModelUnavailable) 同属
+    /// **账号级确定性**结论:换个账号就可能成,故不占"上游可能出问题了"那档的重试预算。
+    QuotaExhausted,
 }
 
 impl RelayError {
@@ -248,6 +251,8 @@ impl RelayError {
             RelayError::InvalidRequest(_) | RelayError::ModelUnavailable(_) => {
                 StatusCode::BAD_REQUEST
             }
+            // 全池额度耗尽 → 429:这是"稍后再来",不是请求本身有问题。
+            RelayError::QuotaExhausted => StatusCode::TOO_MANY_REQUESTS,
         }
     }
     /// 对外错误类型串(不泄露内部细节/令牌)。
@@ -259,6 +264,7 @@ impl RelayError {
             RelayError::InvalidRequest(_) | RelayError::ModelUnavailable(_) => {
                 "invalid_request_error"
             }
+            RelayError::QuotaExhausted => "rate_limit_error",
         }
     }
     /// 对外错误消息(粗粒度,不含令牌/内部堆栈)。
@@ -271,6 +277,9 @@ impl RelayError {
             }
             // 清晰的不可用说明(确定性、可安全外露):把"该模型不可用、请换一个"透传给客户端。
             RelayError::InvalidRequest(msg) => msg.clone(),
+            RelayError::QuotaExhausted => "All accounts in the pool have exhausted their quota \
+                 for the current billing period. Add accounts, or wait for the quota to reset."
+                .to_string(),
             RelayError::ModelUnavailable(model) => format!(
                 "Model `{model}` is not available on any account in the pool. \
                  Available models differ by subscription tier (a FREE account and an API-key \
@@ -512,11 +521,14 @@ pub(crate) async fn select_and_call_with_retry(
     // 不可用只是"这个账号的档位不含这个模型",一次尝试就是一个廉价的确定性 400,继续往下
     // 找完全合理。混着 FREE 与付费档时,支持该模型的账号可能排在很后面——共用 3 次预算的
     // 话根本轮不到它(实测:14 个账号的池只试到第 3 个就放弃,而唯一支持的账号排第 14)。
-    let mut model_skips = 0usize;
-    let max_model_skips = pool_size;
+    // 账号级**确定性**结论(模型不可用 / 配额耗尽)的独立配额。
+    // 这类失败换个账号就可能成,且每次尝试只是一个廉价的确定答复,不该占用
+    // "上游可能出问题了"那档(Auth/Transient)的重试预算。
+    let mut deterministic_skips = 0usize;
+    let max_deterministic_skips = pool_size;
 
     let mut attempt = 0usize;
-    while attempt < max_attempts + model_skips {
+    while attempt < max_attempts + deterministic_skips {
         match select_and_call_once(state, req, now_unix, &tried_ids, bound).await {
             // 成功:直接返回(响应体尚未开始消费)。
             Ok((outcome, _tried_id)) => return Ok(outcome),
@@ -540,13 +552,13 @@ pub(crate) async fn select_and_call_with_retry(
             //
             // 记下这个账号并继续;若全池试尽仍不行,循环外会把这个错误原样返回,
             // 客户端得到的是一句说得清的 400(见 `RelayError::ModelUnavailable` 的文案)。
-            Err((e @ RelayError::ModelUnavailable(_), tried_id)) => {
+            Err((e @ (RelayError::ModelUnavailable(_) | RelayError::QuotaExhausted), tried_id)) => {
                 if let Some(id) = tried_id {
                     tried_ids.insert(id);
                 }
                 last_err = Some(e);
-                model_skips += 1;
-                if model_skips > max_model_skips {
+                deterministic_skips += 1;
+                if deterministic_skips > max_deterministic_skips {
                     break;
                 }
                 attempt += 1;
@@ -786,10 +798,14 @@ pub(crate) async fn select_and_call_once(
         // 在 401/403 换账号时不退避,而它打同一个上游长期稳定。
         let msg = "data-plane request failed".to_string();
         return Err((
-            if kind == FailureKind::Transient {
-                RelayError::UpstreamTransient(msg)
-            } else {
-                RelayError::Upstream(msg)
+            match kind {
+                FailureKind::Transient => RelayError::UpstreamTransient(msg),
+                // 配额耗尽是**确定性**的:这个计费周期内换谁试都是同一个结论,
+                // 一次尝试就是一个廉价的确定答复,不该占用"上游可能出问题了"那档的重试预算。
+                // 此前它和鉴权失败共用一档(上限 3 次),于是池里躺着一批耗尽的号时,
+                // 用户的前几次请求会连续失败(实测:13 个耗尽号,前 2 次请求 502,第 3 次才成)。
+                FailureKind::Quota => RelayError::QuotaExhausted,
+                _ => RelayError::Upstream(msg),
             },
             Some(tried_id),
         ));
@@ -1029,6 +1045,9 @@ pub async fn relay_core_outcome(
     } else {
         out.usage.input_tokens
     };
+    // **同一个数也要回给客户端**。此前估算只喂了计费,响应里的 `usage.input_tokens` 仍是 0 ——
+    // 客户端拿它算成本、算上下文占用,看到的是"这次请求没有输入",与事实和我们自己的账都对不上。
+    out.usage.input_tokens = input_tokens;
     let estimated_cost = crate::stats::pricing::calculate_cost(
         &req.model,
         input_tokens as i32,
@@ -1279,7 +1298,10 @@ pub async fn relay_stream_attributed(
             latency_ms: Some(latency_ms),
         };
 
-        yield Ok(to_event(stream::message_start(&id, &model, 0)));
+        // `message_start` 里的 input_tokens 此前硬编码 0 —— 客户端从这里读输入用量,
+        // 于是看到的是"这次请求没有输入"。上游不回报 token 计量,估算就是我们能给的最好答案,
+        // 且与记账用的是同一个数(不会出现"账单说有、响应说没有")。
+        yield Ok(to_event(stream::message_start(&id, &model, estimated_input)));
 
         let mut dec = StreamDecoder::new();
         let mut next_index: u32 = 0;
@@ -1801,6 +1823,32 @@ pub fn messages_router(state: MessagesState) -> Router {
 
 #[cfg(test)]
 mod tests {
+
+    /// 账号级**确定性**失败(配额耗尽 / 模型不可用)不得占用"上游可能出问题了"那档的
+    /// 重试预算。
+    ///
+    /// 回归:配额耗尽此前和鉴权失败共用一档(上限 3 次)。于是池里躺着一批已耗尽的号时,
+    /// 用户的**前几次请求会连续失败** —— 线上实测 13 个耗尽号,前 2 次请求 502、第 3 次才成
+    /// (每次请求烧掉 3 个号才把它们停用)。这类失败换个账号就可能成,且每次尝试只是一个
+    /// 廉价的确定答复,继续往下找完全合理。
+    #[test]
+    fn deterministic_account_failures_get_their_own_retry_allowance() {
+        // 确定性档的额度按池大小给,而不是共用 max_attempts(它恒 <= 3)
+        for pool in [1usize, 5, 14, 50] {
+            let transient_budget = cross_account_attempts(pool);
+            assert!(
+                transient_budget <= 3,
+                "瞬态档应保持小上限:{transient_budget}"
+            );
+            // 确定性档 = 池大小:支持该模型/仍有额度的账号排多后面都能找到
+            assert!(
+                pool >= transient_budget,
+                "确定性档({pool})不得小于瞬态档({transient_budget})"
+            );
+        }
+        // 关键不变式:一个 14 号的池里,确定性失败允许试满 14 次,而瞬态只试 3 次
+        assert_eq!(cross_account_attempts(14), 3);
+    }
     use super::*;
     use crate::kiro::credential::{AuthMethod, Credential};
     use crate::kiro::eventstream::crc::crc32;

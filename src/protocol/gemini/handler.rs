@@ -204,6 +204,8 @@ fn relay_error_to_gemini(e: RelayError) -> Response {
         RelayError::InvalidRequest(msg) => (msg.clone(), "INVALID_ARGUMENT"),
         // 全池账号都不支持该模型(各账号档位不同)→ 400,文案见 RelayError::message。
         RelayError::ModelUnavailable(_) => (e.message(), "INVALID_ARGUMENT"),
+        // 全池额度耗尽 → 429 / RESOURCE_EXHAUSTED(gRPC 语义里正是这个)。
+        RelayError::QuotaExhausted => (e.message(), "RESOURCE_EXHAUSTED"),
     };
     let body = serde_json::json!({
         "error": { "code": status.as_u16(), "message": message, "status": grpc_status },

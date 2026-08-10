@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.14.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.14.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日付 | 更新内容 |
 |------|----------|
+| 2026-08-10 | v0.14.1 - 🔧 **Two things found while verifying the previous releases in production.** ① `usage.input_tokens` was **always 0** in responses: the estimate added in v0.13.0 only fed billing and was never written back, so the number existed in the invoice but not in the reply the client uses to compute cost and context usage — both the non-streaming `usage` and the streaming `message_start` now carry it. ② **With a batch of quota-exhausted accounts in the pool, a user's first few requests failed in a row**: quota exhaustion shared the 3-attempt budget with auth failures, and with 13 exhausted accounts two requests returned 502 before the third succeeded (each request burned three accounts before disabling them). Quota exhaustion is **deterministic** for the billing period, so it now shares the account-level deterministic class with "model unavailable" and gets an allowance sized to the pool, while transient and auth failures keep their small cap of 3. When the pool really is exhausted the answer is a `429` that says so, instead of an unhelpful 502 |
 | 2026-08-10 | v0.14.0 - 🧩 **比較の締めくくり**。① 履歴内のアシスタント回の `content` が**空文字**になり得て、上流がリクエスト全体を拒否していました(ツール呼び出しのみの回にはテキストが無く、ユーザー回には以前から非空のフォールバックがあったのにアシスタント回には無かった)→ 半角スペースで補完。② **境界が判明している破損フレームを 1 バイトずつ再走査**していました(prelude CRC が通れば `total_len` は信頼できる)→ フレームごとスキップ。③ **`tlsBackend` を実行時に切替可能**に(従来はコンパイル時の二択でイメージの再作成が必要)—— 自己署名 CA のプロキシ配下ではどちらか一方しかハンドシェイクできないことが多く、症状は「トークンを更新できない/接続できない」で、表面上は TLS と無関係に見えます |
 | 2026-08-09 | v0.13.0 - 🧠 **拡張思考(thinking)を完全に接続**しました(従来は機能自体が欠落)。リクエスト側では `thinking` フィールドが黙って捨てられ、上流には指示が届いていませんでした。レスポンス側では上流が `<thinking>…</thinking>` で思考を通常テキスト内に包んで送るのを素通しし、クライアントは思考全体を本文として表示していました。現在は enabled/adaptive の指示を system 冒頭へ注入し、独立した `thinking` ブロックへ分離します(ストリーミングでは `thinking_delta`)。通常テキストは**追加遅延ゼロ**で透過します。ほかに **token 推定が中国語を約 3 倍過小評価**していた点、**ストリーミングの入力トークンが常に 0** だった点、**コンテキストウィンドウが全モデル 200K 固定**(上流の `maxInputTokens` を解析後に破棄)だった点を修正 |
 | 2026-08-09 | v0.12.0 - 🎚️ **異なるサブスクリプション階層のアカウントがようやく共存できます**(ユーザーが調査用に提供した実物の API キーで再現・検証)。原因は 2 つ:① `INVALID_MODEL_ID` を*リクエスト級*の誤りとして即 400 にしていましたが、実際は*アカウント級*です — 利用可能モデルは階層で決まる一方、本サービスがクライアントへ見せるのは全アカウントの**和集合**であり、和集合中のモデルが非対応アカウントに当たれば必ず失敗します → `ModelUnavailable` として分離し、アカウントは罰さず別のアカウントで再試行。② 別アカウントへの再試行枠は 3 回でしたが、対応アカウントが 14 番目ということもあります → モデル非対応はアカウント障害の枠を消費しません。ほかに「どのアカウントがどのモデルに非対応か」を記憶(同一モデルの 2 回目は 1 アカウントのみ、1 回目は 14)、**`priority` は `weight` の別名にすぎず選択に一切影響していなかった** → 数字が小さいほど優先、インポートは一律 999、us-east-1 以外でのモデル更新失敗を `q.{region}` へフォールバック |
@@ -251,7 +252,7 @@ docker compose logs -f
 ```bash
 # ヘルスチェック
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.14.0"}
+# {"service":"kiro2api","status":"ok","version":"0.14.1"}
 
 # 利用可能なモデルを表示
 curl http://localhost:8080/v1/models \
