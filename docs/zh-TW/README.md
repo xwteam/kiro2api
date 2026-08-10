@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.15.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.16.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-08-10 | v0.16.0 - 🔍 **又跑了一轮独立复核,找出 6 处——好几处是此前的修复只落了一半**。①`amz-sdk-invocation-id` 的 UUID 修复**只落了 3/5 个调用点**:balance 与 models_cache 各自私有一份同名旧生成器被局部遮蔽,搜索时看着像"已统一",实际同一枚 Bearer 在数据面发 UUID、在余额发裸 hex;②**登录流对 oidc 主机一个头都不带、连 UA 都没有**——正是 v0.10.0 在刷新链路修过的同一缺陷,而登录打的是**同一台主机的相邻路径**,且注册裸奔、几分钟后同一 clientId 又用完美 SDK 头去刷新,这种前后矛盾比裸请求更易被关联;③**region 三条链路各算各的**(数据面按 profileArn、余额/模型用裸 cred.region)→ 余额恒查不出,且同一枚 Bearer 同时命中两个 region;④history 里的工具名没走缩短,与 tools 列表的短名对不上;⑤**改优先级不触发重新选号**,粘滞档下等于没改;⑥**全池被判停后无自愈**——上游抖一阵把所有号判停,池子就此彻底不可用直到有人重启。另:README 更新历史只留最近 10 条,完整看 CHANGELOG |
 | 2026-08-10 | v0.15.0 - 🔁 **额度耗尽的账号不再每次重启都要重新学一遍**(用户直接问到:"额度用完的号不是已经禁用了吗,为什么还会请求到已禁用的账号?")。是禁用了,但只在**内存**里——v0.10.2 为免一次抖动把账号永久写死,让运行期停用不落盘;而配额恰恰是**有明确恢复时刻**的那类。于是每次发版重启就把"谁没额度"忘光,再拿**用户的请求**去重新发现(实测 13 个耗尽号:前 2 次 502、第 3 次才成)→ 现按恢复时刻落盘,重启仍记得、到点自动回池;恢复时刻优先取上游 `nextResetAt`,没有才按下月一号估。另:**服务端内置搜索 `web_search` 真正接上了** —— 此前只是"容忍"这个工具声明(不再 400),但从不真的搜索,模型照常回段文本、客户端以为搜过了。现在这类请求在进数据面前被截住,调上游 `/mcp` 端点拿结果再合成 `server_tool_use` + `web_search_tool_result` |
 | 2026-08-10 | v0.14.1 - 🔧 **线上验证时当场发现的两件事**。①响应里 `usage.input_tokens` **恒为 0**:v0.13.0 补的输入估算只喂给了计费、没回写客户端 —— 账单里有、响应里没有,而客户端拿它算成本和上下文占用 → 非流式 `usage` 与流式 `message_start` 现在都带同一个值;②**池里有一批耗尽的号时,用户前几次请求会连续失败**:配额耗尽此前与鉴权失败共用 3 次重试预算,实测 13 个耗尽号要连烧 2 次 502、第 3 次才成 → 配额是**确定性**结论(本周期换谁都一样),现与"模型不可用"同归账号级确定性档、按池大小给预算;瞬态/鉴权仍保持 3 次小上限。全池确实耗尽时回 `429` 并说清是额度问题,而不是语焉不详的 502 |
 | 2026-08-10 | v0.14.0 - 🧩 **對照收尾**。①歷史裡助手輪 `content` 可能是**空串**,上游據此拒掉整條請求(純工具呼叫那一輪就是空,使用者輪早有兜底、助手輪一直漏著)→ 用單個空格佔位;②**損壞幀被逐位元組重掃,而它的邊界本來已知**(prelude CRC 通過則 `total_len` 可信)→ 整幀跳過;③**`tlsBackend` 改為執行時可切**(此前編譯期二選一)——走自簽 CA 代理時往往只有一個後端握得上手 |
@@ -70,7 +71,6 @@
 | 2026-08-09 | v0.11.0 - 🧰 **修「會讓請求被上游拒」的一類**。①服務端內建工具(web_search 等)沒有 `input_schema`,而該欄位此前是必填 → 客戶端一用官方寫法,請求就在我們這層 400;②工具 `description` 會序列化成 **null**;③`input_schema` 原樣透傳,形狀不合法會被上游拒掉**整條請求** → 現統一規範化;④超長工具名不縮短(上游上限 63)、縮短後也無法還原 → 現確定性縮短並把 `短名→原名` 帶到出口;⑤`:message-type == "error"` 的框架級錯誤幀被整個忽略 → 上游報錯卻還原成 200+空訊息;⑥面板缺失資源返回 200+HTML 而非 404。另:新增 `POST /api/admin/credentials/{id}/refresh` |
 | 2026-08-09 | v0.10.2 - 🩹 **修:執行期停用被寫進磁碟,「重啟即復活」形同虛設**。v0.10.0 宣告只置記憶體態,但落盤時 `snapshot_credentials()` 拿執行時 `disabled` 覆寫了 `cred.disabled` —— 一次額度耗盡或兩次 401/403 就把帳號**永久**寫死在 credentials.json 裡,比修復前更糟。現落盤只取持久結論。**若你的 credentials.json 裡有你沒手工停過的 `"disabled": true`,改回 false 即可恢復** |
 | 2026-08-09 | v0.10.1 - 🔌 **出站代理按帳號分流 + 補齊工作階段身分欄位**。①代理三件套此前**收下即丟**、`hasProxy` 還硬編碼 false —— 面板顯示配好了、實際全程直連;現真正落庫生效,優先級 憑證級 > 全域 > 直連(`"direct"` 顯式直連),且**同一帳號的資料面/重新整理/餘額/模型清單/背景續期一律同一出口**;②`conversationId` 此前每請求新生成且不是 UUID 形狀 → 改為優先取客戶端 `metadata.user_id` 裡的 session UUID,同工作階段共用;③此前**根本不發** `agentContinuationId`,已補;④管理面新增的帳號不會凍結 machineId,現入池即凍結;⑤`isCurrent` 硬編碼 false,現報真值 |
-| 2026-08-09 | v0.10.0 - 🎯 **按行為形態對齊真實客戶端**。對照一個長期穩定的同類實作逐模組比對後,前兩版對封號的歸因被推翻:那份實作既複用連線、也不鎖 HTTP/1.1、TLS 還預設 rustls,我們賭的三件事它一件沒做。真正的差異是:①`priority` 此前**每請求換一個帳號**,上游在同一 IP 上看到幾百個 machineId 秒級交替 → 改為**黏住一個帳號直到它不可用**;②封停/額度耗盡的帳號此前冷卻 5/30 分鐘後**自動回池**,等於永不停止地去撞牆 → 改為停止使用(記憶體態,重設可復活);③**令牌重新整理請求連 User-Agent 都沒有**(實測位元組),而那是 Kiro 自家端點、每個帳號必走 → 按 axios/sso-oidc 兩種真實形態補齊;④**machineId 每重新整理一次就變**(由會輪換的 refreshToken 現算)→ 載入時凍結落盤;⑤ksk 帳號 machineId 退化成全域常數 → 按型別互斥衍生。另:429 改判瞬時限流、資料面端點三個收斂為一個、`amz-sdk-invocation-id` 改 UUID v4、標頭順序對齊、補 `claude-opus-5` 對應、SSE 加 25 秒保活 |
 
 ---
 
@@ -220,7 +220,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.15.0"}
+# {"service":"kiro2api","status":"ok","version":"0.16.0"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \

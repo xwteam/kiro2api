@@ -42,14 +42,40 @@ struct TokenResp {
     expires_in: u64,
 }
 
+/// 同 builderid:登录流与刷新打同一台 `oidc.{region}.amazonaws.com`,头要一致。
+fn oidc_headers(url: &str) -> reqwest::header::HeaderMap {
+    use reqwest::header::HeaderValue;
+    let mut h = reqwest::header::HeaderMap::new();
+    crate::kiro::login::apply_sso_oidc_headers(&mut h, &crate::kiro::login::login_impersonation());
+    if let Some(host) = crate::kiro::provider::host_of(url) {
+        h.insert(
+            "host",
+            HeaderValue::from_str(&host).unwrap_or_else(|_| HeaderValue::from_static("")),
+        );
+    }
+    h.insert(
+        "amz-sdk-invocation-id",
+        HeaderValue::from_str(&crate::kiro::provider::new_invocation_id())
+            .unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+    h.insert(
+        "amz-sdk-request",
+        HeaderValue::from_static("attempt=1; max=4"),
+    );
+    h.insert("connection", HeaderValue::from_static("close"));
+    h
+}
+
 /// 注册客户端并构造 authorize URL。
 pub async fn start(
     client: &reqwest::Client,
     base: &str,
     start_url: &str,
 ) -> Result<AuthStart, LoginError> {
+    let url = format!("{base}/client/register");
     let resp = client
-        .post(format!("{base}/client/register"))
+        .post(&url)
+        .headers(oidc_headers(&url))
         .json(&serde_json::json!({
             "clientName": CLIENT_NAME, "clientType": CLIENT_TYPE, "scopes": SCOPES,
             "grantTypes": [AUTH_CODE_GRANT, "refresh_token"],
@@ -117,8 +143,10 @@ pub async fn complete(
     s: &AuthStart,
     code: &str,
 ) -> Result<MintedCredential, LoginError> {
+    let url = format!("{base}/token");
     let resp = client
-        .post(format!("{base}/token"))
+        .post(&url)
+        .headers(oidc_headers(&url))
         .json(&serde_json::json!({
             "clientId": s.client_id, "clientSecret": s.client_secret,
             "grantType": AUTH_CODE_GRANT, "code": code,

@@ -58,6 +58,24 @@ pub fn sorted(region: &str, preferred: &str, fallback: bool) -> Vec<Endpoint> {
     }
 }
 
+/// 该账号实际使用的 region:**优先取 profileArn 里编码的真实 region**,回落 `cred.region`,
+/// 再回落 `us-east-1`。
+///
+/// 全项目**唯一入口**。此前数据面用这套、余额与模型清单直接用裸 `cred.region` —— 于是一个
+/// ARN 写 eu-central-1、导入时没给 region 的账号,数据面打 `q.eu-central-1`、余额却打
+/// `q.us-east-1`:功能上余额恒查不出(面板一直显示未知额度),wire 上则是同一枚 Bearer 在
+/// 同一分钟命中两个 region 的端点 —— 真实客户端不会这么做。
+pub fn effective_region(cred: &crate::kiro::credential::Credential) -> String {
+    cred.profile_arn
+        .as_deref()
+        .and_then(region_from_profile_arn)
+        .or_else(|| {
+            let r = cred.region.trim();
+            (!r.is_empty()).then(|| r.to_string())
+        })
+        .unwrap_or_else(|| "us-east-1".to_string())
+}
+
 /// 校验字符串是否长得像 AWS region:`^[a-z]{2}-[a-z]+-\d+$`
 /// (两位小写字母国别 - 一段小写字母方位 - 一位以上数字,如 us-east-1 / ap-northeast-1)。
 /// 无正则依赖,手写扫描等价校验。
@@ -161,6 +179,34 @@ mod tests {
         let s = sorted("us-east-1", "amazonq", true);
         assert_eq!(s.len(), 1);
         assert!(s[0].url.contains("q.us-east-1.amazonaws.com"));
+    }
+
+    /// region 解析必须**全项目一个口径**。
+    ///
+    /// 回归:此前只有数据面按 profileArn 解析,余额与模型清单直接用裸 `cred.region` —— 一个
+    /// ARN 写 eu-central-1、导入时没给 region 的账号,数据面打 q.eu-central-1、余额却打
+    /// q.us-east-1:余额恒查不出,而且同一枚 Bearer 在同一分钟命中两个 region 的端点。
+    #[test]
+    fn effective_region_prefers_the_arn_then_falls_back() {
+        let mut c = crate::kiro::credential::tests_support_cred();
+        c.region = "us-east-1".into();
+
+        // ARN 里的 region 优先(它才是账号真实所在)
+        c.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:1:profile/A".into());
+        assert_eq!(effective_region(&c), "eu-central-1");
+
+        // 没有 ARN → 用 cred.region
+        c.profile_arn = None;
+        assert_eq!(effective_region(&c), "us-east-1");
+
+        // ARN 畸形 → 不把垃圾段当 region,回落 cred.region
+        c.profile_arn = Some("arn:aws:codewhisperer:NOT_A_REGION:1:profile/A".into());
+        assert_eq!(effective_region(&c), "us-east-1");
+
+        // 两者都缺 → us-east-1,绝不产出空 region(那会拼出 `q..amazonaws.com`,DNS 直接失败)
+        c.profile_arn = None;
+        c.region = "  ".into();
+        assert_eq!(effective_region(&c), "us-east-1");
     }
 
     #[test]

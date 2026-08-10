@@ -83,8 +83,34 @@ async fn post_json<T: serde::Serialize>(
     url: &str,
     body: &T,
 ) -> Result<reqwest::Response, LoginError> {
+    // 补齐 sso-oidc 伪装头:登录流与令牌刷新打的是**同一台主机**,理应长得一样。
+    // 此前这里一个头都不带、连 User-Agent 都没有,而登录恰恰是账号刚被创建、
+    // 上游最会看指纹的时刻(见 `apply_sso_oidc_headers` 的说明)。
+    let mut h = reqwest::header::HeaderMap::new();
+    crate::kiro::login::apply_sso_oidc_headers(&mut h, &crate::kiro::login::login_impersonation());
+    if let Some(host) = crate::kiro::provider::host_of(url) {
+        h.insert(
+            "host",
+            reqwest::header::HeaderValue::from_str(&host)
+                .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("")),
+        );
+    }
+    h.insert(
+        "amz-sdk-invocation-id",
+        reqwest::header::HeaderValue::from_str(&crate::kiro::provider::new_invocation_id())
+            .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("")),
+    );
+    h.insert(
+        "amz-sdk-request",
+        reqwest::header::HeaderValue::from_static("attempt=1; max=4"),
+    );
+    h.insert(
+        "connection",
+        reqwest::header::HeaderValue::from_static("close"),
+    );
     client
         .post(url)
+        .headers(h)
         .json(body)
         .send()
         .await

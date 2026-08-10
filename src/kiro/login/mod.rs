@@ -285,3 +285,73 @@ mod tests {
         assert_eq!(expired.take("k"), None); // ttl=0 立即过期
     }
 }
+
+/// 给一个 AWS SSO-OIDC 请求补齐伪装头(照真实客户端形态)。
+///
+/// 登录流(`/client/register`、`/device_authorization`、`/token`)与令牌刷新打的是**同一台
+/// 主机** `oidc.{region}.amazonaws.com`,理应长得一样。此前只有刷新补齐了,登录流
+/// **一个头都不带、连 User-Agent 都没有** —— 而登录恰恰是账号刚被创建、上游最会看指纹的
+/// 时刻。更糟的是前后不一致:注册时裸奔,几分钟后同一个 clientId 又用完美的 aws-sdk-js 头
+/// 去刷新,这种矛盾比单纯的裸请求更容易被关联。
+///
+/// SDK 版本是 sso-oidc 自己的 3.980.0(不是数据面那个 1.0.34),尾部**不带** machineId。
+pub fn apply_sso_oidc_headers(
+    h: &mut reqwest::header::HeaderMap,
+    imp: &crate::kiro::provider::Impersonation,
+) {
+    use reqwest::header::{HeaderName, HeaderValue};
+    let hv = |s: &str| HeaderValue::from_str(s).unwrap_or_else(|_| HeaderValue::from_static(""));
+    h.insert("content-type", HeaderValue::from_static("application/json"));
+    if let Ok(name) = HeaderName::from_bytes(b"x-amz-user-agent") {
+        h.insert(name, HeaderValue::from_static("aws-sdk-js/3.980.0 KiroIDE"));
+    }
+    h.insert(
+        reqwest::header::USER_AGENT,
+        hv(&format!(
+            "aws-sdk-js/3.980.0 ua/2.1 os/{} lang/js md/nodejs#{} api/sso-oidc#3.980.0 m/E KiroIDE",
+            imp.system_version, imp.node_version
+        )),
+    );
+}
+
+/// 登录流用的伪装身份。登录时还没有凭据,故 machineId 不参与(sso-oidc 的 UA 本就不带它)。
+pub fn login_impersonation() -> crate::kiro::provider::Impersonation {
+    let cfg = crate::config::Config::default();
+    crate::kiro::provider::Impersonation {
+        machine_id: String::new(),
+        kiro_version: cfg.kiro_version,
+        agent_mode: "vibe".to_string(),
+        system_version: cfg.system_version,
+        node_version: cfg.node_version,
+    }
+}
+
+#[cfg(test)]
+mod sso_header_tests {
+    use super::*;
+
+    /// SSO-OIDC 请求必须带齐伪装头,**登录流与刷新用同一份**。
+    ///
+    /// 回归:登录流(`/client/register`、`/device_authorization`、`/token`)打的是与刷新
+    /// **同一台主机** `oidc.{region}.amazonaws.com`,却一个头都不带、连 User-Agent 都没有。
+    /// 而登录恰恰是账号刚被创建、上游最会看指纹的时刻;更糟的是前后不一致 —— 注册时裸奔,
+    /// 几分钟后同一个 clientId 又用完美的 aws-sdk-js 头去刷新。
+    #[test]
+    fn sso_oidc_headers_are_complete_and_shared() {
+        let mut h = reqwest::header::HeaderMap::new();
+        apply_sso_oidc_headers(&mut h, &login_impersonation());
+
+        let ua = h[reqwest::header::USER_AGENT].to_str().unwrap();
+        assert!(
+            ua.starts_with("aws-sdk-js/3.980.0"),
+            "SDK 版本应是 sso-oidc 自己的: {ua}"
+        );
+        assert!(ua.contains("api/sso-oidc#3.980.0"), "{ua}");
+        assert!(ua.ends_with("KiroIDE"), "尾部不带 machineId: {ua}");
+        assert_eq!(
+            h["x-amz-user-agent"].to_str().unwrap(),
+            "aws-sdk-js/3.980.0 KiroIDE"
+        );
+        assert_eq!(h["content-type"].to_str().unwrap(), "application/json");
+    }
+}

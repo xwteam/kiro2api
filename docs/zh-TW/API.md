@@ -1249,7 +1249,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.15.0"}
+{"service":"kiro2api","status":"ok","version":"0.16.0"}
 ```
 
 ### GET /v1/ping

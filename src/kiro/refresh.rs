@@ -90,17 +90,7 @@ fn refresh_headers(
             );
         }
         _ => {
-            h.insert("content-type", HeaderValue::from_static("application/json"));
-            if let Ok(name) = reqwest::header::HeaderName::from_bytes(b"x-amz-user-agent") {
-                h.insert(name, HeaderValue::from_static("aws-sdk-js/3.980.0 KiroIDE"));
-            }
-            h.insert(
-                reqwest::header::USER_AGENT,
-                hv(&format!(
-                    "aws-sdk-js/3.980.0 ua/2.1 os/{} lang/js md/nodejs#{} api/sso-oidc#3.980.0 m/E KiroIDE",
-                    imp.system_version, imp.node_version
-                )),
-            );
+            crate::kiro::login::apply_sso_oidc_headers(&mut h, imp);
         }
     }
     if let Some(host) = crate::kiro::provider::host_of(base) {

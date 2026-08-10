@@ -786,7 +786,42 @@ impl Pool {
                 && !excluded(&e.cred)
         };
         // 收集可用下标:disabled/cooldown/RPM 过滤之外再叠加排除集过滤
-        let active: Vec<usize> = (0..n).filter(|&i| eligible(&self.entries[i])).collect();
+        let mut active: Vec<usize> = (0..n).filter(|&i| eligible(&self.entries[i])).collect();
+        // **全池都被运行期判停时的自愈**。
+        //
+        // 运行期停用(连续鉴权失败 / 配额)只活在内存里,本意是"重启即复活"。但服务是常驻的:
+        // 若上游抖了一阵把所有账号都判停,池子就此彻底不可用,直到有人重启或逐个点重置——
+        // 而抖动本身可能早就过去了。这是"坏号不回池"那条纪律的反面代价,不能不管。
+        //
+        // 故:全池皆停时,把**仅因运行期判停**的账号放回来重试一轮(持久禁用、上游确证的
+        // 封禁、以及尚未到恢复时刻的配额**一律不放**——那三类不是抖动)。放回来的号若真坏,
+        // 下一次失败会立刻把它重新判停,不会来回震荡。
+        if active.is_empty() {
+            let revived: Vec<usize> = (0..n)
+                .filter(|&i| {
+                    let e = &self.entries[i];
+                    e.disabled
+                        && !e.cred.disabled
+                        && e.status_reason != StatusReason::Banned
+                        && !Self::quota_still_exhausted(e, now_unix)
+                        && Self::rpm_ok(e, now_unix, max_rpm)
+                        && Self::supports_model(e, model)
+                        && !excluded(&e.cred)
+                })
+                .collect();
+            if !revived.is_empty() {
+                tracing::warn!(
+                    event = "pool_self_heal",
+                    revived = revived.len(),
+                    "全池账号都已被运行期判停,放回一轮重试(持久禁用/封禁/未到期配额不在其列)"
+                );
+                for &i in &revived {
+                    self.entries[i].disabled = false;
+                    self.entries[i].strikes = 0;
+                }
+                active = revived;
+            }
+        }
         if active.is_empty() {
             return None;
         }
@@ -1034,6 +1069,12 @@ impl Pool {
     pub fn set_priority(&mut self, id: &str, priority: i64) -> bool {
         if let Some(e) = self.find(id) {
             e.cred.priority = priority.clamp(0, u32::MAX as i64) as u32;
+            // **必须解除粘滞**,否则改了等于没改。
+            //
+            // Priority 档是粘滞的:只有当前账号不可用才换人。把某个号调成最高优先级后,
+            // 如果不松开粘滞,它要一直等到当前那个号坏掉才轮得到 —— 运营者点了按钮、
+            // 面板也显示改了,流量却纹丝不动。
+            self.current = None;
             true
         } else {
             false
@@ -1601,6 +1642,26 @@ mod tests {
         assert_eq!(p.stats(100)[0].strikes, 0);
     }
 
+    /// 改优先级必须**当场生效**,而不是等当前账号坏掉才轮到。
+    ///
+    /// 回归:Priority 档是粘滞的,只有当前账号不可用才换人。把某个号调成最高优先级后,
+    /// 若不松开粘滞,它要一直等到当前那个号坏掉才轮得到 —— 运营者点了按钮、面板也显示
+    /// 改了,流量却纹丝不动。
+    #[test]
+    fn changing_priority_takes_effect_immediately() {
+        let mut p = Pool::new(vec![cred("a", 1), cred("b", 1)], LbMode::Priority);
+        assert_eq!(p.select(0).unwrap().id, "a", "先粘在 a 上");
+        assert_eq!(p.select(0).unwrap().id, "a");
+
+        // 把 b 调成更高优先级 → 下一次选号就该换过去
+        assert!(p.set_priority("b", 1));
+        assert_eq!(
+            p.select(0).unwrap().id,
+            "b",
+            "改完优先级应当场换号,而不是等 a 坏掉"
+        );
+    }
+
     /// Priority 档换号时取**优先级最小**的账号(数字越小越优先)。
     ///
     /// 回归:`priority` 此前只是 `weight` 的别名,而 `weight` 只在 balanced 档起作用 ——
@@ -1925,23 +1986,67 @@ mod tests {
     #[test]
     fn ambiguous_auth_stops_the_account_after_strikes_and_does_not_come_back() {
         // 裸 403(无失效信号)——上游的封停响应正落在这一档。
-        let mut p = Pool::new(vec![cred("a", 1)], LbMode::Priority);
+        //
+        // 池里放**两个**账号:只剩一个时会触发"全池皆停"的自愈(见
+        // `select_excluding_for_model`),那是另一条刻意的规则,会把这里要测的东西盖掉。
+        let mut p = Pool::new(vec![cred("a", 1), cred("b", 1)], LbMode::Priority);
         let kind = classify(403);
         assert_eq!(kind, FailureKind::AuthAmbiguous);
         p.report_failure("a", kind, 100);
-        assert!(p.select(100).is_some(), "第 1 次还不该停用");
+        assert_eq!(p.select(100).unwrap().id, "a", "第 1 次还不该停用");
         p.report_failure("a", kind, 100);
-        assert!(p.select(100).is_none(), "达阈值后停用");
+        assert_eq!(
+            p.select(100).unwrap().id,
+            "b",
+            "达阈值后停用,应换到另一个号"
+        );
         // 关键:**不再**"冷却 5 分钟又回池"。旧行为让一个已被上游封停的账号每 5 分钟
         // 被重新拿去打一次,永不停止 —— 几百个号就是一条持续的 401/403 背景流。
-        assert!(
-            p.select(100 + 5 * 60 + 1).is_none(),
+        //
+        // 注意这里要**再放一个健康账号进来**才测得准:池里只剩这一个号时会触发"全池皆停"
+        // 的自愈(见 `select_excluding_for_model`),那是另一条刻意的规则 —— 服务常驻,
+        // 上游抖一阵把所有号判停后总得有条出路。有别的号可选时,判停的这个就该一直靠边站。
+        assert_eq!(
+            p.select(100 + 5 * 60 + 1).unwrap().id,
+            "b",
             "被判不可用的账号不该在冷却后自行回池"
         );
-        assert!(p.select(100 + 86_400).is_none());
+        assert_eq!(p.select(100 + 86_400).unwrap().id, "b");
         // 同样只是内存态:重启或管理员重置可复活,避免把上游一次权限抖动变成永久损失。
         p.reset_failures("a");
         assert!(p.select(100 + 86_400).is_some(), "重置后应可复活");
+    }
+
+    /// 全池都被**运行期**判停时要有自愈:放回来重试一轮,而不是就此彻底不可用。
+    ///
+    /// 服务是常驻的。上游抖一阵把所有账号都判停后,若没有出路,池子会一直死到有人重启或
+    /// 逐个点重置 —— 而抖动本身可能早就过去了。这是"坏号不回池"那条纪律的反面代价。
+    ///
+    /// 但**三类不放**:持久禁用(管理员关的)、上游确证的封禁、尚未到恢复时刻的配额。
+    /// 那三类都不是抖动。
+    #[test]
+    fn a_fully_stopped_pool_heals_itself_but_not_for_the_three_hard_verdicts() {
+        let now = 1_000u64;
+        // 运行期判停(鉴权歧义)→ 全池皆停 → 应放回来
+        let mut p = Pool::new(vec![cred("a", 1)], LbMode::Priority);
+        p.report_failure("a", FailureKind::AuthAmbiguous, now);
+        p.report_failure("a", FailureKind::AuthAmbiguous, now);
+        assert!(p.select(now).is_some(), "全池皆停时应放回来重试一轮");
+
+        // 上游确证的封禁 → 不放
+        let mut banned = Pool::new(vec![cred("b", 1)], LbMode::Priority);
+        banned.report_failure_with_reason("b", FailureKind::AuthInvalid, StatusReason::Banned, now);
+        assert!(banned.select(now).is_none(), "确证封禁的账号不得被自愈放回");
+
+        // 管理员手工停用 → 不放
+        let mut off = Pool::new(vec![cred("c", 1)], LbMode::Priority);
+        off.set_disabled("c", true);
+        assert!(off.select(now).is_none(), "手工停用的账号不得被自愈放回");
+
+        // 配额未到恢复时刻 → 不放
+        let mut q = Pool::new(vec![cred("d", 1)], LbMode::Priority);
+        q.report_failure("d", FailureKind::Quota, now);
+        assert!(q.select(now + 60).is_none(), "配额未到期不得被自愈放回");
     }
 
     #[test]

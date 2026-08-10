@@ -460,7 +460,10 @@ fn message_tool_results(msg: &InMsg) -> Vec<ToolResultWire> {
 }
 
 /// 从一条消息里提取所有 `Block::ToolUse`,映射成 Kiro `ToolUseWire` 列表。
-fn message_tool_uses(msg: &InMsg) -> Vec<ToolUseWire> {
+fn message_tool_uses(
+    msg: &InMsg,
+    map: &mut std::collections::HashMap<String, String>,
+) -> Vec<ToolUseWire> {
     let ContentIn::Blocks(blocks) = &msg.content else {
         return Vec::new();
     };
@@ -469,7 +472,12 @@ fn message_tool_uses(msg: &InMsg) -> Vec<ToolUseWire> {
         .filter_map(|b| match b {
             Block::ToolUse { id, name, input } => Some(ToolUseWire {
                 tool_use_id: id.clone(),
-                name: name.clone(),
+                // **历史里的工具名也要走同一套缩短**。
+                //
+                // 此前只有 `tools` 列表里的名字被缩短,history 里的 `toolUses` 发的还是原名 ——
+                // 于是上游看到"声明的工具叫短名、历史里调用的却是另一个名字",两者对不上。
+                // 缩短是确定性的,所以同一个名字在两处必然缩成同一个短名。
+                name: map_tool_name(name, map),
                 input: input.clone(),
             }),
             _ => None,
@@ -693,7 +701,7 @@ fn anthropic_to_kiro_inner(
         .zip(history_msgs.iter())
         .map(|(msg, text)| {
             if msg.role == "assistant" {
-                let tool_uses = message_tool_uses(msg);
+                let tool_uses = message_tool_uses(msg, tool_name_map);
                 Ok(HistoryItem::AssistantResponseMessage {
                     assistant_response_message: AssistantResponseMessage {
                         // 助手轮的内容**不能是空串**。
@@ -1604,6 +1612,67 @@ mod tests {
         }]);
         let c = anthropic_to_kiro_full(&r2, None).unwrap();
         assert!(c.tool_name_map.is_empty());
+    }
+
+    /// history 里的工具名也必须走同一套缩短,否则与 tools 列表里的短名对不上。
+    ///
+    /// 回归:此前只有 `tools` 列表被缩短,history 的 `toolUses` 发的还是原名 —— 上游看到的是
+    /// "声明的工具叫短名、历史里调用的却是另一个名字",两者对不上。
+    #[test]
+    fn history_tool_names_use_the_same_shortening_as_the_tool_list() {
+        let long = "y".repeat(120);
+        let mut r = base_req(vec![
+            InMsg {
+                role: "assistant".into(),
+                content: ContentIn::Blocks(vec![Block::ToolUse {
+                    id: "t1".into(),
+                    name: long.clone(),
+                    input: serde_json::json!({}),
+                }]),
+            },
+            InMsg {
+                role: "user".into(),
+                content: ContentIn::Text("继续".into()),
+            },
+        ]);
+        r.tools = Some(vec![ToolDef {
+            tool_type: None,
+            name: long.clone(),
+            description: Some("d".into()),
+            input_schema: serde_json::json!({"type": "object"}),
+        }]);
+        let c = anthropic_to_kiro_full(&r, None).unwrap();
+
+        let declared = c
+            .request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools
+            .as_ref()
+            .unwrap()[0]
+            .tool_specification
+            .name
+            .clone();
+        let in_history = match &c.request.conversation_state.history[0] {
+            HistoryItem::AssistantResponseMessage {
+                assistant_response_message,
+            } => assistant_response_message.tool_uses.as_ref().unwrap()[0]
+                .name
+                .clone(),
+            other => panic!("首条应是助手轮:{other:?}"),
+        };
+        assert_eq!(
+            in_history, declared,
+            "history 里的工具名必须与声明的短名一致"
+        );
+        assert_ne!(in_history, long, "超长名必须被缩短");
+        assert_eq!(
+            c.tool_name_map.get(&declared),
+            Some(&long),
+            "映射能还原回原名"
+        );
     }
 
     /// 同一次会话的多个请求必须共用同一个 `conversationId`。

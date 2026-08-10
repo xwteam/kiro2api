@@ -828,19 +828,10 @@ pub(crate) async fn select_and_call_once(
 /// 动机(#9):非 us-east-1 账号的 profileArn ARN 段带真实 region;若只看 `cred.region`
 /// (默认 us-east-1)会把请求发到 us-east-1 主机 → 403/400。ARN 解析在
 /// [`crate::kiro::endpoint::region_from_profile_arn`]。
+/// 数据面的有效 region。收口到 [`crate::kiro::endpoint::effective_region`] —— 此前这套逻辑
+/// 只活在数据面,余额与模型清单各用裸 `cred.region`,同一个账号会打到两个 region 的主机。
 fn effective_region(cred: &crate::kiro::credential::Credential) -> String {
-    cred.profile_arn
-        .as_deref()
-        .and_then(crate::kiro::endpoint::region_from_profile_arn)
-        .or_else(|| {
-            let r = cred.region.trim();
-            if r.is_empty() {
-                None
-            } else {
-                Some(r.to_string())
-            }
-        })
-        .unwrap_or_else(|| "us-east-1".to_string())
+    crate::kiro::endpoint::effective_region(cred)
 }
 
 /// 发一次数据面请求(**不反馈池**)。成功→`Ok(Response)`;失败→`Err((FailureKind, status))`,

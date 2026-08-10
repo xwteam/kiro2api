@@ -182,7 +182,7 @@ pub async fn fetch_usage_limits(
     cfg: &crate::config::Config,
     cred: &Credential,
 ) -> Result<UsageLimitsResponse, BalanceError> {
-    let base = region_base(&cred.region);
+    let base = region_base(&crate::kiro::endpoint::effective_region(cred));
     let imp = impersonation_for(cred, cfg);
     fetch_at(client, &base, cred, &imp).await
 }
@@ -244,9 +244,11 @@ pub async fn fetch_usage_limits_fresh(
 
 /// 随机请求关联 id(16 字节 CSPRNG 十六进制),供 amz-sdk-invocation-id 使用。
 fn new_invocation_id() -> String {
-    let mut raw = [0u8; 16];
-    getrandom::getrandom(&mut raw).expect("CSPRNG");
-    hex::encode(raw)
+    // 收口到唯一实现。此前这里各自写了一份 `hex(16 字节)` —— 32 位无连字符十六进制,
+    // 而 aws-sdk-js 这个头**永远**是 UUID v4。数据面那份在 v0.10.0 已改对,这两条控制面
+    // 链路却各留一份旧的,于是同一个账号在数据面发 UUID、在余额/模型清单发裸 hex,
+    // 自己跟自己对不上——比统一发错还刺眼。
+    crate::kiro::provider::new_invocation_id()
 }
 
 #[cfg(test)]
