@@ -458,6 +458,22 @@ pub async fn chat_completions_stream(
             }
         }
 
+
+        // 收尾:把切分器里还压着的内容吐干净(半截标签按普通内容处理),绝不吞。
+        // `feed` 为了兜住跨块的半截 `<thinking` 会扣留结尾那几个字节 —— 不调 `finish`,
+        // 响应结尾只要出现一个 `<`(代码块里的 `<div` 之类极常见),那一截就永远丢了。
+        for piece in splitter.finish() {
+            let (content, reasoning) = match piece {
+                crate::kiro::convert::Piece::Text(x) => (Some(x), None),
+                crate::kiro::convert::Piece::Thinking(x) => (None, Some(x)),
+            };
+            yield Ok(make(ChunkChoice {
+                index: 0,
+                delta: Delta { role: None, content, tool_calls: None, reasoning_content: reasoning },
+                finish_reason: None,
+            }));
+        }
+
         if let Some((status, detail)) = transport_err {
             // 与 exception 分支同口径:发错误 chunk 后终止,不补 [DONE]。
             tracing::warn!(
@@ -1574,6 +1590,53 @@ mod tests {
     /// F1 回归:超长工具名上行前被缩短,上游回来的 `tool_use` 用的就是短名。流式出口不还原的话,
     /// 客户端会收到一个**它自己没声明过**的工具名,那一轮工具调用直接作废(客户端按名字查不到
     /// 对应的本地实现)。非流式出口走中枢 `relay_core_outcome`,那条早已还原;流式这条是自写的。
+    /// 结尾被扣留的内容必须在流末吐出来。
+    ///
+    /// 回归:切分器为了兜住跨块的半截 `<thinking` 会**扣留**结尾那几个字节,要靠 `finish()`
+    /// 在流末吐净。此前只有原生 Anthropic 出口调了 finish,这三个协议接了 feed 却没接
+    /// finish —— 响应结尾只要出现一个 `<`(代码块里的 `<div` 之类极常见),那一截就永远丢了。
+    #[tokio::test]
+    async fn stream_flushes_text_held_back_at_the_end() {
+        let server = MockServer::start().await;
+        let body = event_frame("assistantResponseEvent", br#"{"content":"see <div"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+        let app = openai_router(state(&server.uri(), vec![cred()]));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        let got: String = s
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+            .filter_map(|v| {
+                v["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .map(String::from)
+            })
+            .collect();
+        assert_eq!(
+            got, "see <div",
+            "结尾被扣留的 `<div` 必须吐出来,不能吞: {s}"
+        );
+    }
     #[tokio::test]
     async fn stream_restores_shortened_tool_name() {
         let long =

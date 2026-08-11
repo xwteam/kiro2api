@@ -537,6 +537,22 @@ pub async fn stream_generate_content(
             }
         }
 
+        // 收尾:把切分器里还压着的内容吐干净(半截标签按普通内容处理),绝不吞。
+        // `feed` 为了兜住跨块的半截 `<thinking` 会扣留结尾那几个字节 —— 不调 `finish`,
+        // 响应结尾只要出现一个 `<`(代码块里的 `<div` 之类极常见),那一截就永远丢了。
+        for piece in splitter.finish() {
+            let (txt, is_thought) = match piece {
+                crate::kiro::convert::Piece::Text(x) => (x, None),
+                crate::kiro::convert::Piece::Thinking(x) => (x, Some(true)),
+            };
+            let mut c = text_chunk(txt);
+            if let Some(p0) = c.candidates.first_mut().and_then(|c| c.content.parts.first_mut()) {
+                p0.thought = is_thought;
+            }
+            let json = chunk_json(&c);
+            yield Ok::<Bytes, std::io::Error>(frame_out(wire, &mut first, &json));
+        }
+
         // 收尾块三选一:传输中断 / 上游 exception → Gemini 错误块(绝不能报 STOP,否则客户端把
         // "内容缺失"当成正常完成);否则正常收尾块,finishReason 按是否命中截断给 MAX_TOKENS /
         // STOP,usageMetadata 用上游真实计量(缺项才回退估算)。

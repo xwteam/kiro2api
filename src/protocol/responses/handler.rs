@@ -487,6 +487,36 @@ pub async fn responses_stream(
             }
         }
 
+
+        // 收尾:把切分器里还压着的内容吐干净(半截标签按普通内容处理),绝不吞。
+        // `feed` 为了兜住跨块的半截 `<thinking` 会扣留结尾那几个字节 —— 不调 `finish`,
+        // 响应结尾只要出现一个 `<`(代码块里的 `<div` 之类极常见),那一截就永远丢了。
+        for piece in splitter.finish() {
+            match piece {
+                crate::kiro::convert::Piece::Text(x) => {
+                    if msg_open {
+                        full_text.push_str(&x);
+                        yield Ok(emit!("response.output_text.delta", serde_json::json!({
+                            "item_id": msg_item_id,
+                            "output_index": msg_index,
+                            "content_index": 0,
+                            "delta": x,
+                        })));
+                    }
+                }
+                crate::kiro::convert::Piece::Thinking(x) => {
+                    if reasoning_open {
+                        yield Ok(emit!("response.reasoning_summary_text.delta", serde_json::json!({
+                            "item_id": reasoning_item_id,
+                            "output_index": reasoning_index,
+                            "summary_index": 0,
+                            "delta": x,
+                        })));
+                    }
+                }
+            }
+        }
+
         // 传输层中断:与上游报错同口径,直接以 response.failed 收束(不发"条目已完成")。
         if let Some((status, detail)) = transport_err {
             tracing::warn!(
