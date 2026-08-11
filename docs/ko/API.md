@@ -645,6 +645,24 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.17.0: 세 프로토콜의 계약 변경**
+>
+> - **OpenAI / Gemini / Responses에서 extended thinking을 켤 수 있습니다**(이전에는 허브 요청에서
+>   하드코딩으로 꺼져 있어 무엇을 보내도 적용되지 않았습니다). 각 프로토콜 고유의 방식을 사용합니다:
+>   OpenAI의 `reasoning_effort`, Gemini의 `thinkingConfig`, Responses의 `reasoning`.
+> - **응답 신규 필드**: OpenAI는 `choices[].delta.reasoning_content`(`content`와 나란한 독립 필드로,
+>   모르는 클라이언트는 그냥 무시), Gemini는 `thought: true`인 part, Responses는 `reasoning` 출력 항목과
+>   `response.reasoning_summary_text.delta`. **켜기만 하고 분리하지 않으면 해롭습니다** —
+>   사고 내용이 본문에 섞이므로 둘은 반드시 함께 씁니다.
+> - **이 세 프로토콜에 세션 식별자가 붙습니다.** 다중 턴 대화가 상류에서 매번 새 세션으로 보이지 않습니다.
+> - **Gemini 스트리밍에 SSE 킵얼라이브**: 상류 첫 바이트가 느릴 때 중간 프록시가 연결을 끊지 않습니다.
+> - **CORS 계층 추가**: 브라우저의 교차 출처 클라이언트가 프로토콜 엔드포인트를 직접 호출할 수 있습니다.
+> - **`KIRO_API_KEY` 환경 변수 추가**: Kiro API 키 하나만으로 서비스를 기동합니다(마운트 볼륨에 자격 증명
+>   파일 불필요. 시작 시 계정 풀에 병합·저장되며 동일 키는 중복 가져오지 않음).
+>
+> **v0.17.1**: 위 세 스트리밍 출구가 **응답 끝부분을 삼킬** 수 있었습니다(끝이 `<`일 때, 코드의 `<div` 등).
+> 수정되었습니다. 네이티브 Anthropic 출구는 영향 없음.
+
 > **v0.14.0**: `tlsBackend`를 설정에서 전환할 수 있습니다(`native-tls` 기본 / `rustls`, 재시작 시 적용).
 > 자체 서명 CA 프록시 뒤에서는 보통 한쪽만 핸드셰이크에 성공하기 때문입니다.
 > 인식할 수 없는 값은 경고 후 기본값으로 폴백하며 기동을 막지 않습니다.
@@ -1501,7 +1519,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.16.0"}
+{"service":"kiro2api","status":"ok","version":"0.17.1"}
 ```
 
 ### GET /v1/ping

@@ -624,6 +624,28 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.17.0: contract changes across three protocols**
+>
+> - **Extended thinking now works on OpenAI / Gemini / Responses** (it was hard-coded off in the
+>   hub request, so nothing you sent could enable it). Use each protocol's own knob:
+>   `reasoning_effort` (OpenAI), `thinkingConfig` (Gemini), `reasoning` (Responses).
+> - **New response fields**: OpenAI emits thinking on `choices[].delta.reasoning_content` (a field
+>   parallel to `content`; clients that don't know it simply ignore it); Gemini emits a part with
+>   `thought: true`; Responses emits a `reasoning` output item plus
+>   `response.reasoning_summary_text.delta`. **Enabling thinking without stripping it is harmful** —
+>   the reasoning text would otherwise land in the body, so the two sides go together.
+> - **Those three protocols now carry session identity**, so a multi-turn conversation is no longer
+>   seen upstream as a series of brand-new sessions.
+> - **SSE keep-alive for Gemini streaming**: intermediate proxies no longer drop the connection
+>   while upstream is slow to first byte.
+> - **A CORS layer** — browser-based cross-origin clients can now call the protocol endpoints.
+> - **A `KIRO_API_KEY` env var** — start the service from a single Kiro API Key with no credentials
+>   file in the mounted volume; it is merged into the account pool at startup and persisted, and an
+>   identical key is not imported twice.
+>
+> **v0.17.1**: those three streaming exits could **swallow the tail of a response** (when it ended
+> in a `<`, e.g. `<div` in code). Fixed. The native Anthropic exit was never affected.
+
 > **v0.15.0: two behavioural changes**
 > - **Quota exhaustion is persisted with its reset time** (credentials gain `quotaResetUnix`). It
 >   used to live only in memory, so every restart forgot it and rediscovered it using real user

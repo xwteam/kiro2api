@@ -598,6 +598,24 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.17.0:三個協定的契約變更**
+>
+> - **OpenAI / Gemini / Responses 現在可以開啟 extended thinking**(此前在中樞請求裡被硬編碼
+>   關掉,無論請求怎麼寫都不生效)。開啟方式沿用各協定自己的寫法:OpenAI 的
+>   `reasoning_effort`、Gemini 的 `thinkingConfig`、Responses 的 `reasoning`。
+> - **回應新增欄位**:OpenAI 的思考內容走 `choices[].delta.reasoning_content`(與 `content`
+>   並列的獨立欄位,用戶端不認得時按預設忽略);Gemini 走 `parts[].thought: true` 的 part;
+>   Responses 走 `reasoning` 輸出項與 `response.reasoning_summary_text.delta` 事件。
+>   **只開啟而不切分是有害的** —— 思考內容會混進正文,所以兩側必須一起用。
+> - **這三個協定現在也帶工作階段識別**,同一場多輪對話在上游不再被當成一場場全新工作階段。
+> - **Gemini 串流補上 SSE 保活**:上游首位元組慢時,中間的反代不會再把連線掐掉。
+> - **新增 CORS 層**:瀏覽器裡的跨來源用戶端現在可以直接呼叫協定端點。
+> - **新增 `KIRO_API_KEY` 環境變數**:用一個 Kiro API Key 即可起服務,掛載卷裡不必先準備
+>   憑證檔案;該帳號啟動時併入帳號池並落盤,同名 key 不重複匯入。
+>
+> **v0.17.1**:上面那三個協定的串流出口曾會**吞掉結尾一小截內容**(回應以 `<` 結尾時,
+> 如程式碼裡的 `<div`),已修。原生 Anthropic 出口不受影響。
+
 > **v0.14.0**:`tlsBackend` 可在設定裡切換(`native-tls` 預設 / `rustls`),改設定重啟即生效。
 > 走自簽 CA 代理時往往只有其中一個後端握得上手。取值非法時按預設處理並記 warn。
 > **v0.13.0**:`thinking` 現在真正生效(翻譯成上游認的指令,回應裡作為獨立 `thinking` 區塊,
@@ -1249,7 +1267,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.16.0"}
+{"service":"kiro2api","status":"ok","version":"0.17.1"}
 ```
 
 ### GET /v1/ping

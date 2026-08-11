@@ -106,6 +106,24 @@ cat data/config.json | grep apiKey
 | 422 | 请求体反序列化失败（缺必填字段 / 类型不符），axum 默认拒收，`text/plain` 纯文本。出现在带 body 提取器的端点上：`/api/admin/*` 与 `POST /api/user/login`（四个协议对话端点与 `/v1/messages/count_tokens` 已自行接管拒收、改回各自形状的 `400`）（`/api/user/*` 的其余端点只收 query，参数类型不符是 `400` 而非 `422`） |
 
 
+> **v0.17.0:三个协议的契约变更**
+>
+> - **OpenAI / Gemini / Responses 现在可以开启 extended thinking**(此前在中枢请求里被硬编码
+>   关掉,无论请求怎么写都不生效)。开启方式沿用各协议自己的写法:OpenAI 的
+>   `reasoning_effort`、Gemini 的 `thinkingConfig`、Responses 的 `reasoning`。
+> - **响应新增字段**:OpenAI 的思考内容走 `choices[].delta.reasoning_content`(与 `content`
+>   并列的独立字段,客户端不认得时按缺省忽略);Gemini 走 `parts[].thought: true` 的 part;
+>   Responses 走 `reasoning` 输出项与 `response.reasoning_summary_text.delta` 事件。
+>   **只开启而不切分是有害的** —— 思考内容会混进正文,所以两侧必须一起用。
+> - **这三个协议现在也带会话标识**,同一场多轮对话在上游不再被当成一场场全新会话。
+> - **Gemini 流式补上 SSE 保活**:上游首字节慢时,中间的反代不会再把连接掐掉。
+> - **新增 CORS 层**:浏览器里的跨源客户端现在可以直接调协议端点。
+> - **新增 `KIRO_API_KEY` 环境变量**:用一个 Kiro API Key 即可起服务,挂载卷里不必先准备
+>   凭据文件;该账号启动时并入账号池并落盘,同名 key 不重复导入。
+>
+> **v0.17.1**:上面那三个协议的流式出口曾会**吞掉结尾一小截内容**(响应以 `<` 结尾时,
+> 如代码里的 `<div`),已修。原生 Anthropic 出口不受影响。
+
 > **v0.15.0:两处行为变化**
 > - **额度耗尽按恢复时刻落盘**(凭据新增 `quotaResetUnix`)。此前只置内存态,每次重启就
 >   忘光、再拿用户的请求去重新发现(前几次会失败)。现在重启仍记得,**到点自动回池**,
