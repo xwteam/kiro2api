@@ -646,6 +646,12 @@ curl http://localhost:8080/api/admin/credentials \
 > **v0.17.1**: those three streaming exits could **swallow the tail of a response** (when it ended
 > in a `<`, e.g. `<div` in code). Fixed. The native Anthropic exit was never affected.
 
+> **v0.16.0: two admin-side behavioural changes**
+> - **A priority change now takes effect immediately.** Under sticky selection it previously did not
+>   trigger reselection, so the change had no effect until the current account became unusable.
+> - **The pool now heals itself when every account has been stopped.** A burst of upstream failures
+>   no longer leaves the pool permanently unusable until someone restarts it. Self-healing never
+>   revives accounts that are persistently disabled, banned, or still inside their quota window.
 > **v0.15.0: two behavioural changes**
 > - **Quota exhaustion is persisted with its reset time** (credentials gain `quotaResetUnix`). It
 >   used to live only in memory, so every restart forgot it and rediscovered it using real user
