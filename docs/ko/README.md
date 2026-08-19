@@ -217,7 +217,7 @@ docker compose logs -f
 ```bash
 # 헬스 체크
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.17.1"}
+# {"service":"kiro2api","status":"ok","version":"0.17.2"}
 
 # 프로토콜 고정 모델 목록 조회
 curl http://localhost:8080/v1/models \

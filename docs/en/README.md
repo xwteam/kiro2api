@@ -262,7 +262,7 @@ docker compose logs -f
 ```bash
 # Health check
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.17.1"}
+# {"service":"kiro2api","status":"ok","version":"0.17.2"}
 
 # View available models
 curl http://localhost:8080/v1/models \
