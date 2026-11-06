@@ -649,11 +649,12 @@ async fn preroll_stream(resp: &mut reqwest::Response) -> Preroll {
 /// 这里按 exception 类型还原出它**本该**是的状态码,再连同一份合成响应体交给池的
 /// body-aware 分类器 —— 于是"200 里的额度耗尽"和"402"落在同一档处置上,不必两套规则。
 ///
-/// 合成体同时带 `__type` 与 `message`:池的判定既匹配机器稳定的异常名,也匹配人类措辞,
-/// 只给其中一个会漏判(见 [`classify_with_body`] 对完整响应体的要求)。
+/// 合成体带 `__type`、`message` 与 `reason`:池的判定既匹配机器稳定的类型和原因,
+/// 也匹配人类措辞(见 [`classify_with_body`] 对完整响应体的要求)。
 fn stream_exception_failure(e: &StreamException) -> (FailureKind, u16, String) {
     let status = exception_status(&e.kind);
-    let body = serde_json::json!({ "__type": e.kind, "message": e.message }).to_string();
+    let body = serde_json::json!({ "__type": e.kind, "message": e.message, "reason": e.reason })
+        .to_string();
     let kind = classify_with_body(status, &body);
     // 校验类 exception 被映射成 400,而 classify 在 400 上的兜底是"瞬态、可重试"。它不是:
     // 请求本身不合法,换账号重试只会把一个个健康账号打伤(线上曾一下午把 253 个号打成
@@ -4438,6 +4439,305 @@ mod tests {
         assert_eq!(
             stats[0].failures, 1,
             "搜索失败没反馈账号池:坏号会被一次次挑中去打同一枪;实际:{stats:?}"
+        );
+    }
+
+    #[test]
+    fn stream_exception_classification_keeps_quota_reason() {
+        let e = StreamException {
+            kind: "validationError".to_string(),
+            message: "not available".to_string(),
+            reason: Some("MONTHLY_REQUEST_COUNT".to_string()),
+        };
+        let (kind, status, body) = stream_exception_failure(&e);
+        assert_eq!(kind, FailureKind::Quota);
+        assert_eq!(status, 400);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["reason"],
+            "MONTHLY_REQUEST_COUNT"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_unavailable_stream_frames_retry_without_penalty() {
+        for streaming in [false, true] {
+            for event in [false, true] {
+                let server = MockServer::start().await;
+                let payload = br#"{"reason":"INVALID_MODEL_ID","message":"model not available"}"#;
+                let rejected = if event {
+                    event_frame("validationError", payload)
+                } else {
+                    exception_frame("ValidationException", payload)
+                };
+                Mock::given(method("POST"))
+                    .and(path("/generateAssistantResponse"))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(rejected))
+                    .up_to_n_times(1)
+                    .with_priority(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("POST"))
+                    .and(path("/generateAssistantResponse"))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(event_frame(
+                        "assistantResponseEvent",
+                        br#"{"content":"pong"}"#,
+                    )))
+                    .with_priority(5)
+                    .mount(&server)
+                    .await;
+                let st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+                let pool = st.pool.clone();
+                let request = if streaming {
+                    r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#
+                } else {
+                    r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#
+                };
+                let (status, bytes) = post_messages(messages_router(st), request).await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(String::from_utf8_lossy(&bytes).contains("pong"));
+                assert_eq!(server.received_requests().await.unwrap().len(), 2);
+                let stats = pool.lock().await.stats(1000);
+                assert_eq!(
+                    stats.iter().map(|s| s.failures).sum::<u64>(),
+                    0,
+                    "{stats:?}"
+                );
+                assert_eq!(
+                    stats.iter().map(|s| s.successes).sum::<u64>(),
+                    1,
+                    "{stats:?}"
+                );
+                assert_eq!(
+                    stats.iter().filter(|s| s.requests == 1).count(),
+                    2,
+                    "{stats:?}"
+                );
+                assert!(
+                    stats.iter().all(|s| !s.disabled && s.strikes == 0),
+                    "{stats:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_validation_events_return_400_without_retry() {
+        for payload in [
+            br#"{"message":"invalid input"}"#.as_slice(),
+            br#"{"reason":"OTHER_VALIDATION","message":"invalid input"}"#.as_slice(),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/generateAssistantResponse"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(event_frame("validationError", payload)),
+                )
+                .mount(&server)
+                .await;
+            let st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+            let pool = st.pool.clone();
+            let (status, _) = post_messages(
+                messages_router(st),
+                r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            let stats = pool.lock().await.stats(1000);
+            assert!(
+                stats.iter().all(|s| s.failures == 0 && s.strikes == 0),
+                "{stats:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_streaming_error_event_yields_mapped_status() {
+        let server = MockServer::start().await;
+        let body = event_frame("throttlingError", br#"{"message":"slow down"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let (status, bytes) = post_messages(
+            app,
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "rate_limit_error");
+        let msg = v["error"]["message"].as_str().expect("message 应为字符串");
+        assert!(
+            msg.contains("throttlingError") && msg.contains("slow down"),
+            "错误消息应带上游类型与说明;实际:{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_error_event_emits_error_event() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("assistantResponseEvent", br#"{"content":"po"}"#);
+        body.extend(event_frame(
+            "throttlingError",
+            br#"{"message":"slow down"}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = messages_router(state(&server.uri(), vec![cred()]));
+        let (status, bytes) = post_messages(
+            app,
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let s = String::from_utf8_lossy(&bytes);
+        for needle in [
+            "event: error",
+            "\"type\":\"rate_limit_error\"",
+            "throttlingError",
+        ] {
+            assert!(s.contains(needle), "SSE 缺 `{needle}`;实际:\n{s}");
+        }
+        assert!(
+            !s.contains("event: message_stop"),
+            "出错的流不应发 message_stop;实际:\n{s}"
+        );
+        assert!(
+            !s.contains("event: message_delta"),
+            "出错的流不应发 message_delta;实际:\n{s}"
+        );
+        // 已打开的文本块仍要收尾,保持内容块结构完整。
+        assert!(
+            s.contains("event: content_block_stop"),
+            "已打开的块应先收尾;实际:\n{s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_200_with_an_error_event_retries_on_another_account() {
+        let server = MockServer::start().await;
+        // 头一次:200 + throttlingError(高优先级、只生效一次)。
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(event_frame(
+                "throttlingError",
+                br#"{"message":"slow down"}"#,
+            )))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        // 其后:正常的 pong。
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(event_frame(
+                "assistantResponseEvent",
+                br#"{"content":"pong"}"#,
+            )))
+            .with_priority(5)
+            .mount(&server)
+            .await;
+
+        let st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+        let pool = st.pool.clone();
+        let (status, bytes) = post_messages(
+            messages_router(st),
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "该换个账号重试,而不是把拒绝丢给用户"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["content"][0]["text"], "pong");
+
+        // 被拒的那个账号必须记到一次失败(否则池子永远学不会谁在被上游拒)。
+        let st_snapshot = pool.lock().await.stats(1000);
+        let failed: u64 = st_snapshot.iter().map(|a| a.failures).sum();
+        assert_eq!(failed, 1, "上游拒了一次就该记一次失败;实际:{st_snapshot:?}");
+        let ok: u64 = st_snapshot.iter().map(|a| a.successes).sum();
+        assert_eq!(ok, 1, "只有真正出内容的那次才算成功");
+    }
+
+    #[tokio::test]
+    async fn a_streaming_200_with_an_immediate_error_event_retries_on_another_account() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(event_frame(
+                "throttlingError",
+                br#"{"message":"slow down"}"#,
+            )))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(event_frame(
+                "assistantResponseEvent",
+                br#"{"content":"pong"}"#,
+            )))
+            .with_priority(5)
+            .mount(&server)
+            .await;
+
+        let st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+        let pool = st.pool.clone();
+        let (status, bytes) = post_messages(
+            messages_router(st),
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            !s.contains("event: error"),
+            "一开口就被拒时应换号重试,不该把 error 事件下发给客户端;实际:\n{s}"
+        );
+        assert!(s.contains("pong"), "换号后的正常内容应下发;实际:\n{s}");
+        let stats = pool.lock().await.stats(1000);
+        let failed: u64 = stats.iter().map(|a| a.failures).sum();
+        assert_eq!(failed, 1, "被拒的那个账号该记一次失败;实际:{stats:?}");
+    }
+
+    #[tokio::test]
+    async fn a_mid_stream_error_event_is_still_reported_to_the_pool() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("assistantResponseEvent", br#"{"content":"po"}"#);
+        body.extend(event_frame("throttlingError", br#"{"message":"nope"}"#));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let st = state(&server.uri(), vec![cred()]);
+        let pool = st.pool.clone();
+        let (status, bytes) = post_messages(
+            messages_router(st),
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("event: error"), "流中途出错仍要发 error 事件");
+        let stats = pool.lock().await.stats(1000);
+        assert_eq!(
+            stats[0].failures, 1,
+            "流内 exception 没反馈池:这个号在池子眼里永远只有'刚刚成功过';实际:{stats:?}"
         );
     }
 }

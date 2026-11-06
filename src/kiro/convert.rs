@@ -1165,18 +1165,20 @@ pub fn extract_truncation(frames: &[Message]) -> Option<Truncation> {
 /// 不是错误,故一律不进 [`frame_exception`](两者严格互斥)。
 const TRUNCATION_EXCEPTION_TYPES: [&str; 1] = ["ContentLengthExceededException"];
 
-/// 上游在 200 事件流中下发的非截断类 exception 帧。
+/// 上游在 200 事件流中下发的非截断类异常帧或错误事件。
 ///
-/// AWS event-stream 的错误在响应头(200)之后才以 `:message-type == "exception"` 帧下发,
+/// AWS event-stream 的错误可能在响应头(200)之后以异常帧或普通事件下发,
 /// 因此"HTTP 200 + 空内容"其实可能是限流/鉴权/参数错误。协议层必须在把帧序列还原成
 /// 响应之前先查这个契约,按 [`exception_status`] 映射出对外状态码,而不是回 200 + `end_turn`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamException {
-    /// `:exception-type` 头(如 `"ThrottlingException"`);头缺失时退而取帧体的
+    /// 错误事件的 `:event-type` 或异常帧的 `:exception-type`;异常帧缺头时取
     /// `__type` / `code`,再取不到则为 `"UnknownException"`。
     pub kind: String,
     /// 帧体里的人类可读消息(`message` / `Message` 字段),取不到则为空串。
     pub message: String,
+    /// 帧体中的机器可读原因,供账号池按上游错误语义分类。
+    pub reason: Option<String>,
 }
 
 /// 从帧 payload 里尽力取人类可读消息;非法 JSON / 无该字段 → 空串(不 panic)。
@@ -1192,23 +1194,49 @@ fn exception_message(payload: &[u8]) -> String {
         .unwrap_or_default()
 }
 
-/// 从单个事件帧探测非截断类 exception;非 exception 帧、或截断类 exception 一律 `None`。
+fn exception_reason(payload: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()?
+        .get("reason")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// 从单个事件帧探测非截断类异常及错误事件;其他帧一律 `None`。
 ///
 /// 与 [`frame_truncation`] 严格互斥:凡是 [`frame_truncation`] 认下的帧(含
 /// `ContentLengthExceededException` 与 contextUsage 判出的窗口耗尽)都在这里放行,
 /// 由既有 Truncation 路径处理。payload 非法 JSON 不影响判定(仅消息取空串)。
 pub fn frame_exception(frame: &Message) -> Option<StreamException> {
-    // `exception` 与 `error` 两类都要认。
+    // `exception`、框架级 `error` 及官方客户端识别的八种错误事件都要认。
     //
     // event-stream 协议里 `:message-type` 除了 `event` / `exception`,还有 `error` ——
     // 那是**框架级**错误(类型在 `:error-code` 头里),与业务异常走的不是同一个头。
     // 此前只认 `exception`,于是一个 error 帧会被整个流循环忽略,还原出"没有任何内容"
     // 的成功响应:上游明明报了错,客户端却拿到 200 + 空消息,完全无从判断发生了什么。
     let mt = header_str(frame, ":message-type");
-    if mt != Some("exception") && mt != Some("error") {
+    if frame_truncation(frame).is_some() {
         return None;
     }
-    if frame_truncation(frame).is_some() {
+    if mt != Some("exception") && mt != Some("error") {
+        let kind = event_type(frame)?;
+        if matches!(
+            kind,
+            "error"
+                | "InternalServerException"
+                | "throttlingError"
+                | "ThrottlingException"
+                | "validationError"
+                | "ValidationException"
+                | "serviceUnavailableError"
+                | "ServiceUnavailableException"
+        ) {
+            return Some(StreamException {
+                kind: kind.to_string(),
+                message: exception_message(&frame.payload),
+                reason: exception_reason(&frame.payload),
+            });
+        }
         return None;
     }
     let kind = header_str(frame, ":exception-type")
@@ -1229,6 +1257,7 @@ pub fn frame_exception(frame: &Message) -> Option<StreamException> {
     Some(StreamException {
         kind,
         message: exception_message(&frame.payload),
+        reason: exception_reason(&frame.payload),
     })
 }
 
@@ -1562,6 +1591,19 @@ mod tests {
             }],
             payload: payload.as_bytes().to_vec(),
         }
+    }
+
+    fn event_frame_with_message_type(
+        event_type: &str,
+        payload: &str,
+        message_type: &str,
+    ) -> Message {
+        let mut frame = event_frame(event_type, payload);
+        frame.headers.push(Header {
+            name: ":message-type".to_string(),
+            value: HeaderValue::Str(message_type.to_string()),
+        });
+        frame
     }
 
     #[test]
@@ -3395,8 +3437,83 @@ mod tests {
             Some(StreamException {
                 kind: "ThrottlingException".to_string(),
                 message: "Too many requests".to_string(),
+                reason: None,
             })
         );
+    }
+
+    #[test]
+    fn frame_exception_recognizes_error_events_exactly() {
+        for (kind, status) in [
+            ("error", 502),
+            ("InternalServerException", 502),
+            ("throttlingError", 429),
+            ("ThrottlingException", 429),
+            ("validationError", 400),
+            ("ValidationException", 400),
+            ("serviceUnavailableError", 502),
+            ("ServiceUnavailableException", 502),
+        ] {
+            for frame in [
+                event_frame(kind, r#"{"Message":"failure"}"#),
+                event_frame_with_message_type(kind, r#"{"Message":"failure"}"#, "event"),
+                event_frame_with_message_type(kind, r#"{"Message":"failure"}"#, "other"),
+            ] {
+                let exception = frame_exception(&frame).expect(kind);
+                assert_eq!(exception.kind, kind);
+                assert_eq!(exception.message, "failure");
+                assert_eq!(exception_status(&exception.kind), status);
+                assert_eq!(frame_truncation(&frame), None);
+            }
+        }
+        for kind in ["assistantResponseEvent", "metadataEvent", "ThrottlingError"] {
+            assert_eq!(frame_exception(&event_frame(kind, "{}")), None);
+            assert_eq!(
+                frame_exception(&event_frame_with_message_type(kind, "{}", "event")),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn frame_exception_preserves_reason_for_both_frame_forms() {
+        let payload = r#"{"reason":"INVALID_MODEL_ID","message":"not available"}"#;
+        for frame in [
+            event_frame("validationError", payload),
+            exception_frame_with("ValidationException", payload),
+        ] {
+            let e = frame_exception(&frame).unwrap();
+            assert_eq!(e.reason.as_deref(), Some("INVALID_MODEL_ID"));
+            assert_eq!(e.message, "not available");
+        }
+        for payload in ["not json", r#"{"reason":42}"#, "{}"] {
+            assert_eq!(
+                frame_exception(&event_frame("error", payload))
+                    .unwrap()
+                    .reason,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn error_events_do_not_override_exception_headers_or_truncation() {
+        let mut exception = exception_frame_with("AccessDeniedException", "{}");
+        exception.headers.push(Header {
+            name: ":event-type".into(),
+            value: HeaderValue::Str("validationError".into()),
+        });
+        assert_eq!(
+            frame_exception(&exception).unwrap().kind,
+            "AccessDeniedException"
+        );
+        let mut truncated = exception_frame("ContentLengthExceededException");
+        truncated.headers.push(Header {
+            name: ":event-type".into(),
+            value: HeaderValue::Str("validationError".into()),
+        });
+        assert_eq!(frame_truncation(&truncated), Some(Truncation::MaxTokens));
+        assert_eq!(frame_exception(&truncated), None);
     }
 
     #[test]

@@ -1918,4 +1918,82 @@ mod tests {
         assert_eq!(first, second, "同一场对话的两轮应共用一个 conversationId");
         assert_ne!(first, other, "两场不同的对话不该被并成同一段会话");
     }
+
+    #[tokio::test]
+    async fn responses_upstream_error_event_maps_to_status_code() {
+        let server = MockServer::start().await;
+        let frame = event_frame("throttlingError", br#"{"message":"slow down"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(frame))
+            .mount(&server)
+            .await;
+
+        let app = responses_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"model":"sonnet","input":"hi"}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "throttlingError");
+        assert_eq!(v["error"]["code"], 429);
+    }
+
+    #[tokio::test]
+    async fn responses_stream_emits_failed_event_on_upstream_error_event() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("assistantResponseEvent", br#"{"content":"po"}"#);
+        body.extend(event_frame(
+            "throttlingError",
+            br#"{"message":"slow down"}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = responses_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"model":"sonnet","input":"hi","stream":true}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+
+        for needle in [
+            "event: response.failed",
+            "\"status\":\"failed\"",
+            "throttlingError",
+            "slow down",
+        ] {
+            assert!(s.contains(needle), "SSE 缺 `{needle}`;实际:\n{s}");
+        }
+        assert!(
+            !s.contains("event: response.completed"),
+            "上游报错不得报 response.completed;实际:\n{s}"
+        );
+    }
 }

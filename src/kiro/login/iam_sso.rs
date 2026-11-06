@@ -32,10 +32,6 @@ struct RegisterResp {
 struct TokenResp {
     #[serde(rename = "accessToken")]
     access_token: String,
-    /// AWS SSO-OIDC 换 token 会回带 idToken(JWT):IdC 数据面(Amazon Q)认这个 JWT,
-    /// 而非 portal 会话型 accessToken。铸凭据时优先采纳(缺省才回落 accessToken)。
-    #[serde(rename = "idToken", default)]
-    id_token: Option<String>,
     #[serde(rename = "refreshToken", default)]
     refresh_token: String,
     #[serde(rename = "expiresIn", default)]
@@ -165,8 +161,8 @@ pub async fn complete(
         ));
     }
     Ok(MintedCredential {
-        // IdC 数据面认 idToken(JWT);缺省才回落 accessToken。
-        access_token: t.id_token.unwrap_or(t.access_token),
+        // 官方客户端与参照实现均保存 accessToken。
+        access_token: t.access_token,
         refresh_token: t.refresh_token,
         expires_in_secs: effective_expires_in(t.expires_in),
         region: region.to_string(),
@@ -320,8 +316,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_prefers_id_token_for_idc_data_plane() {
-        // IdC 换 token 回带 idToken(JWT):铸凭据须采 idToken,不是 portal accessToken。
+    async fn complete_uses_access_token_when_id_token_is_present() {
+        // 同时返回两种令牌时仍须保存 accessToken。
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/token"))
@@ -342,7 +338,7 @@ mod tests {
         let cred = complete(&client, &server.uri(), "us-east-1", &s, "code123")
             .await
             .unwrap();
-        assert_eq!(cred.access_token, "jwt-idtok"); // 采 idToken
+        assert_eq!(cred.access_token, "portal-atok");
         assert_eq!(cred.client_id, "cid");
         assert_eq!(cred.client_secret, "csec");
     }

@@ -575,6 +575,7 @@ pub async fn stream_generate_content(
             let synthetic = StreamException {
                 kind: "UpstreamStreamInterrupted".to_string(),
                 message: format!("upstream stream interrupted: {detail}"),
+                reason: None,
             };
             exception_error_body(*status, &synthetic).to_string()
         } else { match &exception {
@@ -2364,5 +2365,81 @@ mod tests {
                 .any(|e| e["candidates"][0]["content"]["parts"][0]["text"] == "pong"),
             "保活不能挤掉内容;实际:{elems:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn generate_content_upstream_error_event_yields_mapped_status() {
+        let server = MockServer::start().await;
+        let body = event_frame("throttlingError", br#"{"message":"slow down"}"#);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:generateContent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["code"], 429);
+        assert_eq!(v["error"]["status"], "throttlingError");
+        assert_eq!(v["error"]["message"], "slow down");
+        assert!(v["candidates"].is_null());
+    }
+
+    #[tokio::test]
+    async fn stream_error_event_yields_error_element_not_stop() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("assistantResponseEvent", br#"{"content":"po"}"#);
+        body.extend(event_frame(
+            "throttlingError",
+            br#"{"message":"slow down"}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let req_body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/claude-sonnet-4.5:streamGenerateContent?alt=sse")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            !s.contains("\"finishReason\""),
+            "上游出错的流不应带任何 finishReason;实际:\n{s}"
+        );
+
+        let items = stream_elements(&s, WireFormat::Sse);
+        let last = items.last().expect("应至少有一个块");
+        assert_eq!(last["error"]["code"], 429);
+        assert_eq!(last["error"]["status"], "throttlingError");
+        assert_eq!(last["error"]["message"], "slow down");
     }
 }

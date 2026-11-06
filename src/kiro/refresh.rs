@@ -32,10 +32,6 @@ pub fn endpoint(cred: &Credential) -> String {
 struct RefreshResp {
     #[serde(rename = "accessToken")]
     access_token: String,
-    /// AWS SSO-OIDC 的 refresh 响应带 idToken(JWT):IdC 数据面(Amazon Q
-    /// generateAssistantResponse)要的是这个 JWT,而非 portal 会话型 accessToken。
-    #[serde(rename = "idToken", default)]
-    id_token: Option<String>,
     #[serde(rename = "refreshToken", default)]
     refresh_token: Option<String>,
     #[serde(rename = "expiresIn", default)]
@@ -157,14 +153,8 @@ pub async fn refresh_at(
     }
     let r: RefreshResp = resp.json().await.map_err(|_| LoginError::Http)?;
     let mut out = cred.clone();
-    // IdC 数据面认 idToken(JWT);缺省才回落 accessToken。Social 一律用 accessToken。
-    // 用 portal 型 accessToken 打 IdC 数据面会 403,进而账号被判死,故必须区分。
-    out.access_token = match cred.auth {
-        AuthMethod::Idc => r.id_token.unwrap_or(r.access_token),
-        AuthMethod::Social => r.access_token,
-        // 不可达:ApiKey 在函数开头就已 return。留此臂只为穷尽,不做静默回落。
-        AuthMethod::ApiKey => return Err(LoginError::Http),
-    };
+    // 官方客户端与参照实现均保存 accessToken,IdC 和 Social 使用相同的令牌字段。
+    out.access_token = r.access_token;
     if let Some(rt) = r.refresh_token {
         out.refresh_token = rt;
     }
@@ -375,9 +365,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idc_refresh_prefers_id_token_over_portal_access_token() {
-        // AWS SSO-OIDC refresh 回 {accessToken: portal 会话型, idToken: 数据面 JWT}。
-        // IdC 数据面(Amazon Q)要 idToken;用 portal accessToken 会 403 → 账号被判死。
+    async fn idc_refresh_uses_access_token_when_id_token_is_present() {
+        // 同时返回两种令牌时仍须保存 accessToken。
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/token"))
@@ -399,12 +388,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(out.access_token, "jwt-data-plane"); // 采 idToken,不是 portal token
+        assert_eq!(out.access_token, "portal-session-token");
         assert_eq!(out.refresh_token, "rt2");
     }
 
     #[tokio::test]
-    async fn idc_refresh_falls_back_to_access_token_when_no_id_token() {
+    async fn idc_refresh_uses_access_token_when_no_id_token() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/token"))
@@ -424,7 +413,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(out.access_token, "only-access"); // 无 idToken → 回落 accessToken
+        assert_eq!(out.access_token, "only-access");
     }
 
     #[tokio::test]
