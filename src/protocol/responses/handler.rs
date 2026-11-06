@@ -310,6 +310,7 @@ pub async fn responses_stream(
 
         let mut next_output_index: u64 = 0;
         // 上游截断信号(命中 max_tokens / 上下文窗口耗尽):末事件改发 response.incomplete。
+        let mut refused = false;
         let mut truncation: Option<crate::kiro::convert::Truncation> = None;
         // 上游中途下发的非截断 exception:置位即停读,末事件改发 response.failed。
         let mut upstream_error: Option<crate::kiro::convert::StreamException> = None;
@@ -392,6 +393,7 @@ pub async fn responses_stream(
                                 }
                             }
                         } else if let Some(v) = crate::kiro::convert::tool_use_frame(&frame) {
+                            if refused { continue; }
                             let Some(id) = v["toolUseId"].as_str() else { continue };
                             if !tools.contains_key(id) {
                                 let index = next_output_index;
@@ -457,6 +459,9 @@ pub async fn responses_stream(
                             // meteringEvent(#4):记住真实积分/缓存计费(多个则末次覆盖),收尾时落库。
                             // 不产出任何 Responses 事件——纯记账,不影响线格式。
                             usage_guard.metering = Some(m);
+                        } else if let Some(refusal) = crate::kiro::convert::frame_refusal(&frame) {
+                            if !refused { crate::kiro::convert::log_refusal(&refusal, credential_id, &model); }
+                            refused = true;
                         } else if let Some(tr) = crate::kiro::convert::frame_truncation(&frame) {
                             truncation = Some(tr);
                         } else if let Some(e) = crate::kiro::convert::frame_exception(&frame) {
@@ -559,7 +564,7 @@ pub async fn responses_stream(
         }
 
         // 截断时文本条目并未写完,条目状态随之报 incomplete(与顶层 status 一致)。
-        let item_status = if truncation.is_some() { "incomplete" } else { "completed" };
+        let item_status = if truncation.is_some() || refused { "incomplete" } else { "completed" };
 
         // 文本条目收尾。
         if msg_open {
@@ -598,7 +603,7 @@ pub async fn responses_stream(
                 "content": [{ "type": "output_text", "text": full_text }],
             })));
         }
-        for id in &tool_order {
+        for id in tool_order.iter().filter(|_| !refused) {
             if let Some(st) = tools.get(id) {
                 finished.push((st.index, serde_json::json!({
                     "type": "function_call",
@@ -622,12 +627,12 @@ pub async fn responses_stream(
             "total_tokens": input_tokens as u64 + output_tokens as u64,
         });
 
-        if truncation.is_some() {
+        if truncation.is_some() || refused {
             let mut incomplete = response_obj("incomplete", serde_json::Value::from(output), usage);
             if let Some(map) = incomplete.as_object_mut() {
                 map.insert(
                     "incomplete_details".to_string(),
-                    serde_json::json!({ "reason": "max_output_tokens" }),
+                    serde_json::json!({ "reason": if refused { "content_filter" } else { "max_output_tokens" } }),
                 );
             }
             yield Ok(emit!("response.incomplete", serde_json::json!({ "response": incomplete })));
@@ -1302,6 +1307,55 @@ mod tests {
             !s.contains("event: response.completed"),
             "上游报错不得报 response.completed;实际:\n{s}"
         );
+    }
+
+    #[tokio::test]
+    async fn refusal_stream_and_buffered() {
+        for streaming in [false, true] {
+            let server = MockServer::start().await;
+            let mut body = event_frame("assistantResponseEvent", br#"{"content":"hello"}"#);
+            body.extend(event_frame(
+                "toolUseEvent",
+                br#"{"name":"f","toolUseId":"tu1","input":"{}","stop":true}"#,
+            ));
+            body.extend(event_frame(
+                "contextUsageEvent",
+                br#"{"contextUsagePercentage":100}"#,
+            ));
+            body.extend(event_frame("metadataEvent", br#"{"stopReason":"refusal"}"#));
+            Mock::given(method("POST"))
+                .and(path("/generateAssistantResponse"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                .mount(&server)
+                .await;
+            let app = responses_router(state(&server.uri(), vec![cred()]));
+            let req = format!(r#"{{"model":"sonnet","input":"hi","stream":{streaming}}}"#);
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/responses")
+                        .header("content-type", "application/json")
+                        .body(Body::from(req))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let s = String::from_utf8_lossy(&bytes);
+            assert!(
+                s.contains("hello")
+                    && s.contains("\"status\":\"incomplete\"")
+                    && s.contains("\"reason\":\"content_filter\""),
+                "{s}"
+            );
+            if streaming {
+                assert!(s.contains("event: response.incomplete"));
+            }
+        }
     }
 
     /// 截断类 exception 不是错误而是截断信号:末事件是 `response.incomplete`

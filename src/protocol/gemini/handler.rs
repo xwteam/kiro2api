@@ -396,6 +396,7 @@ pub async fn stream_generate_content(
     // 统计层用量句柄(Arc,移入哨兵);记账经 Drop 哨兵在流**任意方式结束**时都落一条(#8/#9/#15)。
     let usage_handle = state.stats.usage.clone();
     let record_model = hub_req.model.clone();
+    let model = record_model.clone();
 
     let body = async_stream::stream! {
         // 用量记账哨兵:累计字符存于此;正常收尾显式 flush,断连/出错时其 Drop 补记(#8/#9/#15)。
@@ -418,6 +419,7 @@ pub async fn stream_generate_content(
         let mut tool_args: HashMap<String, String> = HashMap::new();
         // JSON 数组线格式的元素分隔状态(SSE 下不参与);见 frame_out。
         let mut first = true;
+        let mut refused = false;
         let mut truncation: Option<Truncation> = None;
         let mut exception: Option<StreamException> = None;
         // 传输层中断(连接重置 / 读超时 / chunked 体未收尾):与 in-band exception 一样
@@ -466,6 +468,11 @@ pub async fn stream_generate_content(
                             usage_guard.metering = Some(m);
                             continue;
                         }
+                        if let Some(refusal) = crate::kiro::convert::frame_refusal(&frame) {
+                            if !refused { crate::kiro::convert::log_refusal(&refusal, credential_id, &model); }
+                            refused = true;
+                            continue;
+                        }
                         if let Some(tr) = crate::kiro::convert::frame_truncation(&frame) {
                             // 截断是正常收尾的一种,只改 finishReason,不打断流(后续帧照常处理)。
                             truncation = Some(tr);
@@ -488,6 +495,7 @@ pub async fn stream_generate_content(
                             break 'read;
                         }
                         if let Some(v) = crate::kiro::convert::tool_use_frame(&frame) {
+                            if refused { continue; }
                             let Some(tool_use_id) = v["toolUseId"].as_str() else { continue };
                             if let Some(name) = v["name"].as_str() {
                                 // 还原成客户端认识的原名(见上面 tool_name_map 的说明)。
@@ -585,7 +593,7 @@ pub async fn stream_generate_content(
                 chunk_json(&GenerateContentResponse {
                     candidates: vec![Candidate {
                         content: Content { role: Some("model".to_string()), parts: vec![] },
-                        finish_reason: Some(finish_reason_for_truncation(truncation)),
+                        finish_reason: Some(if refused { "SAFETY".to_string() } else { finish_reason_for_truncation(truncation) }),
                         index: 0,
                     }],
                     usage_metadata: Some(UsageMetadata {
@@ -1683,6 +1691,57 @@ mod tests {
         let last = items.last().expect("应至少有一个块");
         assert_eq!(last["error"]["code"], 403);
         assert_eq!(last["error"]["message"], "AccessDeniedException");
+    }
+
+    #[tokio::test]
+    async fn refusal_stream_and_buffered() {
+        for streaming in [false, true] {
+            let server = MockServer::start().await;
+            let mut body = event_frame("assistantResponseEvent", br#"{"content":"hello"}"#);
+            body.extend(event_frame(
+                "toolUseEvent",
+                br#"{"name":"f","toolUseId":"tu1","input":"{}","stop":true}"#,
+            ));
+            body.extend(event_frame(
+                "contextUsageEvent",
+                br#"{"contextUsagePercentage":100}"#,
+            ));
+            body.extend(event_frame("metadataEvent", br#"{"stopReason":"refusal"}"#));
+            Mock::given(method("POST"))
+                .and(path("/generateAssistantResponse"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                .mount(&server)
+                .await;
+            let app = gemini_router(state(&server.uri(), vec![cred()]));
+            let action = if streaming {
+                "streamGenerateContent?alt=sse"
+            } else {
+                "generateContent"
+            };
+            let uri = format!("/v1beta/models/claude-sonnet-4.5:{action}");
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let s = String::from_utf8_lossy(&bytes);
+            assert!(
+                s.contains("hello") && s.contains("\"finishReason\":\"SAFETY\""),
+                "{s}"
+            );
+        }
     }
 
     /// 上游截断(`ContentLengthExceededException`)不是错误,但收尾必须报 `MAX_TOKENS`,

@@ -355,6 +355,7 @@ pub fn openai_to_hub(req: ChatCompletionRequest) -> MessagesRequest {
 pub fn finish_reason_from_stop(stop: Option<&str>) -> Option<String> {
     Some(
         match stop {
+            Some("refusal") => "content_filter",
             Some("tool_use") => "tool_calls",
             Some("max_tokens") | Some("model_context_window_exceeded") => "length",
             _ => "stop",

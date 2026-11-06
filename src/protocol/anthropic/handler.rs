@@ -766,6 +766,15 @@ async fn select_and_call_verified(
                             let frames = dec.drain();
                             // 必须先于还原响应查 exception:交给 kiro_events_to_anthropic 只会得到
                             // 空内容 + end_turn(截断类另有 Truncation 路径,与此互斥,不会被抢走)。
+                            if let Some(refusal) =
+                                frames.iter().find_map(crate::kiro::convert::frame_refusal)
+                            {
+                                crate::kiro::convert::log_refusal(
+                                    &refusal,
+                                    credential_id,
+                                    &req.model,
+                                );
+                            }
                             match extract_exception(&frames) {
                                 Some(e) => PostCall::Rejected(e),
                                 None => PostCall::Done(VerifiedBody::Frames(frames)),
@@ -1682,6 +1691,7 @@ pub async fn relay_stream_attributed(
         let mut tool_index: HashMap<String, u32> = HashMap::new(); // toolUseId → 块 index
         let mut closed_blocks: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut any_tool = false;
+        let mut refused = false;
         let mut truncation: Option<Truncation> = None; // 首个截断信号(max_tokens / 上下文耗尽)
         // 上游中途下发的 exception。预读阶段就被拒、且账号已试尽时在这里种好:
         // 收尾逻辑只此一份,不为"开局被拒"另写一条下发路径。
@@ -1743,6 +1753,7 @@ pub async fn relay_stream_attributed(
                                 }
                             }
                         } else if let Some(v) = crate::kiro::convert::tool_use_frame(&frame) {
+                            if refused { continue; }
                             // toolUseEvent:open 帧开新工具块、input 帧发 input_json_delta、stop 帧关块。
                             let Some(id) = v["toolUseId"].as_str() else { continue };
                             if !tool_index.contains_key(id) {
@@ -1785,6 +1796,9 @@ pub async fn relay_stream_attributed(
                         } else if let Some(m) = crate::kiro::convert::metering_frame(&frame) {
                             // meteringEvent:记住真实积分消耗(多个则末次覆盖),流收尾时落库。
                             usage_guard.metering = Some(m);
+                        } else if let Some(refusal) = crate::kiro::convert::frame_refusal(&frame) {
+                            if !refused { crate::kiro::convert::log_refusal(&refusal, credential_id, &model); }
+                            refused = true;
                         } else if let Some(tr) = crate::kiro::convert::frame_truncation(&frame) {
                             // 截断信号(ContentLengthExceededException / contextUsage 100%):
                             // 取首个,收尾时据此给出 stop_reason,与非流式路径同口径。
@@ -1886,7 +1900,9 @@ pub async fn relay_stream_attributed(
         } else {
             // stop_reason 与非流式 kiro_events_to_anthropic 同口径:tool_use 优先级最高,
             // 其次才看截断信号,最后才是 end_turn。
-            let stop_reason = if any_tool {
+            let stop_reason = if refused {
+                "refusal"
+            } else if any_tool {
                 "tool_use"
             } else {
                 match truncation {
@@ -3495,6 +3511,51 @@ mod tests {
     }
 
     // ==================== 流式截断信号 ====================
+
+    #[tokio::test]
+    async fn refusal_stream_and_buffered_do_not_retry_or_penalize() {
+        for streaming in [false, true] {
+            let server = MockServer::start().await;
+            let mut body = event_frame("assistantResponseEvent", br#"{"content":"hello"}"#);
+            body.extend(event_frame(
+                "toolUseEvent",
+                br#"{"name":"f","toolUseId":"tu1","input":"{}","stop":true}"#,
+            ));
+            body.extend(event_frame(
+                "contextUsageEvent",
+                br#"{"contextUsagePercentage":100}"#,
+            ));
+            body.extend(event_frame("metadataEvent", br#"{"stopReason":"refusal"}"#));
+            Mock::given(method("POST"))
+                .and(path("/generateAssistantResponse"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                .mount(&server)
+                .await;
+            let st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+            let app = messages_router(st.clone());
+            let req = if streaming {
+                r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#
+            } else {
+                r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":false}"#
+            };
+            let (status, bytes) = post_messages(app, req).await;
+            assert_eq!(status, StatusCode::OK);
+            let s = String::from_utf8_lossy(&bytes);
+            assert!(
+                s.contains("hello") && s.contains("\"stop_reason\":\"refusal\""),
+                "{s}"
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            let pool = st.pool.lock().await;
+            assert_eq!(pool.len(), 2);
+            for account in pool.stats(0) {
+                assert_eq!(account.strikes, 0);
+                assert!(!account.disabled);
+                assert_eq!(account.cooldown_until, 0);
+                assert_eq!(account.status_reason, "none");
+            }
+        }
+    }
 
     /// 流式:命中 max_tokens(ContentLengthExceededException)→ stop_reason 必须是
     /// `max_tokens`,而不是按"有无工具调用"推出来的 end_turn。截断不是错误,仍正常收尾。

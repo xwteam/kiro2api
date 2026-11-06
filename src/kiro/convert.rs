@@ -1081,6 +1081,47 @@ fn header_str<'a>(msg: &'a Message, name: &str) -> Option<&'a str> {
     })
 }
 
+/// 上游拒答元数据。日志字段按 Unicode 字符截断,不记录请求内容。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub category: Option<String>,
+    pub explanation: Option<String>,
+    pub recommended_model: Option<String>,
+}
+
+pub fn frame_refusal(frame: &Message) -> Option<Refusal> {
+    if event_type(frame) != Some("metadataEvent") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&frame.payload).ok()?;
+    let details = value.get("stopDetails").and_then(|v| v.get("refusal"));
+    let has_details = details.is_some_and(serde_json::Value::is_object);
+    let is_refusal = value
+        .get("stopReason")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("refusal"));
+    if !has_details && !is_refusal {
+        return None;
+    }
+    let field = |name| {
+        details
+            .and_then(|v| v.get(name))
+            .and_then(|v| v.as_str())
+            .map(|s| s.chars().take(200).collect())
+    };
+    Some(Refusal {
+        category: field("category"),
+        explanation: field("explanation"),
+        recommended_model: field("recommendedModel"),
+    })
+}
+
+pub fn log_refusal(refusal: &Refusal, account_id: u32, model: &str) {
+    tracing::warn!(event = "upstream_refusal", account_id, model,
+        category = ?refusal.category, explanation = ?refusal.explanation,
+        recommended_model = ?refusal.recommended_model, "上游拒答");
+}
+
 /// 上游截断信号(照 §5 观测的数据面契约)。
 ///
 /// Kiro 事件流用两种帧表达"这轮不是正常结束":
@@ -1400,6 +1441,7 @@ pub fn kiro_events_to_anthropic(frames: &[Message], model: &str) -> MessagesResp
         }
     }
 
+    let refusal = frames.iter().any(|frame| frame_refusal(frame).is_some());
     let truncation = extract_truncation(frames);
 
     // usage:meteringEvent 的真实计量优先,缺哪项就单独回退该项的估算
@@ -1427,14 +1469,18 @@ pub fn kiro_events_to_anthropic(frames: &[Message], model: &str) -> MessagesResp
             }
         }
     }
-    content.extend(tools.into_blocks());
-    if content.is_empty() {
+    if !refusal {
+        content.extend(tools.into_blocks());
+    }
+    if content.is_empty() && !refusal {
         content.push(OutBlock::Text {
             text: String::new(),
         });
     }
 
-    let stop_reason = if has_tools {
+    let stop_reason = if refusal {
+        "refusal"
+    } else if has_tools {
         "tool_use"
     } else {
         match truncation {
@@ -1516,6 +1562,68 @@ mod tests {
             }],
             payload: payload.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn metadata_refusal_parsing() {
+        let object = event_frame(
+            "metadataEvent",
+            r#"{"stopDetails":{"refusal":{"category":"safety","explanation":"why","recommendedModel":"other"}}}"#,
+        );
+        let refusal = frame_refusal(&object).unwrap();
+        assert_eq!(refusal.category.as_deref(), Some("safety"));
+        assert_eq!(refusal.explanation.as_deref(), Some("why"));
+        assert_eq!(refusal.recommended_model.as_deref(), Some("other"));
+        assert!(
+            frame_refusal(&event_frame("metadataEvent", r#"{"stopReason":"ReFuSaL"}"#)).is_some()
+        );
+        assert!(
+            frame_refusal(&event_frame(
+                "metadataEvent",
+                r#"{"stopReason":"end_turn","stopDetails":{"refusal":null}}"#
+            ))
+            .is_none()
+        );
+        assert!(frame_refusal(&event_frame("metadataEvent", "not json")).is_none());
+        let long = "界".repeat(250);
+        let payload =
+            serde_json::json!({"stopDetails":{"refusal":{"explanation":long}}}).to_string();
+        assert_eq!(
+            frame_refusal(&event_frame("metadataEvent", &payload))
+                .unwrap()
+                .explanation
+                .unwrap()
+                .chars()
+                .count(),
+            200
+        );
+    }
+
+    #[test]
+    fn refusal_overrides_tool_and_truncation() {
+        let frames = vec![
+            event_frame("assistantResponseEvent", r#"{"content":"before"}"#),
+            event_frame(
+                "toolUseEvent",
+                r#"{"name":"f","toolUseId":"id","input":"{}","stop":true}"#,
+            ),
+            event_frame("contextUsageEvent", r#"{"contextUsagePercentage":100}"#),
+            event_frame("metadataEvent", r#"{"stopReason":"refusal"}"#),
+        ];
+        let response = kiro_events_to_anthropic(&frames, "sonnet");
+        assert_eq!(response.stop_reason.as_deref(), Some("refusal"));
+        assert!(
+            response
+                .content
+                .iter()
+                .any(|b| matches!(b, OutBlock::Text { text } if text == "before"))
+        );
+        assert!(
+            !response
+                .content
+                .iter()
+                .any(|b| matches!(b, OutBlock::ToolUse { .. }))
+        );
     }
 
     fn exception_frame_with(exception_type: &str, payload: &str) -> Message {

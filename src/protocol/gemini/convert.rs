@@ -310,6 +310,7 @@ pub fn gemini_to_hub(
 pub fn finish_reason_gemini(stop: Option<&str>) -> Option<String> {
     Some(
         match stop {
+            Some("refusal") => "SAFETY",
             Some("max_tokens") | Some("model_context_window_exceeded") => "MAX_TOKENS",
             _ => "STOP",
         }

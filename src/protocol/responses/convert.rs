@@ -226,7 +226,12 @@ pub fn hub_to_responses(resp: MessagesResponse, created_at: u64) -> ResponseObje
         resp.stop_reason.as_deref(),
         Some("max_tokens") | Some("model_context_window_exceeded")
     );
-    let status = if truncated { "incomplete" } else { "completed" };
+    let refused = resp.stop_reason.as_deref() == Some("refusal");
+    let status = if truncated || refused {
+        "incomplete"
+    } else {
+        "completed"
+    };
 
     let mut output: Vec<OutputItem> = Vec::new();
     let mut text = String::new();
@@ -276,9 +281,14 @@ pub fn hub_to_responses(resp: MessagesResponse, created_at: u64) -> ResponseObje
         output,
         usage,
     );
-    if truncated {
+    if truncated || refused {
         out.incomplete_details = Some(IncompleteDetails {
-            reason: "max_output_tokens".to_string(),
+            reason: if refused {
+                "content_filter"
+            } else {
+                "max_output_tokens"
+            }
+            .to_string(),
         });
     }
     out

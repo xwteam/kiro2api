@@ -350,6 +350,7 @@ pub async fn chat_completions_stream(
         let mut next_tool_index: u32 = 0;
         let mut any_tool = false;
         // 上游截断信号(命中 max_tokens / 上下文窗口耗尽):收尾 finish_reason 须报 "length"。
+        let mut refused = false;
         let mut truncation: Option<crate::kiro::convert::Truncation> = None;
         // 上游中途下发的非截断 exception:置位即停读,收尾走错误分支。
         let mut upstream_error: Option<crate::kiro::convert::StreamException> = None;
@@ -382,6 +383,7 @@ pub async fn chat_completions_stream(
                                 }));
                             }
                         } else if let Some(v) = crate::kiro::convert::tool_use_frame(&frame) {
+                            if refused { continue; }
                             let Some(tool_use_id) = v["toolUseId"].as_str() else { continue };
                             let is_new = !tool_index.contains_key(tool_use_id);
                             if is_new {
@@ -428,6 +430,9 @@ pub async fn chat_completions_stream(
                             // meteringEvent(#4):记住真实积分/缓存计费(多个则末次覆盖),收尾时落库。
                             // 不产出任何 OpenAI chunk——纯记账,不影响线格式。
                             usage_guard.metering = Some(m);
+                        } else if let Some(refusal) = crate::kiro::convert::frame_refusal(&frame) {
+                            if !refused { crate::kiro::convert::log_refusal(&refusal, credential_id, &model); }
+                            refused = true;
                         } else if let Some(tr) = crate::kiro::convert::frame_truncation(&frame) {
                             truncation = Some(tr);
                         } else if let Some(e) = crate::kiro::convert::frame_exception(&frame) {
@@ -501,7 +506,9 @@ pub async fn chat_completions_stream(
             yield Ok(Event::default().data(err_body.to_string()));
         } else {
             // 截断优先级低于工具调用(与 kiro_events_to_anthropic 一致):有工具就报 tool_calls。
-            let stop = if any_tool {
+            let stop = if refused {
+                Some("refusal")
+            } else if any_tool {
                 Some("tool_use")
             } else {
                 match truncation {
@@ -1510,6 +1517,55 @@ mod tests {
         assert_eq!(s11.total_output_tokens, 7);
         assert!(s11.total_cost > 0.0, "estimated_cost 不应恒为 0");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn refusal_stream_and_buffered() {
+        for streaming in [false, true] {
+            let server = MockServer::start().await;
+            let mut body = event_frame("assistantResponseEvent", br#"{"content":"hello"}"#);
+            body.extend(event_frame(
+                "toolUseEvent",
+                br#"{"name":"f","toolUseId":"tu1","input":"{}","stop":true}"#,
+            ));
+            body.extend(event_frame(
+                "contextUsageEvent",
+                br#"{"contextUsagePercentage":100}"#,
+            ));
+            body.extend(event_frame(
+                "metadataEvent",
+                br#"{"stopDetails":{"refusal":{}}}"#,
+            ));
+            Mock::given(method("POST"))
+                .and(path("/generateAssistantResponse"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                .mount(&server)
+                .await;
+            let app = openai_router(state(&server.uri(), vec![cred()]));
+            let req = format!(
+                r#"{{"model":"sonnet","messages":[{{"role":"user","content":"hi"}}],"stream":{streaming}}}"#
+            );
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(req))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let s = String::from_utf8_lossy(&bytes);
+            assert!(
+                s.contains("hello") && s.contains("\"finish_reason\":\"content_filter\""),
+                "{s}"
+            );
+        }
     }
 
     #[tokio::test]
