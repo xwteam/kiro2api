@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-11-06
+
+### Fixed
+
+- **普通事件形态的上游错误不再被当成成功。** 上游的 `error`、`throttlingError`、`validationError`、`serviceUnavailableError`、`InternalServerException`、`ThrottlingException`、`ValidationException` 和 `ServiceUnavailableException` 此前被忽略，可能导致空回答或部分回答被当作正常结束，限流信号也未送入账号池。现与异常帧走同一错误路径：限流映射 429、参数校验映射 400、其他服务端错误映射 502；四种协议的流式和非流式均返回各自的错误形状，Responses 流式以 `response.failed` 收尾，账号池收到对应信号，限流计入冷却判断。错误里的 `reason` 也会交给账号池判断：流里报 `INVALID_MODEL_ID` 时换号重试、不罚账号，异常帧同样生效。
+- **IAM Identity Center / Builder ID 账号不再存错令牌。** IAM Identity Center 授权码、Builder ID 设备码、SSO Token 导入登录及令牌刷新此前优先保存 `idToken`、缺省才用 `accessToken`，现一律保存 `accessToken`。已有凭据无需迁移，下次刷新时自动换成 `accessToken`；Social（Google/GitHub）和 Kiro API Key 账号不受影响。
+
 ## [0.18.0] - 2026-11-06
 
 ### Fixed

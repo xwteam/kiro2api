@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.18.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.18.1-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-11-06 | v0.18.1 - 🛠️ **普通錯誤事件不再冒充成功；帳號令牌保存已修正**。① 上游錯誤事件與例外幀統一處理，四種協定都回傳錯誤，限流訊號也會送至帳號池。② IAM Identity Center / Builder ID 登入與刷新一律保存 `accessToken`，既有憑證無須遷移，下次刷新時會自動修正。 |
 | 2026-11-06 | v0.18.0 - 🛡️ **上游拒答不再被誤認為空白的正常回應**。四種協定的串流與非串流回應都會回傳各自的拒答結束標記，並保留先前的正文。用戶端應依結束原因判斷，不要執行遭拒那一輪的工具呼叫。 |
 | 2026-08-19 | v0.17.2 - 📄 **僅文件修正,程式碼與 v0.17.1 完全一致,無需重新部署**。①多語言 README 的「最近更新」有 9 行是錯的語言(繁體拿到簡體、日韓拿到英文),成因是拿兩份文案去套六個檔案、沒有逐語言寫,現已逐行核對全部 60 行;②5 份 API.md 缺版本契約——v0.15.0 在日/韓/繁三份裡根本不存在,而那一版正是伺服器端內建搜尋真正接上(新增 `server_tool_use`/`web_search_tool_result`),這三種語言的讀者完全看不到,v0.16.0 則是五份全缺,現已齊全;③補上 v0.17 的契約文本並掃掉殘留舊版本號 |
 | 2026-08-11 | v0.17.1 - 🩹 **修 v0.17.0 引入的回歸**:三個協定(OpenAI/Gemini/Responses)的串流出口會**吞掉結尾一小截內容**。上一版給它們補思考剝離時只接了切分器的「餵資料」、沒接「串流末端吐淨」——切分器為兜住跨區塊的半截 `<thinking` 會扣留結尾幾個位元組,靠串流末端一次 flush 吐出,少了這步,回應結尾只要出現一個 `<`(程式碼裡的 `<div`、`<Component` 極常見)那一截就永遠丟了。原生 Anthropic 出口一直是對的,這三個是新接時漏的 |
@@ -70,7 +71,6 @@
 | 2026-08-10 | v0.14.1 - 🔧 **線上驗證時當場發現的兩件事**。①回應裡 `usage.input_tokens` **恆為 0**:先前補的輸入估算只餵給了計費、沒回寫用戶端 —— 帳單裡有、回應裡沒有,而用戶端拿它算成本和上下文佔用 → 非串流 `usage` 與串流 `message_start` 現在都帶同一個值;②**池裡有一批耗盡的號時,使用者前幾次請求會連續失敗**:配額耗盡此前與驗證失敗共用 3 次重試預算,實測 13 個耗盡號要連燒 2 次 502、第 3 次才成 → 配額是**確定性**結論(本週期換誰都一樣),現與「模型不可用」同歸帳號級確定性檔、按池大小給預算;瞬態/驗證仍保持 3 次小上限。全池確實耗盡時回 `429` 並說清是額度問題,而不是語焉不詳的 502 |
 | 2026-08-10 | v0.14.0 - 🧩 **對照收尾**。①歷史裡助手輪 `content` 可能是**空串**,上游據此拒掉整條請求(純工具呼叫那一輪就是空,使用者輪早有兜底、助手輪一直漏著)→ 用單個空格佔位;②**損壞幀被逐位元組重掃,而它的邊界本來已知**(prelude CRC 通過則 `total_len` 可信)→ 整幀跳過;③**`tlsBackend` 改為執行時可切**(此前編譯期二選一)——走自簽 CA 代理時往往只有一個後端握得上手 |
 | 2026-08-09 | v0.13.0 - 🧠 **擴展思考(thinking)完整接上**,此前整個功能缺失:請求側 `thinking` 欄位被靜默丟棄,回應側上游把思考用 `<thinking>…</thinking>` 包在普通文字裡下發、我們原樣透傳 → 客戶端把整段思考當正文顯示。現按 enabled/adaptive 生成指令注入 system 最前,並切成獨立 `thinking` 區塊,串流與非串流共用同一份增量切分器;**普通文字零延遲透傳**。另修:**token 估算對中文低估約三倍**;**串流記帳 input token 恆為 0**;**上下文視窗全表釘死 200K**(上游 `maxInputTokens` 解析了又丟)→ 拆成兩個欄位 |
-| 2026-08-09 | v0.12.0 - 🎚️ **不同訂閱檔位的帳號終於能共存**(使用者提供的真實 ksk 實測驗證)。①`INVALID_MODEL_ID` 被歸為**請求級**錯誤直接回 400,而它其實是**帳號級**的——可用模型由檔位決定,而我們對客戶端暴露的是全池**並集** → 拆出 `ModelUnavailable`,不罰帳號但換號再試;②換號預算只有 3 次,而支援該模型的號可能排第 14 → 模型不可用**不佔**帳號故障預算。另:記住「誰不支援哪個模型」;**`priority` 此前只是 `weight` 的別名、從不參與選號** → 現數字越小越優先,匯入一律 999;非 us-east-1 帳號重新整理模型必然失敗 → 回落 `q.{region}` |
 
 ---
 
@@ -220,7 +220,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.18.0"}
+# {"service":"kiro2api","status":"ok","version":"0.18.1"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \

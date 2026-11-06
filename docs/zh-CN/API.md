@@ -106,6 +106,11 @@ cat data/config.json | grep apiKey
 | 422 | 请求体反序列化失败（缺必填字段 / 类型不符），axum 默认拒收，`text/plain` 纯文本。出现在带 body 提取器的端点上：`/api/admin/*` 与 `POST /api/user/login`（四个协议对话端点与 `/v1/messages/count_tokens` 已自行接管拒收、改回各自形状的 `400`）（`/api/user/*` 的其余端点只收 query，参数类型不符是 `400` 而非 `422`） |
 
 
+> **v0.18.1:上游错误事件与账号令牌**
+>
+> - 上游普通事件 `error`、`throttlingError`、`validationError`、`serviceUnavailableError`、`InternalServerException`、`ThrottlingException`、`ValidationException`、`ServiceUnavailableException` 现在与异常帧走同一错误路径，不再把空回答或部分回答当成成功。限流映射 429、参数校验映射 400、其他服务端错误映射 502；四种协议的流式和非流式均返回各自的错误形状，Responses 流式以 `response.failed` 收尾。账号池收到对应信号，限流计入冷却判断。错误里的 `reason` 也会交给账号池判断：流里报 `INVALID_MODEL_ID`（该账号不支持此模型）时换号重试、不罚账号，异常帧同样生效。
+> - IAM Identity Center 授权码、Builder ID 设备码和 SSO Token 导入登录及令牌刷新现在一律保存 `accessToken`，不再优先保存 `idToken`。已有凭据无需迁移，下次刷新自动换成 `accessToken`；Social（Google/GitHub）和 Kiro API Key 账号不受影响。
+>
 > **v0.18.0:上游拒答契约**
 >
 > - 上游 `metadataEvent` 带 `stopReason: "refusal"` 或 `stopDetails.refusal` 时不再被丢弃。流式与非流式均使用协议原生拒答信号：Anthropic `stop_reason: "refusal"`（流式在 `message_delta`）；Chat Completions `finish_reason: "content_filter"`；Responses `status: "incomplete"` 和 `incomplete_details: {"reason":"content_filter"}`（流式终结事件 `response.incomplete`）；Gemini `finishReason: "SAFETY"`。
@@ -188,7 +193,7 @@ cat data/config.json | grep apiKey
 >
 > 同一个账号的**数据面、令牌刷新、余额查询、模型清单、后台续期一律走同一个出口**。
 > 代理地址无法解析时会记 `error` 日志并退回直连(不静默吞掉)。
-| 429 | **只来自上游限流**，且只在上游于 HTTP 200 事件流中途下发 `Throttling*` 异常帧时原样映射。本地的 `MAX_RPM_PER_CREDENTIAL` **不会**产生 `429`：超过该上限只是让这个账号本轮选不中，全部账号都选不中才落到 `503`（见下行）。上游在 HTTP 层直接回的 `429` 也**不**原样透出——自 v0.10.0 起它被判为**瞬时限流**(退避后重试,不惩罚账号;此前被误判为配额耗尽并让账号吃长冷却),重试用尽后以 `502` 收尾。据自己设的 RPM 上限去监控 `429` 是等不到的 |
+| 429 | **只来自上游限流**，且只在上游于 HTTP 200 事件流中途下发 `ThrottlingException` 异常帧或 `throttlingError` / `ThrottlingException` 错误事件时映射。本地的 `MAX_RPM_PER_CREDENTIAL` **不会**产生 `429`：超过该上限只是让这个账号本轮选不中，全部账号都选不中才落到 `503`（见下行）。上游在 HTTP 层直接回的 `429` 也**不**原样透出——自 v0.10.0 起它被判为**瞬时限流**(退避后重试,不惩罚账号;此前被误判为配额耗尽并让账号吃长冷却),重试用尽后以 `502` 收尾。据自己设的 RPM 上限去监控 `429` 是等不到的 |
 | 502 | 上游 Kiro 失败（含跨账号重试用尽后的最后一个账号级错误）。**每个上游请求都带 `Connection: close`、且客户端不复用连接**:本中转每个请求携带**不同账号**的令牌,user-agent 里的 machineId 也随账号变化,复用连接会让同一条 TCP/TLS 上依次出现几十个不同身份 —— 真实客户端不可能如此,而这是账号共享最直接的证据。瞬态失败(网络抖动/5xx/限流)换账号前指数退避 200ms→2s + 抖动;账号级失败(令牌失效/额度耗尽)不退避,换个账号立刻可成上游连接锁 **HTTP/1.1**(真实客户端不主动升 h2;且 `Connection: close` 是 1.1 的头,h2 明确禁止它,不锁就只是摆设),TLS 后端默认 **native-tls(OpenSSL)** 以贴合真实客户端的 ClientHello 指纹 —— 该指纹在任何 HTTP 内容发出**之前**就暴露。 |
 | 503 | 无可用账号（全部冷却 / 禁用 / **超本地 RPM 上限**），或日志端点未启用（`logCapacity=0`） |
 
@@ -483,7 +488,7 @@ curl -X POST http://localhost:8080/v1/responses \
 **响应（流式）**：严格按官方协议顺序发送带命名的 SSE 事件，每个事件都带**单调递增**的 `sequence_number`。**没有** `data: [DONE]` 结尾标记（那是 Chat Completions 的老约定）。
 
 > [!IMPORTANT]
-> **终结事件有三种，只等 `response.completed` 会把客户端挂死**：正常结束发 `response.completed`；上游截断（输出预算 / 上下文窗口耗尽）或拒答时发 `response.incomplete`（`status:"incomplete"` + `incomplete_details`）；上游下发非截断异常（限流 / 鉴权 / 参数）或传输中断发 `response.failed`（`status:"failed"` + `error`）。后两种**绝不会**再补一个 `response.completed`——这是刻意的，免得 agent 框架把半截回答当完整结果继续用。收到任一终结事件即可停止读取。
+> **终结事件有三种，只等 `response.completed` 会把客户端挂死**：正常结束发 `response.completed`；上游截断（输出预算 / 上下文窗口耗尽）或拒答时发 `response.incomplete`（`status:"incomplete"` + `incomplete_details`）；上游下发非截断异常帧或错误事件（限流 / 鉴权 / 参数）或传输中断发 `response.failed`（`status:"failed"` + `error`）。后两种**绝不会**再补一个 `response.completed`——这是刻意的，免得 agent 框架把半截回答当完整结果继续用。收到任一终结事件即可停止读取。
 
 纯文本、正常完成时的事件序列：
 

@@ -651,6 +651,11 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.18.1: 업스트림 오류 이벤트와 계정 토큰**
+>
+> - 업스트림의 일반 이벤트 `error`, `throttlingError`, `validationError`, `serviceUnavailableError`, `InternalServerException`, `ThrottlingException`, `ValidationException`, `ServiceUnavailableException`을 예외 프레임과 같은 오류 경로로 처리하여 빈 응답이나 일부 응답을 성공으로 취급하지 않습니다. 스로틀링은 429, 파라미터 검증 오류는 400, 그 밖의 서버 오류는 502에 매핑합니다. 네 프로토콜의 스트리밍과 비스트리밍 모두 각자의 오류 형식을 반환하며 Responses 스트리밍은 `response.failed`로 종료합니다. 계정 풀에도 해당 신호가 전달되고 스로틀은 쿨다운 판단에 반영됩니다.오류의 `reason`도 계정 풀 판단에 전달합니다. 스트림에서 `INVALID_MODEL_ID`(해당 계정이 모델을 지원하지 않음)가 오면 계정에 불이익 없이 다른 계정으로 재시도하며, 예외 프레임도 마찬가지입니다.
+> - IAM Identity Center 인증 코드, Builder ID 디바이스 코드, SSO Token 가져오기를 통한 로그인과 토큰 갱신에서는 `idToken`을 우선하지 않고 항상 `accessToken`을 저장합니다. 기존 자격 증명은 마이그레이션할 필요 없이 다음 갱신 때 자동으로 교체됩니다. Social(Google/GitHub) 및 Kiro API Key 계정은 영향을 받지 않습니다.
+>
 > **v0.18.0: 업스트림 응답 거부 계약**
 >
 > - `stopReason: "refusal"` 또는 `stopDetails.refusal`이 포함된 업스트림 `metadataEvent`를 버리지 않고, 스트리밍과 비스트리밍 모두 각 프로토콜의 거부 신호로 반환합니다. Anthropic은 `stop_reason: "refusal"`(스트리밍에서는 `message_delta`), Chat Completions는 `finish_reason: "content_filter"`, Responses는 `status: "incomplete"`와 `incomplete_details: {"reason":"content_filter"}`(스트리밍 종료 이벤트는 `response.incomplete`), Gemini는 `finishReason: "SAFETY"`입니다.
@@ -1546,7 +1551,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.18.0"}
+{"service":"kiro2api","status":"ok","version":"0.18.1"}
 ```
 
 ### GET /v1/ping
@@ -1575,7 +1580,7 @@ curl http://localhost:8080/v1/ping
 | 403 | 금지 (권한 부족) |
 | 404 | 찾을 수 없음 (엔드포인트 없음, 또는 관리 API에서 존재하지 않는 id 지정 — 예: `{"error":"api key not found","id":…}`, 만료된 로그인 세션) |
 | 422 | 요청 본문 역직렬화 실패 (기본 `Json` 추출기가 그대로 거부 — 필수 필드 누락이나 타입 불일치. 예: `POST /api/admin/credentials/batch-import`를 `{"data": …}` 래퍼 없이 호출. `Json`을 직접 쓰는 `/api/admin/*`, `POST /api/user/login`에서 발생합니다. 반면 프로토콜 4종의 **대화** 엔드포인트(`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1beta/models/{m}:generateContent`)와 `POST /v1/messages/count_tokens`는 같은 상황을 각 프로토콜 형태의 `400` 본문으로 변환해 돌려줍니다) |
-| 429 | 업스트림 Kiro의 스로틀링(`ThrottlingException` 계열 예외를 변환한 결과). `MAX_RPM_PER_CREDENTIAL` 초과는 이 코드가 되지 않습니다 — 해당 계정이 선택 대상에서 빠져 다른 계정으로 넘어가고, 전부 빠졌을 때만 `503`입니다 |
+| 429 | 업스트림 Kiro의 스로틀링(`ThrottlingException` 예외 프레임 또는 `throttlingError` / `ThrottlingException` 오류 이벤트를 변환한 결과). `MAX_RPM_PER_CREDENTIAL` 초과는 이 코드가 되지 않습니다 — 해당 계정이 선택 대상에서 빠져 다른 계정으로 넘어가고, 전부 빠졌을 때만 `503`입니다 |
 | 500 | 서버 오류 (내부 오류) |
 | 502 | 업스트림 Kiro 실패. **모든 업스트림 요청에 `Connection: close`를 붙이고 클라이언트는 연결을 재사용하지 않습니다.** 각 요청은 *서로 다른 계정*의 토큰을 싣고 user-agent의 machineId도 계정마다 달라, 연결을 재사용하면 하나의 TCP/TLS 위에 수십 개의 신원이 차례로 나타납니다 —— 실제 클라이언트로는 불가능하며 계정 공유의 가장 직접적인 증거입니다. 일시적 실패(네트워크/5xx/스로틀링)는 계정 전환 전 200ms→2s 지수 백오프+지터, 계정 수준 실패는 대기하지 않습니다 업스트림 연결은 **HTTP/1.1**로 고정됩니다(실제 클라이언트는 h2로 올리지 않으며, `Connection: close`는 1.1 헤더로 h2에서는 금지되어 고정하지 않으면 장식일 뿐입니다). TLS 백엔드는 기본값이 **native-tls(OpenSSL)**로, 실제 클라이언트의 ClientHello 지문에 맞춥니다 —— 이 지문은 HTTP 내용이 전송되기 **전에** 노출됩니다. |
 | 503 | 서비스 사용 불가 (사용 가능한 계정 없음 — 전체 쿨다운/비활성화/RPM 초과, 또는 `logCapacity=0`인데 로그 엔드포인트 호출) |

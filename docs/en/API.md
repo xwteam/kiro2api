@@ -628,6 +628,11 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.18.1: upstream error events and account tokens**
+>
+> - The ordinary upstream events `error`, `throttlingError`, `validationError`, `serviceUnavailableError`, `InternalServerException`, `ThrottlingException`, `ValidationException`, and `ServiceUnavailableException` now follow the same error path as exception frames instead of treating empty or partial answers as successes. Throttling maps to 429, validation to 400, and other server errors to 502. All four protocols return their native error shapes in streaming and non-streaming responses; Responses streaming terminates with `response.failed`. The account pool receives the corresponding signals, with throttles counted toward cooldown decisions. The error's `reason` is now passed to the account pool as well: an in-stream `INVALID_MODEL_ID` (the account does not support the model) is retried on another account without penalizing this one; exception frames behave the same way.
+> - IAM Identity Center authorization-code login, Builder ID device-code login, SSO Token import, and token refresh now always save `accessToken` rather than preferring `idToken`. Existing credentials need no migration: their next refresh replaces the token automatically. Social (Google/GitHub) and Kiro API Key accounts are unaffected.
+>
 > **v0.18.0: upstream refusal contract**
 >
 > - Upstream `metadataEvent` with `stopReason: "refusal"` or `stopDetails.refusal` is no longer discarded. Streaming and non-streaming responses use native refusal signals: Anthropic `stop_reason: "refusal"` (streaming `message_delta`); Chat Completions `finish_reason: "content_filter"`; Responses `status: "incomplete"` with `incomplete_details: {"reason":"content_filter"}` (streaming `response.incomplete`); Gemini `finishReason: "SAFETY"`.

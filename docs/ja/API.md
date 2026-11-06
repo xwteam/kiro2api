@@ -682,6 +682,11 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.18.1:上流のエラーイベントとアカウントのトークン**
+>
+> - 上流の通常イベント `error`、`throttlingError`、`validationError`、`serviceUnavailableError`、`InternalServerException`、`ThrottlingException`、`ValidationException`、`ServiceUnavailableException` を例外フレームと同じエラー経路で扱い、空または途中までの回答を成功とみなさなくなりました。スロットルは 429、パラメータ検証は 400、その他のサーバーエラーは 502 に対応します。4 プロトコルのストリーミング・非ストリーミングでそれぞれのエラー形式を返し、Responses のストリーミングは `response.failed` で終端します。アカウントプールにも対応する信号が届き、スロットルはクールダウンの判定に加算されます。エラーの `reason` もアカウントプールの判定に渡します。ストリーム内で `INVALID_MODEL_ID`（そのアカウントがモデルに未対応）が返った場合は、アカウントを罰せず別のアカウントで再試行します。例外フレームでも同様です。
+> - IAM Identity Center の認可コード、Builder ID のデバイスコード、SSO Token のインポートによるログインとトークン更新では、`idToken` を優先せず常に `accessToken` を保存します。既存の認証情報は移行不要で、次回の更新時に自動的に切り替わります。Social（Google/GitHub）と Kiro API Key のアカウントには影響しません。
+>
 > **v0.18.0:上流の回答拒否に関する契約**
 >
 > - `stopReason: "refusal"` または `stopDetails.refusal` を含む上流の `metadataEvent` を破棄せず、ストリーミング・非ストリーミングとも各プロトコル固有の拒否を返します。Anthropic は `stop_reason: "refusal"`（ストリーミングでは `message_delta`）、Chat Completions は `finish_reason: "content_filter"`、Responses は `status: "incomplete"` と `incomplete_details: {"reason":"content_filter"}`（ストリーミング終端は `response.incomplete`）、Gemini は `finishReason: "SAFETY"` です。
@@ -1545,7 +1550,7 @@ API エラーは以下のコードで返されます。
 | 403 | 禁止 | 権限がない |
 | 404 | 見つからない（パスが存在しない。または管理エンドポイントにプールへ存在しないアカウント / API-KEY / ログインセッションの id を渡した） | id とパスを確認 |
 | 422 | リクエストボディのデシリアライズ失敗（必須フィールドの欠落や型不一致）。4 プロトコルの対話エンドポイントと `/v1/messages/count_tokens` は自前で拒否を受け取り、それぞれの形状の `400` に変換するため、`422` は主に `/api/admin/*` と `/api/user/login` のように `Json` 抽出器を直接使うエンドポイントで発生します | ボディの形状を確認 |
-| 429 | 上流 Kiro のスロットリング（`ThrottlingException` 系の例外を変換）。`MAX_RPM_PER_CREDENTIAL` の超過はこのコードにはならず、他アカウントへローテーションされ、全滅した場合のみ `503` になります | しばらく待機 |
+| 429 | 上流 Kiro のスロットリング（`ThrottlingException` の例外フレームまたは `throttlingError` / `ThrottlingException` のエラーイベントを変換）。`MAX_RPM_PER_CREDENTIAL` の超過はこのコードにはならず、他アカウントへローテーションされ、全滅した場合のみ `503` になります | しばらく待機 |
 | 502 | 上流エラー | 上流の Kiro が失敗。**すべての上流リクエストに `Connection: close` を付与し、クライアントは接続を再利用しません。** 各リクエストは**異なるアカウント**のトークンを運び、user-agent 内の machineId もアカウントごとに変わるため、接続を再利用すると一つの TCP/TLS 上に数十の異なる身元が順に現れます —— 実際のクライアントには不可能であり、アカウント共有の最も直接的な証拠です。一時的失敗(ネットワーク/5xx/スロットリング)はアカウント切替前に 200ms→2s の指数バックオフ+ジッタ、アカウント級の失敗は待機しません 上流接続は **HTTP/1.1** に固定します(実クライアントは h2 へ昇格せず、`Connection: close` は 1.1 のヘッダで h2 では禁止されているため、固定しなければ飾りにすぎません)。TLS バックエンドは既定で **native-tls(OpenSSL)** とし、実クライアントの ClientHello 指紋に合わせます —— この指紋は HTTP の内容が送られる**前**に露出します。 |
 | 503 | 利用不可 | 利用可能なアカウントがない（全てクールダウン中/無効化/RPM 超過）、またはログ機能無効 |
 

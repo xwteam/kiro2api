@@ -604,6 +604,11 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.18.1:上游錯誤事件與帳號令牌**
+>
+> - 上游普通事件 `error`、`throttlingError`、`validationError`、`serviceUnavailableError`、`InternalServerException`、`ThrottlingException`、`ValidationException`、`ServiceUnavailableException` 現在與例外幀走相同的錯誤路徑，不再把空白或部分回答當成成功。限流對應 429、參數驗證對應 400、其他伺服器錯誤對應 502；四種協定的串流與非串流均回傳各自的錯誤格式，Responses 串流以 `response.failed` 結束。帳號池會收到對應訊號，限流會納入冷卻判斷。錯誤裡的 `reason` 也會交給帳號池判斷：串流裡回報 `INVALID_MODEL_ID`（該帳號不支援此模型）時換帳號重試、不懲罰帳號，例外幀同樣適用。
+> - IAM Identity Center 授權碼、Builder ID 裝置碼與 SSO Token 匯入登入及令牌刷新現在一律保存 `accessToken`，不再優先保存 `idToken`。既有憑證無須遷移，下次刷新時會自動換成 `accessToken`；Social（Google/GitHub）與 Kiro API Key 帳號不受影響。
+>
 > **v0.18.0:上游拒答契約**
 >
 > - 上游 `metadataEvent` 含有 `stopReason: "refusal"` 或 `stopDetails.refusal` 時不再被丟棄。串流與非串流都使用各協定原生的拒答訊號：Anthropic 的 `stop_reason: "refusal"`（串流在 `message_delta`）；Chat Completions 的 `finish_reason: "content_filter"`；Responses 的 `status: "incomplete"` 與 `incomplete_details: {"reason":"content_filter"}`（串流終結事件為 `response.incomplete`）；Gemini 的 `finishReason: "SAFETY"`。
@@ -1290,7 +1295,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.18.0"}
+{"service":"kiro2api","status":"ok","version":"0.18.1"}
 ```
 
 ### GET /v1/ping
@@ -1318,7 +1323,7 @@ curl http://localhost:8080/v1/ping
 | 403 | 禁止 |
 | 404 | 找不到（路徑不存在；或管理端點傳入了池中不存在的帳號 / key id） |
 | 422 | 請求體反序列化失敗（欄位缺失或型別不符）。四個協議的對話端點與 `/v1/messages/count_tokens` 已自行接管拒收、改回各自形狀的 `400`；`422` 主要出現在 `/api/admin/*` 與 `/api/user/login` 這類直接用 `Json` 提取器的端點 |
-| 429 | **上游**回報限流（事件流裡的 `ThrottlingException` 一類）。本服務自己的 `MAX_RPM_PER_CREDENTIAL` **不會**回 `429`——超限的帳號只是暫時不參與選號，全部帳號都選不出來時回的是 `503` |
+| 429 | **上游**回報限流（事件流裡的 `ThrottlingException` 例外幀，或 `throttlingError` / `ThrottlingException` 錯誤事件）。本服務自己的 `MAX_RPM_PER_CREDENTIAL` **不會**回 `429`——超限的帳號只是暫時不參與選號，全部帳號都選不出來時回的是 `503` |
 | 502 | 上游 Kiro 失敗 |
 | 503 | 服務不可用（無可用帳號：全冷卻 / 停用 / 超 RPM） |
 
