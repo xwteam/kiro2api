@@ -8,7 +8,7 @@
 //! 同一条中转内核)→ [`hub_to_gemini`] → `Json` 返回。错误以 Gemini 错误体(而非 Anthropic
 //! 错误体)向外暴露,复用 [`RelayError`] 的分类与 HTTP 状态。
 //!
-//! `streamGenerateContent`:复用 [`select_and_call_with_retry`] 取上游 `reqwest::Response`,`async_stream`
+//! `streamGenerateContent`:复用 [`select_stream_with_retry`] 取上游 `reqwest::Response`,`async_stream`
 //! 里 `resp.chunk()` 喂 `StreamDecoder`,逐帧编码为 `GenerateContentResponse` chunk 下发。
 //!
 //! **两种线格式**:Gemini `streamGenerateContent` 官方定义了两种——默认(无 `?alt=sse` 查询参数)
@@ -30,7 +30,7 @@ use serde::Deserialize;
 use crate::kiro::convert::{StreamException, Truncation};
 use crate::protocol::anthropic::handler::{
     CoreOutcome, MessagesState, RelayError, extract_client_ip, relay_core_outcome,
-    select_and_call_with_retry,
+    select_stream_with_retry,
 };
 use crate::protocol::gemini::convert::{
     GeminiConvertError, finish_reason_for_truncation, gemini_to_hub, hub_to_gemini,
@@ -75,10 +75,15 @@ struct StreamUsageGuard {
     now_unix: i64,
     /// 累计输出字符数(收尾按 ÷CHARS_PER_TOKEN 估算 output_tokens);随流增量更新。
     total_chars: usize,
+    estimated_input_tokens: u32,
     /// 末次 meteringEvent 的真实计费(#4;有则 credits/缓存 token 随之落库,多个则末次覆盖)。
     metering: Option<crate::kiro::convert::MeteringUsage>,
     /// 已记账标记:避免正常收尾 + Drop 双写。
     recorded: bool,
+    failed: bool,
+    failure_status: Option<u16>,
+    failure_logged: bool,
+    has_output: bool,
 }
 
 impl StreamUsageGuard {
@@ -86,7 +91,11 @@ impl StreamUsageGuard {
     /// (上游真实计费,可能 output 为 0 但仍有 credits/缓存计费——纯工具轮即属此类,#9)。二者皆无
     /// = 极早取消(计量前客户端断连、且尚未产出文本),补记只会写零行,应跳过(#16 类比)。
     fn has_meaningful_usage(&self) -> bool {
-        self.total_chars >= CHARS_PER_TOKEN || self.metering.is_some()
+        crate::stats::usage::should_record_stream_usage(
+            false,
+            self.has_output,
+            self.metering.is_some(),
+        )
     }
 
     /// 本次流的 `(input_tokens, output_tokens)`:优先上游 meteringEvent 的真实计量,
@@ -97,12 +106,12 @@ impl StreamUsageGuard {
             .metering
             .as_ref()
             .and_then(|m| m.input_tokens)
-            .unwrap_or(0);
+            .unwrap_or(self.estimated_input_tokens);
         let output = self
             .metering
             .as_ref()
             .and_then(|m| m.output_tokens)
-            .unwrap_or((self.total_chars / CHARS_PER_TOKEN) as u32);
+            .unwrap_or(self.total_chars.div_ceil(CHARS_PER_TOKEN) as u32);
         (input, output)
     }
 
@@ -116,6 +125,13 @@ impl StreamUsageGuard {
             return;
         }
         self.recorded = true;
+        if !crate::stats::usage::should_record_stream_usage(
+            !self.failed,
+            self.has_output,
+            self.metering.is_some(),
+        ) {
+            return;
+        }
 
         let (input_tokens, output_tokens) = self.token_counts();
         let (input_tokens, output_tokens) = (input_tokens as i32, output_tokens as i32);
@@ -137,13 +153,16 @@ impl StreamUsageGuard {
         let (credential_id, api_key_id, now_unix) =
             (self.credential_id, self.api_key_id, self.now_unix);
         let client_ip = self.client_ip.clone();
+        let failed = self.failed;
+        let failure_status = self.failure_status;
+        let failure_logged = self.failure_logged;
 
         // Drop 里 spawn 前先确认有 tokio 运行时:运行时之外/关停期 spawn 会 panic,Drop 绝不可 panic。
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
                     usage
-                        .record_usage_full(
+                        .record_usage_with_failure_log(
                             credential_id,
                             api_key_id,
                             model,
@@ -156,6 +175,9 @@ impl StreamUsageGuard {
                             cache_creation,
                             None,
                             now_unix,
+                            failed,
+                            failure_status,
+                            Some(failure_logged),
                         )
                         .await;
                 });
@@ -382,15 +404,35 @@ pub async fn stream_generate_content(
     wire: WireFormat,
     now_unix: u64,
 ) -> Result<Response, RelayError> {
-    let crate::protocol::anthropic::handler::CallOutcome {
-        mut resp,
-        credential_id,
-        // 超长工具名在上行时被缩短了,上游回来的 `toolUseEvent` 用的就是短名。这张表必须一路
-        // 带进读循环:丢掉它,客户端会在 `functionCall.name` 里看到一个**它自己没声明过**的
-        // 函数名,那一轮工具调用直接作废。非流式那条走中枢内核,早已还原。
-        tool_name_map,
-        cred_id,
-    } = select_and_call_with_retry(&state, &hub_req, now_unix, bound.as_ref()).await?;
+    let estimated_input_tokens =
+        crate::protocol::anthropic::handler::estimate_request_input_tokens_weighted(&hub_req);
+    let started = std::time::Instant::now();
+    let (mut resp, preroll, credential_id, tool_name_map, cred_id, seeded_exception) =
+        match select_stream_with_retry(
+            &state,
+            &hub_req,
+            now_unix,
+            bound.as_ref(),
+            api_key_id,
+            client_ip.clone(),
+        )
+        .await?
+        {
+            Ok((outcome, preroll)) => (
+                Some(outcome.resp),
+                preroll,
+                outcome.credential_id,
+                outcome.tool_name_map,
+                outcome.cred_id,
+                None,
+            ),
+            Err(e) => {
+                return Ok(exception_to_gemini(
+                    crate::kiro::convert::exception_status(&e.kind),
+                    &e,
+                ));
+            }
+        };
     // 流里报错时要反馈账号池,而 state 会被移进 stream! —— 先留一份。
     let feedback_state = state.clone();
     // 统计层用量句柄(Arc,移入哨兵);记账经 Drop 哨兵在流**任意方式结束**时都落一条(#8/#9/#15)。
@@ -409,11 +451,19 @@ pub async fn stream_generate_content(
             model: record_model,
             now_unix: now_unix as i64,
             total_chars: 0,
+            estimated_input_tokens,
             metering: None,
             recorded: false,
+            failed: false,
+            failure_status: None,
+            failure_logged: false,
+            has_output: false,
         };
 
         let mut dec = crate::kiro::eventstream::decoder::StreamDecoder::new();
+        if preroll.is_empty() && resp.is_some() {
+            yield Ok::<Bytes, std::io::Error>(keepalive_frame(wire));
+        }
         // toolUseId → (name, 拼接中的 input 片段);MVP 单工具轮足够,多工具并发轮各自独立累积。
         let mut tool_names: HashMap<String, String> = HashMap::new();
         let mut tool_args: HashMap<String, String> = HashMap::new();
@@ -421,7 +471,8 @@ pub async fn stream_generate_content(
         let mut first = true;
         let mut refused = false;
         let mut truncation: Option<Truncation> = None;
-        let mut exception: Option<StreamException> = None;
+        let mut exception = seeded_exception;
+        let mut pending = Some(preroll);
         // 传输层中断(连接重置 / 读超时 / chunked 体未收尾):与 in-band exception 一样
         // 必须发错误块收尾,**绝不能报 STOP**——否则客户端把"内容缺失"当成正常完成。
         let mut transport_err: Option<(u16, String)> = None;
@@ -433,12 +484,19 @@ pub async fn stream_generate_content(
             // 走 axum 的 `Sse::keep_alive` 自动补注释帧,而这条是裸 `Body::from_stream`
             //(要同时兼顾 SSE 与 JSON 数组两种线格式),拿不到那个包装。不自己补的话,中间的
             // CDN / 反代会按空闲超时把这条静默的连接掐掉,用户看到的是无端断流。
-            let next = match tokio::time::timeout(STREAM_KEEPALIVE_INTERVAL, resp.chunk()).await {
-                Ok(next) => next,
-                Err(_) => {
-                    yield Ok::<Bytes, std::io::Error>(keepalive_frame(wire));
-                    continue;
+            if exception.is_some() { break; }
+            let next = if let Some(bytes) = pending.take().filter(|b| !b.is_empty()) {
+                Ok(Some(bytes.into()))
+            } else if let Some(resp) = resp.as_mut() {
+                match tokio::time::timeout(STREAM_KEEPALIVE_INTERVAL, resp.chunk()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        yield Ok::<Bytes, std::io::Error>(keepalive_frame(wire));
+                        continue;
+                    }
                 }
+            } else {
+                Ok(None)
             };
             match next {
                 Ok(Some(chunk)) => {
@@ -446,6 +504,7 @@ pub async fn stream_generate_content(
                     for frame in dec.drain() {
                         if let Some(t) = crate::kiro::convert::frame_text_delta(&frame) {
                             usage_guard.total_chars += t.chars().count();
+                            usage_guard.has_output |= !t.is_empty();
                             // 先切出 thinking(见 openai/responses 同处说明):不切的话客户端把
                             // 整段思考当正文显示,而本协议刚支持了开启 extended thinking。
                             for piece in splitter.feed(&t) {
@@ -483,14 +542,16 @@ pub async fn stream_generate_content(
                             // 反馈账号池:上游在 200 的流里报错 = 这次它其实没干成。不反馈的话,
                             // 这个账号在池子眼里永远只有"刚刚成功过",坏号一次都不会被惩罚 ——
                             // 此前只有原生 Anthropic 那条出口做了,另外三个协议全漏。
-                            crate::protocol::anthropic::handler::report_stream_exception(
+                            usage_guard.failed = true;
+                            usage_guard.failure_status = Some(crate::kiro::convert::exception_status(&e.kind));
+                            usage_guard.failure_logged = crate::protocol::anthropic::handler::report_stream_exception(
                                 &feedback_state,
                                 &cred_id,
                                 credential_id,
                                 &e,
                                 now_unix,
                             )
-                            .await;
+                            .await.2;
                             exception = Some(e);
                             break 'read;
                         }
@@ -511,6 +572,8 @@ pub async fn stream_generate_content(
                                 let args_str = tool_args.get(tool_use_id).cloned().unwrap_or_default();
                                 let args = serde_json::from_str::<serde_json::Value>(&args_str)
                                     .unwrap_or_else(|_| serde_json::json!({}));
+                                usage_guard.has_output = true;
+                                usage_guard.total_chars += name.chars().count() + args_str.chars().count();
                                 let json = chunk_json(&GenerateContentResponse {
                                     candidates: vec![Candidate {
                                         content: Content {
@@ -543,6 +606,18 @@ pub async fn stream_generate_content(
                     break;
                 }
             }
+        }
+
+        if exception.is_none() && transport_err.is_none() && dec.has_pending_bytes() {
+            transport_err = Some((502, "invalid or truncated event stream".to_string()));
+        }
+        if transport_err.is_some() {
+            usage_guard.failed = true;
+            usage_guard.failure_status = Some(502);
+            crate::protocol::anthropic::handler::report_stream_interrupted(&feedback_state, &cred_id, now_unix).await;
+        } else if exception.is_none() {
+            usage_guard.failed = false;
+            feedback_state.pool.lock().await.report_success_started(&cred_id, started);
         }
 
         // 收尾:把切分器里还压着的内容吐干净(半截标签按普通内容处理),绝不吞。
@@ -1629,7 +1704,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let app = gemini_router(state(&server.uri(), vec![cred()]));
+        let st = state(&server.uri(), vec![cred()]);
+        let pool = st.pool.clone();
+        let app = gemini_router(st);
         let req_body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
         let resp = app
             .oneshot(
@@ -1657,6 +1734,8 @@ mod tests {
         assert_eq!(last["error"]["code"], 429);
         assert_eq!(last["error"]["status"], "ThrottlingException");
         assert_eq!(last["error"]["message"], "slow down");
+        let stats = pool.lock().await.stats(0);
+        assert_eq!(stats[0].successes, 0, "失败流不能记成功: {stats:?}");
     }
 
     /// 上游没带人类可读消息时,错误块的 message 用类型串顶上,不留空串。
@@ -1683,13 +1762,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
-        let s = String::from_utf8_lossy(&bytes);
-        let items = stream_elements(&s, WireFormat::JsonArray);
-        let last = items.last().expect("应至少有一个块");
+        let last: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(last["error"]["code"], 403);
         assert_eq!(last["error"]["message"], "AccessDeniedException");
     }

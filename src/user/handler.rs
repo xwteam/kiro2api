@@ -278,6 +278,7 @@ impl PageQuery {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageRecordView {
+    pub failed: bool,
     pub model: String,
     pub input_tokens: i32,
     pub output_tokens: i32,
@@ -300,6 +301,7 @@ pub struct UsageRecordView {
 impl From<StoredUsageRecord> for UsageRecordView {
     fn from(r: StoredUsageRecord) -> Self {
         UsageRecordView {
+            failed: r.failed,
             model: r.model,
             input_tokens: r.input_tokens,
             output_tokens: r.output_tokens,

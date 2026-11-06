@@ -40,6 +40,26 @@ pub struct UsageRecord {
     /// `None` = 未记录延迟的历史记录(旧数据向后兼容);供 usage-summary 计 `avgLatencyMs`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
+    /// 上游未正常完成的请求。
+    #[serde(default)]
+    pub failed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_logged: Option<bool>,
+}
+
+#[cfg(test)]
+mod failed_usage_tests {
+    #[test]
+    fn legacy_usage_defaults_to_success_and_serializes_failure_flag() {
+        let legacy = serde_json::json!({"credential_id": 1, "model": "m", "input_tokens": 1, "output_tokens": 2, "estimated_cost": 0.1, "created_at_unix": 0});
+        let record: super::UsageRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(record.failure_status, None);
+        let value = serde_json::to_value(record).unwrap();
+        assert_eq!(value["failed"], false);
+        assert!(value.get("failure_status").is_none());
+    }
 }
 
 /// 401/403 失败事件。

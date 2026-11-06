@@ -458,6 +458,7 @@ struct Entry {
     disabled: bool,
     cooldown_until: u64,
     strikes: u32,
+    last_fault: Option<std::time::Instant>,
     /// 最近一次"换新令牌"的尝试因**传输层错误**(连接超时/DNS 失败,无 HTTP 应答)未成行。
     /// 此时账号从未真的用新令牌重试过,紧随其后的 [`FailureKind::AuthInvalid`] 判定缺乏确证,
     /// 按本模块"拿不到确证就保守冷却"的纪律降级为 [`FailureKind::AuthAmbiguous`]。
@@ -570,6 +571,7 @@ impl Pool {
                 status_reason: StatusReason::from_wire(c.status_reason.as_deref().unwrap_or("")),
                 cooldown_until: 0,
                 strikes: 0,
+                last_fault: None,
                 unconfirmed_refresh: false,
                 req_times: Vec::new(),
                 unsupported_models: std::collections::HashSet::new(),
@@ -971,6 +973,7 @@ impl Pool {
             disabled: cred.disabled,
             cooldown_until: 0,
             strikes: 0,
+            last_fault: None,
             unconfirmed_refresh: false,
             req_times: Vec::new(),
             requests: 0,
@@ -1153,6 +1156,7 @@ impl Pool {
     pub fn note_refresh_transport_failure(&mut self, id: &str) -> bool {
         if let Some(e) = self.find(id) {
             e.unconfirmed_refresh = true;
+            e.last_fault = Some(std::time::Instant::now());
             true
         } else {
             false
@@ -1161,13 +1165,20 @@ impl Pool {
 
     /// 成功:清零连续失败计数,累加成功用量统计。
     pub fn report_success(&mut self, id: &str) {
+        self.report_success_started(id, std::time::Instant::now());
+    }
+
+    pub fn report_success_started(&mut self, id: &str, started: std::time::Instant) {
         if let Some(e) = self.find(id) {
+            e.successes += 1;
+            if e.disabled || e.last_fault.is_some_and(|fault| started <= fault) {
+                return;
+            }
             e.strikes = 0;
             // 一次成功即说明额度回来了:清掉恢复时刻,免得一个已经能用的账号
             // 还挂着过期的配额标记(面板上看着像坏的)。
             e.cred.quota_reset_unix = None;
             e.unconfirmed_refresh = false;
-            e.successes += 1;
             // 一次成功即说明上次那个原因(封禁/限流/过期…)已经过去,标签必须跟着清,
             // 否则面板会把一个已经恢复的账号一直挂在"封禁"那一档。
             e.set_status_reason(StatusReason::None);
@@ -1205,6 +1216,7 @@ impl Pool {
     ) {
         if let Some(e) = self.find(id) {
             e.failures += 1;
+            e.last_fault = Some(std::time::Instant::now());
             if reason != StatusReason::None {
                 e.set_status_reason(reason);
             }
@@ -1796,9 +1808,12 @@ mod tests {
             Some(now + 12345)
         );
 
-        // 一次成功即清掉标记(额度回来了,别让面板一直挂着)
+        // 停用账号不会被迟到成功清掉配额标记。
         p2.report_success("b");
-        assert_eq!(p2.snapshot_credentials()[0].quota_reset_unix, None);
+        assert_eq!(
+            p2.snapshot_credentials()[0].quota_reset_unix,
+            Some(now + 12345)
+        );
     }
 
     /// 运行期的"停止使用"**绝不能**落盘,否则"重启即复活"是句空话。
@@ -2424,6 +2439,22 @@ mod tests {
         assert_eq!(p.snapshot_credentials()[0].priority, 0);
         // 未知 id → false
         assert!(!p.set_priority("nope", 2));
+    }
+
+    #[test]
+    fn late_success_preserves_newer_faults() {
+        let mut p = Pool::new(vec![cred("a", 0)], LbMode::Priority);
+        let started = std::time::Instant::now();
+        p.report_failure_with_reason("a", FailureKind::Transient, StatusReason::Throttled, 100);
+        p.report_success_started("a", started);
+        let stat = &p.stats(100)[0];
+        assert_eq!(stat.successes, 1);
+        assert_eq!(stat.strikes, 1);
+        p.report_failure("a", FailureKind::Quota, 100);
+        let reset = p.snapshot_credentials()[0].quota_reset_unix;
+        p.report_success_started("a", started);
+        assert_eq!(p.snapshot_credentials()[0].quota_reset_unix, reset);
+        assert!(p.stats(100)[0].disabled);
     }
 
     #[test]

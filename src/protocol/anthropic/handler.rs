@@ -397,7 +397,7 @@ async fn record_classified_failure(
     status: u16,
     response_body: &str,
     now_unix: u64,
-) {
+) -> bool {
     // 生命周期日志(#7):上游/账号级失败,带分类与 HTTP 状态码(不含响应体/令牌)。
     // WARN 级别:比每请求 INFO 更醒目,便于在实时日志页快速定位账号问题。
     tracing::warn!(
@@ -408,6 +408,18 @@ async fn record_classified_failure(
         "上游请求失败"
     );
     let now_i64 = now_unix as i64;
+    if status == 401 || status == 403 {
+        stats
+            .record_failure(credential_id, "api", status, response_body, now_i64)
+            .await;
+        return true;
+    }
+    if status == 429 {
+        stats
+            .record_throttle(credential_id, "api", response_body, now_i64)
+            .await;
+        return true;
+    }
     match kind {
         // 两类鉴权失败(永久失效 / 歧义冷却)恒来自 401/403,均落失败日志。
         FailureKind::AuthInvalid | FailureKind::AuthAmbiguous => {
@@ -420,23 +432,25 @@ async fn record_classified_failure(
             stats
                 .record_failure(credential_id, "api", code, response_body, now_i64)
                 .await;
+            true
         }
         // 模型对该账号不可用:**不记失败日志**——账号没坏,只是档位不含这个模型。
         // 记进去会让面板上一个完全健康的账号显示成"有失败",运营者据此误判。
-        FailureKind::ModelUnavailable => {}
+        FailureKind::ModelUnavailable => false,
         FailureKind::Quota => {
             stats
                 .record_throttle(credential_id, "api", response_body, now_i64)
                 .await;
+            true
         }
-        FailureKind::Transient => { /* 瞬时错误不落账号级事件日志 */ }
+        FailureKind::Transient => false,
         // 确定性请求错误(INVALID_MODEL_ID 等):非账号故障,不落账号级失败日志。
         // (上层会在反馈池前短路,一般不会带此类走到这里;此 arm 仅为防御性穷尽。)
-        FailureKind::InvalidRequest => {}
+        FailureKind::InvalidRequest => false,
     }
 }
 
-/// 跨账号重试的上限(自适应,见 [`select_and_call_with_retry`])。
+/// 跨账号重试的上限(自适应,见 [`select_stream_with_retry`])。
 ///
 /// 采用 spec 的 `N = min(pool_size, 3)`(最多试 3 个不同账号即放弃,随池大小自然缩放),
 /// 再叠加一个防御性硬顶,避免超大池上重试放飞。取值理由:3 是常见默认,足以覆盖"选中的
@@ -488,26 +502,43 @@ fn cross_account_attempts(pool_size: usize) -> usize {
 /// 都先拿到本函数返回的成功 `CallOutcome` 才开始读 body / 建 SSE,故失败账号的响应永不会开始下发。
 ///
 /// 池锁纪律:选择/反馈池均为短临界区,绝不跨网络 `.await` 持锁(见 [`select_and_call_once`])。
-pub(crate) async fn select_and_call_with_retry(
+pub(crate) async fn select_stream_with_retry(
     state: &MessagesState,
     req: &MessagesRequest,
     now_unix: u64,
     bound: Option<&BoundCredentialIds>,
-) -> Result<CallOutcome, RelayError> {
-    let started = std::time::Instant::now();
-    match select_and_call_verified(state, req, now_unix, bound, started, VerifyMode::None).await? {
-        VerifiedCall::Ok(v) => match v.body {
-            VerifiedBody::Stream { resp, .. } => Ok(CallOutcome {
+    api_key_id: u32,
+    client_ip: Option<String>,
+) -> Result<Result<(CallOutcome, Vec<u8>), StreamException>, RelayError> {
+    match select_and_call_verified(
+        state,
+        req,
+        now_unix,
+        bound,
+        std::time::Instant::now(),
+        VerifyMode::Stream,
+        api_key_id,
+        client_ip,
+    )
+    .await?
+    {
+        VerifiedCall::Ok(VerifiedOk {
+            body: VerifiedBody::Stream { resp, preroll },
+            credential_id,
+            cred_id,
+            tool_name_map,
+            ..
+        }) => Ok(Ok((
+            CallOutcome {
                 resp,
-                credential_id: v.credential_id,
-                tool_name_map: v.tool_name_map,
-                cred_id: v.cred_id,
-            }),
-            // 不验真的入口只会拿到 Stream 形态;防御性折成 502,不 panic。
-            VerifiedBody::Frames(_) => Err(RelayError::Upstream("unexpected body".to_string())),
-        },
-        // 同上:VerifyMode::None 产不出这一支。
-        VerifiedCall::Rejected(e) => Err(RelayError::Upstream(exception_detail(&e))),
+                credential_id,
+                cred_id,
+                tool_name_map,
+            },
+            preroll,
+        ))),
+        VerifiedCall::Ok(_) => Err(RelayError::Upstream("unexpected body".to_string())),
+        VerifiedCall::Rejected(e) => Ok(Err(e)),
     }
 }
 
@@ -516,8 +547,6 @@ pub(crate) async fn select_and_call_with_retry(
 /// 上游把限流 / 鉴权 / 参数错误放在 HTTP 200 的事件流里下发,状态码根本看不出成败;
 /// 两条出口各有各的判法,但判完之后走的是同一条反馈路径。
 enum VerifyMode {
-    /// 不验真:调用方自己消费响应(其它协议的流式出口)。
-    None,
     /// 非流式:读完整份体、查有没有 exception,再交还帧序列。
     Buffered,
     /// 流式:只预读开局,判是不是"一开口就被拒"(见 [`preroll_stream`])。
@@ -553,7 +582,7 @@ enum PostCall {
     /// 这次调用确实成功了。
     Done(VerifiedBody),
     /// 上游回了 200,但事件流里带 exception —— 这次请求它其实拒了。
-    Rejected(StreamException),
+    Rejected(StreamException, Option<crate::kiro::convert::MeteringUsage>),
     /// 验真过程本身断了(读响应体时连接中断等)。按瞬态失败处置。
     Broken(String),
 }
@@ -594,7 +623,7 @@ enum Preroll {
     Content(Vec<u8>),
     /// 上游在出任何内容**之前**就拒了这次请求 —— 此时一个字节都还没下发给客户端,
     /// 换个账号重来完全来得及。
-    Rejected(StreamException),
+    Rejected(StreamException, Option<crate::kiro::convert::MeteringUsage>),
     /// 预读期间连接就断了。
     Broken(String),
 }
@@ -611,6 +640,7 @@ async fn preroll_stream(resp: &mut reqwest::Response) -> Preroll {
     let mut raw: Vec<u8> = Vec::new();
     let mut dec = StreamDecoder::new();
     let mut saw_content = false;
+    let mut metering = None;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
@@ -619,21 +649,39 @@ async fn preroll_stream(resp: &mut reqwest::Response) -> Preroll {
         match tokio::time::timeout(remaining, resp.chunk()).await {
             // 预算用尽:上游只是在想,别再挡着响应头了。剩下的交给主循环边读边判。
             Err(_) => return Preroll::Content(raw),
-            Ok(Ok(None)) => return Preroll::Content(raw),
+            Ok(Ok(None)) => {
+                if dec.has_pending_bytes() || (dec.errors() > 0 && !saw_content) {
+                    return Preroll::Broken("truncated or invalid event stream".to_string());
+                }
+                return Preroll::Content(raw);
+            }
             Ok(Err(e)) => return Preroll::Broken(e.to_string()),
             Ok(Ok(Some(chunk))) => {
                 raw.extend_from_slice(&chunk);
                 dec.push(&chunk);
                 for frame in dec.drain() {
+                    if let Some(m) = crate::kiro::convert::metering_frame(&frame) {
+                        metering = Some(m);
+                    }
                     if let Some(e) = crate::kiro::convert::frame_exception(&frame) {
                         // 已经出过内容 → 不算"一开口就被拒",照常建流,由主循环收尾。
                         if saw_content {
                             return Preroll::Content(raw);
                         }
-                        return Preroll::Rejected(e);
+                        return Preroll::Rejected(e, metering);
                     }
-                    // 任何非 exception 帧都说明上游已经开始干活了。
-                    saw_content = true;
+                    if crate::kiro::convert::frame_text_delta(&frame).is_some_and(|s| !s.is_empty())
+                        || crate::kiro::convert::tool_use_frame(&frame).is_some_and(|v| {
+                            ["toolUseId", "name"].iter().all(|key| {
+                                v.get(key)
+                                    .and_then(|x| x.as_str())
+                                    .is_some_and(|x| !x.is_empty())
+                            })
+                        })
+                        || crate::kiro::convert::frame_refusal(&frame).is_some()
+                    {
+                        saw_content = true;
+                    }
                 }
                 if saw_content {
                     return Preroll::Content(raw);
@@ -667,6 +715,26 @@ fn stream_exception_failure(e: &StreamException) -> (FailureKind, u16, String) {
     (kind, status, body)
 }
 
+fn current_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+pub(crate) async fn report_stream_interrupted(
+    state: &MessagesState,
+    cred_id: &str,
+    _now_unix: u64,
+) {
+    let now_unix = current_unix();
+    state
+        .pool
+        .lock()
+        .await
+        .report_failure(cred_id, FailureKind::Transient, now_unix);
+}
+
 /// 把一次"200 但流内 exception"反馈账号池 + 统计层,并当场落盘持久结论。
 /// 返回分类与合成响应体,供调用方决定是否换号重试。
 ///
@@ -676,8 +744,9 @@ pub(crate) async fn report_stream_exception(
     cred_id: &str,
     credential_id: u32,
     e: &StreamException,
-    now_unix: u64,
-) -> (FailureKind, String) {
+    _now_unix: u64,
+) -> (FailureKind, String, bool) {
+    let now_unix = current_unix();
     let (kind, status, body) = stream_exception_failure(e);
     // 这两档**不罚账号**,与真实 HTTP 失败那条路的处置严格一致(见 `select_and_call_once`
     // 的 5.5 / 5.6):请求本身不合法是请求的事;模型不可用只是这个账号的档位不含它 ——
@@ -686,7 +755,13 @@ pub(crate) async fn report_stream_exception(
         kind,
         FailureKind::InvalidRequest | FailureKind::ModelUnavailable
     ) {
-        return (kind, body);
+        let logged = if matches!(status, 401 | 403 | 429) {
+            record_classified_failure(&state.stats, credential_id, kind, status, &body, now_unix)
+                .await
+        } else {
+            false
+        };
+        return (kind, body, logged);
     }
     {
         let mut pool = state.pool.lock().await;
@@ -703,11 +778,12 @@ pub(crate) async fn report_stream_exception(
         kind,
     )
     .await;
-    record_classified_failure(&state.stats, credential_id, kind, status, &body, now_unix).await;
-    (kind, body)
+    let logged =
+        record_classified_failure(&state.stats, credential_id, kind, status, &body, now_unix).await;
+    (kind, body, logged)
 }
 
-/// [`select_and_call_with_retry`] 的本体:多一个**验真**环节。
+/// [`select_stream_with_retry`] 的本体:多一个**验真**环节。
 ///
 /// 为什么需要验真:上游把限流 / 鉴权 / 参数错误放在 **HTTP 200** 的事件流里下发。只看
 /// HTTP 状态码的话,这类被拒的请求会被记成成功 —— 坏账号的 strike 每次都清零、永远不被
@@ -718,6 +794,7 @@ pub(crate) async fn report_stream_exception(
 ///
 /// `started` 是调用方开始计时的时刻:延迟口径统一为"至上游响应就绪",跨账号重试的耗时
 /// 算在里面(用户等的就是这段),读体与下发不算。
+#[allow(clippy::too_many_arguments)]
 async fn select_and_call_verified(
     state: &MessagesState,
     req: &MessagesRequest,
@@ -725,6 +802,8 @@ async fn select_and_call_verified(
     bound: Option<&BoundCredentialIds>,
     started: std::time::Instant,
     mode: VerifyMode,
+    api_key_id: u32,
+    client_ip: Option<String>,
 ) -> Result<VerifiedCall, RelayError> {
     let pool_size = { state.pool.lock().await.len() };
     let max_attempts = cross_account_attempts(pool_size);
@@ -756,10 +835,6 @@ async fn select_and_call_verified(
                 } = outcome;
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let verdict = match mode {
-                    VerifyMode::None => PostCall::Done(VerifiedBody::Stream {
-                        resp,
-                        preroll: Vec::new(),
-                    }),
                     VerifyMode::Buffered => match resp.bytes().await {
                         Ok(bytes) => {
                             let mut dec = StreamDecoder::new();
@@ -777,7 +852,10 @@ async fn select_and_call_verified(
                                 );
                             }
                             match extract_exception(&frames) {
-                                Some(e) => PostCall::Rejected(e),
+                                Some(e) => PostCall::Rejected(e, None),
+                                None if dec.has_pending_bytes() => {
+                                    PostCall::Broken("truncated event stream".to_string())
+                                }
                                 None => PostCall::Done(VerifiedBody::Frames(frames)),
                             }
                         }
@@ -787,14 +865,20 @@ async fn select_and_call_verified(
                         Preroll::Content(preroll) => {
                             PostCall::Done(VerifiedBody::Stream { resp, preroll })
                         }
-                        Preroll::Rejected(e) => PostCall::Rejected(e),
+                        Preroll::Rejected(e, metering) => PostCall::Rejected(e, metering),
                         Preroll::Broken(msg) => PostCall::Broken(msg),
                     },
                 };
                 match verdict {
-                    // 真成功 —— 此刻才记成功(在此之前记的话,被拒的那次会把 strike 清零)。
+                    // 只有完整读完的非流式响应能在这里记成功。
                     PostCall::Done(body) => {
-                        state.pool.lock().await.report_success(&tried_id);
+                        if matches!(body, VerifiedBody::Frames(_)) {
+                            state
+                                .pool
+                                .lock()
+                                .await
+                                .report_success_started(&tried_id, started);
+                        }
                         return Ok(VerifiedCall::Ok(VerifiedOk {
                             body,
                             credential_id,
@@ -804,10 +888,37 @@ async fn select_and_call_verified(
                         }));
                     }
                     // 200 但流内 exception:走与真实 HTTP 失败**同一条**反馈路径,再按分类决定换不换号。
-                    PostCall::Rejected(e) => {
-                        let (kind, body) =
+                    PostCall::Rejected(e, metering) => {
+                        let (kind, body, logged) =
                             report_stream_exception(state, &tried_id, credential_id, &e, now_unix)
                                 .await;
+                        if let Some(m) = metering {
+                            let input = m.input_tokens.unwrap_or(0).min(i32::MAX as u32) as i32;
+                            let output = m.output_tokens.unwrap_or(0).min(i32::MAX as u32) as i32;
+                            state
+                                .stats
+                                .usage
+                                .record_usage_with_failure_log(
+                                    credential_id,
+                                    api_key_id,
+                                    req.model.clone(),
+                                    input,
+                                    output,
+                                    crate::stats::pricing::calculate_cost(
+                                        &req.model, input, output,
+                                    ),
+                                    Some(m.credits),
+                                    client_ip.clone(),
+                                    m.cache_read_input_tokens,
+                                    m.cache_creation_input_tokens,
+                                    Some(latency_ms),
+                                    current_unix() as i64,
+                                    true,
+                                    Some(exception_status(&e.kind)),
+                                    Some(logged),
+                                )
+                                .await;
+                        }
                         tracing::warn!(
                             event = "upstream_stream_exception",
                             model = %req.model,
@@ -857,7 +968,7 @@ async fn select_and_call_verified(
                                 &tried_id,
                                 FailureKind::Transient,
                                 crate::kiro::pool::StatusReason::None,
-                                now_unix,
+                                current_unix(),
                             );
                         }
                         tried_ids.insert(tried_id);
@@ -1079,7 +1190,7 @@ pub(crate) async fn select_and_call_once(
     // 5.5) 确定性请求错误(如上游 INVALID_MODEL_ID:该模型对当前账号档位不可用):
     //      **非账号故障** —— 换任何同档账号都会同样失败。故此处**不反馈池**(不冷却/不禁用/
     //      不累计 strike)、**不落账号级失败日志**,直接返回 [`RelayError::InvalidModel`],
-    //      由 [`select_and_call_with_retry`] 当作致命错误**不重试**、以 400 把清晰的不可用说明回客户端。
+    //      由 [`select_stream_with_retry`] 当作致命错误**不重试**、以 400 把清晰的不可用说明回客户端。
     if let Err((FailureKind::InvalidRequest, _, body)) = &outcome {
         // 文案按 reason 码分别给:这一档现在含义不止一种(工具规格畸形 / 缺工具定义 /
         // 上下文超长),笼统套一句会把其中一种讲成另一种,使用者照着改,改多少次都没用。
@@ -1184,7 +1295,7 @@ fn effective_region(cred: &crate::kiro::credential::Credential) -> String {
 /// status 为可精确解析到的 HTTP 码(端点回退路径无从精确解析时回落 0)。
 ///
 /// 覆盖两条路径:`endpoint_override`(代理/mock,单端点直调 [`provider::call`])与生产端点回退
-/// [`provider::call_with_fallback_no_report`]。是否重试/反馈池由调用方 [`select_and_call_with_retry`] 决定。
+/// [`provider::call_with_fallback_no_report`]。是否重试/反馈池由调用方 [`select_stream_with_retry`] 决定。
 ///
 /// 分类:override 路径能精确拿到状态码与响应体,故用 [`classify_with_body`] 依响应体升级判定
 /// (真凭据失效才永久禁用);端点回退路径由 provider 内部分类,status 回落 0。
@@ -1323,6 +1434,8 @@ pub async fn relay_core_outcome(
         bound.as_ref(),
         started,
         VerifyMode::Buffered,
+        api_key_id,
+        client_ip.clone(),
     )
     .await?;
     let (frames, credential_id, tool_name_map, latency_ms) = match verified {
@@ -1446,6 +1559,10 @@ struct StreamUsageGuard {
     /// 流式无"整体完成"墙钟(下发时长取决于客户端消费速度),故此处记的是**首字节前**的建立延迟,
     /// 与非流式 relay_core 的 latency 口径统一(都测选-调至上游响应就绪),供 usage-summary 计 avgLatencyMs。
     latency_ms: Option<u64>,
+    failed: bool,
+    failure_status: Option<u16>,
+    failure_logged: bool,
+    has_output: bool,
 }
 
 impl StreamUsageGuard {
@@ -1453,7 +1570,11 @@ impl StreamUsageGuard {
     /// (上游真实计费,可能 output 为 0 但仍有 input/credits/缓存计费)。二者皆无 = 极早取消
     /// (纯工具轮尚未产出文本、或计量前客户端断连),落库只会写一条零/近零行,应跳过。
     fn has_meaningful_usage(&self) -> bool {
-        self.total_chars >= CHARS_PER_TOKEN || self.metering.is_some()
+        crate::stats::usage::should_record_stream_usage(
+            false,
+            self.has_output,
+            self.metering.is_some(),
+        )
     }
 
     /// 累进一段下行文本(按字符类别分桶,末尾一次换算)。
@@ -1478,6 +1599,13 @@ impl StreamUsageGuard {
             return;
         }
         self.recorded = true;
+        if !crate::stats::usage::should_record_stream_usage(
+            !self.failed,
+            self.has_output,
+            self.metering.is_some(),
+        ) {
+            return;
+        }
 
         // token 数优先取 meteringEvent 的真实计量,逐项回退:input 无从估算 → 0;
         // output → 累计字符数 ÷ 4。
@@ -1512,9 +1640,12 @@ impl StreamUsageGuard {
             (self.credential_id, self.api_key_id, self.now_unix);
         let latency_ms = self.latency_ms;
         let client_ip = self.client_ip.clone();
+        let failed = self.failed;
+        let failure_status = self.failure_status;
+        let failure_logged = self.failure_logged;
         tokio::spawn(async move {
             usage
-                .record_usage_full(
+                .record_usage_with_failure_log(
                     credential_id,
                     api_key_id,
                     model,
@@ -1527,6 +1658,9 @@ impl StreamUsageGuard {
                     cache_creation,
                     latency_ms,
                     now_unix,
+                    failed,
+                    failure_status,
+                    Some(failure_logged),
                 )
                 .await;
         });
@@ -1583,6 +1717,8 @@ pub async fn relay_stream_attributed(
         bound.as_ref(),
         started,
         VerifyMode::Stream,
+        api_key_id,
+        client_ip.clone(),
     )
     .await?;
     // 账号试尽仍是"200 + exception":一个字节都还没下发,但 SSE 的错误契约要求以
@@ -1669,6 +1805,10 @@ pub async fn relay_stream_attributed(
             metering: None,
             recorded: false,
             latency_ms: Some(latency_ms),
+            failed: false,
+            failure_status: None,
+            failure_logged: false,
+            has_output: false,
         };
 
         // `message_start` 里的 input_tokens 此前硬编码 0 —— 客户端从这里读输入用量,
@@ -1711,6 +1851,7 @@ pub async fn relay_stream_attributed(
                     for frame in dec.drain() {
                         if let Some(t) = crate::kiro::convert::frame_text_delta(&frame) {
                             usage_guard.total_chars += t.chars().count();
+                            usage_guard.has_output |= !t.is_empty();
                             usage_guard.add_text(&t);
                             // 先切出 thinking:上游把思考过程用 `<thinking>…</thinking>` 包在
                             // 普通文本里下发。不切的话客户端把整段思考当正文显示,而协议里
@@ -1776,6 +1917,8 @@ pub async fn relay_stream_attributed(
                                 let idx = next_index;
                                 next_index += 1;
                                 tool_index.insert(id.to_string(), idx);
+                                usage_guard.has_output = true;
+                                usage_guard.add_text(name);
                                 yield Ok(to_event(stream::tool_use_start(idx, id, name)));
                                 open_block = Some(idx);
                                 any_tool = true;
@@ -1784,6 +1927,8 @@ pub async fn relay_stream_attributed(
                             // 该块已收尾 → 迟到的 input/stop 帧一律丢弃,不再产出 delta 或第二个 stop。
                             if !closed_blocks.contains(&idx) {
                                 if let Some(inp) = v["input"].as_str() {
+                                    usage_guard.has_output = true;
+                                    usage_guard.add_text(inp);
                                     yield Ok(to_event(stream::input_json_delta(idx, inp)));
                                 }
                                 if v["stop"].as_bool() == Some(true) {
@@ -1808,6 +1953,11 @@ pub async fn relay_stream_attributed(
                             }
                         } else if let Some(e) = crate::kiro::convert::frame_exception(&frame) {
                             // 上游中途报错(限流/鉴权/参数):记下并立刻停止读帧,收尾走 error 事件。
+                            usage_guard.failed = true;
+                            usage_guard.failure_status = Some(crate::kiro::convert::exception_status(&e.kind));
+                            if !already_reported {
+                                usage_guard.failure_logged = report_stream_exception(&feedback_state, &cred_id, credential_id, &e, now_unix).await.2;
+                            }
                             stream_error = Some(e);
                             break;
                         }
@@ -1831,6 +1981,18 @@ pub async fn relay_stream_attributed(
                 },
                 None => break,
             }
+        }
+
+        if stream_error.is_none() && transport_err.is_none() && dec.has_pending_bytes() {
+            transport_err = Some((502, "invalid or truncated event stream".to_string()));
+        }
+        if transport_err.is_some() {
+            usage_guard.failed = true;
+            usage_guard.failure_status = Some(502);
+            report_stream_interrupted(&feedback_state, &cred_id, now_unix).await;
+        } else if stream_error.is_none() {
+            usage_guard.failed = false;
+            feedback_state.pool.lock().await.report_success_started(&cred_id, started);
         }
 
         // 收尾:把切分器里还压着的内容吐干净(半截标签按普通内容处理),绝不吞。
@@ -1891,12 +2053,6 @@ pub async fn relay_stream_attributed(
                 status = status,
                 "上游事件流下发 exception"
             );
-            // 反馈账号池:上游在 200 的流里报错 = 这次它其实没干成。不反馈的话,这个账号在
-            // 池子眼里永远只有"刚刚成功过",坏号一次都不会被惩罚。
-            // (内容已经开始下发,换号已来不及;开局就被拒的那种在选-调循环里换过了。)
-            if !already_reported {
-                report_stream_exception(&feedback_state, &cred_id, credential_id, &e, now_unix).await;
-            }
             yield Ok(to_event(stream_error_event(status, &exception_detail(&e))));
         } else {
             // stop_reason 与非流式 kiro_events_to_anthropic 同口径:tool_use 优先级最高,
@@ -4340,10 +4496,624 @@ mod tests {
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("event: error"), "流中途出错仍要发 error 事件");
         let stats = pool.lock().await.stats(1000);
+        assert_eq!(stats[0].successes, 0, "失败流不能记成功: {stats:?}");
         assert_eq!(
             stats[0].failures, 1,
             "流内 exception 没反馈池:这个号在池子眼里永远只有'刚刚成功过';实际:{stats:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_throttling_accumulates_for_all_protocols() {
+        for protocol in 0..4 {
+            let server = MockServer::start().await;
+            let mut body = event_frame("assistantResponseEvent", br#"{"content":"part"}"#);
+            body.extend(event_frame(
+                "throttlingError",
+                br#"{"message":"slow down"}"#,
+            ));
+            Mock::given(method("POST"))
+                .and(path("/generateAssistantResponse"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                .mount(&server)
+                .await;
+            let st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+            let pool = st.pool.clone();
+            let (app, uri, request) = match protocol {
+                0 => (
+                    messages_router(st),
+                    "/v1/messages",
+                    r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                ),
+                1 => (
+                    crate::protocol::openai::handler::openai_router(st),
+                    "/v1/chat/completions",
+                    r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                ),
+                2 => (
+                    crate::protocol::responses::handler::responses_router(st),
+                    "/v1/responses",
+                    r#"{"model":"sonnet","input":"hi","stream":true}"#,
+                ),
+                _ => (
+                    crate::protocol::gemini::handler::gemini_router(st),
+                    "/v1beta/models/claude-sonnet-4.5:streamGenerateContent?alt=sse",
+                    r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#,
+                ),
+            };
+            for _ in 0..4 {
+                let resp = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("content-type", "application/json")
+                            .body(Body::from(request))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                assert!(String::from_utf8_lossy(&bytes).contains("slow down"));
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let stats = pool.lock().await.stats(now);
+            assert_eq!(
+                stats.iter().map(|s| s.successes).sum::<u64>(),
+                0,
+                "protocol {protocol}: {stats:?}"
+            );
+            assert_eq!(
+                stats.iter().map(|s| s.failures).sum::<u64>(),
+                4,
+                "protocol {protocol}: {stats:?}"
+            );
+            assert!(
+                stats.iter().any(|s| s.in_cooldown),
+                "protocol {protocol}: {stats:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_stream_clears_prior_strike() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(event_frame(
+                "assistantResponseEvent",
+                br#"{"content":"ok"}"#,
+            )))
+            .mount(&server)
+            .await;
+        let st = state(&server.uri(), vec![cred()]);
+        let pool = st.pool.clone();
+        pool.lock()
+            .await
+            .report_failure("a", FailureKind::Transient, 1);
+        let (_, bytes) = post_messages(
+            messages_router(st),
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&bytes).contains("ok"));
+        let stats = pool.lock().await.stats(1);
+        assert_eq!(stats[0].successes, 1);
+        assert_eq!(stats[0].strikes, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_interruption_cooldown_uses_completion_time() {
+        let st = state("http://127.0.0.1:1", vec![cred()]);
+        for _ in 0..3 {
+            report_stream_interrupted(&st, "a", 1).await;
+        }
+        let now = current_unix();
+        let stats = st.pool.lock().await.stats(now);
+        assert!(stats[0].in_cooldown, "{stats:?}");
+        assert!(stats[0].cooldown_until > now);
+    }
+
+    #[tokio::test]
+    async fn complete_answer_with_corrupt_frame_is_not_an_error() {
+        let server = MockServer::start().await;
+        let mut body = event_frame("assistantResponseEvent", br#"{"content":"complete"}"#);
+        let mut corrupt = event_frame("contextUsageEvent", br#"{"contextUsagePercentage":1}"#);
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        body.extend(corrupt);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+        let st = state(&server.uri(), vec![cred()]);
+        let pool = st.pool.clone();
+        let (status, bytes) = post_messages(
+            messages_router(st),
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("complete") && !text.contains("event: error"),
+            "{text}"
+        );
+        assert_eq!(pool.lock().await.stats(0)[0].successes, 1);
+    }
+
+    #[tokio::test]
+    async fn other_protocols_skip_complete_corrupt_frames() {
+        for protocol in 0..3 {
+            let server = MockServer::start().await;
+            let mut body = event_frame("assistantResponseEvent", br#"{"content":"before"}"#);
+            let mut bad = event_frame("contextUsageEvent", br#"{"contextUsagePercentage":1}"#);
+            let last = bad.len() - 1;
+            bad[last] ^= 1;
+            body.extend(bad);
+            body.extend(event_frame(
+                "assistantResponseEvent",
+                br#"{"content":"after"}"#,
+            ));
+            Mock::given(method("POST"))
+                .and(path("/generateAssistantResponse"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                .mount(&server)
+                .await;
+            let st = state(&server.uri(), vec![cred_id("1")]);
+            let pool = st.pool.clone();
+            let (app, uri, request, ending) = match protocol {
+                0 => (
+                    crate::protocol::openai::handler::openai_router(st),
+                    "/v1/chat/completions",
+                    r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                    "[DONE]",
+                ),
+                1 => (
+                    crate::protocol::responses::handler::responses_router(st),
+                    "/v1/responses",
+                    r#"{"model":"sonnet","input":"hi","stream":true}"#,
+                    "response.completed",
+                ),
+                _ => (
+                    crate::protocol::gemini::handler::gemini_router(st),
+                    "/v1beta/models/claude-sonnet-4.5:streamGenerateContent?alt=sse",
+                    r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#,
+                    "STOP",
+                ),
+            };
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(request))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                text.contains("before") && text.contains("after") && text.contains(ending),
+                "protocol {protocol}: {text}"
+            );
+            assert_eq!(pool.lock().await.stats(0)[0].successes, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn client_cancellation_after_content_preserves_usage_without_pool_feedback() {
+        for protocol in 0..2 {
+            let server = MockServer::start().await;
+            let body = event_frame("assistantResponseEvent", br#"{"content":"partial output"}"#);
+            Mock::given(method("POST"))
+                .and(path("/generateAssistantResponse"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                .mount(&server)
+                .await;
+            let mut st = state(&server.uri(), vec![cred_id("1")]);
+            let dir = std::env::temp_dir().join(format!("usage_test_{}", crate::kiro::uuid_v4()));
+            st.stats = StatsManager::load_from_dir(&dir);
+            let usage = st.stats.usage.clone();
+            let pool = st.pool.clone();
+            let (app, uri, request) = if protocol == 0 {
+                (
+                    messages_router(st),
+                    "/v1/messages",
+                    r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                )
+            } else {
+                (
+                    crate::protocol::openai::handler::openai_router(st),
+                    "/v1/chat/completions",
+                    r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                )
+            };
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(request))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            use futures_core::Stream;
+            let mut body = resp.into_body().into_data_stream();
+            loop {
+                let item = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_next(cx))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if String::from_utf8_lossy(&item).contains("partial output") {
+                    break;
+                }
+            }
+            drop(body);
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            let page = usage.records_for_credential(1, 1, 10).await;
+            assert_eq!(page.total, 1, "protocol {protocol}");
+            assert!(!page.items[0].failed);
+            assert_eq!(page.items[0].failure_status, None);
+            let stat = &pool.lock().await.stats(0)[0];
+            assert_eq!(
+                (stat.successes, stat.failures),
+                (0, 0),
+                "protocol {protocol}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_error_feedback_precedes_closing_event_drop() {
+        use futures_core::Stream;
+        let server = MockServer::start().await;
+        let mut upstream = event_frame("assistantResponseEvent", br#"{"content":"partial"}"#);
+        upstream.extend(event_frame(
+            "throttlingError",
+            br#"{"message":"slow down"}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(upstream))
+            .mount(&server)
+            .await;
+        let st = state(&server.uri(), vec![cred_id("1")]);
+        let pool = st.pool.clone();
+        let resp = messages_router(st).oneshot(Request::builder().method("POST").uri("/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#)).unwrap()).await.unwrap();
+        let mut body = resp.into_body().into_data_stream();
+        loop {
+            let item = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_next(cx))
+                .await
+                .unwrap()
+                .unwrap();
+            if String::from_utf8_lossy(&item).contains("content_block_stop") {
+                break;
+            }
+        }
+        drop(body);
+        let stat = &pool.lock().await.stats(0)[0];
+        assert_eq!((stat.successes, stat.failures), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_records_gateway_failure_status() {
+        for protocol in 0..4 {
+            let server = MockServer::start().await;
+            let mut upstream = event_frame("assistantResponseEvent", br#"{"content":"partial"}"#);
+            let truncated = event_frame("contextUsageEvent", br#"{"contextUsagePercentage":1}"#);
+            upstream.extend(&truncated[..truncated.len() / 2]);
+            Mock::given(method("POST"))
+                .and(path("/generateAssistantResponse"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(upstream))
+                .mount(&server)
+                .await;
+            let mut st = state(&server.uri(), vec![cred_id("1")]);
+            let dir = std::env::temp_dir().join(format!("usage_test_{}", crate::kiro::uuid_v4()));
+            st.stats = StatsManager::load_from_dir(&dir);
+            let usage = st.stats.usage.clone();
+            let (app, uri, request) = match protocol {
+                0 => (
+                    messages_router(st),
+                    "/v1/messages",
+                    r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                ),
+                1 => (
+                    crate::protocol::openai::handler::openai_router(st),
+                    "/v1/chat/completions",
+                    r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                ),
+                2 => (
+                    crate::protocol::responses::handler::responses_router(st),
+                    "/v1/responses",
+                    r#"{"model":"sonnet","input":"hi","stream":true}"#,
+                ),
+                _ => (
+                    crate::protocol::gemini::handler::gemini_router(st),
+                    "/v1beta/models/claude-sonnet-4.5:streamGenerateContent?alt=sse",
+                    r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#,
+                ),
+            };
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(request))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            let page = usage.records_for_credential(1, 1, 10).await;
+            assert_eq!(page.total, 1, "protocol {protocol}");
+            assert!(page.items[0].failed);
+            assert_eq!(page.items[0].failure_status, Some(502));
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_preroll_and_buffered_body_retry_next_account() {
+        for streaming in [false, true] {
+            let server = MockServer::start().await;
+            let frame = event_frame("assistantResponseEvent", br#"{"content":"lost"}"#);
+            Mock::given(method("POST"))
+                .and(path("/generateAssistantResponse"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_bytes(frame[..frame.len() / 2].to_vec()),
+                )
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/generateAssistantResponse"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(event_frame(
+                    "assistantResponseEvent",
+                    br#"{"content":"recovered"}"#,
+                )))
+                .with_priority(5)
+                .mount(&server)
+                .await;
+            let st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+            let request = if streaming {
+                r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#
+            } else {
+                r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":false}"#
+            };
+            let (status, bytes) = post_messages(messages_router(st), request).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(String::from_utf8_lossy(&bytes).contains("recovered"));
+        }
+    }
+
+    #[tokio::test]
+    async fn other_protocol_streams_retry_immediate_rejection() {
+        for protocol in 0..3 {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/generateAssistantResponse"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes({
+                    let mut bytes =
+                        event_frame("contextUsageEvent", br#"{"contextUsagePercentage":1}"#);
+                    bytes.extend(event_frame(
+                        "throttlingError",
+                        br#"{"message":"slow down"}"#,
+                    ));
+                    bytes
+                }))
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/generateAssistantResponse"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(event_frame(
+                    "assistantResponseEvent",
+                    br#"{"content":"recovered"}"#,
+                )))
+                .with_priority(5)
+                .mount(&server)
+                .await;
+            let st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+            let pool = st.pool.clone();
+            let (app, uri, request) = match protocol {
+                0 => (
+                    crate::protocol::openai::handler::openai_router(st),
+                    "/v1/chat/completions",
+                    r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                ),
+                1 => (
+                    crate::protocol::responses::handler::responses_router(st),
+                    "/v1/responses",
+                    r#"{"model":"sonnet","input":"hi","stream":true}"#,
+                ),
+                _ => (
+                    crate::protocol::gemini::handler::gemini_router(st),
+                    "/v1beta/models/claude-sonnet-4.5:streamGenerateContent?alt=sse",
+                    r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#,
+                ),
+            };
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(request))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let s = String::from_utf8_lossy(&bytes);
+            assert!(s.contains("recovered"), "protocol {protocol}: {s}");
+            assert!(!s.contains("slow down"), "protocol {protocol}: {s}");
+            let stats = pool.lock().await.stats(0);
+            assert_eq!(stats.iter().map(|s| s.failures).sum::<u64>(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_stream_usage_is_recorded_only_with_consumption() {
+        for protocol in 0..4 {
+            for case in 0..5 {
+                let partial = case == 2 || case == 3;
+                let server = MockServer::start().await;
+                let mut body = match case {
+                    0 => Vec::new(),
+                    1 => event_frame("contextUsageEvent", br#"{"contextUsagePercentage":1}"#),
+                    2 => event_frame("assistantResponseEvent", br#"{"content":"part"}"#),
+                    3 => event_frame(
+                        "toolUseEvent",
+                        br#"{"toolUseId":"id1","name":"search","input":"{}","stop":true}"#,
+                    ),
+                    _ => event_frame("toolUseEvent", br#"{"name":"discarded"}"#),
+                };
+                body.extend(event_frame(
+                    "throttlingError",
+                    br#"{"message":"slow down"}"#,
+                ));
+                Mock::given(method("POST"))
+                    .and(path("/generateAssistantResponse"))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                    .mount(&server)
+                    .await;
+                let mut st = state(&server.uri(), vec![cred_id("1")]);
+                let dir =
+                    std::env::temp_dir().join(format!("usage_test_{}", crate::kiro::uuid_v4()));
+                st.stats = StatsManager::load_from_dir(&dir);
+                let usage = st.stats.usage.clone();
+                let (app, uri, request) = match protocol {
+                    0 => (
+                        messages_router(st),
+                        "/v1/messages",
+                        r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                    ),
+                    1 => (
+                        crate::protocol::openai::handler::openai_router(st),
+                        "/v1/chat/completions",
+                        r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                    ),
+                    2 => (
+                        crate::protocol::responses::handler::responses_router(st),
+                        "/v1/responses",
+                        r#"{"model":"sonnet","input":"hi","stream":true}"#,
+                    ),
+                    _ => (
+                        crate::protocol::gemini::handler::gemini_router(st),
+                        "/v1beta/models/claude-sonnet-4.5:streamGenerateContent?alt=sse",
+                        r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#,
+                    ),
+                };
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("content-type", "application/json")
+                            .body(Body::from(request))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                let page = usage.records_for_credential(1, 1, 10).await;
+                assert_eq!(
+                    page.total,
+                    usize::from(partial),
+                    "protocol {protocol}, partial {partial}"
+                );
+                if partial {
+                    assert!(page.items[0].failed);
+                    assert_eq!(page.items[0].failure_status, Some(429));
+                    assert!(page.items[0].input_tokens > 0, "protocol {protocol}");
+                    assert!(page.items[0].output_tokens > 0, "protocol {protocol}");
+                    assert!(page.items[0].estimated_cost > 0.0, "protocol {protocol}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn all_stream_accounts_rejected_preserves_protocol_error_shape() {
+        for protocol in 0..3 {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/generateAssistantResponse"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(event_frame(
+                    "throttlingError",
+                    br#"{"message":"slow down"}"#,
+                )))
+                .mount(&server)
+                .await;
+            let st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+            let (app, uri, request, expected) = match protocol {
+                0 => (
+                    crate::protocol::openai::handler::openai_router(st),
+                    "/v1/chat/completions",
+                    r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                    "\"error\"",
+                ),
+                1 => (
+                    crate::protocol::responses::handler::responses_router(st),
+                    "/v1/responses",
+                    r#"{"model":"sonnet","input":"hi","stream":true}"#,
+                    "\"error\"",
+                ),
+                _ => (
+                    crate::protocol::gemini::handler::gemini_router(st),
+                    "/v1beta/models/claude-sonnet-4.5:streamGenerateContent?alt=sse",
+                    r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#,
+                    "\"error\"",
+                ),
+            };
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(request))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                text.contains(expected) && text.contains("slow down"),
+                "protocol {protocol}: {text}"
+            );
+        }
     }
 
     /// 数据面判出的**额度耗尽**必须当场落盘。
@@ -4672,6 +5442,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quota_classified_gateway_error_is_counted_once() {
+        let server = MockServer::start().await;
+        let mut data = event_frame("assistantResponseEvent", br#"{"content":"partial"}"#);
+        data.extend(event_frame(
+            "InternalServerException",
+            br#"{"message":"monthly quota reached","reason":"MONTHLY_REQUEST_COUNT"}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(data))
+            .mount(&server)
+            .await;
+        let mut st = state(&server.uri(), vec![cred_id("1")]);
+        st.stats = StatsManager::load_from_dir(
+            &std::env::temp_dir().join(format!("usage_test_{}", crate::kiro::uuid_v4())),
+        );
+        let (_, _) = post_messages(
+            messages_router(st.clone()),
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let rec = st.stats.usage.records_for_credential(1, 1, 10).await;
+        assert_eq!(rec.total, 1);
+        assert_eq!(rec.items[0].failure_status, Some(502));
+        let response = crate::admin::admin_api_router(st)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/usage/summary?range=6h")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["failedRequests"], 1);
+        assert_eq!(result["totalRequests"], 1);
+    }
+
+    #[tokio::test]
+    async fn preroll_metered_rejection_then_retry_preserves_both_accounts_usage() {
+        let server = MockServer::start().await;
+        let mut rejected = event_frame(
+            "meteringEvent",
+            br#"{"usage":1.25,"inputTokens":10,"outputTokens":2}"#,
+        );
+        rejected.extend(event_frame(
+            "throttlingError",
+            br#"{"message":"slow down"}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(rejected))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(event_frame(
+                "assistantResponseEvent",
+                br#"{"content":"pong"}"#,
+            )))
+            .with_priority(5)
+            .mount(&server)
+            .await;
+        let mut st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+        st.stats = StatsManager::load_from_dir(
+            &std::env::temp_dir().join(format!("usage_test_{}", crate::kiro::uuid_v4())),
+        );
+        let usage = st.stats.usage.clone();
+        let (_, bytes) = post_messages(
+            messages_router(st),
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&bytes).contains("pong"));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let first = usage.records_for_credential(1, 1, 10).await;
+        let second = usage.records_for_credential(2, 1, 10).await;
+        assert_eq!(first.total, 1);
+        assert!(first.items[0].failed);
+        assert_eq!(first.items[0].failure_logged, Some(true));
+        assert_eq!(first.items[0].failure_status, Some(429));
+        assert_eq!(first.items[0].credits_used, Some(1.25));
+        assert_eq!(first.items[0].input_tokens, 10);
+        assert_eq!(first.items[0].output_tokens, 2);
+        assert_eq!(second.total, 1);
+        assert!(!second.items[0].failed);
+    }
+
+    #[tokio::test]
+    async fn empty_text_before_rejection_retries_another_account() {
+        let server = MockServer::start().await;
+        let mut rejected = event_frame("assistantResponseEvent", br#"{"content":""}"#);
+        rejected.extend(event_frame(
+            "throttlingError",
+            br#"{"message":"slow down"}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(rejected))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(event_frame(
+                "assistantResponseEvent",
+                br#"{"content":"pong"}"#,
+            )))
+            .with_priority(5)
+            .mount(&server)
+            .await;
+        let (status, bytes) = post_messages(
+            messages_router(state(&server.uri(), vec![cred_id("1"), cred_id("2")])),
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&bytes).contains("pong"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn a_streaming_200_with_an_immediate_error_event_retries_on_another_account() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -4735,6 +5635,7 @@ mod tests {
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("event: error"), "流中途出错仍要发 error 事件");
         let stats = pool.lock().await.stats(1000);
+        assert_eq!(stats[0].successes, 0, "失败流不能记成功: {stats:?}");
         assert_eq!(
             stats[0].failures, 1,
             "流内 exception 没反馈池:这个号在池子眼里永远只有'刚刚成功过';实际:{stats:?}"

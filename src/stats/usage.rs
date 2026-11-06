@@ -70,6 +70,8 @@ pub struct DaySummary {
 pub struct DailyRollup {
     pub date: String,
     pub total_requests: u64,
+    pub failed_requests: u64,
+    pub unlogged_failures: u64,
     pub total_cost: f64,
     pub total_credits: f64,
 }
@@ -81,6 +83,8 @@ pub struct DailyRollup {
 pub struct RangeSummary {
     /// 命中窗口的记录条数。
     pub total_requests: u64,
+    pub failed_requests: u64,
+    pub unlogged_failures: u64,
     pub total_input_tokens: i64,
     pub total_output_tokens: i64,
     pub total_cost: f64,
@@ -185,14 +189,27 @@ impl ApiKeyUsageSummary {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 struct DayArchive {
     requests: u64,
+    #[serde(default)]
+    failed_requests: u64,
+    #[serde(default)]
+    unlogged_failures: u64,
     cost: f64,
     credits: f64,
+}
+
+fn unlogged_failure(r: &UsageRecord) -> bool {
+    r.failed
+        && !r
+            .failure_logged
+            .unwrap_or(matches!(r.failure_status, Some(401 | 403 | 429)))
 }
 
 impl DayArchive {
     /// 并入一条即将被淘汰的记录。credits 缺失记 0(与其它聚合口径一致)。
     fn absorb(&mut self, r: &UsageRecord) {
         self.requests += 1;
+        self.failed_requests += u64::from(r.failed);
+        self.unlogged_failures += u64::from(unlogged_failure(r));
         self.cost += r.estimated_cost;
         self.credits += r.credits_used.unwrap_or(0.0);
     }
@@ -619,6 +636,117 @@ impl UsageTracker {
         latency_ms: Option<u64>,
         now_unix: i64,
     ) {
+        self.record_usage_full_with_status(
+            credential_id,
+            api_key_id,
+            model,
+            input_tokens,
+            output_tokens,
+            estimated_cost,
+            credits_used,
+            client_ip,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+            latency_ms,
+            now_unix,
+            false,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_usage_full_with_status(
+        &self,
+        credential_id: u32,
+        api_key_id: u32,
+        model: String,
+        input_tokens: i32,
+        output_tokens: i32,
+        estimated_cost: f64,
+        credits_used: Option<f64>,
+        client_ip: Option<String>,
+        cache_read_input_tokens: Option<i32>,
+        cache_creation_input_tokens: Option<i32>,
+        latency_ms: Option<u64>,
+        now_unix: i64,
+        failed: bool,
+    ) {
+        self.record_usage_with_failure_status(
+            credential_id,
+            api_key_id,
+            model,
+            input_tokens,
+            output_tokens,
+            estimated_cost,
+            credits_used,
+            client_ip,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+            latency_ms,
+            now_unix,
+            failed,
+            None,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_usage_with_failure_status(
+        &self,
+        credential_id: u32,
+        api_key_id: u32,
+        model: String,
+        input_tokens: i32,
+        output_tokens: i32,
+        estimated_cost: f64,
+        credits_used: Option<f64>,
+        client_ip: Option<String>,
+        cache_read_input_tokens: Option<i32>,
+        cache_creation_input_tokens: Option<i32>,
+        latency_ms: Option<u64>,
+        now_unix: i64,
+        failed: bool,
+        failure_status: Option<u16>,
+    ) {
+        self.record_usage_with_failure_log(
+            credential_id,
+            api_key_id,
+            model,
+            input_tokens,
+            output_tokens,
+            estimated_cost,
+            credits_used,
+            client_ip,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+            latency_ms,
+            now_unix,
+            failed,
+            failure_status,
+            None,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_usage_with_failure_log(
+        &self,
+        credential_id: u32,
+        api_key_id: u32,
+        model: String,
+        input_tokens: i32,
+        output_tokens: i32,
+        estimated_cost: f64,
+        credits_used: Option<f64>,
+        client_ip: Option<String>,
+        cache_read_input_tokens: Option<i32>,
+        cache_creation_input_tokens: Option<i32>,
+        latency_ms: Option<u64>,
+        now_unix: i64,
+        failed: bool,
+        failure_status: Option<u16>,
+        failure_logged: Option<bool>,
+    ) {
         let rec = UsageRecord {
             credential_id,
             model,
@@ -632,6 +760,9 @@ impl UsageTracker {
             client_ip,
             api_key_id,
             latency_ms,
+            failed,
+            failure_status,
+            failure_logged,
         };
         {
             let mut guard = self.state.write().await;
@@ -692,6 +823,8 @@ impl UsageTracker {
                 DailyRollup {
                     date: date.clone(),
                     total_requests: a.requests,
+                    failed_requests: a.failed_requests,
+                    unlogged_failures: a.unlogged_failures,
                     total_cost: a.cost,
                     total_credits: a.credits,
                 },
@@ -702,10 +835,14 @@ impl UsageTracker {
             let e = by_day.entry(day.clone()).or_insert(DailyRollup {
                 date: day,
                 total_requests: 0,
+                failed_requests: 0,
+                unlogged_failures: 0,
                 total_cost: 0.0,
                 total_credits: 0.0,
             });
             e.total_requests += 1;
+            e.failed_requests += u64::from(r.failed);
+            e.unlogged_failures += u64::from(unlogged_failure(r));
             e.total_cost += r.estimated_cost;
             e.total_credits += r.credits_used.unwrap_or(0.0);
         }
@@ -742,11 +879,15 @@ impl UsageTracker {
             }
             let credits = r.credits_used.unwrap_or(0.0);
             s.total_requests += 1;
+            s.failed_requests += u64::from(r.failed);
+            s.unlogged_failures += u64::from(unlogged_failure(r));
             s.total_input_tokens += r.input_tokens as i64;
             s.total_output_tokens += r.output_tokens as i64;
             s.total_cost += r.estimated_cost;
             s.total_credits += credits;
-            if let Some(lat) = r.latency_ms {
+            if !r.failed
+                && let Some(lat) = r.latency_ms
+            {
                 s.latency_ms_sum += lat;
                 s.latency_sample_count += 1;
             }
@@ -781,19 +922,21 @@ impl UsageTracker {
         &self,
         since_unix: i64,
         until_unix: i64,
-    ) -> HashMap<String, (u64, f64, f64)> {
+    ) -> HashMap<String, (u64, f64, f64, u64, u64)> {
         let guard = self.state.read().await;
-        let mut by_day: HashMap<String, (u64, f64, f64)> = HashMap::new();
+        let mut by_day: HashMap<String, (u64, f64, f64, u64, u64)> = HashMap::new();
         for r in guard.records.iter() {
             if r.created_at_unix < since_unix || r.created_at_unix > until_unix {
                 continue;
             }
             let e = by_day
                 .entry(cst_daykey(r.created_at_unix))
-                .or_insert((0, 0.0, 0.0));
+                .or_insert((0, 0.0, 0.0, 0, 0));
             e.0 += 1;
             e.1 += r.estimated_cost;
             e.2 += r.credits_used.unwrap_or(0.0);
+            e.3 += u64::from(r.failed);
+            e.4 += u64::from(unlogged_failure(r));
         }
         by_day
     }
@@ -978,6 +1121,15 @@ fn paginate<T: Clone>(items: Vec<T>, page: usize, page_size: usize) -> Page<T> {
     }
 }
 
+/// 失败或中断的流只在确有输出或上游计量时记账。
+pub(crate) fn should_record_stream_usage(
+    completed: bool,
+    has_output: bool,
+    has_metering: bool,
+) -> bool {
+    completed || has_output || has_metering
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,7 +1148,40 @@ mod tests {
             client_ip: Some("1.2.3.4".into()),
             api_key_id: 0,
             latency_ms: None,
+            failed: false,
+            failure_status: None,
+            failure_logged: None,
         }
+    }
+
+    #[test]
+    fn archived_failures_use_actual_log_outcome_and_legacy_fallback() {
+        let mut archive = DayArchive::default();
+        let mut r = rec(1, 1, 1.0, 1);
+        r.failed = true;
+        r.failure_status = Some(502);
+        r.failure_logged = Some(true);
+        archive.absorb(&r);
+        r.failure_status = Some(429);
+        r.failure_logged = Some(false);
+        archive.absorb(&r);
+        r.failure_logged = None;
+        archive.absorb(&r);
+        assert_eq!(archive.requests, 3);
+        assert_eq!(archive.failed_requests, 3);
+        assert_eq!(archive.unlogged_failures, 1);
+        let restored: DayArchive =
+            serde_json::from_str(&serde_json::to_string(&archive).unwrap()).unwrap();
+        assert_eq!(restored, archive);
+    }
+
+    #[test]
+    fn legacy_day_archive_defaults_failure_counts_to_zero() {
+        let archive: DayArchive =
+            serde_json::from_str(r#"{"requests":3,"cost":1.5,"credits":2.0}"#).unwrap();
+        assert_eq!(archive.requests, 3);
+        assert_eq!(archive.failed_requests, 0);
+        assert_eq!(archive.unlogged_failures, 0);
     }
 
     #[test]
@@ -1098,6 +1283,7 @@ mod tests {
                     requests: 1,
                     cost: 1.0,
                     credits: 0.0,
+                    ..Default::default()
                 },
             );
         }
@@ -1356,6 +1542,7 @@ mod tests {
                     requests: 3,
                     cost: 3.0,
                     credits: 1.5,
+                    ..Default::default()
                 },
             );
             // 另一天:该日记录全被淘汰,存活记录里已无此日 —— 汇总仍须给出该日。
@@ -1365,6 +1552,7 @@ mod tests {
                     requests: 5,
                     cost: 5.0,
                     credits: 0.0,
+                    ..Default::default()
                 },
             );
         }
@@ -1400,6 +1588,7 @@ mod tests {
                         requests: 7,
                         cost: 7.0,
                         credits: 3.5,
+                        ..Default::default()
                     },
                 );
             }
@@ -1560,6 +1749,7 @@ mod tests {
                     requests: 4,
                     cost: 4.0,
                     credits: 2.0,
+                    ..Default::default()
                 },
             );
         }

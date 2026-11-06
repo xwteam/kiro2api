@@ -90,6 +90,11 @@ impl StreamDecoder {
         out
     }
 
+    /// 是否存在尚未解析的帧字节。
+    pub fn has_pending_bytes(&self) -> bool {
+        !self.buf.is_empty()
+    }
+
     /// 累计跳过的坏字节/坏帧次数。
     pub fn errors(&self) -> u32 {
         self.errors

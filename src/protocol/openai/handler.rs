@@ -6,7 +6,7 @@
 //! HTTP 200 事件流里的 exception 由内核单独回报,按 429/403/400/502 精确出错。
 //!
 //! 流式(`stream:true`)分支:OpenAI 流式 chunk 编码照 OpenAI 公开规范自写状态机——
-//! 复用 [`select_and_call_with_retry`] 取上游 `reqwest::Response`,`async_stream` 里 `resp.chunk()`
+//! 复用 [`select_stream_with_retry`] 取上游 `reqwest::Response`,`async_stream` 里 `resp.chunk()`
 //! 喂 `StreamDecoder`,逐帧转换为 `chat.completion.chunk`;工具调用按 `toolUseId` 首现顺序
 //! 分配 `tool_calls[].index`(与 Anthropic 流式 `content_block` index 同构但含义不同:
 //! 这里是 `tool_calls` 数组下标,纯文本不占用)。
@@ -23,7 +23,7 @@ use axum::routing::{get, post};
 
 use crate::protocol::anthropic::handler::{
     CoreOutcome, MessagesState, RelayError, extract_client_ip, relay_core_outcome,
-    select_and_call_with_retry,
+    select_stream_with_retry,
 };
 use crate::protocol::anthropic::types::MessagesRequest;
 use crate::protocol::openai::convert::{finish_reason_from_stop, hub_to_openai, openai_to_hub};
@@ -67,10 +67,15 @@ struct StreamUsageGuard {
     now_unix: i64,
     /// 累计输出字符数(收尾按 ÷CHARS_PER_TOKEN 估算 output_tokens);随流增量更新。
     total_chars: usize,
+    estimated_input_tokens: u32,
     /// 末次 meteringEvent 的真实计费(#4;有则 credits/缓存 token 随之落库,多个则末次覆盖)。
     metering: Option<crate::kiro::convert::MeteringUsage>,
     /// 已记账标记:避免正常收尾 + Drop 双写。
     recorded: bool,
+    failed: bool,
+    failure_status: Option<u16>,
+    failure_logged: bool,
+    has_output: bool,
 }
 
 impl StreamUsageGuard {
@@ -78,7 +83,11 @@ impl StreamUsageGuard {
     /// (上游真实计费,可能 output 为 0 但仍有 credits/缓存计费——纯工具轮即属此类,#9)。二者皆无
     /// = 极早取消(计量前客户端断连、且尚未产出文本),补记只会写零行,应跳过(#16 类比)。
     fn has_meaningful_usage(&self) -> bool {
-        self.total_chars >= CHARS_PER_TOKEN || self.metering.is_some()
+        crate::stats::usage::should_record_stream_usage(
+            false,
+            self.has_output,
+            self.metering.is_some(),
+        )
     }
 
     /// 本次流的 `(input, output)` token 数:优先取 meteringEvent 的真实计量,缺哪项回退哪项
@@ -89,12 +98,12 @@ impl StreamUsageGuard {
             .metering
             .as_ref()
             .and_then(|m| m.input_tokens)
-            .unwrap_or(0);
+            .unwrap_or(self.estimated_input_tokens);
         let output = self
             .metering
             .as_ref()
             .and_then(|m| m.output_tokens)
-            .unwrap_or((self.total_chars / CHARS_PER_TOKEN) as u32);
+            .unwrap_or(self.total_chars.div_ceil(CHARS_PER_TOKEN) as u32);
         (input, output)
     }
 
@@ -108,6 +117,13 @@ impl StreamUsageGuard {
             return;
         }
         self.recorded = true;
+        if !crate::stats::usage::should_record_stream_usage(
+            !self.failed,
+            self.has_output,
+            self.metering.is_some(),
+        ) {
+            return;
+        }
 
         let (input_tokens, output_tokens) = self.token_counts();
         let (input_tokens, output_tokens) = (input_tokens as i32, output_tokens as i32);
@@ -128,13 +144,16 @@ impl StreamUsageGuard {
         let (credential_id, api_key_id, now_unix) =
             (self.credential_id, self.api_key_id, self.now_unix);
         let client_ip = self.client_ip.clone();
+        let failed = self.failed;
+        let failure_status = self.failure_status;
+        let failure_logged = self.failure_logged;
 
         // Drop 里 spawn 前先确认有 tokio 运行时:运行时之外/关停期 spawn 会 panic,Drop 绝不可 panic。
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
                     usage
-                        .record_usage_full(
+                        .record_usage_with_failure_log(
                             credential_id,
                             api_key_id,
                             model,
@@ -147,6 +166,9 @@ impl StreamUsageGuard {
                             cache_creation,
                             None,
                             now_unix,
+                            failed,
+                            failure_status,
+                            Some(failure_logged),
                         )
                         .await;
                 });
@@ -300,16 +322,34 @@ pub async fn chat_completions_stream(
     bound: Option<BoundCredentialIds>,
     now_unix: u64,
     include_usage: bool,
-) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>> + use<>>, RelayError> {
-    let crate::protocol::anthropic::handler::CallOutcome {
-        mut resp,
-        credential_id,
-        // 超长工具名在上行时被缩短了,上游回来的 `toolUseEvent` 用的就是短名。这张表必须一路
-        // 带进读循环:丢掉它,客户端会收到一个**它自己没声明过**的工具名,那一轮工具调用直接
-        // 作废(客户端按名字查不到对应实现)。非流式那条走中枢内核,早已还原。
-        tool_name_map,
-        cred_id,
-    } = select_and_call_with_retry(&state, &hub_req, now_unix, bound.as_ref()).await?;
+) -> Result<Response, RelayError> {
+    let estimated_input_tokens =
+        crate::protocol::anthropic::handler::estimate_request_input_tokens_weighted(&hub_req);
+    let started = std::time::Instant::now();
+    let (mut resp, preroll, credential_id, tool_name_map, cred_id, seeded_exception) =
+        match select_stream_with_retry(
+            &state,
+            &hub_req,
+            now_unix,
+            bound.as_ref(),
+            api_key_id,
+            client_ip.clone(),
+        )
+        .await?
+        {
+            Ok((outcome, preroll)) => (
+                Some(outcome.resp),
+                preroll,
+                outcome.credential_id,
+                outcome.tool_name_map,
+                outcome.cred_id,
+                None,
+            ),
+            Err(e) => {
+                let (status, body) = upstream_exception_to_openai(&e);
+                return Ok((status, Json(body)).into_response());
+            }
+        };
     // 流里报错时要反馈账号池,而 state 会被移进 stream! —— 先留一份。
     let feedback_state = state.clone();
     // 统计层用量句柄(Arc,移入哨兵);记账经 Drop 哨兵在流**任意方式结束**时都落一条(#8/#9/#15)。
@@ -329,8 +369,13 @@ pub async fn chat_completions_stream(
             model: record_model,
             now_unix: now_unix as i64,
             total_chars: 0,
+            estimated_input_tokens,
             metering: None,
             recorded: false,
+            failed: false,
+            failure_status: None,
+            failure_logged: false,
+            has_output: false,
         };
 
         let make = |choice: ChunkChoice| {
@@ -339,7 +384,7 @@ pub async fn chat_completions_stream(
         };
 
         // 首个 chunk:仅 role,无 content/tool_calls。
-        yield Ok(make(ChunkChoice {
+        yield Ok::<Event, Infallible>(make(ChunkChoice {
             index: 0,
             delta: Delta { role: Some("assistant".to_string()), content: None, tool_calls: None, ..Default::default() },
             finish_reason: None,
@@ -353,7 +398,8 @@ pub async fn chat_completions_stream(
         let mut refused = false;
         let mut truncation: Option<crate::kiro::convert::Truncation> = None;
         // 上游中途下发的非截断 exception:置位即停读,收尾走错误分支。
-        let mut upstream_error: Option<crate::kiro::convert::StreamException> = None;
+        let mut upstream_error = seeded_exception;
+        let mut pending = Some(preroll);
         // 传输层中断(连接重置 / 读超时 / chunked 体未收尾):与 in-band exception 一样
         // 必须以错误 chunk 收尾且**不发 [DONE]**,否则客户端把半截回答当正常完成。
         let mut transport_err: Option<(u16, String)> = None;
@@ -361,12 +407,21 @@ pub async fn chat_completions_stream(
         let mut splitter = crate::kiro::convert::ThinkingSplitter::new();
 
         'read: loop {
-            match resp.chunk().await {
+            if upstream_error.is_some() { break; }
+            let next = if let Some(bytes) = pending.take().filter(|b| !b.is_empty()) {
+                Ok(Some(bytes.into()))
+            } else if let Some(resp) = resp.as_mut() {
+                resp.chunk().await
+            } else {
+                Ok(None)
+            };
+            match next {
                 Ok(Some(chunk)) => {
                     dec.push(&chunk);
                     for frame in dec.drain() {
                         if let Some(t) = crate::kiro::convert::frame_text_delta(&frame) {
                             usage_guard.total_chars += t.chars().count();
+                            usage_guard.has_output |= !t.is_empty();
                             // 先切出 thinking:上游把思考过程用 `<thinking>…</thinking>` 包在普通
                             // 文本里下发。不切的话客户端把整段思考当正文显示 —— 而这三个协议刚
                             // 支持了开启 extended thinking,不切等于把问题放大。切分器是增量的,
@@ -395,6 +450,8 @@ pub async fn chat_completions_stream(
                                 // 还原成客户端认识的原名(见上面 tool_name_map 的说明)。
                                 // 名字都没超长时该表为空,`get` 直接落空、零开销。
                                 let name = tool_name_map.get(raw_name).map(String::as_str).unwrap_or(raw_name);
+                                usage_guard.has_output = true;
+                                usage_guard.total_chars += name.chars().count();
                                 yield Ok(make(ChunkChoice {
                                     index: 0,
                                     delta: Delta {
@@ -411,6 +468,8 @@ pub async fn chat_completions_stream(
                             }
                             let idx = tool_index[tool_use_id];
                             if let Some(inp) = v["input"].as_str() {
+                                usage_guard.has_output = true;
+                                usage_guard.total_chars += inp.chars().count();
                                 yield Ok(make(ChunkChoice {
                                     index: 0,
                                     delta: Delta {
@@ -440,14 +499,16 @@ pub async fn chat_completions_stream(
                             // 反馈账号池:上游在 200 的流里报错 = 这次它其实没干成。不反馈的话,
                             // 这个账号在池子眼里永远只有"刚刚成功过",坏号一次都不会被惩罚 ——
                             // 此前只有原生 Anthropic 那条出口做了,另外三个协议全漏。
-                            crate::protocol::anthropic::handler::report_stream_exception(
+                            usage_guard.failed = true;
+                            usage_guard.failure_status = Some(crate::kiro::convert::exception_status(&e.kind));
+                            usage_guard.failure_logged = crate::protocol::anthropic::handler::report_stream_exception(
                                 &feedback_state,
                                 &cred_id,
                                 credential_id,
                                 &e,
                                 now_unix,
                             )
-                            .await;
+                            .await.2;
                             upstream_error = Some(e);
                             break 'read;
                         }
@@ -463,6 +524,18 @@ pub async fn chat_completions_stream(
             }
         }
 
+
+        if upstream_error.is_none() && transport_err.is_none() && dec.has_pending_bytes() {
+            transport_err = Some((502, "invalid or truncated event stream".to_string()));
+        }
+        if transport_err.is_some() {
+            usage_guard.failed = true;
+            usage_guard.failure_status = Some(502);
+            crate::protocol::anthropic::handler::report_stream_interrupted(&feedback_state, &cred_id, now_unix).await;
+        } else if upstream_error.is_none() {
+            usage_guard.failed = false;
+            feedback_state.pool.lock().await.report_success_started(&cred_id, started);
+        }
 
         // 收尾:把切分器里还压着的内容吐干净(半截标签按普通内容处理),绝不吞。
         // `feed` 为了兜住跨块的半截 `<thinking` 会扣留结尾那几个字节 —— 不调 `finish`,
@@ -550,15 +623,17 @@ pub async fn chat_completions_stream(
         usage_guard.flush();
     };
 
-    Ok(Sse::new(body).keep_alive(
-        // SSE 保活。上游"想"得久时(长推理、长工具链)会有几十秒一个字节都不出,
-        // 中间的 CDN / 反代 / 客户端读超时会把这条静默的连接掐掉,表现成"会话莫名其妙断了"。
-        // 25 秒一个注释帧,既低于常见的 30/60 秒空闲阈值,又不干扰任何客户端解析
-        //(`:` 开头的注释行是 SSE 规范里明确要求忽略的)。
-        axum::response::sse::KeepAlive::new()
-            .interval(std::time::Duration::from_secs(25))
-            .text("keep-alive"),
-    ))
+    Ok(Sse::new(body)
+        .keep_alive(
+            // SSE 保活。上游"想"得久时(长推理、长工具链)会有几十秒一个字节都不出,
+            // 中间的 CDN / 反代 / 客户端读超时会把这条静默的连接掐掉,表现成"会话莫名其妙断了"。
+            // 25 秒一个注释帧,既低于常见的 30/60 秒空闲阈值,又不干扰任何客户端解析
+            //(`:` 开头的注释行是 SSE 规范里明确要求忽略的)。
+            axum::response::sse::KeepAlive::new()
+                .interval(std::time::Duration::from_secs(25))
+                .text("keep-alive"),
+        )
+        .into_response())
 }
 
 /// axum handler:`POST /v1/chat/completions`(与 `/openai/v1/chat/completions` 共用)。
@@ -1241,7 +1316,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let app = openai_router(state(&server.uri(), vec![cred()]));
+        let st = state(&server.uri(), vec![cred()]);
+        let pool = st.pool.clone();
+        let app = openai_router(st);
         let req_body =
             r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
         let resp = app
@@ -1270,6 +1347,8 @@ mod tests {
         ] {
             assert!(s.contains(needle), "SSE 缺 `{needle}`;实际:\n{s}");
         }
+        let stats = pool.lock().await.stats(0);
+        assert_eq!(stats[0].successes, 0, "失败流不能记成功: {stats:?}");
         assert!(
             !s.contains("[DONE]"),
             "上游报错不得以 [DONE] 收尾;实际:\n{s}"

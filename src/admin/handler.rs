@@ -1352,6 +1352,7 @@ impl PageQuery {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageRecordView {
+    pub failed: bool,
     pub model: String,
     pub input_tokens: i32,
     pub output_tokens: i32,
@@ -1387,6 +1388,7 @@ impl UsageRecordView {
     ) -> Self {
         let credential_label = labels.and_then(|m| m.get(&r.credential_id).cloned());
         UsageRecordView {
+            failed: r.failed,
             model: r.model,
             input_tokens: r.input_tokens,
             output_tokens: r.output_tokens,
@@ -1746,9 +1748,9 @@ pub struct UsageSummaryResponse {
     pub series: Vec<UsageBucketView>,
 
     // ===== 运行健康指标(#6)。口径见 usage_summary 文档;皆为"窗口内、尽力而为"的最佳可得值。 =====
-    /// 窗口内成功中转的请求数(= 窗口内用量记录条数;每条成功中转落一条)。
+    /// 窗口内未标记失败的用量记录数。
     pub successful_requests: u64,
-    /// 窗口内失败的请求数(= 失败日志 401/403 + 限流日志 429 在窗口内的条数)。
+    /// 窗口内失败/限流日志数,加上未写事件日志的失败用量记录数。
     /// 注:事件日志按凭据有 LRU 上限,极高频失败下最旧事件可能已淘汰 → 此值为下界(errorRate 偏保守)。
     pub failed_requests: u64,
     /// 错误率 = failedRequests / (successfulRequests + failedRequests)。
@@ -1778,8 +1780,8 @@ pub struct UsageSummaryResponse {
 /// (≤ 1 天,原始记录一般未淘汰)不做兜底,直接返回原始精确聚合。
 ///
 /// **运行健康指标(#6)**:在同一窗口内额外计算三项"尽力而为"的指标:
-/// - `errorRate` = 失败数 /(成功数 + 失败数)。成功数取窗口内用量记录条数(每条成功中转落一条);
-///   失败数取窗口内失败日志(401/403)+ 限流日志(429)条数。事件日志按凭据有 LRU 上限,极高频
+/// - `errorRate` = 失败数 /(成功数 + 失败数)。成功数取未标记失败的用量记录;
+///   失败数取失败/限流日志条数,加上未写事件日志的失败用量记录。事件日志按凭据有 LRU 上限,极高频
 ///   失败下最旧事件可能已淘汰,故失败数为下界、errorRate 偏保守(不会虚高)。
 /// - `avgLatencyMs` = 窗口内成功记录 `latency_ms` 之和 / 有延迟样本数(旧记录无 latency 不计)。
 /// - `rotationSuccessRate` ≈ 成功数 /(成功数 + 失败数):以"最终是否落一条成功用量记录"为成功信号,
@@ -1858,9 +1860,10 @@ pub async fn usage_summary(
         0.0
     };
 
-    // 成功 = 窗口内用量记录条数(含长窗兜底补齐后的 total_requests);失败 = 401/403 + 429。
-    let successful_requests = summary.total_requests;
-    let failed_requests = failure_count + throttle_count;
+    let successful_requests = summary
+        .total_requests
+        .saturating_sub(summary.failed_requests);
+    let failed_requests = failure_count + throttle_count + summary.unlogged_failures;
     let attempted = successful_requests + failed_requests;
     // 错误率:无活动 → 0;轮换成功率:无活动 → 1(无异常)。二者互补(在此近似口径下之和为 1)。
     let (error_rate, rotation_success_rate) = if attempted == 0 {
@@ -1876,7 +1879,7 @@ pub async fn usage_summary(
         since_unix,
         until_unix,
         bucket_secs,
-        total_requests: summary.total_requests,
+        total_requests: attempted,
         total_input_tokens: summary.total_input_tokens,
         total_output_tokens: summary.total_output_tokens,
         total_cost: summary.total_cost,
@@ -1924,8 +1927,12 @@ async fn apply_daily_fallback(
         if day_start_unix < since_unix || day_end_unix - 1 > until_unix {
             continue;
         }
-        let (raw_req, raw_cost, raw_credits) =
-            raw_by_day.get(&d.date).copied().unwrap_or((0, 0.0, 0.0));
+        let (raw_req, raw_cost, raw_credits, raw_failed, raw_unlogged) = raw_by_day
+            .get(&d.date)
+            .copied()
+            .unwrap_or((0, 0.0, 0.0, 0, 0));
+        summary.failed_requests += d.failed_requests.saturating_sub(raw_failed);
+        summary.unlogged_failures += d.unlogged_failures.saturating_sub(raw_unlogged);
         // 每日汇总 ≥ 原始 → 用差额补齐(原始已计入 summary)。
         if d.total_requests > raw_req {
             summary.total_requests += d.total_requests - raw_req;
@@ -4935,6 +4942,140 @@ mod tests {
         // hours=0 → 400。
         let (st5, _v5) = get(&app, "/api/admin/usage/summary?hours=0").await;
         assert_eq!(st5, HttpStatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn usage_summary_counts_failed_stream_once() {
+        let stats = empty_stats("summary_failed_stream_once");
+        let now = now_unix() as i64;
+        stats
+            .usage
+            .record_usage_full_with_status(
+                1,
+                0,
+                "m".into(),
+                2,
+                3,
+                1.0,
+                None,
+                None,
+                None,
+                None,
+                Some(500),
+                now,
+                true,
+            )
+            .await;
+        let app = admin_api_router(state_with_stats(vec![], Config::default(), stats));
+        let (status, body) = get(&app, "/api/admin/usage/summary?range=6h").await;
+        assert_eq!(status, HttpStatusCode::OK);
+        assert_eq!(body["successfulRequests"], 0);
+        assert_eq!(body["failedRequests"], 1);
+        assert_eq!(body["totalRequests"], 1);
+        assert_eq!(body["totalCost"], 1.0);
+    }
+
+    #[tokio::test]
+    async fn usage_summary_deduplicates_logged_failures_and_keeps_costs() {
+        let stats = empty_stats("summary_deduplicate_logged");
+        let now = now_unix() as i64;
+        for (failed, status, cost, latency) in [
+            (true, Some(429), 1.0, 900),
+            (true, Some(502), 2.0, 800),
+            (false, None, 3.0, 100),
+            (false, None, 4.0, 300),
+        ] {
+            stats
+                .usage
+                .record_usage_with_failure_status(
+                    1,
+                    0,
+                    "m".into(),
+                    2,
+                    3,
+                    cost,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(latency),
+                    now,
+                    failed,
+                    status,
+                )
+                .await;
+        }
+        stats.record_throttle(1, "api", "throttled", now).await;
+        let app = admin_api_router(state_with_stats(vec![], Config::default(), stats));
+        let (status, body) = get(&app, "/api/admin/usage/summary?range=6h").await;
+        assert_eq!(status, HttpStatusCode::OK);
+        assert_eq!(body["successfulRequests"], 2);
+        assert_eq!(body["failedRequests"], 2);
+        assert_eq!(body["totalRequests"], 4);
+        assert_eq!(body["totalCost"], 10.0);
+        assert_eq!(body["avgLatencyMs"], 200.0);
+    }
+
+    #[tokio::test]
+    async fn usage_summary_archived_failures_preserve_counts_and_costs() {
+        let stats = empty_stats("summary_archived_failures");
+        let now = now_unix() as i64;
+        let old = now - 3 * 86400;
+        for (failed, status, cost) in [
+            (true, Some(429), 1.0),
+            (true, Some(502), 2.0),
+            (false, None, 3.0),
+        ] {
+            stats
+                .usage
+                .record_usage_with_failure_status(
+                    1,
+                    0,
+                    "m".into(),
+                    1,
+                    1,
+                    cost,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    old,
+                    failed,
+                    status,
+                )
+                .await;
+        }
+        stats.record_throttle(1, "api", "throttled", old).await;
+        for _ in 0..crate::stats::usage::USAGE_CAP_PER_CREDENTIAL + 256 {
+            stats
+                .usage
+                .record_usage_with_failure_status(
+                    1,
+                    0,
+                    "m".into(),
+                    1,
+                    1,
+                    0.0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    old,
+                    false,
+                    None,
+                )
+                .await;
+        }
+        let app = admin_api_router(state_with_stats(vec![], Config::default(), stats));
+        let (status, body) = get(&app, "/api/admin/usage/summary?range=7d").await;
+        assert_eq!(status, HttpStatusCode::OK);
+        assert_eq!(body["successfulRequests"], 10257);
+        assert_eq!(body["failedRequests"], 2);
+        assert_eq!(body["totalRequests"], 10259);
+        assert_eq!(body["totalCost"], 6.0);
+        assert_eq!(body["dailyFallbackApplied"], true);
     }
 
     #[tokio::test]
