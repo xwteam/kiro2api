@@ -1519,7 +1519,7 @@ mod tests {
         ));
         body.extend(event_frame(
             "meteringEvent",
-            br#"{"usage":3.5,"cache_read_input_tokens":128,"cache_creation_input_tokens":64}"#,
+            br#"{"usage":3.53,"cache_read_input_tokens":128,"cache_creation_input_tokens":64}"#,
         ));
         Mock::given(method("POST"))
             .and(path("/generateAssistantResponse"))
@@ -1547,21 +1547,26 @@ mod tests {
             .await
             .unwrap();
 
-        // 共享 temp-dir 的 usage 存储可能含其它测试的记录,故按本用例特征值(credits==3.5)定位,
+        // 共享 temp-dir 的 usage 存储可能含其它测试的记录,故按本用例特征值(credits==3.53,三个协议各用不同值,免得命中别的用例或上次运行残留的记录)定位,
         // 不取"首条",避免跨测试污染导致误判。
         let mut found = None;
         for _ in 0..50 {
             let page = usage.records_for_credential(0, 0, 100).await;
-            if let Some(r) = page.items.into_iter().find(|r| r.credits_used == Some(3.5)) {
+            if let Some(r) = page
+                .items
+                .into_iter()
+                .find(|r| r.credits_used == Some(3.53))
+            {
                 found = Some(r);
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         let rec = found.expect("纯工具轮 + meteringEvent 应落一条含 credits 的用量(#4/#9)");
+        // 工具名与参数计入输出字符("get_weather" 11 + "{}" 2 = 13 → 向上取整 4),对齐 Anthropic。
         assert_eq!(
-            rec.output_tokens, 0,
-            "纯工具轮无文本 → output_tokens 为 0,但仍须落库"
+            rec.output_tokens, 4,
+            "纯工具轮无文本 → output_tokens 按工具名与参数估算,且仍须落库"
         );
         assert_eq!(rec.cache_read_input_tokens, Some(128));
         assert_eq!(rec.cache_creation_input_tokens, Some(64));
