@@ -279,6 +279,8 @@ curl -X POST http://localhost:8080/v1/responses \
 > [!NOTE]
 > 上面就是**完整**的頂層欄位集合，別按官方 Responses API 的形狀去讀多餘的鍵：回應**沒有** `previous_response_id`、`instructions`、`error` 這幾個欄位（不是 `null`，是整個鍵不出現），`usage` 只有 `input_tokens` / `output_tokens` / `total_tokens`（**沒有** `input_tokens_details` / `output_tokens_details`），`output_text` 區塊也**沒有** `annotations`。唯一的可選欄位是 `incomplete_details`：上游截斷或拒答、`status` 為 `incomplete` 時才出現：截斷為 `{"reason":"max_output_tokens"}`，拒答為 `{"reason":"content_filter"}`。要判斷失敗請看 HTTP 狀態碼與錯誤體，不要讀 `error` 欄位。
 
+> 開局預讀時所有帳號都被拒，OpenAI Chat、Responses 與 Gemini 不會先回傳 HTTP 200 或正常開局幀，而是直接回傳各協定的非 200 錯誤回應（429 / 400 / 502）。
+
 **回應（流式）**：嚴格按官方協議順序發送帶命名的 SSE 事件，每個事件都帶遞增的 `sequence_number`。**沒有** `data: [DONE]` 結尾標記（那是 Chat Completions 的老約定）——正常完成訊號是 `response.completed`，截斷或拒答是 `response.incomplete`，失敗是 `response.failed`：
 
 ```
@@ -604,6 +606,15 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.19.0:串流重試、帳號狀態與用量記錄**
+>
+> - 串流請求僅在上游正常讀完且無錯誤時記帳號成功；中途出錯只記失敗，用戶端主動斷開既不記成功也不記失敗。上游拒答且正常結束仍算成功。
+> - 四種協定的串流開局均會預讀，只認真正的內容：計量事件之後報錯或開局半幀斷開也可換號，預讀期間照常發送保活。全部帳號開局被拒時不先發正常開局幀，直接回傳各協定非 200 錯誤（限流 429、參數 400、其他 502）。
+> - 非串流回應在半幀處斷開時換號重試，不把半截內容當成功；個別壞幀仍整幀跳過，正常結束不算失敗。
+> - 失敗請求無輸出且無上游計量時不寫記錄；有消耗的上游例外幀、錯誤事件、傳輸中斷或串流截斷記為 `failed: true`。用戶端主動斷開但已有消耗時記錄為 `failed: false`，舊記錄也預設為 `false`。
+> - `usage/summary` 的 `successfulRequests` 統計未失敗記錄，`failedRequests` 統計 401/403/429 日誌及其他失敗記錄；401/403/429 的失敗記錄只計消耗、不重複計請求。每個請求只計一次，token、積分、成本包含所有記錄，平均延遲只統計未失敗記錄。
+> - OpenAI Chat 的 `usage`（含串流 `include_usage`）、Responses 的 `usage` 與 Gemini 的 `usageMetadata` 在上游沒有 token 計量時改用估算，與 Anthropic 一致：輸入按轉換後的請求估算（此前為 0），輸出按字元數除以 4 向上取整（此前向下取整），工具呼叫名稱與參數也計入輸出。上游有計量時仍以上游為準。
+>
 > **v0.18.1:上游錯誤事件與帳號令牌**
 >
 > - 上游普通事件 `error`、`throttlingError`、`validationError`、`serviceUnavailableError`、`InternalServerException`、`ThrottlingException`、`ValidationException`、`ServiceUnavailableException` 現在與例外幀走相同的錯誤路徑，不再把空白或部分回答當成成功。限流對應 429、參數驗證對應 400、其他伺服器錯誤對應 502；四種協定的串流與非串流均回傳各自的錯誤格式，Responses 串流以 `response.failed` 結束。帳號池會收到對應訊號，限流會納入冷卻判斷。錯誤裡的 `reason` 也會交給帳號池判斷：串流裡回報 `INVALID_MODEL_ID`（該帳號不支援此模型）時換帳號重試、不懲罰帳號，例外幀同樣適用。
@@ -949,6 +960,7 @@ curl "http://localhost:8080/api/admin/usage/daily/2026-07-26/records?page=1&page
   "records": [
     {
       "model": "claude-sonnet-4.5",
+      "failed": false,
       "inputTokens": 100,
       "outputTokens": 200,
       "estimatedCost": 0.05,
@@ -967,6 +979,8 @@ curl "http://localhost:8080/api/admin/usage/daily/2026-07-26/records?page=1&page
   "totalPages": 1
 }
 ```
+
+`failed` 表示記錄的請求是否因上游例外幀、錯誤事件、傳輸中斷或串流截斷而失敗；用戶端主動斷開即使已有消耗也為 `false`，舊記錄預設為 `false`。此欄位也適用於 `GET /api/admin/credentials/{id}/usage/records`、`GET /api/admin/api-keys/{id}/usage/records`、`GET /api/admin/usage/daily/{date}/records` 與 `GET /api/user/usage/records` 的 `records[]`。
 
 `credentialLabel` 由帳號池快照解析：暱稱 → 郵箱 → `#{id}`；池裡已無該帳號時該鍵**不出現**。`creditsUsed` / `cacheReadInputTokens` / `cacheCreationInputTokens` / `clientIp` 在無值時同樣**整個鍵不出現**（不是 `null`）。另有一個 `creditsSaved` 欄位恆為 `None`，**永遠不會出現**。
 
@@ -1024,10 +1038,10 @@ curl "http://localhost:8080/api/admin/usage/summary?range=24h" \
 - `bucketSecs` —— 圖表分桶寬度：窗口 ≤ 24 小時為 `3600`（每小時），更長為 `86400`（每天）。`series` 按桶起始**升序**，空窗口 → 空陣列。
 - 數值全為 f64/i64 **原始精度、未預先四捨五入**，格式化交給前端。
 - `dailyFallbackApplied` —— 窗口 > 1 天時，原始記錄可能已被逐帳號上限淘汰，服務會逐個「完整落在窗口內的 CST 日」用每日彙總取 `max` 補齊 requests/cost/credits。此值為 `true` 表示真的補過。**tokens 沒有每日彙總可補**，故補齊發生時 `totalInputTokens` / `totalOutputTokens` 可能偏低。
-- `successfulRequests` = 窗口內用量記錄條數；`failedRequests` = 窗口內失敗日誌（401/403）+ 限流日誌（429）條數。
+- `successfulRequests` = 窗口內未標 `failed` 的用量記錄條數，不再總與 `totalRequests` 同值；`failedRequests` = 失敗日誌（401/403）+ 限流日誌（429）+ 其他標 `failed` 的用量記錄條數（如傳輸中斷、502、400）。401/403/429 的失敗記錄只計消耗、不重複計請求數，每個請求只算一次。token、積分、成本包含所有記錄。
 - `errorRate` = `failedRequests / (successfulRequests + failedRequests)`，分母為 `0` 時為 `0.0`。
 - `rotationSuccessRate` = `1 - errorRate`，分母為 `0` 時為 `1.0`。這是**近似值**：跨帳號重試鏈路本身沒有單獨埋點，服務以「最終有沒有落一筆成功用量記錄」當成功訊號來逼近。
-- `avgLatencyMs` —— 窗口內**帶延遲樣本**的成功記錄均值（沒有 latency 的舊記錄不計入）；無樣本 → `0.0`。
+- `avgLatencyMs` —— 窗口內**帶延遲樣本**的未失敗記錄均值（沒有 latency 的舊記錄不計入）；無樣本 → `0.0`。
 
 > **注意：** 事件日誌有 LRU 上限，`failedRequests` 是下界，因此 `errorRate` 偏保守（只會低估、不會虛高）。空存儲 / 空窗口 → 全零 + 空 `series` 的 `200`，不會 `500`。
 
@@ -1261,6 +1275,7 @@ curl "http://localhost:8080/api/user/usage/records?page=1&page_size=20" \
   "records": [
     {
       "model": "claude-sonnet-4.5",
+      "failed": false,
       "inputTokens": 100,
       "outputTokens": 200,
       "estimatedCost": 0.05,
@@ -1277,6 +1292,8 @@ curl "http://localhost:8080/api/user/usage/records?page=1&page_size=20" \
   "totalPages": 3
 }
 ```
+
+`failed` 表示記錄的請求是否因上游例外幀、錯誤事件、傳輸中斷或串流截斷而失敗；用戶端主動斷開即使已有消耗也為 `false`，舊記錄預設為 `false`。此欄位也適用於 `GET /api/admin/credentials/{id}/usage/records`、`GET /api/admin/api-keys/{id}/usage/records`、`GET /api/admin/usage/daily/{date}/records` 與 `GET /api/user/usage/records` 的 `records[]`。
 
 記錄只包含歸屬於這把 key 的流量（別的 key 的記錄不會混進來）。`creditsUsed` / `cacheReadInputTokens` / `cacheCreationInputTokens` / `clientIp` 無值時**整個鍵不出現**。另有 `credentialLabel` 與 `creditsSaved` 兩個欄位在使用者面**恆不填**，因此**永遠不會出現**——別去讀它們（帳號標籤屬於管理面資訊，只有 `/api/admin/*` 的記錄端點才給）。
 
@@ -1295,7 +1312,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.18.1"}
+{"service":"kiro2api","status":"ok","version":"0.19.0"}
 ```
 
 ### GET /v1/ping

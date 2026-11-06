@@ -341,6 +341,8 @@ curl -X POST http://localhost:8080/openai/v1/responses \
 >
 > 선택 필드는 `incomplete_details` 하나뿐이며, 업스트림이 응답을 자르거나 거부했을 때 나타납니다 — `status`는 `"incomplete"`가 되고, `incomplete_details`는 잘림 시 `{"reason": "max_output_tokens"}`, 거부 시 `{"reason": "content_filter"}`입니다.
 
+> 시작 사전 읽기에서 모든 계정이 거부하면 OpenAI Chat, Responses, Gemini는 HTTP 200이나 정상 시작 프레임을 먼저 보내지 않고 각 프로토콜의 비 200 오류 응답(429 / 400 / 502)을 직접 반환합니다.
+
 **응답 (스트리밍)**: 각 이벤트마다 단조 증가하는 `sequence_number`를 포함하는, 공식 프로토콜 순서를 그대로 따르는 명명된 SSE 이벤트 시퀀스입니다. `data: [DONE]` 같은 종료 표시는 **없으며** (이는 Chat Completions 방식의 관례입니다) — 정상 종료는 `response.completed`, 잘림이나 거부는 `response.incomplete`, 실패는 `response.failed`로 알립니다:
 
 ```
@@ -651,6 +653,15 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.19.0: 스트리밍 재시도, 계정 상태와 사용량 기록**
+>
+> - 스트리밍 요청은 업스트림을 오류 없이 정상적으로 모두 읽었을 때만 계정 성공으로 기록합니다. 중간 오류는 실패로만 기록하고 클라이언트의 자발적 연결 종료는 성공이나 실패로 기록하지 않습니다. 업스트림 응답 거부가 정상 종료되면 성공입니다.
+> - 네 프로토콜 모두 실제 내용이 나올 때까지 스트림 시작을 미리 읽습니다. 계량 이벤트 뒤 오류나 시작 프레임 중간의 연결 종료에도 계정을 전환하며 사전 읽기 중 연결 유지를 보냅니다. 모든 계정이 시작 시 거부하면 정상 시작 프레임 없이 각 프로토콜의 비 200 오류를 반환합니다(스로틀 429, 파라미터 400, 기타 502).
+> - 비스트리밍 응답이 프레임 중간에 끊기면 일부 내용을 성공으로 반환하지 않고 다른 계정으로 재시도합니다. 개별 잘못된 프레임은 이전처럼 통째로 건너뛰며 정상 완료는 실패가 아닙니다.
+> - 출력과 업스트림 계량이 모두 없는 실패는 기록하지 않습니다. 소비가 있는 업스트림 예외 프레임·오류 이벤트, 전송 중단이나 스트림 잘림은 `failed: true`로 기록합니다. 소비가 있는 클라이언트의 자발적 연결 종료는 `failed: false`로 기록하며 이전 기록도 기본값은 `false`입니다.
+> - `usage/summary`의 `successfulRequests`는 실패하지 않은 기록, `failedRequests`는 401/403/429 로그와 그 밖의 실패 기록을 셉니다. 401/403/429 실패 기록은 소비만 더하고 요청 수를 중복 계산하지 않습니다. 각 요청은 한 번만 세며 토큰·크레딧·비용은 모든 기록을 포함하고 평균 지연은 실패하지 않은 기록만 사용합니다.
+> - 업스트림에 토큰 계량이 없으면 OpenAI Chat의 `usage`(스트리밍 `include_usage` 포함), Responses의 `usage`, Gemini의 `usageMetadata`는 Anthropic과 같이 추정값을 반환합니다. 입력은 변환된 요청에서 추정하고(이전에는 0), 출력은 문자 수를 4로 나누어 올림합니다(이전에는 버림). 도구 호출 이름과 인자도 출력에 포함합니다. 업스트림 계량이 있으면 계속 그 값을 우선합니다.
+>
 > **v0.18.1: 업스트림 오류 이벤트와 계정 토큰**
 >
 > - 업스트림의 일반 이벤트 `error`, `throttlingError`, `validationError`, `serviceUnavailableError`, `InternalServerException`, `ThrottlingException`, `ValidationException`, `ServiceUnavailableException`을 예외 프레임과 같은 오류 경로로 처리하여 빈 응답이나 일부 응답을 성공으로 취급하지 않습니다. 스로틀링은 429, 파라미터 검증 오류는 400, 그 밖의 서버 오류는 502에 매핑합니다. 네 프로토콜의 스트리밍과 비스트리밍 모두 각자의 오류 형식을 반환하며 Responses 스트리밍은 `response.failed`로 종료합니다. 계정 풀에도 해당 신호가 전달되고 스로틀은 쿨다운 판단에 반영됩니다.오류의 `reason`도 계정 풀 판단에 전달합니다. 스트림에서 `INVALID_MODEL_ID`(해당 계정이 모델을 지원하지 않음)가 오면 계정에 불이익 없이 다른 계정으로 재시도하며, 예외 프레임도 마찬가지입니다.
@@ -972,6 +983,7 @@ curl "http://localhost:8080/api/admin/usage/daily/2026-07-25/records?page=1&page
   "records": [
     {
       "model": "claude-sonnet-4.5",
+      "failed": false,
       "inputTokens": 1200,
       "outputTokens": 340,
       "estimatedCost": 0.0123,
@@ -990,6 +1002,8 @@ curl "http://localhost:8080/api/admin/usage/daily/2026-07-25/records?page=1&page
   "totalPages": 1
 }
 ```
+
+`failed`는 업스트림 예외 프레임·오류 이벤트, 전송 중단 또는 스트림 잘림으로 인한 실패를 나타냅니다. 클라이언트의 자발적 연결 종료는 소비가 있어도 `false`이며 이전 기록의 기본값도 `false`입니다. 이 필드는 `GET /api/admin/credentials/{id}/usage/records`, `GET /api/admin/api-keys/{id}/usage/records`, `GET /api/admin/usage/daily/{date}/records`, `GET /api/user/usage/records`의 `records[]`에도 적용됩니다.
 
 > `creditsUsed` / `cacheReadInputTokens` / `cacheCreationInputTokens` / `credentialLabel` / `clientIp`는 값이 없으면 `null`이 아니라 **필드 자체가 빠집니다**. `creditsUsed`는 업스트림이 보고한 실제 적립금 소비량이지 `estimatedCost`에서 환산한 값이 **아닙니다**(업스트림이 주지 않으면 필드가 없고, 이 API는 비용에서 역산하지 않습니다). `credentialLabel`은 저장된 값이 아니라 계정 풀에서 닉네임 → 이메일 → `#{id}` 순으로 만들어 붙이는 표시용 이름입니다. `creditsSaved`는 이 저장소가 산출하지 않으므로 **항상 빠집니다**.
 
@@ -1035,8 +1049,8 @@ curl "http://localhost:8080/api/admin/usage/summary?range=24h" \
 > - `range`는 입력을 정규화해 되돌려 준 라벨입니다(`hours=N`으로 물었으면 `"<N>h"`). 창은 `[untilUnix - windowSecs, untilUnix]`이고 `untilUnix`는 요청 처리 시각입니다.
 > - `bucketSecs`는 창이 24시간 이하면 3600(시간별), 그보다 길면 86400(일별)입니다. `series`는 버킷 시작 오름차순이며 활동이 없으면 빈 배열입니다.
 > - 창이 **1일보다 길면** 원본 기록의 계정당 상한(10000건) 탓에 오래된 건이 이미 밀려났을 수 있어, 창에 통째로 들어가는 CST 하루마다 일별 집계와 대조해 `max(원본, 일별)`의 차액으로 requests/cost/credits만 메웁니다. 그렇게 메웠으면 `dailyFallbackApplied: true`가 되며, **토큰 합계는 메우지 않으므로 낮게 나올 수 있습니다**.
-> - `failedRequests`는 창 안의 실패 로그(401/403) + 스로틀 로그(429) 건수입니다. 이벤트 로그는 계정당 500건 LRU 상한이 있어 이 값은 **하한**이고, 따라서 `errorRate`는 보수적으로(낮게) 나옵니다.
-> - `avgLatencyMs`는 지연이 기록된 성공 건만의 평균이며(옛 기록에는 지연이 없습니다) 표본이 하나도 없으면 `0.0`입니다.
+> - `successfulRequests`는 창 안에서 `failed`로 표시되지 않은 사용량 기록 수이며 항상 `totalRequests`와 같지는 않습니다. `failedRequests`는 실패 로그(401/403) + 스로틀 로그(429) + 그 밖의 `failed` 사용량 기록(전송 중단, 502, 400 등) 수입니다. 401/403/429 실패 기록은 소비만 더하고 요청 수는 중복 계산하지 않으며 각 요청은 한 번만 셉니다. 토큰·크레딧·비용에는 모든 기록이 포함됩니다. 이벤트 로그가 축출되면 `failedRequests`는 하한이 될 수 있습니다.
+> - `avgLatencyMs`는 지연이 기록된 실패하지 않은 기록만의 평균이며(옛 기록에는 지연이 없습니다) 표본이 하나도 없으면 `0.0`입니다.
 > - `rotationSuccessRate`는 `1 − errorRate`인 **근사치**입니다 — 계정 교체 재시도 자체를 따로 계측하지 않고 "성공 기록이 남았는가"를 성공 신호로 삼습니다. 창 안에 활동이 전혀 없으면 `errorRate: 0.0` / `rotationSuccessRate: 1.0`.
 > - `totalCredits`는 각 기록에 실린 **업스트림 보고 적립금 소비량의 합**입니다 — `totalCost`에서 환산한 값이 아니며, 적립금 값이 없는 기록은 0으로 칩니다.
 > - 수치는 전부 반올림하지 않은 원본이므로 자릿수는 클라이언트가 알아서 다듬으십시오.
@@ -1515,6 +1529,7 @@ curl "http://localhost:8080/api/user/usage/records?page=1&page_size=50" \
   "records": [
     {
       "model": "claude-sonnet-4.5",
+      "failed": false,
       "inputTokens": 1200,
       "outputTokens": 340,
       "estimatedCost": 0.0123,
@@ -1531,6 +1546,8 @@ curl "http://localhost:8080/api/user/usage/records?page=1&page_size=50" \
   "totalPages": 1
 }
 ```
+
+`failed`는 업스트림 예외 프레임·오류 이벤트, 전송 중단 또는 스트림 잘림으로 인한 실패를 나타냅니다. 클라이언트의 자발적 연결 종료는 소비가 있어도 `false`이며 이전 기록의 기본값도 `false`입니다. 이 필드는 `GET /api/admin/credentials/{id}/usage/records`, `GET /api/admin/api-keys/{id}/usage/records`, `GET /api/admin/usage/daily/{date}/records`, `GET /api/user/usage/records`의 `records[]`에도 적용됩니다.
 
 > 관리 API의 같은 이름 응답과 달리 `credentialId`라는 필드가 **아예 없고**(어느 계정으로 중계됐는지는 사용자 면에 노출하지 않습니다), `credentialLabel`과 `creditsSaved`도 채우지 않으므로 **항상 빠집니다**. `creditsUsed` / `cacheReadInputTokens` / `cacheCreationInputTokens` / `clientIp`도 값이 없으면 필드째 빠집니다.
 >
@@ -1551,7 +1568,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.18.1"}
+{"service":"kiro2api","status":"ok","version":"0.19.0"}
 ```
 
 ### GET /v1/ping

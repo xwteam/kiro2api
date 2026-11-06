@@ -304,6 +304,8 @@ curl -X POST http://localhost:8080/openai/v1/responses \
 >
 > One optional key can appear: when the upstream truncates or refuses the answer, `status` is `"incomplete"` (and so is the message item's `status`) and `incomplete_details` is added with `{"reason": "max_output_tokens"}` for truncation or `{"reason": "content_filter"}` for refusal. It is omitted entirely on a `"completed"` response. Both an output-budget cut-off and an exhausted context window report `max_output_tokens`.
 
+> If all accounts reject during the opening pre-read, OpenAI Chat, Responses and Gemini return their protocol-specific non-200 error response (429 / 400 / 502) directly, without first sending HTTP 200 or a normal opening frame.
+
 **Response (Streaming):** a spec-correct sequence of named SSE events, each carrying a monotonically increasing `sequence_number`. There is **no** `data: [DONE]` sentinel (that's a Chat Completions convention) — normal completion is signaled by `response.completed`; truncation or refusal by `response.incomplete`; failure by `response.failed`:
 
 ```
@@ -628,6 +630,15 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.19.0: streaming retries, account status and usage records**
+>
+> - A streaming request counts as an account success only after the upstream stream ends normally without error. A midstream error counts only as failure; an intentional client disconnect counts as neither. An upstream refusal that ends normally still counts as success.
+> - All four protocols pre-read streaming openings until actual content: an error after metering or a disconnect mid-frame at the start can trigger an account retry; keepalives continue during pre-read. If all accounts reject at the start, the protocol's non-200 error response is returned without a normal opening frame (429 for throttling, 400 for parameters, 502 otherwise).
+> - A non-streaming response cut off mid-frame is retried on another account instead of returned as a successful partial answer. Individual malformed frames are still skipped whole; normal completion is not a failure.
+> - Failed requests with neither output nor upstream metering produce no record. Upstream exception frames or error events, transport interruption or stream truncation with consumption are recorded as `failed: true`. An intentional client disconnect with consumption is recorded as `failed: false`; old records also default to `false`.
+> - In `usage/summary`, `successfulRequests` counts non-failed records; `failedRequests` counts 401/403/429 logs plus other failed records. Failed 401/403/429 records contribute consumption without being counted again as requests. Each request counts once; tokens, credits and cost include all records, while average latency uses only non-failed records.
+> - When upstream provides no token metering, OpenAI Chat `usage` (including streaming `include_usage`), Responses `usage` and Gemini `usageMetadata` now use estimates, as in Anthropic: input is estimated from the converted request (previously 0), and output is the character count divided by 4 rounded up (previously rounded down), including tool-call names and arguments. Upstream metering still takes precedence when provided.
+>
 > **v0.18.1: upstream error events and account tokens**
 >
 > - The ordinary upstream events `error`, `throttlingError`, `validationError`, `serviceUnavailableError`, `InternalServerException`, `ThrottlingException`, `ValidationException`, and `ServiceUnavailableException` now follow the same error path as exception frames instead of treating empty or partial answers as successes. Throttling maps to 429, validation to 400, and other server errors to 502. All four protocols return their native error shapes in streaming and non-streaming responses; Responses streaming terminates with `response.failed`. The account pool receives the corresponding signals, with throttles counted toward cooldown decisions. The error's `reason` is now passed to the account pool as well: an in-stream `INVALID_MODEL_ID` (the account does not support the model) is retried on another account without penalizing this one; exception frames behave the same way.
@@ -996,6 +1007,7 @@ curl "http://localhost:8080/api/admin/credentials/12345/usage/records?page=1&pag
   "records": [
     {
       "model": "claude-sonnet-4.5",
+      "failed": false,
       "inputTokens": 1200,
       "outputTokens": 340,
       "estimatedCost": 0.0123,
@@ -1013,7 +1025,9 @@ curl "http://localhost:8080/api/admin/credentials/12345/usage/records?page=1&pag
 }
 ```
 
-`model`, `inputTokens`, `outputTokens`, `estimatedCost`, `createdAt` and `credentialId` always serialize; `creditsUsed`, `cacheReadInputTokens`, `cacheCreationInputTokens`, `clientIp` and `credentialLabel` are omitted when absent. `credentialLabel` is resolved from the pool as nickname → email → `#{id}`. `creditsSaved` is declared on the record but never produced, so it is always absent.
+`failed` indicates failure from an upstream exception frame or error event, transport interruption, or stream truncation. An intentional client disconnect is `false` even after consumption; old records default to `false`. This field also applies to `records[]` in `GET /api/admin/credentials/{id}/usage/records`, `GET /api/admin/api-keys/{id}/usage/records`, `GET /api/admin/usage/daily/{date}/records` and `GET /api/user/usage/records`.
+
+`model`, `inputTokens`, `outputTokens`, `estimatedCost`, `createdAt`, `failed` and `credentialId` always serialize; `creditsUsed`, `cacheReadInputTokens`, `cacheCreationInputTokens`, `clientIp` and `credentialLabel` are omitted when absent. `credentialLabel` is resolved from the pool as nickname → email → `#{id}`. `creditsSaved` is declared on the record but never produced, so it is always absent.
 
 **Request** (`/usage/today`):
 ```bash
@@ -1169,9 +1183,9 @@ curl "http://localhost:8080/api/admin/usage/summary?range=24h" \
 
 Every field above always serializes; an empty window returns zeros with `series: []` (still `200`), `series` is ordered by bucket start ascending, and `range` echoes the effective label (`"<N>h"` when you passed `hours`). Read the derived numbers with their caveats:
 
-- `successfulRequests` counts the window's usage records (one per relayed request, including anything added by the daily top-up below); `failedRequests` counts auth-failure plus throttle events in it. Those event logs are capped per account, so `failedRequests` is a **lower bound** and `errorRate` errs low.
+- `successfulRequests` counts usage records in the window not marked `failed` and no longer always equals `totalRequests`. `failedRequests` counts failure logs (401/403), throttle logs (429), and other usage records marked `failed` (such as transport interruptions, 502 and 400). Failed 401/403/429 records contribute consumption but do not count again as requests; each request counts once. Tokens, credits and costs include all records. Event-log eviction can make `failedRequests` a lower bound.
 - `errorRate` = `failedRequests / (successfulRequests + failedRequests)`, `rotationSuccessRate` is its complement — it is an approximation of "requests that eventually reached upstream", not an instrumented count of cross-account retries. With no activity at all they are `0.0` and `1.0`.
-- `avgLatencyMs` averages only records that carry a latency; records written before latency was tracked are excluded, and with no samples it is `0.0`.
+- `avgLatencyMs` averages only non-failed records that carry a latency; records written before latency was tracked are excluded, and with no samples it is `0.0`.
 - `dailyFallbackApplied` is `true` when a window longer than a day had to be topped up from the daily rollups because raw records had been evicted. Only requests / cost / credits are topped up — token totals cannot be, so they may read low on long windows.
 
 ### GET /api/admin/rpm
@@ -1512,6 +1526,7 @@ curl "http://localhost:8080/api/user/usage/records?page=1&page_size=50" \
   "records": [
     {
       "model": "claude-sonnet-4.5",
+      "failed": false,
       "inputTokens": 1200,
       "outputTokens": 340,
       "estimatedCost": 0.0123,
@@ -1527,7 +1542,9 @@ curl "http://localhost:8080/api/user/usage/records?page=1&page_size=50" \
 }
 ```
 
-`model`, `inputTokens`, `outputTokens`, `estimatedCost`, `createdAt` and the envelope counters always serialize; `creditsUsed`, `cacheReadInputTokens`, `cacheCreationInputTokens` and `clientIp` are omitted when absent. Two further fields are declared on this record but never populated on the user side, so they are **always absent**: `creditsSaved` (no data source) and `credentialLabel` (the user view does not resolve account labels — unlike the admin records, which do). Note there is no `credentialId` either: which pooled account served a request is not exposed to the key's owner.
+`failed` indicates failure from an upstream exception frame or error event, transport interruption, or stream truncation. An intentional client disconnect is `false` even after consumption; old records default to `false`. This field also applies to `records[]` in `GET /api/admin/credentials/{id}/usage/records`, `GET /api/admin/api-keys/{id}/usage/records`, `GET /api/admin/usage/daily/{date}/records` and `GET /api/user/usage/records`.
+
+`model`, `inputTokens`, `outputTokens`, `estimatedCost`, `createdAt`, `failed` and the envelope counters always serialize; `creditsUsed`, `cacheReadInputTokens`, `cacheCreationInputTokens` and `clientIp` are omitted when absent. Two further fields are declared on this record but never populated on the user side, so they are **always absent**: `creditsSaved` (no data source) and `credentialLabel` (the user view does not resolve account labels — unlike the admin records, which do). Note there is no `credentialId` either: which pooled account served a request is not exposed to the key's owner.
 
 ## System Endpoints
 

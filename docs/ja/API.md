@@ -310,6 +310,8 @@ curl -X POST http://localhost:8080/openai/v1/responses \
 
 返るフィールドは上記がすべてです。`usage` は 3 つのカウンタのみで、`input_tokens_details` / `output_tokens_details` は**ありません**。`output_text` パーツに `annotations` は付かず、レスポンス直下の `previous_response_id` / `instructions` / `error` も**返しません**（これらで分岐しないでください）。上流による切り詰めまたは回答拒否の場合、`status` が `"incomplete"` になり、`incomplete_details` は切り詰め時に `{"reason": "max_output_tokens"}`、拒否時に `{"reason": "content_filter"}` になります。
 
+> 冒頭の先読みで全アカウントが拒否した場合、OpenAI Chat・Responses・Gemini は HTTP 200 や正常な開始フレームを先に送らず、各プロトコルの非 200 エラー応答（429 / 400 / 502）を直接返します。
+
 **レスポンス（ストリーミング）:** 仕様に準拠した名前付き SSE イベントの並びで、各イベントは単調増加する `sequence_number` を持ちます。`data: [DONE]` のような終端マーカーは**ありません**（これは Chat Completions の慣習です）— 正常終了は `response.completed`、切り詰めまたは拒否は `response.incomplete`、失敗は `response.failed` で通知されます。
 
 ```
@@ -682,6 +684,15 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.19.0:ストリーミングの再試行、アカウント状態と使用量記録**
+>
+> - ストリーミングは上流をエラーなく正常に読み終えた場合のみアカウントの成功に数えます。途中のエラーは失敗のみ、クライアントの自発的な切断は成功にも失敗にも数えません。上流の回答拒否が正常終了した場合は成功です。
+> - 4 プロトコルとも冒頭を実際の内容まで先読みし、計量イベント後のエラーや冒頭のフレーム途中の切断でも別アカウントに切り替えます。先読み中も keepalive を送ります。全アカウントが冒頭で拒否した場合、正常な開始フレームを送らず各プロトコルの非 200 エラーを返します（スロットル 429、パラメータ 400、その他 502）。
+> - 非ストリーミング応答がフレーム途中で切断された場合、途中までの内容を成功として返さず別アカウントで再試行します。個々の不正フレームは従来どおりフレームごと飛ばし、正常終了なら失敗にはしません。
+> - 出力も上流の計量もない失敗は記録しません。消費のある上流の例外フレーム・エラーイベント、伝送中断やストリーム切断は `failed: true` とします。消費のあるクライアントの自発的な切断は `failed: false` で記録し、旧記録も `false` が既定です。
+> - `usage/summary` の `successfulRequests` は失敗していない記録、`failedRequests` は 401/403/429 のログとその他の失敗記録を数えます。401/403/429 の失敗記録は消費だけを計上し、件数を重複させません。各リクエストは一度だけ数え、トークン・クレジット・コストは全記録を含み、平均遅延は失敗していない記録のみを対象にします。
+> - 上流から token の計量がない場合、OpenAI Chat の `usage`（ストリーミングの `include_usage` を含む）、Responses の `usage`、Gemini の `usageMetadata` は Anthropic と同様に推定値を返します。入力は変換後のリクエストから推定し（従来は 0）、出力は文字数を 4 で割って切り上げます（従来は切り捨て）。ツール呼び出しの名前と引数も出力に含めます。上流の計量がある場合は引き続きそれを優先します。
+>
 > **v0.18.1:上流のエラーイベントとアカウントのトークン**
 >
 > - 上流の通常イベント `error`、`throttlingError`、`validationError`、`serviceUnavailableError`、`InternalServerException`、`ThrottlingException`、`ValidationException`、`ServiceUnavailableException` を例外フレームと同じエラー経路で扱い、空または途中までの回答を成功とみなさなくなりました。スロットルは 429、パラメータ検証は 400、その他のサーバーエラーは 502 に対応します。4 プロトコルのストリーミング・非ストリーミングでそれぞれのエラー形式を返し、Responses のストリーミングは `response.failed` で終端します。アカウントプールにも対応する信号が届き、スロットルはクールダウンの判定に加算されます。エラーの `reason` もアカウントプールの判定に渡します。ストリーム内で `INVALID_MODEL_ID`（そのアカウントがモデルに未対応）が返った場合は、アカウントを罰せず別のアカウントで再試行します。例外フレームでも同様です。
@@ -1057,6 +1068,7 @@ curl "http://localhost:8080/api/admin/usage/daily/2026-07-26/records?page=1&page
   "records": [
     {
       "model": "claude-sonnet-4.5",
+      "failed": false,
       "inputTokens": 120,
       "outputTokens": 340,
       "estimatedCost": 0.0051,
@@ -1073,6 +1085,8 @@ curl "http://localhost:8080/api/admin/usage/daily/2026-07-26/records?page=1&page
   "totalPages": 1
 }
 ```
+
+`failed` は上流の例外フレーム・エラーイベント、伝送中断、ストリーム切断による失敗を示します。クライアントの自発的な切断は消費があっても `false`、旧記録の既定値も `false` です。このフィールドは `GET /api/admin/credentials/{id}/usage/records`、`GET /api/admin/api-keys/{id}/usage/records`、`GET /api/admin/usage/daily/{date}/records`、`GET /api/user/usage/records` の `records[]` にも適用されます。
 
 ページングの前に**その日の新しい順で 2000 件に切り詰められます**（それより古い記録はこのエンドポイントからは見えません）。`credentialLabel` はプールのスナップショットから解決した表示名（ニックネーム → メール → `#{id}` の優先順）で、プールに該当 id が無ければ省略されます。`creditsUsed` / `cacheReadInputTokens` / `cacheCreationInputTokens` / `clientIp` は値が無ければ省略されます。`creditsSaved` は予約枠で**常に省略されます**。日付の綴りが暦日キーと一致しなければ（不正な日付を含め）空ページが `200` で返ります。
 
@@ -1125,9 +1139,9 @@ curl "http://localhost:8080/api/admin/usage/summary?range=24h" \
 - `range` は正規化後のラベルの**エコー**です（`hours=5` を渡した場合は `"5h"`）。`untilUnix` は現在時刻、`sinceUnix` は `untilUnix - windowSecs`。
 - `bucketSecs` は窓幅から自動決定されます：24 時間以下なら `3600`（1 時間ごと）、それより長ければ `86400`（1 日ごと）。`series` は桶の開始時刻の昇順で、活動が無ければ空配列です。
 - `dailyFallbackApplied` は、**1 日を超える窓**で生記録の欠落分を日次ロールアップで補填したかどうかを示します（生記録はアカウントごとに上限があり古いものが淘汰されるため）。補填されるのは `totalRequests` / `totalCost` / `totalCredits` だけで、**トークン数には日次集計が無いため補填されません**——`true` のときトークン合計は過小になり得ます。
-- `successfulRequests` は窓内の使用量記録の件数、`failedRequests` は窓内の失敗ログ（`401`/`403`）＋スロットルログ（`429`）の件数です。イベントログは LRU 上限があるので `failedRequests` は**下界**であり、`errorRate` は過小に出る側に倒れます。
+- `successfulRequests` は窓内の `failed` でない使用量記録の件数で、`totalRequests` と常に同じではありません。`failedRequests` は失敗ログ（401/403）＋スロットルログ（429）＋それ以外の `failed` な使用量記録（伝送中断、502、400 など）の件数です。401/403/429 の失敗記録は消費のみを計上し、リクエスト件数を重複させず、各リクエストを一度だけ数えます。トークン・クレジット・コストには全記録を含みます。イベントログの上限により `failedRequests` は下界になり得ます。
 - `errorRate` = `failedRequests / (successfulRequests + failedRequests)`、`rotationSuccessRate` = `1 - errorRate`（この近似では両者の和は常に 1）。分母が 0 のときは `errorRate = 0.0` / `rotationSuccessRate = 1.0` です。`rotationSuccessRate` は「最終的に成功記録が残ったか」を成功シグナルとする**近似**で、アカウント間リトライの実回数を数えたものではありません。
-- `avgLatencyMs` は `latency_ms` を持つ成功記録の平均です（この項目を持たない古い記録は分母に入りません。サンプルが無ければ `0.0`）。なお `latency_ms` 自体は使用量記録のレスポンスには出力されません。
+- `avgLatencyMs` は `latency_ms` を持つ未失敗記録の平均です（この項目を持たない古い記録は分母に入りません。サンプルが無ければ `0.0`）。なお `latency_ms` 自体は使用量記録のレスポンスには出力されません。
 - 数値は丸めずに f64 の精度のまま返します。ストレージが空／窓内に活動が無い場合も `500` ではなく全 0 ＋空 `series` の `200` です。
 
 ### GET /api/admin/credits/global
@@ -1481,6 +1495,7 @@ curl "http://localhost:8080/api/user/usage/records?page=1&page_size=20" \
   "records": [
     {
       "model": "claude-sonnet-4.5",
+      "failed": false,
       "inputTokens": 120,
       "outputTokens": 340,
       "estimatedCost": 0.0051,
@@ -1496,7 +1511,9 @@ curl "http://localhost:8080/api/user/usage/records?page=1&page_size=20" \
 }
 ```
 
-返るのは**その key に紐づく記録だけ**です。1 件のレコードが持ち得るのは `model` / `inputTokens` / `outputTokens` / `estimatedCost` / `createdAt` と、値がある場合のみ現れる `creditsUsed` / `cacheReadInputTokens` / `cacheCreationInputTokens` / `clientIp` です。管理側の同種レスポンスと違い**`credentialId` は含まれません**（どのアカウントで処理されたかは利用者側には出しません）。`creditsSaved` と `credentialLabel` はこのエンドポイントでは解決されず**常に省略されます**。key が有効で記録が 1 件も無ければ `500` ではなく空ページ（`total: 0`、`totalPages: 0`、`page: 1`）が `200` で返ります。key が無効／停用／期限切れなら `401`（`{"error":"…"}`）。
+`failed` は上流の例外フレーム・エラーイベント、伝送中断、ストリーム切断による失敗を示します。クライアントの自発的な切断は消費があっても `false`、旧記録の既定値も `false` です。このフィールドは `GET /api/admin/credentials/{id}/usage/records`、`GET /api/admin/api-keys/{id}/usage/records`、`GET /api/admin/usage/daily/{date}/records`、`GET /api/user/usage/records` の `records[]` にも適用されます。
+
+返るのは**その key に紐づく記録だけ**です。1 件のレコードが持ち得るのは `model` / `inputTokens` / `outputTokens` / `estimatedCost` / `createdAt` / `failed` と、値がある場合のみ現れる `creditsUsed` / `cacheReadInputTokens` / `cacheCreationInputTokens` / `clientIp` です。管理側の同種レスポンスと違い**`credentialId` は含まれません**（どのアカウントで処理されたかは利用者側には出しません）。`creditsSaved` と `credentialLabel` はこのエンドポイントでは解決されず**常に省略されます**。key が有効で記録が 1 件も無ければ `500` ではなく空ページ（`total: 0`、`totalPages: 0`、`page: 1`）が `200` で返ります。key が無効／停用／期限切れなら `401`（`{"error":"…"}`）。
 
 ## 運用
 

@@ -106,6 +106,15 @@ cat data/config.json | grep apiKey
 | 422 | 请求体反序列化失败（缺必填字段 / 类型不符），axum 默认拒收，`text/plain` 纯文本。出现在带 body 提取器的端点上：`/api/admin/*` 与 `POST /api/user/login`（四个协议对话端点与 `/v1/messages/count_tokens` 已自行接管拒收、改回各自形状的 `400`）（`/api/user/*` 的其余端点只收 query，参数类型不符是 `400` 而非 `422`） |
 
 
+> **v0.19.0:流式重试、账号状态与用量记录**
+>
+> - 流式请求仅在上游正常读完且无错误时记账号成功；中途出错只记失败，客户端主动断开既不记成功也不记失败。上游拒答且正常结束仍算成功。
+> - 四种协议流式开局均会预读，只认真正的内容：计量事件之后报错或开局半帧断开也可换号，预读期间照常发保活。全部账号开局被拒时不先发正常开局帧，直接返回各协议非 200 错误（限流 429、参数 400、其他 502）。
+> - 非流式响应在半帧处断开时换号重试，不把半截内容当成功；个别坏帧仍整帧跳过，正常完成不算失败。
+> - 失败请求无输出且无上游计量时不写记录；有消耗的上游异常帧、错误事件、传输中断或流截断记为 `failed: true`。客户端主动断开但已有消耗时记录为 `failed: false`，旧记录也默认为 `false`。
+> - `usage/summary` 的 `successfulRequests` 统计未失败记录，`failedRequests` 统计 401/403/429 日志及其他失败记录；401/403/429 的失败记录只计消耗、不重复计请求。每个请求只计一次，token、积分、成本包含所有记录，平均延迟只统计未失败记录。
+> - OpenAI Chat 的 `usage`（含流式 `include_usage`）、Responses 的 `usage` 和 Gemini 的 `usageMetadata` 在上游没有 token 计量时改用估算，与 Anthropic 一致：输入按转换后的请求估算（此前为 0），输出按字符数除以 4 向上取整（此前向下取整），工具调用名称与参数也计入输出。上游有计量时仍以上游为准。
+>
 > **v0.18.1:上游错误事件与账号令牌**
 >
 > - 上游普通事件 `error`、`throttlingError`、`validationError`、`serviceUnavailableError`、`InternalServerException`、`ThrottlingException`、`ValidationException`、`ServiceUnavailableException` 现在与异常帧走同一错误路径，不再把空回答或部分回答当成成功。限流映射 429、参数校验映射 400、其他服务端错误映射 502；四种协议的流式和非流式均返回各自的错误形状，Responses 流式以 `response.failed` 收尾。账号池收到对应信号，限流计入冷却判断。错误里的 `reason` 也会交给账号池判断：流里报 `INVALID_MODEL_ID`（该账号不支持此模型）时换号重试、不罚账号，异常帧同样生效。
@@ -193,7 +202,7 @@ cat data/config.json | grep apiKey
 >
 > 同一个账号的**数据面、令牌刷新、余额查询、模型清单、后台续期一律走同一个出口**。
 > 代理地址无法解析时会记 `error` 日志并退回直连(不静默吞掉)。
-| 429 | **只来自上游限流**，且只在上游于 HTTP 200 事件流中途下发 `ThrottlingException` 异常帧或 `throttlingError` / `ThrottlingException` 错误事件时映射。本地的 `MAX_RPM_PER_CREDENTIAL` **不会**产生 `429`：超过该上限只是让这个账号本轮选不中，全部账号都选不中才落到 `503`（见下行）。上游在 HTTP 层直接回的 `429` 也**不**原样透出——自 v0.10.0 起它被判为**瞬时限流**(退避后重试,不惩罚账号;此前被误判为配额耗尽并让账号吃长冷却),重试用尽后以 `502` 收尾。据自己设的 RPM 上限去监控 `429` 是等不到的 |
+| 429 | **只来自上游限流**，包括上游于 HTTP 200 事件流开局或中途下发 `ThrottlingException` 异常帧或 `throttlingError` / `ThrottlingException` 错误事件时映射。本地的 `MAX_RPM_PER_CREDENTIAL` **不会**产生 `429`：超过该上限只是让这个账号本轮选不中，全部账号都选不中才落到 `503`（见下行）。上游在 HTTP 层直接回的 `429` 也**不**原样透出——自 v0.10.0 起它被判为**瞬时限流**(退避后重试,不惩罚账号;此前被误判为配额耗尽并让账号吃长冷却),重试用尽后以 `502` 收尾。据自己设的 RPM 上限去监控 `429` 是等不到的 |
 | 502 | 上游 Kiro 失败（含跨账号重试用尽后的最后一个账号级错误）。**每个上游请求都带 `Connection: close`、且客户端不复用连接**:本中转每个请求携带**不同账号**的令牌,user-agent 里的 machineId 也随账号变化,复用连接会让同一条 TCP/TLS 上依次出现几十个不同身份 —— 真实客户端不可能如此,而这是账号共享最直接的证据。瞬态失败(网络抖动/5xx/限流)换账号前指数退避 200ms→2s + 抖动;账号级失败(令牌失效/额度耗尽)不退避,换个账号立刻可成上游连接锁 **HTTP/1.1**(真实客户端不主动升 h2;且 `Connection: close` 是 1.1 的头,h2 明确禁止它,不锁就只是摆设),TLS 后端默认 **native-tls(OpenSSL)** 以贴合真实客户端的 ClientHello 指纹 —— 该指纹在任何 HTTP 内容发出**之前**就暴露。 |
 | 503 | 无可用账号（全部冷却 / 禁用 / **超本地 RPM 上限**），或日志端点未启用（`logCapacity=0`） |
 
@@ -488,6 +497,8 @@ curl -X POST http://localhost:8080/v1/responses \
 **响应（流式）**：严格按官方协议顺序发送带命名的 SSE 事件，每个事件都带**单调递增**的 `sequence_number`。**没有** `data: [DONE]` 结尾标记（那是 Chat Completions 的老约定）。
 
 > [!IMPORTANT]
+> 开局预读时所有账号都被拒，OpenAI Chat、Responses 和 Gemini 不会先返回 HTTP 200 或正常开局帧，而是直接返回各协议的非 200 错误响应（429 / 400 / 502）。
+
 > **终结事件有三种，只等 `response.completed` 会把客户端挂死**：正常结束发 `response.completed`；上游截断（输出预算 / 上下文窗口耗尽）或拒答时发 `response.incomplete`（`status:"incomplete"` + `incomplete_details`）；上游下发非截断异常帧或错误事件（限流 / 鉴权 / 参数）或传输中断发 `response.failed`（`status:"failed"` + `error`）。后两种**绝不会**再补一个 `response.completed`——这是刻意的，免得 agent 框架把半截回答当完整结果继续用。收到任一终结事件即可停止读取。
 
 纯文本、正常完成时的事件序列：
@@ -1034,6 +1045,7 @@ curl "http://localhost:8080/api/admin/credentials/12345/usage/records?page=1&pag
   "records": [
     {
       "model": "claude-sonnet-4.5",
+      "failed": false,
       "inputTokens": 1200,
       "outputTokens": 340,
       "estimatedCost": 0.0123,
@@ -1052,6 +1064,8 @@ curl "http://localhost:8080/api/admin/credentials/12345/usage/records?page=1&pag
   "totalPages": 1
 }
 ```
+
+`failed` 表示记录的请求是否因上游异常帧、错误事件、传输中断或流截断而失败；客户端主动断开即使已有消耗也为 `false`，旧记录缺省为 `false`。该字段也适用于 `GET /api/admin/credentials/{id}/usage/records`、`GET /api/admin/api-keys/{id}/usage/records`、`GET /api/admin/usage/daily/{date}/records` 和 `GET /api/user/usage/records` 的 `records[]`。
 
 记录按时间降序（最新在前）。`creditsUsed`、`cacheReadInputTokens`、`cacheCreationInputTokens`、`credentialLabel`、`clientIp` 无值时**整个键不出现**（不是 `null`）；`creditsSaved` 目前**恒无数据源**，永远不会出现。`credentialLabel` 由账号池现算：昵称 → 邮箱 → `#<数值 id>`。
 
@@ -1209,9 +1223,9 @@ curl "http://localhost:8080/api/admin/usage/summary?range=24h" \
 - `range` 回显规整后的窗口标签（用 `?hours=N` 时是 `"<N>h"`）；`untilUnix` 为当前时刻，`sinceUnix = untilUnix - windowSecs`，闭区间。
 - 数值一律是**未预舍入**的 f64/i64 原始精度，格式化交给前端。
 - `dailyFallbackApplied`：窗口 > 1 天时，服务端会拿每日汇总与原始记录逐个**完整 CST 日**取较大值，用差额补齐 requests/cost/credits（原始记录按账号有条数上限，长窗最旧的可能已被淘汰）。补过就是 `true`——**此时 tokens 两项没有对应的每日汇总、补不了，可能偏低**。
-- `successfulRequests` = 窗口内用量记录条数（含上面兜底补齐的部分），与 `totalRequests` 同源同值；`failedRequests` = 窗口内失败日志（401/403）+ 限流日志（429）条数。事件日志按账号有 500 条上限，极高频失败时最旧的已被淘汰，故 `failedRequests` 是**下界**、`errorRate` 只会偏保守。
+- `successfulRequests` = 窗口内未标 `failed` 的用量记录条数，不再总与 `totalRequests` 同值；`failedRequests` = 失败日志（401/403）+ 限流日志（429）+ 其他标 `failed` 的用量记录条数（如传输中断、502、400）。401/403/429 的失败记录只计消耗、不重复计请求数，每个请求只算一次。token、积分、成本包含所有记录。事件日志按账号有上限，淘汰日志时 `failedRequests` 可能偏低。
 - `errorRate` = 失败 /（成功 + 失败）；`rotationSuccessRate` 就是 `1 - errorRate`（近似值：跨账号重试链路本身没有单独埋点，只以"最终有没有落一条成功用量记录"来近似）。窗口内无任何活动时，二者分别为 `0.0` 与 `1.0`。
-- `avgLatencyMs` 只统计带延迟样本的成功记录（早期记录没有该字段，不计入），无样本 → `0.0`。
+- `avgLatencyMs` 只统计带延迟样本的未失败记录（早期记录没有该字段，不计入），无样本 → `0.0`。
 - `series` 按桶起始升序；空窗口 → `[]`。
 
 ### GET /api/admin/rpm
@@ -1476,6 +1490,7 @@ curl "http://localhost:8080/api/user/usage/records?page=1&page_size=20" \
   "records": [
     {
       "model": "claude-sonnet-4.5",
+      "failed": false,
       "inputTokens": 1200,
       "outputTokens": 340,
       "estimatedCost": 0.0123,
@@ -1492,6 +1507,8 @@ curl "http://localhost:8080/api/user/usage/records?page=1&page_size=20" \
   "totalPages": 1
 }
 ```
+
+`failed` 表示记录的请求是否因上游异常帧、错误事件、传输中断或流截断而失败；客户端主动断开即使已有消耗也为 `false`，旧记录缺省为 `false`。该字段也适用于 `GET /api/admin/credentials/{id}/usage/records`、`GET /api/admin/api-keys/{id}/usage/records`、`GET /api/admin/usage/daily/{date}/records` 和 `GET /api/user/usage/records` 的 `records[]`。
 
 无值的可选键**整个不出现**（不是 `null`）：`creditsUsed`、`cacheReadInputTokens`、`cacheCreationInputTokens`、`clientIp` 均如此；`creditsSaved` 与 `credentialLabel` 则是**恒定无值**（前者没有数据源，后者用户面不解析账号标签），永远不会出现。用户面的记录里也**没有** `credentialId`——用哪个账号中转只在管理端可见。
 
