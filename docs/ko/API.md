@@ -169,6 +169,8 @@ curl -X POST http://localhost:8080/openai/v1/chat/completions \
 
 도구를 사용하면 `message`에 `tool_calls`가 들어가고 `finish_reason`은 `tool_calls`가 됩니다.
 
+업스트림이 응답을 거부하면 `finish_reason`은 `content_filter`입니다.
+
 **응답 (스트리밍)**:
 
 ```
@@ -337,9 +339,9 @@ curl -X POST http://localhost:8080/openai/v1/responses \
 > [!NOTE]
 > 위가 응답 객체의 **전부**입니다. 공식 OpenAI 응답에는 있지만 이 서버가 **절대 내보내지 않는** 필드가 있으니 클라이언트에서 읽지 마십시오(`KeyError`가 납니다): `output_text` 파트의 `annotations`, `usage`의 `input_tokens_details` / `output_tokens_details`, 그리고 최상위의 `previous_response_id` / `instructions` / `error`. 실패는 별도 필드가 아니라 HTTP 상태 코드와 오류 본문으로 전달됩니다.
 >
-> 선택 필드는 `incomplete_details` 하나뿐이며, 업스트림이 응답을 잘랐을 때만 나타납니다 — 그때 `status`는 `"completed"`가 아니라 `"incomplete"`가 되고 `"incomplete_details": {"reason": "max_output_tokens"}`가 함께 실립니다.
+> 선택 필드는 `incomplete_details` 하나뿐이며, 업스트림이 응답을 자르거나 거부했을 때 나타납니다 — `status`는 `"incomplete"`가 되고, `incomplete_details`는 잘림 시 `{"reason": "max_output_tokens"}`, 거부 시 `{"reason": "content_filter"}`입니다.
 
-**응답 (스트리밍)**: 각 이벤트마다 단조 증가하는 `sequence_number`를 포함하는, 공식 프로토콜 순서를 그대로 따르는 명명된 SSE 이벤트 시퀀스입니다. `data: [DONE]` 같은 종료 표시는 **없으며** (이는 Chat Completions 방식의 관례입니다) — 완료는 `response.completed`(실패 시 `response.failed`)로 알립니다:
+**응답 (스트리밍)**: 각 이벤트마다 단조 증가하는 `sequence_number`를 포함하는, 공식 프로토콜 순서를 그대로 따르는 명명된 SSE 이벤트 시퀀스입니다. `data: [DONE]` 같은 종료 표시는 **없으며** (이는 Chat Completions 방식의 관례입니다) — 정상 종료는 `response.completed`, 잘림이나 거부는 `response.incomplete`, 실패는 `response.failed`로 알립니다:
 
 ```
 event: response.created
@@ -405,6 +407,8 @@ curl -X POST http://localhost:8080/openai/v1/responses \
 ## Claude 호환 API
 
 ### POST /claude/v1/messages
+
+업스트림이 응답을 거부하면 `stop_reason`은 `refusal`입니다(스트리밍에서는 `message_delta`에 표시).
 
 Claude(Anthropic) 형식의 메시지 생성 API입니다. 내부적으로 **Anthropic Messages를 중추 모(母) 포맷**으로 사용하므로, 이 프로토콜이 중전(中転) 커널에 가장 직접적으로 매핑됩니다.
 
@@ -542,6 +546,8 @@ curl http://localhost:8080/gemini/v1beta/models \
 
 ### POST /gemini/v1beta/models/{model}:generateContent
 
+업스트림이 응답을 거부하면 `finishReason`은 `SAFETY`입니다.
+
 Gemini 형식의 콘텐츠 생성 (**전체 camelCase**)
 
 **요청**:
@@ -645,6 +651,12 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.18.0: 업스트림 응답 거부 계약**
+>
+> - `stopReason: "refusal"` 또는 `stopDetails.refusal`이 포함된 업스트림 `metadataEvent`를 버리지 않고, 스트리밍과 비스트리밍 모두 각 프로토콜의 거부 신호로 반환합니다. Anthropic은 `stop_reason: "refusal"`(스트리밍에서는 `message_delta`), Chat Completions는 `finish_reason: "content_filter"`, Responses는 `status: "incomplete"`와 `incomplete_details: {"reason":"content_filter"}`(스트리밍 종료 이벤트는 `response.incomplete`), Gemini는 `finishReason: "SAFETY"`입니다.
+> - 거부 전에 출력된 본문은 보존하며 내용을 지어내거나 거부 이유를 본문에 넣지 않습니다. 거부는 도구 호출과 잘림보다 우선합니다. 비스트리밍에서는 해당 턴의 도구 호출을 버리고, 스트리밍에서는 거부 이후 도착한 도구 프레임을 무시합니다. 이미 전송된 도구 호출은 취소할 수 없으므로 클라이언트는 종료 이유를 확인하고 거부된 턴의 도구 호출을 실행하지 않아야 합니다.
+> - 거부 시 재시도하거나 계정을 전환하지 않으며 계정 장애로도 집계하지 않습니다. 업스트림의 `category` / `explanation` / `recommendedModel`은 각각 200자로 잘라 계정 ID와 모델을 포함한 warn 수준의 `upstream_refusal` 로그에 기록합니다.
+>
 > **v0.17.0: 세 프로토콜의 계약 변경**
 >
 > - **OpenAI / Gemini / Responses에서 extended thinking을 켤 수 있습니다**(이전에는 허브 요청에서
@@ -1534,7 +1546,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.17.2"}
+{"service":"kiro2api","status":"ok","version":"0.18.0"}
 ```
 
 ### GET /v1/ping

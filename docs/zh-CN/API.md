@@ -106,6 +106,12 @@ cat data/config.json | grep apiKey
 | 422 | 请求体反序列化失败（缺必填字段 / 类型不符），axum 默认拒收，`text/plain` 纯文本。出现在带 body 提取器的端点上：`/api/admin/*` 与 `POST /api/user/login`（四个协议对话端点与 `/v1/messages/count_tokens` 已自行接管拒收、改回各自形状的 `400`）（`/api/user/*` 的其余端点只收 query，参数类型不符是 `400` 而非 `422`） |
 
 
+> **v0.18.0:上游拒答契约**
+>
+> - 上游 `metadataEvent` 带 `stopReason: "refusal"` 或 `stopDetails.refusal` 时不再被丢弃。流式与非流式均使用协议原生拒答信号：Anthropic `stop_reason: "refusal"`（流式在 `message_delta`）；Chat Completions `finish_reason: "content_filter"`；Responses `status: "incomplete"` 和 `incomplete_details: {"reason":"content_filter"}`（流式终结事件 `response.incomplete`）；Gemini `finishReason: "SAFETY"`。
+> - 保留拒答前的正文，不编造内容，也不把拒答原因写进正文。拒答优先于工具调用和截断：非流式丢弃该轮工具调用，流式忽略拒答后到达的工具帧。已经流式发出的工具调用无法撤回，客户端应检查结束原因，不要执行被拒那一轮的工具调用。
+> - 拒答不重试、不换号、不计入账号故障。上游 `category` / `explanation` / `recommendedModel` 各截断到 200 字符，以 warn 级事件 `upstream_refusal` 记录到服务日志，并附账号 ID 和模型。
+>
 > **v0.17.0:三个协议的契约变更**
 >
 > - **OpenAI / Gemini / Responses 现在可以开启 extended thinking**(此前在中枢请求里被硬编码
@@ -333,6 +339,8 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 > 命中工具时，`message.tool_calls` 承载调用，`finish_reason` 为 `tool_calls`。
 
+上游拒答时，`finish_reason` 为 `content_filter`。
+
 **流式请求示例**：
 
 ```bash
@@ -470,12 +478,12 @@ curl -X POST http://localhost:8080/v1/responses \
 ```
 
 > [!NOTE]
-> 上面就是**全部**字段。本服务**不发** `previous_response_id`、`instructions`、`error`，`output_text` 块上也**没有** `annotations`，`usage` 只有这三个计数器（无 `input_tokens_details` / `output_tokens_details`）——按官方 SDK 的完整形状去索引这些键会取到空。唯一的额外字段是 `incomplete_details`：仅当上游截断、`status` 为 `"incomplete"` 时出现，形如 `{"reason":"max_output_tokens"}`；`status:"completed"` 时整个字段省略。
+> 上面就是**全部**字段。本服务**不发** `previous_response_id`、`instructions`、`error`，`output_text` 块上也**没有** `annotations`，`usage` 只有这三个计数器（无 `input_tokens_details` / `output_tokens_details`）——按官方 SDK 的完整形状去索引这些键会取到空。唯一的额外字段是 `incomplete_details`：上游截断或拒答、`status` 为 `"incomplete"` 时出现；截断为 `{"reason":"max_output_tokens"}`，拒答为 `{"reason":"content_filter"}`；`status:"completed"` 时整个字段省略。
 
 **响应（流式）**：严格按官方协议顺序发送带命名的 SSE 事件，每个事件都带**单调递增**的 `sequence_number`。**没有** `data: [DONE]` 结尾标记（那是 Chat Completions 的老约定）。
 
 > [!IMPORTANT]
-> **终结事件有三种，只等 `response.completed` 会把客户端挂死**：正常结束发 `response.completed`；上游截断（输出预算 / 上下文窗口耗尽）发 `response.incomplete`（`status:"incomplete"` + `incomplete_details`）；上游下发非截断异常（限流 / 鉴权 / 参数）或传输中断发 `response.failed`（`status:"failed"` + `error`）。后两种**绝不会**再补一个 `response.completed`——这是刻意的，免得 agent 框架把半截回答当完整结果继续用。收到任一终结事件即可停止读取。
+> **终结事件有三种，只等 `response.completed` 会把客户端挂死**：正常结束发 `response.completed`；上游截断（输出预算 / 上下文窗口耗尽）或拒答时发 `response.incomplete`（`status:"incomplete"` + `incomplete_details`）；上游下发非截断异常（限流 / 鉴权 / 参数）或传输中断发 `response.failed`（`status:"failed"` + `error`）。后两种**绝不会**再补一个 `response.completed`——这是刻意的，免得 agent 框架把半截回答当完整结果继续用。收到任一终结事件即可停止读取。
 
 纯文本、正常完成时的事件序列：
 
@@ -592,7 +600,7 @@ curl -X POST http://localhost:8080/v1/messages \
 ```
 
 > [!NOTE]
-> 非流式响应体**没有** `stop_sequence` 字段（该字段只出现在流式的 `message_start` / `message_delta` 事件里）。`stop_reason` 取值：正常结束 `end_turn`、命中工具 `tool_use`、上游输出预算耗尽 `max_tokens`、上下文窗口耗尽 `model_context_window_exceeded`。
+> 非流式响应体**没有** `stop_sequence` 字段（该字段只出现在流式的 `message_start` / `message_delta` 事件里）。`stop_reason` 取值：正常结束 `end_turn`、拒答 `refusal`、命中工具 `tool_use`、上游输出预算耗尽 `max_tokens`、上下文窗口耗尽 `model_context_window_exceeded`。
 
 > 流式为 Anthropic 标准 SSE：`message_start` → `content_block_start` → `content_block_delta` → … → `message_stop`。工具走 `tool_use` 块与 `input_json_delta`。
 
@@ -645,6 +653,8 @@ curl http://localhost:8080/v1beta/models \
 ```
 
 ### POST /v1beta/models/{model}:generateContent
+
+上游拒答时，`finishReason` 为 `SAFETY`。
 
 生成内容（非流式）。也可使用带前缀路径 `/gemini/v1beta/models/{model}:generateContent`。
 

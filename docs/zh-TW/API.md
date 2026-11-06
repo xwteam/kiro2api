@@ -185,6 +185,8 @@ curl http://localhost:8080/v1/models \
 
 工具呼叫時，`message` 內含 `tool_calls`，`finish_reason` 為 `"tool_calls"`。
 
+上游拒答時，`finish_reason` 為 `content_filter`。
+
 **流式回應（SSE 格式，`chat.completion.chunk`）：**
 ```
 data: {"choices":[{"delta":{"role":"assistant"},"index":0}]}
@@ -275,9 +277,9 @@ curl -X POST http://localhost:8080/v1/responses \
 ```
 
 > [!NOTE]
-> 上面就是**完整**的頂層欄位集合，別按官方 Responses API 的形狀去讀多餘的鍵：回應**沒有** `previous_response_id`、`instructions`、`error` 這幾個欄位（不是 `null`，是整個鍵不出現），`usage` 只有 `input_tokens` / `output_tokens` / `total_tokens`（**沒有** `input_tokens_details` / `output_tokens_details`），`output_text` 區塊也**沒有** `annotations`。唯一的可選欄位是 `incomplete_details`：只有 `status` 為 `incomplete`（命中截斷）時才出現，形如 `{"reason":"max_output_tokens"}`。要判斷失敗請看 HTTP 狀態碼與錯誤體，不要讀 `error` 欄位。
+> 上面就是**完整**的頂層欄位集合，別按官方 Responses API 的形狀去讀多餘的鍵：回應**沒有** `previous_response_id`、`instructions`、`error` 這幾個欄位（不是 `null`，是整個鍵不出現），`usage` 只有 `input_tokens` / `output_tokens` / `total_tokens`（**沒有** `input_tokens_details` / `output_tokens_details`），`output_text` 區塊也**沒有** `annotations`。唯一的可選欄位是 `incomplete_details`：上游截斷或拒答、`status` 為 `incomplete` 時才出現：截斷為 `{"reason":"max_output_tokens"}`，拒答為 `{"reason":"content_filter"}`。要判斷失敗請看 HTTP 狀態碼與錯誤體，不要讀 `error` 欄位。
 
-**回應（流式）**：嚴格按官方協議順序發送帶命名的 SSE 事件，每個事件都帶遞增的 `sequence_number`。**沒有** `data: [DONE]` 結尾標記（那是 Chat Completions 的老約定）——完成訊號是 `response.completed`（失敗是 `response.failed`）：
+**回應（流式）**：嚴格按官方協議順序發送帶命名的 SSE 事件，每個事件都帶遞增的 `sequence_number`。**沒有** `data: [DONE]` 結尾標記（那是 Chat Completions 的老約定）——正常完成訊號是 `response.completed`，截斷或拒答是 `response.incomplete`，失敗是 `response.failed`：
 
 ```
 event: response.created
@@ -378,6 +380,8 @@ curl http://localhost:8080/claude/v1/models \
 
 ### POST /messages
 
+上游拒答時，`stop_reason` 為 `refusal`（串流位於 `message_delta`）。
+
 發送訊息請求（Claude 格式，中樞母格式）。
 
 **請求體：**
@@ -475,6 +479,8 @@ curl http://localhost:8080/v1beta/models \
 每條只有 `name` 與 `supportedGenerationMethods` 兩個鍵：`supportedGenerationMethods` 是**寫死的常數**陣列 `["generateContent","streamGenerateContent"]`（逐條相同，不反映該模型的真實能力）；`displayName` 一律不填，因此該鍵**不會出現**在回應裡（要展示名請走 `/claude/v1/models` 或 `GET /api/admin/models`）。呼叫時**要去掉 `models/` 前綴**:路由是 `/v1beta/{model_action}` 形式,路徑參數只捕獲**一個**路徑段,把 `name` 原樣填回會變成 `/v1beta/models/models/claude-sonnet-4.5:generateContent`(兩段)而直接 404。正確寫法是 `/v1beta/models/claude-sonnet-4.5:generateContent`。
 
 ### POST /models/{model}:generateContent
+
+上游拒答時，`finishReason` 為 `SAFETY`。
 
 生成內容（非流式）。全欄位 **camelCase**。
 
@@ -598,6 +604,12 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.18.0:上游拒答契約**
+>
+> - 上游 `metadataEvent` 含有 `stopReason: "refusal"` 或 `stopDetails.refusal` 時不再被丟棄。串流與非串流都使用各協定原生的拒答訊號：Anthropic 的 `stop_reason: "refusal"`（串流在 `message_delta`）；Chat Completions 的 `finish_reason: "content_filter"`；Responses 的 `status: "incomplete"` 與 `incomplete_details: {"reason":"content_filter"}`（串流終結事件為 `response.incomplete`）；Gemini 的 `finishReason: "SAFETY"`。
+> - 保留拒答前已輸出的正文，不編造內容，也不將拒答原因寫入正文。拒答優先於工具呼叫與截斷：非串流捨棄該輪工具呼叫，串流忽略拒答後抵達的工具幀。已透過串流送出的工具呼叫無法撤回，用戶端應檢查結束原因，不要執行遭拒那一輪的工具呼叫。
+> - 拒答不重試、不切換帳號，也不計入帳號故障。上游的 `category` / `explanation` / `recommendedModel` 各截斷至 200 字元，以 warn 層級事件 `upstream_refusal` 寫入服務日誌，並附上帳號 ID 與模型。
+>
 > **v0.17.0:三個協定的契約變更**
 >
 > - **OpenAI / Gemini / Responses 現在可以開啟 extended thinking**(此前在中樞請求裡被硬編碼
@@ -1278,7 +1290,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.17.2"}
+{"service":"kiro2api","status":"ok","version":"0.18.0"}
 ```
 
 ### GET /v1/ping

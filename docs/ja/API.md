@@ -216,6 +216,8 @@ curl -X POST http://localhost:8080/openai/v1/chat/completions \
 
 ツール呼び出し時は `choices[0].message.tool_calls` を返し、`finish_reason` は `"tool_calls"` になります。
 
+上流が回答を拒否した場合、`finish_reason` は `content_filter` になります。
+
 **レスポンス（ストリーミング）:**
 
 先頭フレームは `delta.role`、末尾フレームは `finish_reason` を含み、`data: [DONE]` で終端します。
@@ -306,9 +308,9 @@ curl -X POST http://localhost:8080/openai/v1/responses \
 }
 ```
 
-返るフィールドは上記がすべてです。`usage` は 3 つのカウンタのみで、`input_tokens_details` / `output_tokens_details` は**ありません**。`output_text` パーツに `annotations` は付かず、レスポンス直下の `previous_response_id` / `instructions` / `error` も**返しません**（これらで分岐しないでください）。`max_tokens` 到達などで切り詰められた場合のみ `status` が `"incomplete"` になり、`"incomplete_details": {"reason": "max_output_tokens"}` が追加されます。
+返るフィールドは上記がすべてです。`usage` は 3 つのカウンタのみで、`input_tokens_details` / `output_tokens_details` は**ありません**。`output_text` パーツに `annotations` は付かず、レスポンス直下の `previous_response_id` / `instructions` / `error` も**返しません**（これらで分岐しないでください）。上流による切り詰めまたは回答拒否の場合、`status` が `"incomplete"` になり、`incomplete_details` は切り詰め時に `{"reason": "max_output_tokens"}`、拒否時に `{"reason": "content_filter"}` になります。
 
-**レスポンス（ストリーミング）:** 仕様に準拠した名前付き SSE イベントの並びで、各イベントは単調増加する `sequence_number` を持ちます。`data: [DONE]` のような終端マーカーは**ありません**（これは Chat Completions の慣習です）— 完了は `response.completed`（または `response.failed`）によって通知されます。
+**レスポンス（ストリーミング）:** 仕様に準拠した名前付き SSE イベントの並びで、各イベントは単調増加する `sequence_number` を持ちます。`data: [DONE]` のような終端マーカーは**ありません**（これは Chat Completions の慣習です）— 正常終了は `response.completed`、切り詰めまたは拒否は `response.incomplete`、失敗は `response.failed` で通知されます。
 
 ```
 event: response.created
@@ -416,6 +418,8 @@ curl http://localhost:8080/claude/v1/models \
 ```
 
 ### POST /claude/v1/messages
+
+上流が回答を拒否すると `stop_reason` は `refusal` になります（ストリーミングでは `message_delta` に現れます）。
 
 メッセージを送信します。標準ベアパス `/v1/messages` でもアクセスできます（Anthropic SDK は `base_url` に自動で `/v1/messages` を補完します）。
 
@@ -539,6 +543,8 @@ curl http://localhost:8080/gemini/v1beta/models \
 ```
 
 ### POST /gemini/v1beta/models/{model}:generateContent
+
+上流が回答を拒否した場合、`finishReason` は `SAFETY` です。
 
 コンテンツを生成します。
 
@@ -676,6 +682,12 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.18.0:上流の回答拒否に関する契約**
+>
+> - `stopReason: "refusal"` または `stopDetails.refusal` を含む上流の `metadataEvent` を破棄せず、ストリーミング・非ストリーミングとも各プロトコル固有の拒否を返します。Anthropic は `stop_reason: "refusal"`（ストリーミングでは `message_delta`）、Chat Completions は `finish_reason: "content_filter"`、Responses は `status: "incomplete"` と `incomplete_details: {"reason":"content_filter"}`（ストリーミング終端は `response.incomplete`）、Gemini は `finishReason: "SAFETY"` です。
+> - 拒否前の本文は保持し、内容を捏造したり拒否理由を本文に書き込んだりしません。拒否はツール呼び出しと切り詰めより優先されます。非ストリーミングではそのターンのツール呼び出しを破棄し、ストリーミングでは拒否後のツールフレームを無視します。送信済みのツール呼び出しは取り消せないため、クライアントは終了理由を確認し、拒否されたターンの呼び出しを実行しないでください。
+> - 拒否時は再試行やアカウント切り替えを行わず、アカウント障害としても数えません。上流の `category` / `explanation` / `recommendedModel` はそれぞれ 200 文字に切り詰め、アカウント ID とモデルを添えて warn レベルの `upstream_refusal` ログに記録します。
+>
 > **v0.17.0:3 つのプロトコルの契約変更**
 >
 > - **OpenAI / Gemini / Responses で extended thinking が有効化できるようになりました**

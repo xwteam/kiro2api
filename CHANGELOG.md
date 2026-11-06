@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-06
+
+### Fixed
+
+- **上游拒答不再被丢弃、伪装成空的正常回答。** Kiro 的 `metadataEvent` 若带
+  `stopReason: "refusal"` 或 `stopDetails.refusal`，四种协议的流式和非流式响应都会给出原生
+  拒答标记：Anthropic `stop_reason: "refusal"`（流式在 `message_delta`）；OpenAI Chat
+  `finish_reason: "content_filter"`；Responses `status: "incomplete"` 和
+  `incomplete_details: {"reason":"content_filter"}`（流式终结事件 `response.incomplete`）；
+  Gemini `finishReason: "SAFETY"`。
+- 保留拒答前的正文，不编造内容或将拒答原因写进正文。拒答优先于工具调用和截断：非流式丢弃该轮
+  工具调用，流式忽略拒答后到达的工具帧；**已流式发出的工具调用无法撤回**，客户端应根据结束原因
+  判断，不要执行被拒那一轮的工具调用。
+- 拒答不重试、不换号、不计入账号故障。上游的 `category` / `explanation` / `recommendedModel`
+  各截断到 200 字符，以 warn 级事件 `upstream_refusal` 写入服务日志，并附账号 ID 和模型。
+
 ## [0.17.2] - 2026-08-19
 
 **仅文档修正,代码与 v0.17.1 完全一致** —— 无需为此重新部署。

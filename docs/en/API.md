@@ -219,6 +219,8 @@ curl -X POST http://localhost:8080/openai/v1/chat/completions \
 
 Tool calls are returned in `choices[0].message.tool_calls` with `finish_reason:"tool_calls"`. Send the tool result back with a `role:"tool"` message. Tool calls are passed through **verbatim** — no simulation.
 
+When upstream refuses, `finish_reason` is `content_filter`.
+
 ### Tool specs backfilled from history
 
 Upstream requires that `toolConfig` be present whenever a message carries `toolUse` or `toolResult` content blocks; without it the whole request is rejected with `TOOL_CONFIG_MISSING`.
@@ -300,9 +302,9 @@ curl -X POST http://localhost:8080/openai/v1/responses \
 > [!NOTE]
 > That is the **complete** shape — this server emits no other top-level keys. In particular `previous_response_id`, `instructions` and `error` are **absent**, not `null`, and an `output_text` part carries no `annotations`; `usage` has exactly the three counters shown, with no `input_tokens_details` / `output_tokens_details` breakdown. Read them defensively (`.get(...)`) if your client library expects the full OpenAI shape.
 >
-> One optional key can appear: when the upstream truncates the answer, `status` is `"incomplete"` (and so is the message item's `status`) and `incomplete_details` is added as `{"reason": "max_output_tokens"}`. It is omitted entirely on a `"completed"` response. Both an output-budget cut-off and an exhausted context window report that same reason.
+> One optional key can appear: when the upstream truncates or refuses the answer, `status` is `"incomplete"` (and so is the message item's `status`) and `incomplete_details` is added with `{"reason": "max_output_tokens"}` for truncation or `{"reason": "content_filter"}` for refusal. It is omitted entirely on a `"completed"` response. Both an output-budget cut-off and an exhausted context window report `max_output_tokens`.
 
-**Response (Streaming):** a spec-correct sequence of named SSE events, each carrying a monotonically increasing `sequence_number`. There is **no** `data: [DONE]` sentinel (that's a Chat Completions convention) — completion is signaled by `response.completed` (or `response.failed`):
+**Response (Streaming):** a spec-correct sequence of named SSE events, each carrying a monotonically increasing `sequence_number`. There is **no** `data: [DONE]` sentinel (that's a Chat Completions convention) — normal completion is signaled by `response.completed`; truncation or refusal by `response.incomplete`; failure by `response.failed`:
 
 ```
 event: response.created
@@ -423,7 +425,7 @@ curl -X POST http://localhost:8080/claude/v1/messages \
 | `max_tokens` | number | No | **Accepted and ignored** — see the note below |
 | `temperature` | number | No | **Accepted and ignored** — see the note below |
 
-> ⚠️ Same as on the OpenAI front end (see the [generation-controls note](#post-openaiv1chatcompletions)): `temperature` is not a field on the request struct and is dropped as an unknown key, and `max_tokens` is parsed but never forwarded to the upstream, so it does not cap the answer. A `stop_reason` of `"max_tokens"` reports the *upstream's own* output budget — not a limit you set — and an exhausted context window comes back as `"model_context_window_exceeded"`. (`stop_reason` is otherwise `"tool_use"` when the turn contains tool calls, else `"end_turn"`.)
+> ⚠️ Same as on the OpenAI front end (see the [generation-controls note](#post-openaiv1chatcompletions)): `temperature` is not a field on the request struct and is dropped as an unknown key, and `max_tokens` is parsed but never forwarded to the upstream, so it does not cap the answer. A `stop_reason` of `"max_tokens"` reports the *upstream's own* output budget — not a limit you set — and an exhausted context window comes back as `"model_context_window_exceeded"`. (`stop_reason` is otherwise `"refusal"` for refusal, `"tool_use"` when the turn contains tool calls, else `"end_turn"`.)
 >
 > Note also that **this server does not require `max_tokens`** — omitting it returns `200`, it does not `400`/`422`. The official Anthropic SDKs still require it client-side, so keep sending it when you use one; the examples here do.
 
@@ -500,6 +502,8 @@ curl http://localhost:8080/gemini/v1beta/models \
 ```
 
 ### POST /gemini/v1beta/models/{model}:generateContent
+
+On upstream refusal, `finishReason` is `SAFETY`.
 
 Generate content using Gemini format.
 
@@ -624,6 +628,12 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.18.0: upstream refusal contract**
+>
+> - Upstream `metadataEvent` with `stopReason: "refusal"` or `stopDetails.refusal` is no longer discarded. Streaming and non-streaming responses use native refusal signals: Anthropic `stop_reason: "refusal"` (streaming `message_delta`); Chat Completions `finish_reason: "content_filter"`; Responses `status: "incomplete"` with `incomplete_details: {"reason":"content_filter"}` (streaming `response.incomplete`); Gemini `finishReason: "SAFETY"`.
+> - Previously emitted text is preserved; no content is invented and the refusal reason is not inserted into the answer. Refusal takes precedence over tool calls and truncation. Non-streaming responses discard that turn's tool calls; streaming ignores tool frames received after the refusal. Tool calls already streamed cannot be retracted: clients must check the finish reason and not execute tool calls from a refused turn.
+> - Refusals are not retried, do not trigger account switching, and do not count as account failures. Upstream `category`, `explanation`, and `recommendedModel` are each truncated to 200 characters and logged at warn level in `upstream_refusal` with account ID and model.
+>
 > **v0.17.0: contract changes across three protocols**
 >
 > - **Extended thinking now works on OpenAI / Gemini / Responses** (it was hard-coded off in the
