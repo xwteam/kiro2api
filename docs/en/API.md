@@ -674,6 +674,12 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.21.0: IDE new-endpoint identity (default)**
+>
+> - The official Kiro IDE 1.4.x now defaults to the new `runtime` / `management.{region}.kiro.dev` services; the old `q.{region}.amazonaws.com` survives only as an endpoint-override preset in the official IDE. A new upstream identity `ide-runtime` (matching the official IDE 1.4.x) is added and made the default. `upstreamEndpoint` now takes three values: `ide` (old q host, fallback only), `ide-runtime` (default), `cli` (official CLI).
+> - IDE new endpoint: conversation `POST runtime/generateAssistantResponse` (JSON, no `x-amz-target`, body `origin` is `AI_EDITOR`, with `rootConversationId`); models `GET management/List-Available-Models?origin=AI_EDITOR` (no body, up to 10 pages); balance `GET management/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST`; web search `POST runtime/mcp` (profileArn in the `x-amzn-kiro-profile-arn` header). UA is `aws-sdk-js/1.0.0 … api/kiroruntime#1.0.0 m/N KiroIDE-<version>-<machineId>-KAS/<agent version> acp-client/kiro-ide` with `x-amzn-kiro-attempt: 1;max=3`; API-key accounts send `tokentype: API_KEY`, IdC accounts `tokentype: SSO_OIDC`, Social none. Token refresh is unchanged.
+> - A config without an explicit `upstreamEndpoint` uses `ide-runtime` after upgrade. Set `"ide"` to keep the old q host, or `"cli"` for the official CLI identity.
+>
 > **v0.20.0: Client identity**
 >
 > - The old IDE client version is disabled upstream; upgrading is required. Defaults are IDE `1.4.178`, Node `24.22.1` and conversation SDK `1.0.44`. Change or remove an explicit `"kiroVersion": "0.11.107"` in `config.json` or requests remain rejected.
@@ -1401,7 +1407,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.20.0",
+  "version": "0.21.0",
   "kiroVersion": "1.4.178",
   "rustVersion": "1.90.0",
   "runMode": "Docker",

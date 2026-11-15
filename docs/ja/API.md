@@ -728,6 +728,12 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.21.0: IDE 新接続先の識別(既定)**
+>
+> - 公式 Kiro IDE 1.4.x は既定で新サービス `runtime` / `management.{region}.kiro.dev` を使用し、旧 `q.{region}.amazonaws.com` は公式 IDE では「エンドポイント上書き」のプリセットとしてのみ残ります。新しい上流識別 `ide-runtime`(公式 IDE 1.4.x と同じ)を追加し既定にしました。`upstreamEndpoint` は 3 値:`ide`(旧 q ホスト・予備のみ)、`ide-runtime`(既定)、`cli`(公式 CLI)。
+> - IDE 新接続先:対話 `POST runtime/generateAssistantResponse`(JSON、`x-amz-target` なし、本文 `origin` は `AI_EDITOR`、`rootConversationId` 付き);モデル一覧 `GET management/List-Available-Models?origin=AI_EDITOR`(本文なし、最大 10 ページ);残高 `GET management/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST`;Web 検索 `POST runtime/mcp`(profileArn はヘッダー `x-amzn-kiro-profile-arn`)。UA は `aws-sdk-js/1.0.0 … api/kiroruntime#1.0.0 m/N KiroIDE-<版>-<machineId>-KAS/<agent 版> acp-client/kiro-ide`、`x-amzn-kiro-attempt: 1;max=3` 付き。API キーは `tokentype: API_KEY`、IdC は `tokentype: SSO_OIDC`、Social はなし。トークン更新は従来どおり。
+> - `upstreamEndpoint` 未設定の設定は更新後 `ide-runtime` を使用します。旧 q ホストを保つには `"ide"`、公式 CLI 識別には `"cli"` を設定してください。
+>
 > **v0.20.0: クライアント識別情報**
 >
 > - 旧 IDE クライアントは上流で無効化され、更新が必須です。既定値は IDE `1.4.178`、Node `24.22.1`、対話 SDK `1.0.44`。`config.json` に `"kiroVersion": "0.11.107"` を明示している場合は変更または削除してください。
@@ -1360,7 +1366,7 @@ curl -X PUT http://localhost:8080/api/admin/config/auth-keys \
 ```json
 {
   "masterApiKey": "sk-マスターキーの平文",
-  "version": "0.20.0",
+  "version": "0.21.0",
   "kiroVersion": "1.4.178",
   "rustVersion": "1.90.0",
   "runMode": "Docker",

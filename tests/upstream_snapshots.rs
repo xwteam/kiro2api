@@ -94,10 +94,10 @@ async fn snapshot(identity: &str, operation: &str) {
             })).unwrap();
             let converted =
                 convert::anthropic_to_kiro_full(&request, c.profile_arn.as_deref()).unwrap();
-            let mut ep = if identity == "cli" {
-                endpoint::cli("us-east-1")
-            } else {
-                endpoint::all("us-east-1").remove(0)
+            let mut ep = match identity {
+                "cli" => endpoint::cli("us-east-1"),
+                "ide-runtime" => endpoint::ide_runtime("us-east-1"),
+                _ => endpoint::all("us-east-1").remove(0),
             };
             ep.url = format!(
                 "{}{}",
@@ -168,6 +168,15 @@ async fn snapshot(identity: &str, operation: &str) {
 async fn ide_complete_raw_requests_match_snapshots() {
     for operation in ["conversation", "mcp", "models", "balance"] {
         snapshot("ide", operation).await;
+    }
+}
+
+/// IDE 新服务身份(官方 IDE 1.4.178 默认形态):对话与 MCP 打 runtime 主机(REST 路径、无 target),
+/// 模型列表 GET `/List-Available-Models`,余额沿用 IDE 的 `GET /getUsageLimits`(主机为 management)。
+#[tokio::test]
+async fn ide_runtime_complete_raw_requests_match_snapshots() {
+    for operation in ["conversation", "mcp", "models", "balance"] {
+        snapshot("ide-runtime", operation).await;
     }
 }
 

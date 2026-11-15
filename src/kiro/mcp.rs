@@ -16,6 +16,11 @@ pub fn endpoint(region: &str) -> String {
     format!("https://q.{region}.amazonaws.com/mcp")
 }
 
+/// 官方 IDE 1.4.x 默认的 MCP 地址:新服务 runtime 主机上的 `/mcp`(JSON-RPC,profileArn 走头)。
+pub fn ide_runtime_endpoint(region: &str) -> String {
+    format!("https://runtime.{region}.kiro.dev/mcp")
+}
+
 /// JSON-RPC 请求。
 #[derive(Debug, Serialize)]
 pub struct McpRequest {
@@ -69,21 +74,39 @@ fn build_headers(cred: &Credential, imp: &Impersonation, base: &str) -> HeaderMa
     let mut h = HeaderMap::new();
     h.insert("content-type", HeaderValue::from_static("application/json"));
     h.insert("connection", HeaderValue::from_static("close"));
+    // IDE 新服务身份:官方 agent 的 MCP 客户端(KiroRuntime 1.0.0,`m/N`,UA 尾部带 KAS)。
+    let ide_runtime = imp.endpoint == "ide-runtime";
     if let Ok(name) = HeaderName::from_bytes(b"x-amz-user-agent") {
         h.insert(
             name,
-            hv(&format!(
-                "aws-sdk-js/1.0.44 KiroIDE-{}-{}",
-                imp.kiro_version, imp.machine_id
-            )),
+            hv(&if ide_runtime {
+                format!(
+                    "aws-sdk-js/1.0.0 {}",
+                    crate::kiro::provider::ide_runtime_ua_suffix(imp)
+                )
+            } else {
+                format!(
+                    "aws-sdk-js/1.0.44 KiroIDE-{}-{}",
+                    imp.kiro_version, imp.machine_id
+                )
+            }),
         );
     }
     h.insert(
         reqwest::header::USER_AGENT,
-        hv(&format!(
-            "aws-sdk-js/1.0.44 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.44 m/E KiroIDE-{}-{}",
-            imp.system_version, imp.node_version, imp.kiro_version, imp.machine_id
-        )),
+        hv(&if ide_runtime {
+            format!(
+                "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/kiroruntime#1.0.0 m/N {}",
+                imp.system_version,
+                imp.node_version,
+                crate::kiro::provider::ide_runtime_ua_suffix(imp)
+            )
+        } else {
+            format!(
+                "aws-sdk-js/1.0.44 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.44 m/E KiroIDE-{}-{}",
+                imp.system_version, imp.node_version, imp.kiro_version, imp.machine_id
+            )
+        }),
     );
     if let Some(host) = crate::kiro::provider::host_of(base) {
         h.insert("host", hv(&host));
@@ -103,7 +126,11 @@ fn build_headers(cred: &Credential, imp: &Impersonation, base: &str) -> HeaderMa
     {
         h.insert(name, hv(arn));
     }
-    if cred.is_api_key() {
+    if ide_runtime {
+        if let Some(t) = crate::kiro::provider::ide_runtime_token_type(cred) {
+            h.insert("tokentype", HeaderValue::from_static(t));
+        }
+    } else if cred.is_api_key() {
         h.insert("tokentype", HeaderValue::from_static("API_KEY"));
     }
     h

@@ -107,7 +107,7 @@
     card.appendChild(el('p', 'settings-card-desc', t('identity.warning')));
     function field(label, input) { var g = el('div', 'form-group'); g.appendChild(el('label', 'form-label', label)); g.appendChild(input); card.appendChild(g); }
     identityEndpoint = el('select', 'form-control');
-    [['ide', t('identity.ideEndpoint')], ['cli', t('identity.cliEndpoint')]].forEach(function (item) { var opt = el('option', null, item[1]); opt.value = item[0]; identityEndpoint.appendChild(opt); });
+    [['ide', t('identity.ideEndpoint')], ['ide-runtime', t('identity.ideRuntimeEndpoint')], ['cli', t('identity.cliEndpoint')]].forEach(function (item) { var opt = el('option', null, item[1]); opt.value = item[0]; identityEndpoint.appendChild(opt); });
     field(t('identity.endpoint'), identityEndpoint);
     identityIde = el('input', 'form-control'); identityIde.type = 'text'; field(t('identity.ideVersion'), identityIde);
     identityCli = el('input', 'form-control'); identityCli.type = 'text'; field(t('identity.cliVersion'), identityCli);

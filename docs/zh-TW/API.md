@@ -650,6 +650,12 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.21.0: IDE 新地址身分(預設)**
+>
+> - 官方 Kiro IDE 1.4.x 預設已改走新服務 `runtime` / `management.{region}.kiro.dev`,舊 `q.{region}.amazonaws.com` 在官方 IDE 裡只剩「端點覆蓋」預設。新增上游身分 `ide-runtime`(與官方 IDE 1.4.x 一致)並設為預設;`upstreamEndpoint` 現有三值:`ide`(舊 q 地址,僅兜底)、`ide-runtime`(預設)、`cli`(官方 CLI)。
+> - IDE 新地址:對話 `POST runtime/generateAssistantResponse`(JSON、不帶 `x-amz-target`,請求本文 `origin` 為 `AI_EDITOR`、帶 `rootConversationId`);模型清單 `GET management/List-Available-Models?origin=AI_EDITOR`(無本文,最多翻 10 頁);餘額 `GET management/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST`;網路搜尋 `POST runtime/mcp`(profileArn 走標頭 `x-amzn-kiro-profile-arn`)。UA 為 `aws-sdk-js/1.0.0 … api/kiroruntime#1.0.0 m/N KiroIDE-<版本>-<機器碼>-KAS/<agent 版本> acp-client/kiro-ide`,帶 `x-amzn-kiro-attempt: 1;max=3`;API Key 帳號帶 `tokentype: API_KEY`、IdC 帳號帶 `tokentype: SSO_OIDC`、Social 不帶。令牌刷新不變。
+> - 未顯式設定 `upstreamEndpoint` 的設定升級後自動走 `ide-runtime`。要保留舊 q 地址設 `"ide"`,要用官方 CLI 身分設 `"cli"`。
+>
 > **v0.20.0: 用戶端身分**
 >
 > - 舊 IDE 用戶端版本已被上游停用，必須升級。預設 IDE 為 `1.4.178`、Node 為 `24.22.1`、對話 SDK 為 `1.0.44`；若 `config.json` 明確設定 `"kiroVersion": "0.11.107"`，請修改或刪除，否則仍被拒絕。
@@ -1370,7 +1376,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.20.0"}
+{"service":"kiro2api","status":"ok","version":"0.21.0"}
 ```
 
 ### GET /v1/ping

@@ -81,7 +81,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 /// 最小百分号编码:对非 `unreserved`(ALPHA/DIGIT/`-._~`)字节一律 `%XX`。
 /// 足以安全编码 ARN(含 `:`、`/`)进 query value。
-fn pct_encode(s: &str) -> String {
+pub(crate) fn pct_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for &b in s.as_bytes() {
         let unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~');
@@ -187,7 +187,15 @@ pub async fn fetch_at(
     // 同理 tokentype 必须跟着走,否则上游按 OAuth 令牌解析这枚 ksk。
     req = req
         .header("amz-sdk-invocation-id", inv)
-        .header("amz-sdk-request", "attempt=1; max=1")
+        // 官方 IDE 新服务路径上这个客户端配的是最多 3 次;旧 q 主机路径保持原样。
+        .header(
+            "amz-sdk-request",
+            if imp.endpoint == "ide-runtime" {
+                "attempt=1; max=3"
+            } else {
+                "attempt=1; max=1"
+            },
+        )
         .header("authorization", format!("Bearer {}", cred.bearer()))
         // 控制面同样每请求一条新连接:与数据面自相矛盾的连接行为本身就是可观测差异。
         //
@@ -223,8 +231,11 @@ pub async fn fetch_usage_limits(
 ) -> Result<UsageLimitsResponse, BalanceError> {
     let region = crate::kiro::endpoint::effective_region(cred);
     let imp = impersonation_for(cred, cfg);
-    // CLI 身份的余额走新控制面主机(与模型目录同一台),IDE 身份照旧走 q 主机。
-    let base = if imp.endpoint == "cli" {
+    // CLI 与 IDE 新服务身份的余额走新控制面主机(与模型目录同一台),IDE 旧路径照旧走 q 主机。
+    // IDE 新服务身份沿用官方 IDE 保留的 CodeWhispererRuntime 调用:同样是
+    // `GET /getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST[&profileArn=…]`,
+    // 只是默认主机换成了 management(实测 200)。
+    let base = if imp.endpoint == "cli" || imp.endpoint == "ide-runtime" {
         format!("https://management.{region}.kiro.dev")
     } else {
         region_base(&region)

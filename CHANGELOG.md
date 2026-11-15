@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-15
+
+### Changed
+
+- **新增「IDE 新地址」上游身份,并设为默认。** 官方 Kiro IDE 1.4.x 默认已不走旧的 `q.{region}.amazonaws.com`,改走新服务 `runtime` / `management.{region}.kiro.dev`(请求体 `origin` 仍为 `AI_EDITOR`、UA 仍为 `KiroIDE-<版本>-<机器码>` 加 `KAS/<agent 版本>`、带 `x-amzn-kiro-attempt`、IdC 账号带 `tokentype: SSO_OIDC`)。`upstreamEndpoint` 现有三个取值:`ide`(旧 q 地址,仅作兜底)、`ide-runtime`(**默认**,与官方 IDE 1.4.x 一致)、`cli`(与官方 CLI 一致)。对话、联网搜索、模型列表、余额四条调用均已用真实账号验证可用;令牌刷新不变。
+- **升级后默认切到「IDE 新地址」。** 未显式设置 `upstreamEndpoint` 的部署升级后会从旧 q 地址(已被上游停用)自动切到新服务,无需手动改配置。要保留旧地址请显式设 `"upstreamEndpoint": "ide"`;要用官方 CLI 身份设 `"cli"`。管理面板「客户端身份」卡片新增这三个端点选项。
+
 ## [0.20.0] - 2026-11-15
 
 ### Fixed

@@ -1,0 +1,10 @@
+GET /List-Available-Models?origin=AI_EDITOR&profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A699475941385%3Aprofile%2FEHGA3GRVQMUK HTTP/1.1
+connection: close
+x-amz-user-agent: aws-sdk-js/1.0.0 KiroIDE-1.4.178-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef-KAS/0.66.102-hotfix.1 acp-client/kiro-ide
+user-agent: aws-sdk-js/1.0.0 ua/2.1 os/win32#10.0.22631 lang/js md/nodejs#24.22.1 api/kirocontrolplanebearer#1.0.0 m/N,E KiroIDE-1.4.178-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef-KAS/0.66.102-hotfix.1 acp-client/kiro-ide
+host: upstream.test
+amz-sdk-invocation-id: 00000000-0000-4000-8000-000000000000
+amz-sdk-request: attempt=1; max=3
+authorization: Bearer snapshot-access-token
+accept: */*
+

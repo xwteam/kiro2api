@@ -697,6 +697,12 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.21.0: IDE 새 주소 식별(기본값)**
+>
+> - 공식 Kiro IDE 1.4.x는 기본적으로 새 서비스 `runtime` / `management.{region}.kiro.dev`를 사용하며, 이전 `q.{region}.amazonaws.com`은 공식 IDE에서 「엔드포인트 재정의」 프리셋으로만 남습니다. 새 업스트림 식별 `ide-runtime`(공식 IDE 1.4.x와 동일)을 추가하고 기본값으로 지정했습니다. `upstreamEndpoint`는 세 값: `ide`(이전 q 호스트, 폴백 전용), `ide-runtime`(기본), `cli`(공식 CLI).
+> - IDE 새 주소: 대화 `POST runtime/generateAssistantResponse`(JSON, `x-amz-target` 없음, 본문 `origin`은 `AI_EDITOR`, `rootConversationId` 포함); 모델 목록 `GET management/List-Available-Models?origin=AI_EDITOR`(본문 없음, 최대 10페이지); 잔액 `GET management/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST`; 웹 검색 `POST runtime/mcp`(profileArn은 헤더 `x-amzn-kiro-profile-arn`). UA는 `aws-sdk-js/1.0.0 … api/kiroruntime#1.0.0 m/N KiroIDE-<버전>-<machineId>-KAS/<agent 버전> acp-client/kiro-ide`이며 `x-amzn-kiro-attempt: 1;max=3` 포함. API 키 계정은 `tokentype: API_KEY`, IdC 계정은 `tokentype: SSO_OIDC`, Social은 없음. 토큰 갱신은 그대로입니다.
+> - `upstreamEndpoint`를 명시하지 않은 설정은 업그레이드 후 `ide-runtime`을 사용합니다. 이전 q 호스트를 유지하려면 `"ide"`, 공식 CLI 식별에는 `"cli"`를 설정하세요.
+>
 > **v0.20.0: 클라이언트 식별 정보**
 >
 > - 기존 IDE 클라이언트 버전이 업스트림에서 중단되어 업그레이드가 필수입니다. 기본값은 IDE `1.4.178`, Node `24.22.1`, 대화 SDK `1.0.44`입니다. `config.json`에 `"kiroVersion": "0.11.107"`을 명시했다면 수정하거나 삭제하세요.
@@ -1626,7 +1632,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.20.0"}
+{"service":"kiro2api","status":"ok","version":"0.21.0"}
 ```
 
 ### GET /v1/ping

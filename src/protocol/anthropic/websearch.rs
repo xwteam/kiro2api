@@ -97,10 +97,10 @@ pub async fn search(
 ) -> Result<WebSearchResults, SearchError> {
     search_at(
         client,
-        &if imp.endpoint == "cli" {
-            crate::kiro::endpoint::cli(region).url
-        } else {
-            crate::kiro::mcp::endpoint(region)
+        &match imp.endpoint.as_str() {
+            "cli" => crate::kiro::endpoint::cli(region).url,
+            "ide-runtime" => crate::kiro::mcp::ide_runtime_endpoint(region),
+            _ => crate::kiro::mcp::endpoint(region),
         },
         cred,
         imp,

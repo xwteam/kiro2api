@@ -29,6 +29,16 @@ pub fn cli(region: &str) -> Endpoint {
     }
 }
 
+/// 官方 Kiro IDE 1.4.x 的**默认**对话端点:新服务 runtime 主机上的 REST 路径(与旧 q 主机同
+/// 路径同 JSON 契约,不带 `x-amz-target`)。旧 q 主机在官方 IDE 里只剩「端点覆盖」预设。
+pub fn ide_runtime(region: &str) -> Endpoint {
+    Endpoint {
+        url: format!("https://runtime.{region}.kiro.dev/generateAssistantResponse"),
+        origin: "AI_EDITOR",
+        target: None,
+    }
+}
+
 pub fn all(region: &str) -> Vec<Endpoint> {
     vec![Endpoint {
         url: format!("https://q.{region}.amazonaws.com/generateAssistantResponse"),

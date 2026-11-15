@@ -817,7 +817,7 @@ pub async fn set_client_identity(
         || input
             .upstream_endpoint
             .as_deref()
-            .is_some_and(|s| !matches!(s, "ide" | "cli"))
+            .is_some_and(|s| !matches!(s, "ide" | "ide-runtime" | "cli"))
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -5786,6 +5786,26 @@ mod tests {
         assert_eq!(disk["apiKey"], "secret");
         assert_eq!(disk["custom"]["ok"], true);
         assert_eq!(disk["upstreamEndpoint"], "cli");
+        // 第三种身份:官方 IDE 1.4.x 默认的新服务地址。只给端点,其他字段原样保留。
+        let (status, response) = put(
+            &app,
+            "/api/admin/config/client-identity",
+            r#"{"upstreamEndpoint":"ide-runtime"}"#,
+        )
+        .await;
+        assert_eq!(status, HttpStatusCode::OK);
+        assert_eq!(response["saved"]["upstreamEndpoint"], "ide-runtime");
+        let disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(disk["upstreamEndpoint"], "ide-runtime");
+        assert_eq!(disk["kiroCliVersion"], "3.3.0");
+        let (status, _) = put(
+            &app,
+            "/api/admin/config/client-identity",
+            r#"{"upstreamEndpoint":"runtime"}"#,
+        )
+        .await;
+        assert_eq!(status, HttpStatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

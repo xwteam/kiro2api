@@ -189,6 +189,74 @@ pub fn origin_of(url: &str) -> Option<String> {
     (!scheme.is_empty() && !host.is_empty()).then(|| format!("{scheme}://{host}"))
 }
 
+/// 官方 IDE 1.4.178 内置的 agent 运行时(KAS)版本。它出现在 IDE 新服务调用的 UA 尾部。
+pub const KIRO_AGENT_VERSION: &str = "0.66.102-hotfix.1";
+
+/// IDE 新服务调用的自定义 UA 尾部(官方 1.4.178,实验开关未下发时的默认写法):
+/// 宿主串 `KiroIDE <版本> <机器码>` 加 `KAS/<版本>` 作为一个 UA 对,SDK 把其中空格转成 `-`;
+/// 客户端归属 `acp-client/kiro-ide` 单独成对。
+pub fn ide_runtime_ua_suffix(imp: &Impersonation) -> String {
+    format!(
+        "KiroIDE-{}-{}-KAS/{} acp-client/kiro-ide",
+        imp.kiro_version, imp.machine_id, KIRO_AGENT_VERSION
+    )
+}
+
+/// 官方 IDE 新服务(KiroRuntime / KiroControlPlaneBearer)客户端的鉴权类型头:
+/// API Key → `API_KEY`,IdC → `SSO_OIDC`;Social 不加。
+pub fn ide_runtime_token_type(cred: &Credential) -> Option<&'static str> {
+    if cred.is_api_key() {
+        Some("API_KEY")
+    } else if cred.auth == crate::kiro::credential::AuthMethod::Idc {
+        Some("SSO_OIDC")
+    } else {
+        None
+    }
+}
+
+/// IDE 新服务的数据面头。头的集合与取值照官方 1.4.178 代码;次序沿用 IDE 旧路径。
+fn ide_runtime_headers(
+    cred: &Credential,
+    imp: &Impersonation,
+    ep: &Endpoint,
+    invocation_id: &str,
+) -> HeaderMap {
+    let suffix = ide_runtime_ua_suffix(imp);
+    let mut h = HeaderMap::new();
+    h.insert("content-type", HeaderValue::from_static("application/json"));
+    h.insert("connection", HeaderValue::from_static("close"));
+    h.insert(
+        "x-amzn-codewhisperer-optout",
+        HeaderValue::from_static("true"),
+    );
+    h.insert("x-amzn-kiro-agent-mode", hv(&imp.agent_mode));
+    if let Ok(name) = HeaderName::from_bytes(b"x-amz-user-agent") {
+        h.insert(name, hv(&format!("aws-sdk-js/1.0.0 {suffix}")));
+    }
+    // `m/N`:显式指定了 endpoint;重试由 agent 自己的包装器管,外层没有 retry mode 特性位。
+    h.insert(
+        reqwest::header::USER_AGENT,
+        hv(&format!(
+            "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/kiroruntime#1.0.0 m/N {suffix}",
+            imp.system_version, imp.node_version
+        )),
+    );
+    if let Some(host) = host_of(&ep.url) {
+        h.insert("host", hv(&host));
+    }
+    h.insert("amz-sdk-invocation-id", hv(invocation_id));
+    h.insert(
+        "amz-sdk-request",
+        HeaderValue::from_static("attempt=1; max=3"),
+    );
+    h.insert("x-amzn-kiro-attempt", HeaderValue::from_static("1;max=3"));
+    h.insert("authorization", hv(&format!("Bearer {}", cred.bearer())));
+    if let Some(t) = ide_runtime_token_type(cred) {
+        h.insert("tokentype", HeaderValue::from_static(t));
+    }
+    h
+}
+
 /// 构造一次数据面请求的头(照观测,契约 §3)。
 pub fn build_headers(
     cred: &Credential,
@@ -206,6 +274,9 @@ pub fn build_headers(
             "codewhispererstreaming/0.1.19636",
             true,
         );
+    }
+    if imp.endpoint == "ide-runtime" {
+        return ide_runtime_headers(cred, imp, ep, invocation_id);
     }
     // **插入顺序即线上顺序**(HeaderMap 按插入序迭代),故这里的次序不是风格问题。
     //
@@ -321,6 +392,32 @@ pub fn cli_headers(
     h
 }
 
+/// 按身份改写数据面请求体:CLI 换 origin 等字段;IDE 新服务补 `rootConversationId`。
+fn body_for(imp: &Impersonation, body: &[u8]) -> Vec<u8> {
+    match imp.endpoint.as_str() {
+        "cli" => cli_body(body),
+        "ide-runtime" => ide_runtime_body(body),
+        _ => body.to_vec(),
+    }
+}
+
+/// 官方 IDE 新服务的请求构造器总会带 `rootConversationId`(会话元数据里没有时等于
+/// `conversationId`)。其余字段与旧路径相同。
+fn ide_runtime_body(body: &[u8]) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.to_vec();
+    };
+    if let Some(state) = value
+        .get_mut("conversationState")
+        .and_then(|v| v.as_object_mut())
+        && !state.contains_key("rootConversationId")
+        && let Some(id) = state.get("conversationId").cloned()
+    {
+        state.insert("rootConversationId".into(), id);
+    }
+    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+}
+
 /// CLI 对话中的 origin 和续写字段(依据③)。
 fn cli_body(body: &[u8]) -> Vec<u8> {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
@@ -365,11 +462,7 @@ pub async fn call(
     let resp = client
         .post(&ep.url)
         .headers(build_headers(cred, imp, ep, &inv))
-        .body(if imp.endpoint == "cli" {
-            cli_body(body)
-        } else {
-            body.to_vec()
-        })
+        .body(body_for(imp, body))
         .send()
         .await
         .map_err(|_| LoginError::Http)?;
@@ -456,11 +549,7 @@ async fn try_endpoints(
         match client
             .post(&ep.url)
             .headers(build_headers(cred, imp, ep, &inv))
-            .body(if imp.endpoint == "cli" {
-                cli_body(body)
-            } else {
-                body.to_vec()
-            })
+            .body(body_for(imp, body))
             .send()
             .await
         {
@@ -534,10 +623,10 @@ pub async fn call_with_fallback(
     body: &[u8],
     now_unix: u64,
 ) -> Result<reqwest::Response, (LoginError, FailureKind)> {
-    let eps = if imp.endpoint == "cli" {
-        vec![crate::kiro::endpoint::cli(region)]
-    } else {
-        sorted(region, preferred, fallback)
+    let eps = match imp.endpoint.as_str() {
+        "cli" => vec![crate::kiro::endpoint::cli(region)],
+        "ide-runtime" => vec![crate::kiro::endpoint::ide_runtime(region)],
+        _ => sorted(region, preferred, fallback),
     };
     match try_endpoints(client, &eps, cred, imp, body).await {
         Ok(r) => {
@@ -571,10 +660,10 @@ pub async fn call_with_fallback_no_report(
     imp: &Impersonation,
     body: &[u8],
 ) -> Result<reqwest::Response, DataPlaneFailure> {
-    let eps = if imp.endpoint == "cli" {
-        vec![crate::kiro::endpoint::cli(region)]
-    } else {
-        sorted(region, preferred, fallback)
+    let eps = match imp.endpoint.as_str() {
+        "cli" => vec![crate::kiro::endpoint::cli(region)],
+        "ide-runtime" => vec![crate::kiro::endpoint::ide_runtime(region)],
+        _ => sorted(region, preferred, fallback),
     };
     try_endpoints(client, &eps, cred, imp, body).await
 }

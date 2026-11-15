@@ -106,6 +106,12 @@ cat data/config.json | grep apiKey
 | 422 | 请求体反序列化失败（缺必填字段 / 类型不符），axum 默认拒收，`text/plain` 纯文本。出现在带 body 提取器的端点上：`/api/admin/*` 与 `POST /api/user/login`（四个协议对话端点与 `/v1/messages/count_tokens` 已自行接管拒收、改回各自形状的 `400`）（`/api/user/*` 的其余端点只收 query，参数类型不符是 `400` 而非 `422`） |
 
 
+> **v0.21.0: IDE 新地址身份(默认)**
+>
+> - 官方 Kiro IDE 1.4.x 默认已改走新服务 `runtime` / `management.{region}.kiro.dev`,旧 `q.{region}.amazonaws.com` 在官方 IDE 里只剩「端点覆盖」预设。新增上游身份 `ide-runtime`(与官方 IDE 1.4.x 一致)并设为默认;`upstreamEndpoint` 现有三值:`ide`(旧 q 地址,仅兜底)、`ide-runtime`(默认)、`cli`(官方 CLI)。
+> - IDE 新地址:对话 `POST runtime/generateAssistantResponse`(JSON、不带 `x-amz-target`,请求体 `origin` 为 `AI_EDITOR`、带 `rootConversationId`);模型列表 `GET management/List-Available-Models?origin=AI_EDITOR`(无体,最多翻 10 页);余额 `GET management/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST`;联网搜索 `POST runtime/mcp`(profileArn 走头 `x-amzn-kiro-profile-arn`)。UA 为 `aws-sdk-js/1.0.0 … api/kiroruntime#1.0.0 m/N KiroIDE-<版本>-<机器码>-KAS/<agent 版本> acp-client/kiro-ide`,带 `x-amzn-kiro-attempt: 1;max=3`;API Key 账号带 `tokentype: API_KEY`、IdC 账号带 `tokentype: SSO_OIDC`、Social 不带。令牌刷新不变。
+> - 未显式设置 `upstreamEndpoint` 的配置升级后自动走 `ide-runtime`。要保留旧 q 地址设 `"ide"`,要用官方 CLI 身份设 `"cli"`。
+>
 > **v0.20.0: 客户端身份**
 >
 > - 旧 IDE 客户端版本已被上游停用，必须升级；默认 IDE 为 `1.4.178`、Node 为 `24.22.1`、对话 SDK 为 `1.0.44`。若 `config.json` 显式设置 `"kiroVersion": "0.11.107"`，请修改或删除，否则仍被拒绝。
@@ -1395,7 +1401,7 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.20.0",
+  "version": "0.21.0",
   "kiroVersion": "1.4.178",
   "rustVersion": "1.90.0",
   "runMode": "Docker",

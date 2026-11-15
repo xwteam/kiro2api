@@ -126,6 +126,80 @@ fn build_body(profile_arn: Option<&str>) -> Vec<u8> {
     serde_json::to_vec(&serde_json::Value::Object(obj)).unwrap_or_else(|_| b"{}".to_vec())
 }
 
+/// 官方 IDE 1.4.x 的模型列表:新控制面主机上的
+/// `GET /List-Available-Models?origin=AI_EDITOR[&profileArn=…][&nextToken=…]`,无请求体、
+/// 不带 `x-amz-target`,最多翻 10 页(官方同样上限)。
+async fn fetch_ide_runtime(
+    client: &reqwest::Client,
+    base: &str,
+    cred: &Credential,
+    imp: &Impersonation,
+) -> Result<AvailableModelsResponse, ModelsError> {
+    let suffix = crate::kiro::provider::ide_runtime_ua_suffix(imp);
+    let mut all = AvailableModelsResponse::default();
+    let mut next: Option<String> = None;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..10 {
+        let mut url = format!(
+            "{}/List-Available-Models?origin=AI_EDITOR",
+            base.trim_end_matches('/')
+        );
+        if let Some(arn) = cred.profile_arn.as_deref().filter(|s| !s.is_empty()) {
+            url.push_str(&format!(
+                "&profileArn={}",
+                crate::balance::client::pct_encode(arn)
+            ));
+        }
+        if let Some(token) = &next {
+            url.push_str(&format!(
+                "&nextToken={}",
+                crate::balance::client::pct_encode(token)
+            ));
+        }
+        let mut req = client
+            .get(&url)
+            .header("connection", "close")
+            .header("x-amz-user-agent", format!("aws-sdk-js/1.0.0 {suffix}"))
+            .header(
+                reqwest::header::USER_AGENT,
+                format!(
+                    "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/kirocontrolplanebearer#1.0.0 m/N,E {suffix}",
+                    imp.system_version, imp.node_version
+                ),
+            );
+        if let Some(host) = crate::kiro::provider::host_of(&url) {
+            req = req.header("host", host);
+        }
+        req = req
+            .header("amz-sdk-invocation-id", new_invocation_id())
+            .header("amz-sdk-request", "attempt=1; max=3")
+            .header("authorization", format!("Bearer {}", cred.bearer()));
+        if let Some(t) = crate::kiro::provider::ide_runtime_token_type(cred) {
+            req = req.header("tokentype", t);
+        }
+        let resp = req.send().await.map_err(|_| ModelsError::Http)?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let text = crate::kiro::provider::read_body_capped(resp).await;
+            return Err(ModelsError::Upstream {
+                status,
+                message: extract_amz_message(&text),
+            });
+        }
+        let page: AvailableModelsResponse = resp.json().await.map_err(|_| ModelsError::Decode)?;
+        if all.default_model.is_none() {
+            all.default_model = page.default_model;
+        }
+        all.models.extend(page.models);
+        match page.next_token.filter(|s| !s.is_empty()) {
+            Some(token) if seen.insert(token.clone()) => next = Some(token),
+            Some(_) => return Err(ModelsError::Decode),
+            None => return Ok(all),
+        }
+    }
+    Ok(all)
+}
+
 /// 向 `base` 发一次 ListAvailableModels 并解析。测试可注入 mock base;生产用 [`fetch_available_models`]。
 pub async fn fetch_at(
     client: &reqwest::Client,
@@ -133,6 +207,9 @@ pub async fn fetch_at(
     cred: &Credential,
     imp: &Impersonation,
 ) -> Result<AvailableModelsResponse, ModelsError> {
+    if imp.endpoint == "ide-runtime" {
+        return fetch_ide_runtime(client, base, cred, imp).await;
+    }
     if imp.endpoint == "cli" {
         let url = format!("{}/", base.trim_end_matches('/'));
         let mut body = serde_json::json!({"origin":"KIRO_CLI"});
@@ -248,7 +325,7 @@ pub async fn fetch_available_models(
     // ARN 写 eu-central-1、导入时 region 填了 us-east-1 的账号,请求实打 `q.eu-central-1`
     // 日志却说 us-east-1,排障的人照着日志去查另一个 region 只会白跑。
     let region = crate::kiro::endpoint::effective_region(cred);
-    if imp.endpoint == "cli" {
+    if imp.endpoint == "cli" || imp.endpoint == "ide-runtime" {
         // 新控制面主机依据①,服务 target 依据①。
         return fetch_at(
             client,
@@ -552,11 +629,12 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            let _ = rt.block_on(fetch_available_models(
-                &client,
-                &crate::config::Config::default(),
-                &c,
-            ));
+            // 两主机回落是旧 q 路径(ide)的机制,显式用它。
+            let cfg = crate::config::Config {
+                upstream_endpoint: "ide".into(),
+                ..Default::default()
+            };
+            let _ = rt.block_on(fetch_available_models(&client, &cfg, &c));
         });
         let logs = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
         assert!(logs.contains("备用主机"), "应打出回落日志: {logs}");

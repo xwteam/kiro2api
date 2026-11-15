@@ -19,7 +19,7 @@ pub struct Config {
     pub credentials_path: String,
     /// 伪装 UA 里的 Kiro 版本号(契约 §3)。
     pub kiro_version: String,
-    /// 上游客户端身份: ide(默认)或 cli。
+    /// 上游客户端身份:`ide`(旧 q 地址)、`ide-runtime`(默认,官方 IDE 1.4.x 默认的新服务地址)、`cli`。
     pub upstream_endpoint: String,
     /// CLI 客户端版本。
     pub kiro_cli_version: String,
@@ -111,7 +111,7 @@ impl Default for Config {
             admin_api_key: None,
             credentials_path: "credentials.json".into(),
             kiro_version: "1.4.178".into(),
-            upstream_endpoint: "ide".into(),
+            upstream_endpoint: "ide-runtime".into(),
             kiro_cli_version: "3.3.0".into(),
             system_version: "win32#10.0.22631".into(),
             node_version: "24.22.1".into(),
@@ -403,8 +403,9 @@ mod tests {
 
     #[test]
     fn client_identity_config_is_backward_compatible() {
+        // 不写该字段 → 取默认身份(官方 IDE 1.4.x 默认的新服务地址)。
         let old: Config = serde_json::from_str(r#"{"kiroVersion":"1.2.3"}"#).unwrap();
-        assert_eq!(old.upstream_endpoint, "ide");
+        assert_eq!(old.upstream_endpoint, "ide-runtime");
         assert_eq!(old.kiro_cli_version, "3.3.0");
         let cli: Config =
             serde_json::from_str(r#"{"upstreamEndpoint":"cli","kiroCliVersion":"4.5.6"}"#).unwrap();

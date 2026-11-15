@@ -1,0 +1,10 @@
+GET /getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A699475941385%3Aprofile%2FEHGA3GRVQMUK HTTP/1.1
+x-amz-user-agent: aws-sdk-js/1.0.0 KiroIDE-1.4.178-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+user-agent: aws-sdk-js/1.0.0 ua/2.1 os/win32#10.0.22631 lang/js md/nodejs#24.22.1 api/codewhispererruntime#1.0.0 m/N,E KiroIDE-1.4.178-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+host: upstream.test
+amz-sdk-invocation-id: 00000000-0000-4000-8000-000000000000
+amz-sdk-request: attempt=1; max=3
+authorization: Bearer snapshot-access-token
+connection: close
+accept: */*
+
