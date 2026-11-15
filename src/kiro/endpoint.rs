@@ -20,6 +20,15 @@ pub struct Endpoint {
 /// 更糟的是它们何时被用:上游一限流(429),我们就**立刻拿同一个账号的令牌**去打这两个
 /// 端点。于是"被限流的账号紧接着去探另外两个服务入口"——这是探测行为的形状,不是客户端
 /// 行为的形状。收敛成一个之后,限流就只是限流,退避重试即可。
+/// CLI 运行时地址和目标(依据①)。
+pub fn cli(region: &str) -> Endpoint {
+    Endpoint {
+        url: format!("https://runtime.{region}.kiro.dev/"),
+        origin: "KIRO_CLI",
+        target: Some("AmazonCodeWhispererStreamingService.GenerateAssistantResponse"),
+    }
+}
+
 pub fn all(region: &str) -> Vec<Endpoint> {
     vec![Endpoint {
         url: format!("https://q.{region}.amazonaws.com/generateAssistantResponse"),

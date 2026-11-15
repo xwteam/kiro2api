@@ -224,6 +224,8 @@ fn relay_error_to_gemini(e: RelayError) -> Response {
         }
         // 上游确定性拒绝(工具规格畸形 / 缺工具定义 / 上下文超长)→ 400 + 清晰说明。
         RelayError::InvalidRequest(msg) => (msg.clone(), "INVALID_ARGUMENT"),
+        // 全池账号的 profileArn 都不被接受 → 400 + 说明。
+        RelayError::AccountConfig(msg) => (msg.clone(), "FAILED_PRECONDITION"),
         // 全池账号都不支持该模型(各账号档位不同)→ 400,文案见 RelayError::message。
         RelayError::ModelUnavailable(_) => (e.message(), "INVALID_ARGUMENT"),
         // 全池额度耗尽 → 429 / RESOURCE_EXHAUSTED(gRPC 语义里正是这个)。
@@ -911,6 +913,8 @@ mod tests {
     fn cred() -> Credential {
         Credential {
             quota_reset_unix: None,
+            endpoint: None,
+            provider: None,
             priority: 999,
             proxy_url: None,
             proxy_username: None,

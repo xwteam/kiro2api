@@ -1,0 +1,15 @@
+POST /generateAssistantResponse HTTP/1.1
+content-type: application/json
+connection: close
+x-amzn-codewhisperer-optout: true
+x-amzn-kiro-agent-mode: vibe
+x-amz-user-agent: aws-sdk-js/1.0.44 KiroIDE-1.4.178-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+user-agent: aws-sdk-js/1.0.44 ua/2.1 os/win32#10.0.22631 lang/js md/nodejs#24.22.1 api/codewhispererstreaming#1.0.44 m/E KiroIDE-1.4.178-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+host: upstream.test
+amz-sdk-invocation-id: 00000000-0000-4000-8000-000000000000
+amz-sdk-request: attempt=1; max=3
+authorization: Bearer snapshot-access-token
+accept: */*
+content-length: 418
+
+{"conversationState":{"agentContinuationId":"00000000-0000-4000-8000-000000000000","agentTaskType":"vibe","chatTriggerType":"MANUAL","currentMessage":{"userInputMessage":{"content":"Hello snapshot","modelId":"claude-sonnet-4.5","origin":"AI_EDITOR","userInputMessageContext":{}}},"conversationId":"00000000-0000-4000-8000-000000000000"},"profileArn":"arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"}

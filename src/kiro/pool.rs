@@ -10,6 +10,7 @@ use serde::Serialize;
 pub struct CredentialUpdate {
     pub refresh_token: Option<String>,
     pub auth: Option<AuthMethod>,
+    pub provider: Option<crate::kiro::credential::Provider>,
     pub email: Option<String>,
     pub nickname: Option<String>,
     pub client_id: Option<String>,
@@ -68,6 +69,12 @@ pub enum FailureKind {
     /// 处置:不罚账号(它没坏),但把它排除出**本次请求**的候选,换个账号再试;
     /// 全池都不支持时才回 400。
     ModelUnavailable,
+    /// **这个账号**的配置不被上游接受(缺 profileArn、profileArn 无效、查不到可用 profile)。
+    ///
+    /// 与 [`InvalidRequest`](Self::InvalidRequest) 不同,它是账号级的:换个配置正确的账号就能成。
+    /// 与 [`ModelUnavailable`](Self::ModelUnavailable) 同样处置 —— 不罚账号、排除出本次候选、
+    /// 换号再试,全池试尽才回 400 —— 但**不**写"该账号不支持某模型"的记忆。
+    AccountConfig,
 }
 
 /// 下个自然月的 1 号 00:00 UTC(unix 秒)。
@@ -132,6 +139,28 @@ pub fn classify(status: u16) -> FailureKind {
 /// `__type` 里的机器稳定异常名(ExpiredTokenException/InvalidGrantException/…)会被漏看,
 /// 分类退化(见 provider 的 `#6`)。本函数同时匹配 `__type` 与 `message` 措辞。
 pub fn classify_with_body(status: u16, body: &str) -> FailureKind {
+    if status == 400 && client_config_error(body).is_some() {
+        // 账号级:profileArn 缺失/无效只说明这个账号没配好,换号就能成。
+        if body_signals_profile_error(body) {
+            return FailureKind::AccountConfig;
+        }
+        // 全局:客户端版本被上游停用,换哪个账号都一样 → 请求级,直接回。
+        if body
+            .to_ascii_lowercase()
+            .contains("this version of kiro is no longer supported")
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            LAST_UNSUPPORTED_VERSION.store(now, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                event = "upstream_version_unsupported",
+                "上游要求更新客户端版本"
+            );
+        }
+        return FailureKind::InvalidRequest;
+    }
     match status {
         // 402 = 额度真的用尽(月度请求数),按配额处置。
         // 429 **不是**配额:它是上游临时限流,退避后重试即可恢复。此前把 429 也判成配额,
@@ -191,6 +220,40 @@ pub fn body_signals_model_unavailable(body: &str) -> bool {
     body.to_ascii_lowercase().contains("invalid_model_id")
 }
 
+/// 上游明确指出版本或 profile 配置错误,不得误当成账号暂时故障。
+static LAST_UNSUPPORTED_VERSION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub fn last_unsupported_version() -> Option<String> {
+    let seconds = LAST_UNSUPPORTED_VERSION.load(std::sync::atomic::Ordering::Relaxed);
+    if seconds == 0 {
+        return None;
+    }
+    chrono::DateTime::from_timestamp(seconds as i64, 0).map(|time| {
+        time.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid timezone"))
+            .to_rfc3339()
+    })
+}
+
+pub fn client_config_error(body: &str) -> Option<&'static str> {
+    let text = body.to_ascii_lowercase();
+    if text.contains("this version of kiro is no longer supported") {
+        Some(
+            "Upstream requires a client update: update the configured client version and restart the service.",
+        )
+    } else if body_signals_profile_error(body) {
+        Some("Upstream rejected profileArn: configure a valid profileArn for this account.")
+    } else {
+        None
+    }
+}
+
+/// 上游对**这个账号**的 profileArn 不满意(缺失或无效)。账号级,见 [`FailureKind::AccountConfig`]。
+pub fn body_signals_profile_error(body: &str) -> bool {
+    let text = body.to_ascii_lowercase();
+    text.contains("profilearn is required") || text.contains("invalid profilearn")
+}
+
 pub fn body_signals_invalid_request(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     lower.contains("content_length_exceeds_threshold")
@@ -205,6 +268,9 @@ pub fn body_signals_invalid_request(body: &str) -> bool {
 /// 现在含义不止一种,笼统套一句"模型不可用"会把"上下文超长"讲成完全无关的另一回事,
 /// 使用者照着去换模型,换多少次都没用。
 pub fn invalid_request_message(body: &str, model: &str) -> String {
+    if let Some(message) = client_config_error(body) {
+        return message.to_string();
+    }
     let lower = body.to_ascii_lowercase();
     if lower.contains("request_body_invalid") {
         return "Invalid request body: the upstream rejected the request shape, most often a \
@@ -532,6 +598,7 @@ pub struct AccountStat {
 
 /// 账号池。
 pub struct Pool {
+    pub(crate) profile_coordinator: crate::kiro::profiles::ProfileCoordinator,
     entries: Vec<Entry>,
     mode: LbMode,
     cursor: usize,
@@ -583,6 +650,7 @@ impl Pool {
             })
             .collect();
         Self {
+            profile_coordinator: Default::default(),
             entries,
             mode,
             cursor: 0,
@@ -961,6 +1029,7 @@ impl Pool {
         // 不在这里补的话它们照旧每请求现算 —— 而派生材料 refreshToken 会被刷新轮换,
         // 于是这些新号又回到"每刷新一次换一台机器"的老毛病上。
         crate::kiro::credential::freeze_machine_id(&mut cred);
+        crate::kiro::credential::fill_social_profile(&mut cred);
         // **必须解除粘滞**,理由与 [`set_priority`](Self::set_priority) 完全相同。
         //
         // Priority 档只有当前账号不可用才换人。新导入一个更高优先级的账号后不松开粘滞,
@@ -998,7 +1067,13 @@ impl Pool {
             c.refresh_token = v;
         }
         if let Some(v) = upd.auth {
+            if c.auth != v {
+                c.provider = None;
+            }
             c.auth = v;
+        }
+        if let Some(v) = upd.provider {
+            c.provider = Some(v);
         }
         if let Some(v) = upd.email {
             c.email = Some(v);
@@ -1023,6 +1098,56 @@ impl Pool {
         }
         if let Some(v) = upd.region {
             c.region = v;
+        }
+        true
+    }
+
+    pub(crate) fn credential(&self, id: &str) -> Option<Credential> {
+        self.entries
+            .iter()
+            .find(|e| e.cred.id == id)
+            .map(|e| e.cred.clone())
+    }
+
+    /// 查询期间不覆盖管理员写入的 profile 或已更换的账号身份。
+    /// 该账号的**身份**是否仍与快照一致(令牌链、登录来源、区域、端点)。异步查询期间管理员
+    /// 可能改了这个账号;旧查询的结论(成功或失败)只能落在发起时的那份身份上。
+    pub(crate) fn identity_matches(c: &Credential, expected: &Credential) -> bool {
+        c.refresh_token == expected.refresh_token
+            && c.auth == expected.auth
+            && c.provider == expected.provider
+            && c.client_id == expected.client_id
+            && c.region == expected.region
+            && c.endpoint == expected.endpoint
+    }
+
+    /// 只在身份未变时反馈失败;身份已变(管理员改了账号)则丢弃这条旧结论,返回 false。
+    pub(crate) fn report_failure_if_unchanged(
+        &mut self,
+        expected: &Credential,
+        kind: FailureKind,
+        reason: StatusReason,
+        now_unix: u64,
+    ) -> bool {
+        let unchanged = self
+            .find(&expected.id)
+            .is_some_and(|e| Self::identity_matches(&e.cred, expected));
+        if unchanged {
+            self.report_failure_with_reason(&expected.id, kind, reason, now_unix);
+        }
+        unchanged
+    }
+
+    pub(crate) fn set_profile_if_unchanged(&mut self, expected: &Credential, arn: String) -> bool {
+        let Some(e) = self.find(&expected.id) else {
+            return false;
+        };
+        let c = &mut e.cred;
+        if !Self::identity_matches(c, expected) {
+            return false;
+        }
+        if c.profile_arn.as_deref().is_none_or(|s| s.trim().is_empty()) {
+            c.profile_arn = Some(arn);
         }
         true
     }
@@ -1277,6 +1402,8 @@ impl Pool {
                 // 模型对该账号不可用:同样**不罚账号**——它没坏,只是档位不含这个模型。
                 // 排除出本次请求候选是调用方的事(见 handler 的跨账号重试)。
                 FailureKind::ModelUnavailable => {}
+                // 账号配置(profileArn)不被接受:也不罚 —— 账号没坏,只是没配好。
+                FailureKind::AccountConfig => {}
             }
         }
     }
@@ -1333,6 +1460,8 @@ mod tests {
     fn cred(id: &str, weight: u32) -> Credential {
         Credential {
             quota_reset_unix: None,
+            endpoint: None,
+            provider: None,
             priority: 999,
             proxy_url: None,
             proxy_username: None,
@@ -1403,6 +1532,30 @@ mod tests {
             assert!(!e.disabled, "{kind:?} 不该禁用账号");
             assert_eq!(e.cooldown_until, 0, "{kind:?} 不该冷却账号");
             assert_eq!(e.strikes, 0, "{kind:?} 不该累计 strike");
+        }
+    }
+
+    #[test]
+    fn unsupported_version_and_profile_errors_are_deterministic_only_on_400() {
+        for message in [
+            "This version of Kiro is no longer supported. Please update to the latest version of Kiro to continue.",
+            "profileArn is required for this request.",
+            "Invalid profileArn.",
+        ] {
+            // 版本被停用是全局的(请求级);profileArn 缺失/无效只关这个账号(账号级,换号)。
+            let expected = if message.starts_with("This version") {
+                FailureKind::InvalidRequest
+            } else {
+                FailureKind::AccountConfig
+            };
+            assert_eq!(classify_with_body(400, message), expected);
+            assert_eq!(classify_with_body(500, message), FailureKind::Transient);
+            let friendly = invalid_request_message(message, "model");
+            if message.starts_with("This version") {
+                assert!(friendly.contains("update"));
+            } else {
+                assert!(friendly.contains("profileArn"));
+            }
         }
     }
 

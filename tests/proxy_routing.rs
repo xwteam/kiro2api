@@ -15,6 +15,8 @@ use kiro2api::kiro::credential::{AuthMethod, Credential};
 fn cred_with_proxy(proxy: Option<String>) -> Credential {
     Credential {
         quota_reset_unix: None,
+        endpoint: None,
+        provider: None,
         priority: 999,
         id: "p1".into(),
         access_token: "AT".into(),

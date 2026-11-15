@@ -89,6 +89,14 @@ pub fn admin_api_router(state: MessagesState) -> Router {
         )
         // ---- Phase 5 运行期可变配置端点(设置面板)----
         .route(
+            "/api/admin/config/client-identity",
+            get(handler::get_client_identity).put(handler::set_client_identity),
+        )
+        .route(
+            "/api/admin/config/client-identity/check",
+            get(handler::check_client_identity),
+        )
+        .route(
             "/api/admin/config/load-balancing",
             get(handler::get_load_balancing).put(handler::set_load_balancing),
         )

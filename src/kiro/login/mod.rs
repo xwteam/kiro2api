@@ -28,6 +28,7 @@ pub const SCOPES: [&str; 5] = [
 /// 端点、须重放 clientId+clientSecret;丢掉它们首刷会打错端点而失败。admin 层据此设 auth=Idc。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MintedCredential {
+    pub provider: crate::kiro::credential::Provider,
     pub access_token: String,
     pub refresh_token: String,
     pub expires_in_secs: u64,
@@ -422,6 +423,8 @@ fn placeholder_cred() -> crate::kiro::credential::Credential {
         proxy_username: None,
         proxy_password: None,
         quota_reset_unix: None,
+        endpoint: None,
+        provider: None,
     }
 }
 

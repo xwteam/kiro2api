@@ -73,7 +73,7 @@ fn build_headers(cred: &Credential, imp: &Impersonation, base: &str) -> HeaderMa
         h.insert(
             name,
             hv(&format!(
-                "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
+                "aws-sdk-js/1.0.44 KiroIDE-{}-{}",
                 imp.kiro_version, imp.machine_id
             )),
         );
@@ -81,7 +81,7 @@ fn build_headers(cred: &Credential, imp: &Impersonation, base: &str) -> HeaderMa
     h.insert(
         reqwest::header::USER_AGENT,
         hv(&format!(
-            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
+            "aws-sdk-js/1.0.44 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.44 m/E KiroIDE-{}-{}",
             imp.system_version, imp.node_version, imp.kiro_version, imp.machine_id
         )),
     );
@@ -117,6 +117,37 @@ pub async fn call_at(
     imp: &Impersonation,
     req: &McpRequest,
 ) -> Result<McpResponse, crate::kiro::login::LoginError> {
+    if imp.endpoint == "cli" {
+        let mut body =
+            serde_json::to_value(req).map_err(|_| crate::kiro::login::LoginError::Http)?;
+        if let Some(arn) = cred.profile_arn.as_deref().filter(|a| !a.is_empty()) {
+            body["profileArn"] = arn.into();
+        }
+        let headers = crate::kiro::provider::cli_headers(
+            cred,
+            imp,
+            base,
+            "AmazonCodeWhispererStreamingService.InvokeMCP",
+            "codewhispererstreaming/0.1.19636",
+            false,
+        );
+        let resp = client
+            .post(base)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| crate::kiro::login::LoginError::Http)?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = crate::kiro::provider::read_body_capped(resp).await;
+            return Err(crate::kiro::login::LoginError::UpstreamHttp { status, body });
+        }
+        return resp
+            .json()
+            .await
+            .map_err(|_| crate::kiro::login::LoginError::Http);
+    }
     let resp = client
         .post(base)
         .headers(build_headers(cred, imp, base))
@@ -140,6 +171,41 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[tokio::test]
+    async fn cli_mcp_sends_json_rpc_to_root() {
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header(
+                "x-amz-target",
+                "AmazonCodeWhispererStreamingService.InvokeMCP",
+            ))
+            .and(body_partial_json(
+                serde_json::json!({"method":"tools/call","params":{"name":"web_search"}}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"result":{"content":[]}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut i = imp();
+        i.endpoint = "cli".into();
+        let req = tools_call("web_search", serde_json::json!({"query":"x"}));
+        call_at(
+            &reqwest::Client::new(),
+            &format!("{}/", server.uri()),
+            &cred(),
+            &i,
+            &req,
+        )
+        .await
+        .unwrap();
+    }
+
     fn cred() -> Credential {
         let mut c = crate::kiro::credential::tests_support_cred();
         c.profile_arn = Some("arn:aws:codewhisperer:us-east-1:1:profile/A".into());
@@ -152,6 +218,8 @@ mod tests {
             agent_mode: "vibe".into(),
             system_version: "win32#10.0.22631".into(),
             node_version: "22.22.0".into(),
+            endpoint: "ide".into(),
+            cli_version: "3.3.0".into(),
         }
     }
 

@@ -885,6 +885,8 @@ mod tests {
     fn cred() -> Credential {
         Credential {
             quota_reset_unix: None,
+            endpoint: None,
+            provider: None,
             priority: 999,
             proxy_url: None,
             proxy_username: None,

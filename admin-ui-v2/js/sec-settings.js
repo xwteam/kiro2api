@@ -91,12 +91,62 @@
     var grid = el('div', 'settings-grid'); grid.id = 'settingsGrid';
     grid.appendChild(buildAuthKeysCard());
     grid.appendChild(buildLoadBalancingCard());
+    grid.appendChild(buildClientIdentityCard());
     container.appendChild(grid);
 
     // 集成示例(全宽,置于两张设置卡之下):协议 × 语言的可复制代码片段。
     container.appendChild(buildIntegrationCard());
 
     if (K.i18n) K.i18n.apply(container);
+  }
+
+  var identityEndpoint, identityIde, identityCli, identityLatest, identitySaved = null;
+  function buildClientIdentityCard() {
+    var card = el('div', 'card');
+    var header = el('div', 'card-header'); header.appendChild(el('h3', null, t('identity.title'))); card.appendChild(header);
+    card.appendChild(el('p', 'settings-card-desc', t('identity.warning')));
+    function field(label, input) { var g = el('div', 'form-group'); g.appendChild(el('label', 'form-label', label)); g.appendChild(input); card.appendChild(g); }
+    identityEndpoint = el('select', 'form-control');
+    [['ide', t('identity.ideEndpoint')], ['cli', t('identity.cliEndpoint')]].forEach(function (item) { var opt = el('option', null, item[1]); opt.value = item[0]; identityEndpoint.appendChild(opt); });
+    field(t('identity.endpoint'), identityEndpoint);
+    identityIde = el('input', 'form-control'); identityIde.type = 'text'; field(t('identity.ideVersion'), identityIde);
+    identityCli = el('input', 'form-control'); identityCli.type = 'text'; field(t('identity.cliVersion'), identityCli);
+    identityLatest = el('p', 'form-hint'); card.appendChild(identityLatest);
+    var check = el('button', 'btn btn-outline', t('identity.check')); check.type = 'button';
+    check.addEventListener('click', function () {
+      check.disabled = true;
+      api.get('/config/client-identity/check').then(function (r) {
+        var newer = function (latest, current) { var a = latest.split('.').map(Number), b = current.split('.').map(Number); for (var i = 0; i < 3; i++) { if (a[i] !== b[i]) return a[i] > b[i]; } return false; };
+        identityLatest.textContent = t('identity.latest') + ': IDE ' + r.latestIdeVersion + (newer(r.latestIdeVersion, r.kiroVersion) ? ' ↑' : '') + ' / CLI ' + r.latestCliVersion + (newer(r.latestCliVersion, r.kiroCliVersion) ? ' ↑' : '') + ' · ' + t('identity.checkedAt') + ': ' + r.checkedAt;
+        identityLatest.style.color = newer(r.latestIdeVersion, r.kiroVersion) || newer(r.latestCliVersion, r.kiroCliVersion) ? 'var(--warning, #d97706)' : '';
+      }).catch(function (e) { api.toast(e.message || t('common.error'), 'error'); }).then(function () { check.disabled = false; });
+    });
+    card.appendChild(check);
+    var save = el('button', 'btn btn-primary', t('common.save')); save.type = 'button';
+    save.addEventListener('click', function () {
+      save.disabled = true;
+      // 只提交改过的字段:别把运行中的旧值写回去覆盖了另一次已保存、待重启的选择。
+      var body = {}, now = {upstreamEndpoint: identityEndpoint.value, kiroVersion: identityIde.value.trim(), kiroCliVersion: identityCli.value.trim()};
+      Object.keys(now).forEach(function (k) { if (!identitySaved || identitySaved[k] !== now[k]) body[k] = now[k]; });
+      if (!Object.keys(body).length) { save.disabled = false; api.toast(t('identity.restart'), 'success'); return; }
+      api.put('/config/client-identity', body)
+        .then(function (r) { applyClientIdentity(r); api.toast(t('identity.restart'), 'success'); }).catch(function (e) { api.toast(e.message || t('common.error'), 'error'); }).then(function () { save.disabled = false; });
+    });
+    card.appendChild(save); return card;
+  }
+  // 表单显示「已保存」的值(重启后生效的那份);和运行中的不一样时提示待重启。
+  function applyClientIdentity(r) {
+    var saved = r.saved || {upstreamEndpoint: r.upstreamEndpoint, kiroVersion: r.kiroVersion, kiroCliVersion: r.kiroCliVersion};
+    identitySaved = {upstreamEndpoint: saved.upstreamEndpoint, kiroVersion: saved.kiroVersion, kiroCliVersion: saved.kiroCliVersion};
+    identityEndpoint.value = saved.upstreamEndpoint; identityIde.value = saved.kiroVersion; identityCli.value = saved.kiroCliVersion;
+    var notes = [];
+    if (r.restartRequired) notes.push(t('identity.pending') + ': ' + r.upstreamEndpoint + ' / IDE ' + r.kiroVersion + ' / CLI ' + r.kiroCliVersion);
+    if (r.lastUnsupportedVersionAt) notes.push(t('identity.unsupported') + ': ' + r.lastUnsupportedVersionAt);
+    if (notes.length) { identityLatest.textContent = notes.join(' · '); identityLatest.style.color = 'var(--warning, #d97706)'; }
+  }
+  function loadClientIdentity() {
+    if (!identityEndpoint) return;
+    api.get('/config/client-identity').then(applyClientIdentity).catch(function () {});
   }
 
   // ---------- Load Balancing ----------
@@ -319,6 +369,7 @@
 
   // ---------- orchestration ----------
   function loadAll() {
+    loadClientIdentity();
     loadLoadBalancing();
     loadAuthKeys();
   }

@@ -634,6 +634,50 @@ test('usage: 汇总接口失败时费用/积分卡显示 —,不能伪造 $0.000
   assert.equal(host.querySelector('#usSumRequests').textContent, '—');
 });
 
+// ---------------------------------------------------------------- 设置页 ----
+
+test('settings: client identity can be checked and saved with Beijing check time', async () => {
+  const { host, sections, api } = boot('sec-settings.js', 'sec-settings', (p) => {
+    if (p === '/config/client-identity') return { upstreamEndpoint: 'ide', kiroVersion: '1.0.0', kiroCliVersion: '3.3.0' };
+    if (p === '/config/client-identity/check') return { kiroVersion: '1.0.0', kiroCliVersion: '3.3.0', latestIdeVersion: '1.4.178', latestCliVersion: '3.3.0', checkedAt: '2026-01-01T12:00:00+08:00' };
+    return {};
+  });
+  sections.settings.init(); sections.settings.onShow();
+  assert.ok(await waitFor(() => host.textContent.includes('identity.title')));
+  const card = host.querySelectorAll('.card').find((n) => n.textContent.includes('identity.title'));
+  assert.ok(await waitFor(() => card.querySelectorAll('input')[0].value === '1.0.0'));
+  const buttons = card.querySelectorAll('button');
+  buttons[0].click();
+  assert.ok(await waitFor(() => card.textContent.includes('1.4.178')));
+  assert.match(card.textContent, /2026-01-01T12:00:00\+08:00/);
+  card.querySelector('select').value = 'cli';
+  buttons[1].click();
+  assert.ok(await waitFor(() => api._stats.puts.length > 0));
+  // 只提交改过的字段,别把未改的值写回去。
+  assert.deepEqual(api._stats.puts[0], { path: '/config/client-identity', body: { upstreamEndpoint: 'cli' } });
+});
+
+test('settings: client identity form edits the saved (pending-restart) values, not the running ones', async () => {
+  const { host, sections, api } = boot('sec-settings.js', 'sec-settings', (p) => {
+    if (p === '/config/client-identity') return {
+      upstreamEndpoint: 'ide', kiroVersion: '1.4.178', kiroCliVersion: '3.3.0',
+      saved: { upstreamEndpoint: 'cli', kiroVersion: '1.4.178', kiroCliVersion: '3.3.0' },
+      restartRequired: true,
+    };
+    return {};
+  });
+  sections.settings.init(); sections.settings.onShow();
+  assert.ok(await waitFor(() => host.textContent.includes('identity.title')));
+  const card = host.querySelectorAll('.card').find((n) => n.textContent.includes('identity.title'));
+  assert.ok(await waitFor(() => card.querySelector('select').value === 'cli'));
+  assert.match(card.textContent, /identity\.pending/);
+  // 只改 CLI 版本 → 只提交它,不会把运行中的 ide 写回去覆盖已保存的 cli。
+  card.querySelectorAll('input')[1].value = '3.4.0';
+  card.querySelectorAll('button')[1].click();
+  assert.ok(await waitFor(() => api._stats.puts.length > 0));
+  assert.deepEqual(api._stats.puts[0], { path: '/config/client-identity', body: { kiroCliVersion: '3.4.0' } });
+});
+
 // ---------------------------------------------------------------- 模型测试 ----
 
 test('modeltest: 只配了主 API Key 时,发完一条消息密钥下拉框不能被锁死', async () => {

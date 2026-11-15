@@ -3544,6 +3544,18 @@ mod tests {
     }
 
     #[test]
+    fn cli_initial_response_is_not_content_or_error_and_uppercase_end_turn_is_not_refusal() {
+        let initial = event_frame("initial-response", r#"{"conversationId":""}"#);
+        assert!(frame_text_delta(&initial).is_none());
+        assert!(tool_use_frame(&initial).is_none());
+        assert!(frame_exception(&initial).is_none());
+        assert!(frame_refusal(&initial).is_none());
+        let metadata = event_frame("metadataEvent", r#"{"stopReason":"END_TURN"}"#);
+        assert!(frame_refusal(&metadata).is_none());
+        assert!(frame_exception(&metadata).is_none());
+    }
+
+    #[test]
     fn frame_exception_none_for_non_exception_frames() {
         assert_eq!(
             frame_exception(&event_frame(

@@ -358,6 +358,7 @@ mod tests {
         let cred = redeem(&client, &s.uri(), &s.uri(), "us-east-1", "bearer-xyz")
             .await
             .unwrap();
+        assert_eq!(cred.provider, crate::kiro::credential::Provider::BuilderId);
         assert_eq!(cred.access_token, "atok");
         assert_eq!(cred.region, "us-east-1");
         // 客户端凭据经 builderid::poll 一路带出(auth=Idc 首刷依赖)。
@@ -407,6 +408,7 @@ mod tests {
         let cred = redeem(&client, &s.uri(), &s.uri(), "us-east-1", "bearer-xyz")
             .await
             .unwrap();
+        assert_eq!(cred.provider, crate::kiro::credential::Provider::BuilderId);
         assert_eq!(cred.access_token, "atok");
         assert_eq!(cred.refresh_token, "rtok");
     }

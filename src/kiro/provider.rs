@@ -16,6 +16,8 @@ pub struct Impersonation {
     pub system_version: String,
     /// user-agent 里的 `md/nodejs#{node_version}`(如 `22.22.0`)。
     pub node_version: String,
+    pub endpoint: String,
+    pub cli_version: String,
 }
 
 /// 伪装用的进程级静态配置(kiro/系统/node 版本 + 全局 machineId)。
@@ -91,6 +93,8 @@ impl Impersonation {
             agent_mode: "vibe".to_string(),
             system_version: d.system_version,
             node_version: d.node_version,
+            endpoint: "ide".into(),
+            cli_version: "3.3.0".into(),
         }
     }
 
@@ -116,6 +120,12 @@ impl Impersonation {
             agent_mode: "vibe".to_string(),
             system_version: cfg.system_version.clone(),
             node_version: cfg.node_version.clone(),
+            endpoint: cred
+                .endpoint
+                .as_deref()
+                .unwrap_or(&cfg.upstream_endpoint)
+                .to_string(),
+            cli_version: cfg.kiro_cli_version.clone(),
         }
     }
 }
@@ -186,6 +196,17 @@ pub fn build_headers(
     ep: &Endpoint,
     invocation_id: &str,
 ) -> HeaderMap {
+    if imp.endpoint == "cli" {
+        return cli_headers(
+            cred,
+            imp,
+            &ep.url,
+            ep.target
+                .unwrap_or("AmazonCodeWhispererStreamingService.GenerateAssistantResponse"),
+            "codewhispererstreaming/0.1.19636",
+            true,
+        );
+    }
     // **插入顺序即线上顺序**(HeaderMap 按插入序迭代),故这里的次序不是风格问题。
     //
     // HTTP 头顺序是与 TLS 指纹并列的一个标准识别维度:同一个客户端库发出的头次序是固定的。
@@ -215,7 +236,7 @@ pub fn build_headers(
         h.insert(
             name,
             hv(&format!(
-                "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
+                "aws-sdk-js/1.0.44 KiroIDE-{}-{}",
                 imp.kiro_version, imp.machine_id
             )),
         );
@@ -223,7 +244,7 @@ pub fn build_headers(
     h.insert(
         reqwest::header::USER_AGENT,
         hv(&format!(
-            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
+            "aws-sdk-js/1.0.44 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.44 m/E KiroIDE-{}-{}",
             imp.system_version, imp.node_version, imp.kiro_version, imp.machine_id
         )),
     );
@@ -251,6 +272,87 @@ pub fn build_headers(
     h
 }
 
+/// CLI 的 Rust SDK 身份:服务版本和 app 标识依据①,头部结构依据②③。
+pub fn cli_headers(
+    cred: &Credential,
+    imp: &Impersonation,
+    url: &str,
+    target: &str,
+    service: &str,
+    optout: bool,
+) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    h.insert(
+        "content-type",
+        HeaderValue::from_static("application/x-amz-json-1.0"),
+    );
+    h.insert("connection", HeaderValue::from_static("close"));
+    let ua = format!(
+        "aws-sdk-rust/1.6.0 ua/2.1 api/{service} os/linux lang/rust/1.94.1 md/appVersion-{} app/AmazonQ-For-CLI",
+        imp.cli_version
+    );
+    h.insert(reqwest::header::USER_AGENT, hv(&ua));
+    // 官方 3.3.0 抓包:`x-amz-user-agent` 与 UA 同值(依据①+实测)。
+    if let Ok(name) = HeaderName::from_bytes(b"x-amz-user-agent") {
+        h.insert(name, hv(&ua));
+    }
+    if let Some(host) = host_of(url) {
+        h.insert("host", hv(&host));
+    }
+    h.insert("amz-sdk-invocation-id", hv(&new_invocation_id()));
+    // Rust SDK 标准重试档默认最多 3 次;官方 CLI 另有 `AttemptHeaderInterceptor`
+    // 加 `x-amzn-kiro-attempt`(依据①+抓包,取值 `1;max=3`)。
+    h.insert(
+        "amz-sdk-request",
+        HeaderValue::from_static("attempt=1; max=3"),
+    );
+    h.insert("x-amzn-kiro-attempt", HeaderValue::from_static("1;max=3"));
+    h.insert("authorization", hv(&format!("Bearer {}", cred.bearer())));
+    if cred.is_api_key() {
+        h.insert("tokentype", HeaderValue::from_static("API_KEY"));
+    }
+    h.insert("x-amz-target", hv(target));
+    if optout {
+        h.insert(
+            "x-amzn-codewhisperer-optout",
+            HeaderValue::from_static("true"),
+        );
+    }
+    h
+}
+
+/// CLI 对话中的 origin 和续写字段(依据③)。
+fn cli_body(body: &[u8]) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.to_vec();
+    };
+    if let Some(state) = value
+        .get_mut("conversationState")
+        .and_then(|v| v.as_object_mut())
+    {
+        state.remove("agentContinuationId");
+        state.remove("agentTaskType");
+        state.insert("chatTriggerType".into(), "MANUAL".into());
+        fn update(message: &mut serde_json::Value) {
+            if let Some(user) = message
+                .get_mut("userInputMessage")
+                .and_then(|v| v.as_object_mut())
+            {
+                user.insert("origin".into(), "KIRO_CLI".into());
+            }
+        }
+        if let Some(message) = state.get_mut("currentMessage") {
+            update(message);
+        }
+        if let Some(history) = state.get_mut("history").and_then(|v| v.as_array_mut()) {
+            for message in history {
+                update(message);
+            }
+        }
+    }
+    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+}
+
 /// 向单个端点发一次请求。成功返回原始 Response(流由上层解析);非 2xx → Err。
 pub async fn call(
     client: &reqwest::Client,
@@ -263,7 +365,11 @@ pub async fn call(
     let resp = client
         .post(&ep.url)
         .headers(build_headers(cred, imp, ep, &inv))
-        .body(body.to_vec())
+        .body(if imp.endpoint == "cli" {
+            cli_body(body)
+        } else {
+            body.to_vec()
+        })
         .send()
         .await
         .map_err(|_| LoginError::Http)?;
@@ -296,7 +402,10 @@ fn signal_strength(kind: FailureKind) -> u8 {
         FailureKind::AuthAmbiguous => 1,
         FailureKind::Quota => 2,
         // 模型不可用与确定性请求错误同为"机器稳定信号":都不该被后续端点的传输错误盖掉。
-        FailureKind::AuthInvalid | FailureKind::InvalidRequest | FailureKind::ModelUnavailable => 3,
+        FailureKind::AuthInvalid
+        | FailureKind::InvalidRequest
+        | FailureKind::ModelUnavailable
+        | FailureKind::AccountConfig => 3,
     }
 }
 
@@ -347,7 +456,11 @@ async fn try_endpoints(
         match client
             .post(&ep.url)
             .headers(build_headers(cred, imp, ep, &inv))
-            .body(body.to_vec())
+            .body(if imp.endpoint == "cli" {
+                cli_body(body)
+            } else {
+                body.to_vec()
+            })
             .send()
             .await
         {
@@ -421,7 +534,11 @@ pub async fn call_with_fallback(
     body: &[u8],
     now_unix: u64,
 ) -> Result<reqwest::Response, (LoginError, FailureKind)> {
-    let eps = sorted(region, preferred, fallback);
+    let eps = if imp.endpoint == "cli" {
+        vec![crate::kiro::endpoint::cli(region)]
+    } else {
+        sorted(region, preferred, fallback)
+    };
     match try_endpoints(client, &eps, cred, imp, body).await {
         Ok(r) => {
             pool.report_success(&cred.id);
@@ -454,7 +571,11 @@ pub async fn call_with_fallback_no_report(
     imp: &Impersonation,
     body: &[u8],
 ) -> Result<reqwest::Response, DataPlaneFailure> {
-    let eps = sorted(region, preferred, fallback);
+    let eps = if imp.endpoint == "cli" {
+        vec![crate::kiro::endpoint::cli(region)]
+    } else {
+        sorted(region, preferred, fallback)
+    };
     try_endpoints(client, &eps, cred, imp, body).await
 }
 
@@ -545,6 +666,8 @@ mod tests {
     fn cred() -> Credential {
         Credential {
             quota_reset_unix: None,
+            endpoint: None,
+            provider: None,
             priority: 999,
             proxy_url: None,
             proxy_username: None,
@@ -575,7 +698,67 @@ mod tests {
             agent_mode: "vibe".into(),
             system_version: "win32#10.0.22631".into(),
             node_version: "22.22.0".into(),
+            endpoint: "ide".into(),
+            cli_version: "3.3.0".into(),
         }
+    }
+
+    #[test]
+    fn cli_request_uses_runtime_and_converts_all_user_origins() {
+        let ep = crate::kiro::endpoint::cli("eu-central-1");
+        assert_eq!(ep.url, "https://runtime.eu-central-1.kiro.dev/");
+        let input = br#"{"conversationState":{"currentMessage":{"userInputMessage":{"origin":"AI_EDITOR","content":"hi"}},"history":[{"userInputMessage":{"origin":"AI_EDITOR"}}]}}"#;
+        let out: serde_json::Value = serde_json::from_slice(&cli_body(input)).unwrap();
+        assert_eq!(
+            out["conversationState"]["currentMessage"]["userInputMessage"]["origin"],
+            "KIRO_CLI"
+        );
+        assert_eq!(
+            out["conversationState"]["history"][0]["userInputMessage"]["origin"],
+            "KIRO_CLI"
+        );
+    }
+
+    #[test]
+    fn credential_identity_override_takes_precedence() {
+        let mut c = cred();
+        let cfg = crate::config::Config {
+            upstream_endpoint: "cli".into(),
+            ..Default::default()
+        };
+        assert_eq!(Impersonation::for_credential(&c, &cfg).endpoint, "cli");
+        c.endpoint = Some("ide".into());
+        assert_eq!(Impersonation::for_credential(&c, &cfg).endpoint, "ide");
+        let data = serde_json::to_string(&c).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Credential>(&data)
+                .unwrap()
+                .endpoint
+                .as_deref(),
+            Some("ide")
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_data_call_sends_json_target_and_origin() {
+        use wiremock::matchers::{body_partial_json, header};
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/"))
+            .and(header("x-amz-target", "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"))
+            .and(header("content-type", "application/x-amz-json-1.0"))
+            .and(body_partial_json(serde_json::json!({"conversationState":{"currentMessage":{"userInputMessage":{"origin":"KIRO_CLI"}}}})))
+            .respond_with(ResponseTemplate::new(200)).expect(1).mount(&server).await;
+        let mut i = imp();
+        i.endpoint = "cli".into();
+        let ep = Endpoint {
+            url: format!("{}/", server.uri()),
+            origin: "KIRO_CLI",
+            target: Some("AmazonCodeWhispererStreamingService.GenerateAssistantResponse"),
+        };
+        let body = br#"{"conversationState":{"currentMessage":{"userInputMessage":{"origin":"AI_EDITOR"}}}}"#;
+        call(&reqwest::Client::new(), &ep, &cred(), &i, body)
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -607,7 +790,7 @@ mod tests {
         };
         let h = build_headers(&cred(), &imp(), &ep, "inv-1");
         let xamz_ua = h.get("x-amz-user-agent").unwrap().to_str().unwrap();
-        assert_eq!(xamz_ua, "aws-sdk-js/1.0.34 KiroIDE-0.0.1-mid");
+        assert_eq!(xamz_ua, "aws-sdk-js/1.0.44 KiroIDE-0.0.1-mid");
         let sdk_req = h.get("amz-sdk-request").unwrap().to_str().unwrap();
         assert_eq!(sdk_req, "attempt=1; max=3");
     }
@@ -621,9 +804,9 @@ mod tests {
         };
         let h = build_headers(&cred(), &imp(), &ep, "inv-1");
         let ua = h.get("user-agent").unwrap().to_str().unwrap();
-        assert!(ua.starts_with("aws-sdk-js/1.0.34 ua/2.1 os/win32#10.0.22631 lang/js"));
+        assert!(ua.starts_with("aws-sdk-js/1.0.44 ua/2.1 os/win32#10.0.22631 lang/js"));
         assert!(ua.contains("md/nodejs#22.22.0"));
-        assert!(ua.contains("api/codewhispererstreaming#1.0.34"));
+        assert!(ua.contains("api/codewhispererstreaming#1.0.44"));
         assert!(ua.contains("m/E KiroIDE-0.0.1-mid"));
     }
 
@@ -1070,9 +1253,9 @@ mod tests {
         };
         let h = build_headers(&cred(), &imp(), &ep, "inv");
         let ua = h.get("user-agent").unwrap().to_str().unwrap();
-        assert!(ua.contains("aws-sdk-js/1.0.34"), "UA 版本未对齐: {ua}");
+        assert!(ua.contains("aws-sdk-js/1.0.44"), "UA 版本未对齐: {ua}");
         assert!(
-            ua.contains("codewhispererstreaming#1.0.34"),
+            ua.contains("codewhispererstreaming#1.0.44"),
             "API 版本未对齐: {ua}"
         );
         assert!(!ua.contains("1.0.27"), "仍残留旧版本号: {ua}");

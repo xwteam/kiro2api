@@ -21,6 +21,16 @@ pub enum AuthMethod {
     ApiKey,
 }
 
+/// 登录来源与令牌刷新协议分开记录;旧 IdC 凭据不能据此猜成 Builder ID。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Provider {
+    Social,
+    BuilderId,
+    Idc,
+    ApiKey,
+}
+
 /// 优先级缺省值:所有导入的账号都是它。数字越小越优先,故 999 = 最低。
 pub const DEFAULT_PRIORITY: u32 = 999;
 
@@ -99,6 +109,8 @@ pub struct Credential {
     #[serde(rename = "authMethod")]
     pub auth: AuthMethod,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Provider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
@@ -163,6 +175,9 @@ pub struct Credential {
     /// 就该按时间记下来 —— 到点自动回池,不必手工重置,也不怕落盘把一个会自愈的账号写死。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_reset_unix: Option<u64>,
+    /// 凭据级上游身份覆盖。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 #[cfg(test)]
@@ -187,6 +202,8 @@ pub(crate) fn tests_support_cred() -> Credential {
         priority: DEFAULT_PRIORITY,
         status_reason: None,
         quota_reset_unix: None,
+        endpoint: None,
+        provider: None,
         proxy_url: None,
         proxy_username: None,
         proxy_password: None,
@@ -197,6 +214,17 @@ pub(crate) fn tests_support_cred() -> Credential {
 pub const PROXY_DIRECT: &str = "direct";
 
 impl Credential {
+    pub fn effective_provider(&self) -> Provider {
+        if self.is_api_key() {
+            return Provider::ApiKey;
+        }
+        self.provider.unwrap_or(match self.auth {
+            AuthMethod::Social => Provider::Social,
+            AuthMethod::Idc => Provider::Idc,
+            AuthMethod::ApiKey => Provider::ApiKey,
+        })
+    }
+
     /// 定出该账号实际使用的代理:**凭据级 > 全局 > 直连**;`"direct"` 显式直连。
     ///
     /// 返回的三元组直接用于构造客户端缓存的键,故这里把用户名/密码一并带出 —— 同一个
@@ -254,6 +282,36 @@ impl Credential {
     pub fn effective_weight(&self) -> u32 {
         self.weight.max(1)
     }
+}
+
+/// 官方社交登录的默认 profile;已有值不得覆盖。
+pub const SOCIAL_DEFAULT_PROFILE: &str =
+    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+/// 官方 Builder ID 默认 profile。
+pub const BUILDER_ID_DEFAULT_PROFILE: &str =
+    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+
+/// 兼容旧调用名;离线来源迁移统一经 fill_offline_profile。
+pub fn fill_social_profile(cred: &mut Credential) -> bool {
+    fill_offline_profile(cred)
+}
+
+/// 只补有可靠来源的默认值;未知来源的 IdC 必须在线查询。
+pub fn fill_offline_profile(cred: &mut Credential) -> bool {
+    if cred
+        .profile_arn
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return false;
+    }
+    let arn = match cred.effective_provider() {
+        Provider::Social => SOCIAL_DEFAULT_PROFILE,
+        Provider::BuilderId => BUILDER_ID_DEFAULT_PROFILE,
+        Provider::Idc | Provider::ApiKey => return false,
+    };
+    cred.profile_arn = Some(arn.into());
+    true
 }
 
 /// 读取 credentials.json(数组);文件不存在返回空。
@@ -633,6 +691,8 @@ mod tests {
     fn sample() -> Credential {
         Credential {
             quota_reset_unix: None,
+            endpoint: None,
+            provider: None,
             priority: 999,
             proxy_url: None,
             proxy_username: None,
@@ -655,6 +715,48 @@ mod tests {
             disabled: false,
             status_reason: None,
         }
+    }
+
+    #[test]
+    fn legacy_credentials_infer_provider_without_guessing_builder_id() {
+        for (auth, expected) in [
+            (AuthMethod::Social, Provider::Social),
+            (AuthMethod::Idc, Provider::Idc),
+            (AuthMethod::ApiKey, Provider::ApiKey),
+        ] {
+            let mut c = tests_support_cred();
+            c.auth = auth;
+            let value = serde_json::to_value(&c).unwrap();
+            assert!(value.get("provider").is_none());
+            let loaded: Credential = serde_json::from_value(value).unwrap();
+            assert_eq!(loaded.effective_provider(), expected);
+        }
+        let mut c = tests_support_cred();
+        c.auth = AuthMethod::Idc;
+        c.provider = Some(Provider::BuilderId);
+        assert!(fill_offline_profile(&mut c));
+        assert_eq!(c.profile_arn.as_deref(), Some(BUILDER_ID_DEFAULT_PROFILE));
+        c.profile_arn = Some("admin".into());
+        assert!(!fill_offline_profile(&mut c));
+        let value = serde_json::to_value(&c).unwrap();
+        assert_eq!(value["provider"], "builder_id");
+        assert_eq!(serde_json::from_value::<Credential>(value).unwrap(), c);
+    }
+
+    #[test]
+    fn social_profile_default_preserves_existing_and_skips_idc_and_api_key() {
+        let mut social = sample();
+        assert!(fill_social_profile(&mut social));
+        assert_eq!(social.profile_arn.as_deref(), Some(SOCIAL_DEFAULT_PROFILE));
+        social.profile_arn = Some("existing".into());
+        assert!(!fill_social_profile(&mut social));
+        assert_eq!(social.profile_arn.as_deref(), Some("existing"));
+        let mut idc = sample();
+        idc.auth = AuthMethod::Idc;
+        assert!(!fill_social_profile(&mut idc));
+        let mut key = sample();
+        key.kiro_api_key = Some("ksk_test".into());
+        assert!(!fill_social_profile(&mut key));
     }
 
     #[test]

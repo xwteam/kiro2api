@@ -128,6 +128,43 @@ pub async fn fetch_at(
     cred: &Credential,
     imp: &Impersonation,
 ) -> Result<UsageLimitsResponse, BalanceError> {
+    if imp.endpoint == "cli" {
+        // 官方 CLI 3.3.0 抓包:控制面主机上 `POST /?origin=KIRO_CLI&isEmailRequired=false`,
+        // `x-amz-target` 仍是 CodeWhisperer 的 GetUsageLimits。实测(北京 11-15):OAuth 令牌必须在
+        // **请求体**里带 profileArn(放查询串或不带都回 400 `Invalid profileArn.`)。
+        let url = format!(
+            "{}/?origin=KIRO_CLI&isEmailRequired=false",
+            base.trim_end_matches('/')
+        );
+        let body = match cred.profile_arn.as_deref().filter(|s| !s.is_empty()) {
+            Some(arn) => serde_json::json!({ "profileArn": arn }),
+            None => serde_json::json!({}),
+        };
+        let headers = crate::kiro::provider::cli_headers(
+            cred,
+            imp,
+            &url,
+            "AmazonCodeWhispererService.GetUsageLimits",
+            "codewhispererruntime/0.1.19636",
+            false,
+        );
+        let resp = client
+            .post(&url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| BalanceError::Http)?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = crate::kiro::provider::read_body_capped(resp).await;
+            return Err(BalanceError::Upstream {
+                status,
+                message: extract_amz_message(&body),
+            });
+        }
+        return resp.json().await.map_err(|_| BalanceError::Decode);
+    }
     let url = build_url(base, cred.profile_arn.as_deref());
     let inv = new_invocation_id();
     let user_agent = format!(
@@ -184,8 +221,14 @@ pub async fn fetch_usage_limits(
     cfg: &crate::config::Config,
     cred: &Credential,
 ) -> Result<UsageLimitsResponse, BalanceError> {
-    let base = region_base(&crate::kiro::endpoint::effective_region(cred));
+    let region = crate::kiro::endpoint::effective_region(cred);
     let imp = impersonation_for(cred, cfg);
+    // CLI 身份的余额走新控制面主机(与模型目录同一台),IDE 身份照旧走 q 主机。
+    let base = if imp.endpoint == "cli" {
+        format!("https://management.{region}.kiro.dev")
+    } else {
+        region_base(&region)
+    };
     fetch_at(client, &base, cred, &imp).await
 }
 
@@ -260,9 +303,43 @@ mod tests {
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[tokio::test]
+    async fn cli_balance_sends_post_with_origin_and_target() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(query_param("origin", "KIRO_CLI"))
+            .and(query_param("isEmailRequired", "false"))
+            .and(header(
+                "x-amz-target",
+                "AmazonCodeWhispererService.GetUsageLimits",
+            ))
+            .and(header("x-amzn-kiro-attempt", "1;max=3"))
+            .and(body_partial_json(serde_json::json!({})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut i = imp();
+        i.endpoint = "cli".into();
+        fetch_at(&reqwest::Client::new(), &server.uri(), &cred(), &i)
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        // 测试凭据带 profileArn → 请求体只有它;没有 profileArn 时是空对象。
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        match cred().profile_arn {
+            Some(arn) => assert_eq!(body, serde_json::json!({ "profileArn": arn })),
+            None => assert_eq!(body, serde_json::json!({})),
+        }
+    }
+
     fn cred() -> Credential {
         Credential {
             quota_reset_unix: None,
+            endpoint: None,
+            provider: None,
             priority: 999,
             proxy_url: None,
             proxy_username: None,
@@ -293,6 +370,8 @@ mod tests {
             agent_mode: "vibe".into(),
             system_version: "win32#10.0.22631".into(),
             node_version: "22.22.0".into(),
+            endpoint: "ide".into(),
+            cli_version: "3.3.0".into(),
         }
     }
 

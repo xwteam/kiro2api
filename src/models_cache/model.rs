@@ -16,6 +16,8 @@ pub struct AvailableModelsResponse {
     /// 可用模型清单。
     #[serde(default)]
     pub models: Vec<UpstreamModel>,
+    #[serde(default)]
+    pub next_token: Option<String>,
 }
 
 /// 上游单个模型条目。

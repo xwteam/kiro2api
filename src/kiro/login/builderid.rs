@@ -177,6 +177,7 @@ pub async fn poll(
             ));
         }
         Ok(MintedCredential {
+            provider: crate::kiro::credential::Provider::BuilderId,
             // 官方客户端与参照实现均保存 accessToken。
             access_token: t.access_token,
             refresh_token: t.refresh_token,
@@ -283,6 +284,7 @@ mod tests {
         let p = start(&client, &server.uri()).await.unwrap();
         assert_eq!(p.user_code, "ABCD-1234");
         let cred = poll(&client, &server.uri(), "us-east-1", &p).await.unwrap();
+        assert_eq!(cred.provider, crate::kiro::credential::Provider::BuilderId);
         assert_eq!(cred.access_token, "atok");
         assert_eq!(cred.refresh_token, "rtok");
         assert_eq!(cred.region, "us-east-1");

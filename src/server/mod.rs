@@ -389,6 +389,8 @@ fn inject_configured_api_keys(
             disabled: false,
             status_reason: None,
             quota_reset_unix: None,
+            endpoint: None,
+            provider: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -463,7 +465,11 @@ pub fn build_router_with_persist_handles(
     }
     // 冻结出的 machineId 与新注入的账号都要写回,且**合并成一次写**:两件事各写一次的话,
     // 后一次会拿着自己那份快照把前一次的结果覆盖掉。
-    if (frozen > 0 || injected > 0)
+    let profiles_filled = creds
+        .iter_mut()
+        .map(|c| usize::from(credential::fill_social_profile(c)))
+        .sum::<usize>();
+    if (frozen > 0 || injected > 0 || profiles_filled > 0)
         && let Err(e) = credential::save(&cfg.credentials_path, &creds)
     {
         tracing::warn!(error = ?e, "凭据落盘失败:本次进程内的账号池仍是对的,但重启后冻结的 machineId 会重算、注入的账号会重新分配编号");
@@ -2190,6 +2196,8 @@ mod tests {
             disabled: false,
             status_reason: None,
             quota_reset_unix: None,
+            endpoint: None,
+            provider: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,

@@ -1,0 +1,14 @@
+POST /mcp HTTP/1.1
+content-type: application/json
+connection: close
+x-amz-user-agent: aws-sdk-js/1.0.44 KiroIDE-1.4.178-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+user-agent: aws-sdk-js/1.0.44 ua/2.1 os/win32#10.0.22631 lang/js md/nodejs#24.22.1 api/codewhispererstreaming#1.0.44 m/E KiroIDE-1.4.178-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+host: upstream.test
+amz-sdk-invocation-id: 00000000-0000-4000-8000-000000000000
+amz-sdk-request: attempt=1; max=3
+authorization: Bearer snapshot-access-token
+x-amzn-kiro-profile-arn: arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK
+accept: */*
+content-length: 153
+
+{"id":"00000000-0000-4000-8000-000000000000","jsonrpc":"2.0","method":"tools/call","params":{"name":"web_search","arguments":{"query":"snapshot query"}}}

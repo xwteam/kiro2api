@@ -1,0 +1,16 @@
+POST / HTTP/1.1
+content-type: application/x-amz-json-1.0
+connection: close
+user-agent: aws-sdk-rust/1.6.0 ua/2.1 api/codewhispererstreaming/0.1.19636 os/linux lang/rust/1.94.1 md/appVersion-3.3.0 app/AmazonQ-For-CLI
+x-amz-user-agent: aws-sdk-rust/1.6.0 ua/2.1 api/codewhispererstreaming/0.1.19636 os/linux lang/rust/1.94.1 md/appVersion-3.3.0 app/AmazonQ-For-CLI
+host: upstream.test
+amz-sdk-invocation-id: 00000000-0000-4000-8000-000000000000
+amz-sdk-request: attempt=1; max=3
+x-amzn-kiro-attempt: 1;max=3
+authorization: Bearer snapshot-access-token
+x-amz-target: AmazonCodeWhispererStreamingService.GenerateAssistantResponse
+x-amzn-codewhisperer-optout: true
+accept: */*
+content-length: 333
+
+{"conversationState":{"chatTriggerType":"MANUAL","conversationId":"00000000-0000-4000-8000-000000000000","currentMessage":{"userInputMessage":{"content":"Hello snapshot","modelId":"claude-sonnet-4.5","origin":"KIRO_CLI","userInputMessageContext":{}}}},"profileArn":"arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"}

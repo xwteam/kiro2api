@@ -239,6 +239,9 @@ pub enum RelayError {
     /// 该账号本计费周期额度已耗尽。与 [`ModelUnavailable`](Self::ModelUnavailable) 同属
     /// **账号级确定性**结论:换个账号就可能成,故不占"上游可能出问题了"那档的重试预算。
     QuotaExhausted,
+    /// **这个账号**的 profileArn 不被上游接受(缺失、无效、查不到)。账号级:换号再试,
+    /// 全池试尽才以 400 回给客户端,携带说明。
+    AccountConfig(String),
 }
 
 impl RelayError {
@@ -247,9 +250,9 @@ impl RelayError {
             RelayError::Convert(_) => StatusCode::BAD_REQUEST,
             RelayError::NoAccount => StatusCode::SERVICE_UNAVAILABLE,
             RelayError::Upstream(_) | RelayError::UpstreamTransient(_) => StatusCode::BAD_GATEWAY,
-            RelayError::InvalidRequest(_) | RelayError::ModelUnavailable(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            RelayError::InvalidRequest(_)
+            | RelayError::ModelUnavailable(_)
+            | RelayError::AccountConfig(_) => StatusCode::BAD_REQUEST,
             // 全池额度耗尽 → 429:这是"稍后再来",不是请求本身有问题。
             RelayError::QuotaExhausted => StatusCode::TOO_MANY_REQUESTS,
         }
@@ -260,9 +263,9 @@ impl RelayError {
             RelayError::Convert(_) => "invalid_request_error",
             RelayError::NoAccount => "overloaded_error",
             RelayError::Upstream(_) | RelayError::UpstreamTransient(_) => "api_error",
-            RelayError::InvalidRequest(_) | RelayError::ModelUnavailable(_) => {
-                "invalid_request_error"
-            }
+            RelayError::InvalidRequest(_)
+            | RelayError::ModelUnavailable(_)
+            | RelayError::AccountConfig(_) => "invalid_request_error",
             RelayError::QuotaExhausted => "rate_limit_error",
         }
     }
@@ -275,7 +278,7 @@ impl RelayError {
                 "upstream request failed".to_string()
             }
             // 清晰的不可用说明(确定性、可安全外露):把"该模型不可用、请换一个"透传给客户端。
-            RelayError::InvalidRequest(msg) => msg.clone(),
+            RelayError::InvalidRequest(msg) | RelayError::AccountConfig(msg) => msg.clone(),
             RelayError::QuotaExhausted => "All accounts in the pool have exhausted their quota \
                  for the current billing period. Add accounts, or wait for the quota to reset."
                 .to_string(),
@@ -437,6 +440,8 @@ async fn record_classified_failure(
         // 模型对该账号不可用:**不记失败日志**——账号没坏,只是档位不含这个模型。
         // 记进去会让面板上一个完全健康的账号显示成"有失败",运营者据此误判。
         FailureKind::ModelUnavailable => false,
+        // 账号配置不被接受同理:账号没坏,不记失败日志(错误日志另有 error 级记录)。
+        FailureKind::AccountConfig => false,
         FailureKind::Quota => {
             stats
                 .record_throttle(credential_id, "api", response_body, now_i64)
@@ -753,7 +758,7 @@ pub(crate) async fn report_stream_exception(
     // 账号都没坏。罚下去只会把一个个健康账号打成带伤,而每次重试都注定失败。
     if matches!(
         kind,
-        FailureKind::InvalidRequest | FailureKind::ModelUnavailable
+        FailureKind::InvalidRequest | FailureKind::ModelUnavailable | FailureKind::AccountConfig
     ) {
         let logged = if matches!(status, 401 | 403 | 429) {
             record_classified_failure(&state.stats, credential_id, kind, status, &body, now_unix)
@@ -946,6 +951,8 @@ async fn select_and_call_verified(
                                 deterministic_skips += 1;
                             }
                             FailureKind::Quota => deterministic_skips += 1,
+                            // 这个账号的 profileArn 不被接受:换个配置正确的账号再试,不写模型记忆。
+                            FailureKind::AccountConfig => deterministic_skips += 1,
                             // 瞬态:换号前退避一下,免得把上游的抖动放大成尖峰。
                             FailureKind::Transient => {
                                 if tried_ids.len() < max_attempts {
@@ -1001,7 +1008,12 @@ async fn select_and_call_verified(
             //
             // 记下这个账号并继续;若全池试尽仍不行,循环外会把这个错误原样返回,
             // 客户端得到的是一句说得清的 400(见 `RelayError::ModelUnavailable` 的文案)。
-            Err((e @ (RelayError::ModelUnavailable(_) | RelayError::QuotaExhausted), tried_id)) => {
+            Err((
+                e @ (RelayError::ModelUnavailable(_)
+                | RelayError::QuotaExhausted
+                | RelayError::AccountConfig(_)),
+                tried_id,
+            )) => {
                 if let Some(id) = tried_id {
                     tried_ids.insert(id);
                 }
@@ -1115,6 +1127,29 @@ pub(crate) async fn select_and_call_once(
         })?;
         pool = state.pool.lock().await;
     }
+    // profile 解析必须先于转换(转换将 ARN 写入请求体),网络期间不持池锁。
+    drop(pool);
+    cred = crate::kiro::profiles::ensure_profile(
+        &state.pool,
+        &cred.id,
+        &crate::http::unary_for(&cred),
+        &state.cfg,
+        now_unix,
+        Some(&state.refresh_ctx),
+    )
+    .await
+    .map_err(|e| {
+        let err = if e.kind == FailureKind::AccountConfig {
+            RelayError::AccountConfig(e.message)
+        } else if e.kind == FailureKind::InvalidRequest {
+            RelayError::InvalidRequest(e.message)
+        } else if e.kind == FailureKind::Transient {
+            RelayError::UpstreamTransient(e.message)
+        } else {
+            RelayError::Upstream(e.message)
+        };
+        (err, Some(tried_id.clone()))
+    })?;
     let credential_id = credential_id_num(&cred.id);
 
     // 3) 转换请求体(未映射模型/空消息 → 400)。Convert 为请求级致命错误,不触发跨账号重试。
@@ -1135,7 +1170,6 @@ pub(crate) async fn select_and_call_once(
     //    这里先释放池锁:数据面调用**不持锁**发出(force_refresh 内部要重取池锁,持锁会死锁),
     //    调用返回后再短暂重取锁反馈成败。
     let imp = Impersonation::for_credential(&cred, &state.cfg);
-    drop(pool);
 
     // 一次数据面尝试:成功→Ok(Response);失败→Err((kind, status))。**不反馈池**,由本函数
     // 在决定是否重试后统一反馈,避免首个 Auth 失败就把可刷新自愈的好账号立即禁用。
@@ -1218,6 +1252,14 @@ pub(crate) async fn select_and_call_once(
             RelayError::ModelUnavailable(req.model.clone()),
             Some(tried_id),
         ));
+    }
+    // 这个账号的 profileArn 不被接受:同为账号级,不罚号、交给上层换号。
+    if let Err((FailureKind::AccountConfig, _, body)) = &outcome {
+        let msg = crate::kiro::pool::client_config_error(body).unwrap_or(
+            "Upstream rejected profileArn: configure a valid profileArn for this account.",
+        );
+        tracing::error!(account_id = %tried_id, event = "account_profile_rejected", "{msg}");
+        return Err((RelayError::AccountConfig(msg.to_string()), Some(tried_id)));
     }
 
     // 6) 失败则反馈池(短暂持锁)。分类失败随后在池锁释放外落统计。
@@ -1356,6 +1398,7 @@ async fn call_data_plane(
                 FailureKind::InvalidRequest => 400u16,
                 // 模型对该账号不可用:上游给的就是 400,但语义是"换个账号可能行"。
                 FailureKind::ModelUnavailable => 400u16,
+                FailureKind::AccountConfig => 400u16,
             };
             (f.kind, status, f.body)
         }),
@@ -2252,6 +2295,25 @@ async fn handle_web_search(
         Err(e) => return RelayError::Upstream(format!("ensure_fresh: {e}")).into_response(),
     };
 
+    let cred = match crate::kiro::profiles::ensure_profile(
+        &state.pool,
+        &cred_id,
+        &crate::http::unary_for(&cred),
+        &state.cfg,
+        now_unix,
+        Some(&state.refresh_ctx),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) if e.kind == FailureKind::InvalidRequest => {
+            return RelayError::InvalidRequest(e.message).into_response();
+        }
+        Err(e) if e.kind == FailureKind::AccountConfig => {
+            return RelayError::AccountConfig(e.message).into_response();
+        }
+        Err(e) => return RelayError::Upstream(e.message).into_response(),
+    };
     let imp = Impersonation::for_credential(&cred, &state.cfg);
     let outcome = ws::search(
         &crate::http::unary_for(&cred),
@@ -2274,6 +2336,19 @@ async fn handle_web_search(
             None
         }
         Err(ws::SearchError::Call(e)) => {
+            // 客户端版本被停用、profileArn 不被接受:这是配置问题,不是"没搜到"。
+            // 合成一个空结果会让人以为搜索正常只是没命中,真实原因被埋掉;也别罚账号。
+            if let LoginError::UpstreamHttp { status, body } = e
+                && let Some(msg) = crate::kiro::pool::client_config_error(body)
+            {
+                let kind = classify_with_body(*status, body);
+                tracing::error!(account_id = credential_id, kind = ?kind, "联网搜索被上游按配置拒绝: {msg}");
+                return match kind {
+                    FailureKind::AccountConfig => RelayError::AccountConfig(msg.to_string()),
+                    _ => RelayError::InvalidRequest(msg.to_string()),
+                }
+                .into_response();
+            }
             report_mcp_failure(state, &cred_id, credential_id, e, now_unix).await;
             None
         }
@@ -2819,6 +2894,8 @@ mod tests {
     fn cred() -> Credential {
         Credential {
             quota_reset_unix: None,
+            endpoint: None,
+            provider: None,
             priority: 999,
             proxy_url: None,
             proxy_username: None,
@@ -5391,6 +5468,131 @@ mod tests {
             s.contains("event: content_block_stop"),
             "已打开的块应先收尾;实际:\n{s}"
         );
+    }
+
+    #[tokio::test]
+    async fn initial_response_before_throttling_retries_another_account() {
+        let server = MockServer::start().await;
+        let mut rejected = event_frame("initial-response", br#"{"conversationId":""}"#);
+        rejected.extend(event_frame(
+            "throttlingError",
+            br#"{"message":"slow down"}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(rejected))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(event_frame(
+                "assistantResponseEvent",
+                br#"{"content":"pong"}"#,
+            )))
+            .with_priority(5)
+            .mount(&server)
+            .await;
+        let st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+        let pool = st.pool.clone();
+        let (status, bytes) = post_messages(
+            messages_router(st),
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&bytes).contains("pong"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        let stats = pool.lock().await.stats(1000);
+        assert_eq!(stats.iter().map(|s| s.failures).sum::<u64>(), 1);
+        assert_eq!(stats.iter().map(|s| s.successes).sum::<u64>(), 1);
+    }
+
+    #[tokio::test]
+    async fn deterministic_configuration_errors_do_not_retry_or_penalize_accounts() {
+        // 版本被停用:全局错误,只打一次上游就回 400。
+        // profileArn 不被接受:账号级,两个账号都试过(各一次)才回 400。两种都不罚号。
+        for (message, expected, calls) in [
+            (
+                "This version of Kiro is no longer supported. Please update to the latest version of Kiro to continue.",
+                "version",
+                1,
+            ),
+            ("profileArn is required", "profileArn", 2),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/generateAssistantResponse"))
+                .respond_with(
+                    ResponseTemplate::new(400)
+                        .set_body_json(serde_json::json!({"message":message})),
+                )
+                .mount(&server)
+                .await;
+            let st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+            let pool = st.pool.clone();
+            let before = pool.lock().await.stats(1000);
+            let (status, body) = post_messages(
+                messages_router(st),
+                r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                String::from_utf8_lossy(&body)
+                    .to_lowercase()
+                    .contains(&expected.to_lowercase())
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), calls);
+            let after = pool.lock().await.stats(1000);
+            for (old, new) in before.iter().zip(&after) {
+                assert_eq!(new.failures, old.failures);
+                assert_eq!(new.disabled, old.disabled);
+                assert_eq!(new.cooldown_until, old.cooldown_until);
+                assert_eq!(new.strikes, old.strikes);
+                assert_eq!(new.status_reason, old.status_reason);
+            }
+        }
+    }
+
+    /// 一个账号的 profileArn 不被接受,不影响别的账号:换号成功,前一个账号不受罚。
+    #[tokio::test]
+    async fn profile_rejection_on_one_account_switches_to_another() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"message":"Invalid profileArn."})),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(event_frame(
+                "assistantResponseEvent",
+                br#"{"content":"ok"}"#,
+            )))
+            .mount(&server)
+            .await;
+        let st = state(&server.uri(), vec![cred_id("1"), cred_id("2")]);
+        let pool = st.pool.clone();
+        let (status, body) = post_messages(
+            messages_router(st),
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert!(String::from_utf8_lossy(&body).contains("ok"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        for stat in pool.lock().await.stats(1000) {
+            assert_eq!(stat.failures, 0);
+            assert!(!stat.disabled);
+            assert_eq!(stat.cooldown_until, 0);
+        }
     }
 
     #[tokio::test]

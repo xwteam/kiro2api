@@ -738,6 +738,265 @@ pub async fn config_view(State(state): State<MessagesState>) -> Json<AdminConfig
 // (set_mode / set_max_rpm)并原子落盘 config.json。GET 侧对 key 做脱敏,绝不出明文。
 // ==========================================================================
 
+fn valid_client_version(value: &str) -> bool {
+    let parts: Vec<_> = value.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetClientIdentityRequest {
+    kiro_version: Option<String>,
+    kiro_cli_version: Option<String>,
+    upstream_endpoint: Option<String>,
+}
+
+/// 磁盘上**已保存**(重启后才生效)的客户端身份。配置文件里没写的键取默认值 —— 重启后
+/// 实际生效的就是它。读不到文件时回落到运行中的值。
+fn saved_client_identity(state: &MessagesState) -> serde_json::Value {
+    let path = state.runtime_cfg.read().config_path.clone();
+    let doc: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let defaults = crate::config::Config::default();
+    let pick = |key: &str, default: &str| -> String {
+        doc.get(key)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .unwrap_or(default)
+            .to_string()
+    };
+    if doc.is_null() {
+        let cfg = &state.cfg;
+        return json!({"kiroVersion":cfg.kiro_version,"kiroCliVersion":cfg.kiro_cli_version,"upstreamEndpoint":cfg.upstream_endpoint});
+    }
+    json!({
+        "kiroVersion": pick("kiroVersion", &defaults.kiro_version),
+        "kiroCliVersion": pick("kiroCliVersion", &defaults.kiro_cli_version),
+        "upstreamEndpoint": pick("upstreamEndpoint", &defaults.upstream_endpoint),
+    })
+}
+
+/// 运行中的值 + 已保存待重启的值。面板编辑的是后者:保存后、重启前再打开面板,看到的
+/// 仍是刚保存的选择,不会被运行中的旧值覆盖回去。
+fn client_identity_view(state: &MessagesState) -> serde_json::Value {
+    let cfg = &state.cfg;
+    let saved = saved_client_identity(state);
+    let running = json!({"kiroVersion":cfg.kiro_version,"kiroCliVersion":cfg.kiro_cli_version,"upstreamEndpoint":cfg.upstream_endpoint});
+    let restart_required = saved != running;
+    json!({
+        "kiroVersion": cfg.kiro_version,
+        "kiroCliVersion": cfg.kiro_cli_version,
+        "upstreamEndpoint": cfg.upstream_endpoint,
+        "saved": saved,
+        "restartRequired": restart_required,
+        "lastUnsupportedVersionAt": crate::kiro::pool::last_unsupported_version(),
+    })
+}
+
+pub async fn get_client_identity(State(state): State<MessagesState>) -> Json<serde_json::Value> {
+    Json(client_identity_view(&state))
+}
+
+pub async fn set_client_identity(
+    State(state): State<MessagesState>,
+    Json(input): Json<SetClientIdentityRequest>,
+) -> Response {
+    if input
+        .kiro_version
+        .as_deref()
+        .is_some_and(|s| !valid_client_version(s))
+        || input
+            .kiro_cli_version
+            .as_deref()
+            .is_some_and(|s| !valid_client_version(s))
+        || input
+            .upstream_endpoint
+            .as_deref()
+            .is_some_and(|s| !matches!(s, "ide" | "cli"))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"invalid client identity"})),
+        )
+            .into_response();
+    }
+    // 同运行期设置使用同一把锁,避免并发写回时丢失其它字段或密钥。
+    let rc = state.runtime_cfg.write();
+    let path = std::path::Path::new(&rc.config_path);
+    let mut doc: serde_json::Value = match std::fs::read_to_string(path) {
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error":"invalid config file"})),
+                )
+                    .into_response();
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"config read failed"})),
+            )
+                .into_response();
+        }
+    };
+    let Some(obj) = doc.as_object_mut() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"invalid config file"})),
+        )
+            .into_response();
+    };
+    if let Some(v) = input.kiro_version {
+        obj.insert("kiroVersion".into(), v.into());
+    }
+    if let Some(v) = input.kiro_cli_version {
+        obj.insert("kiroCliVersion".into(), v.into());
+    }
+    if let Some(v) = input.upstream_endpoint {
+        obj.insert("upstreamEndpoint".into(), v.into());
+    }
+    let persisted = serde_json::to_vec_pretty(&doc)
+        .ok()
+        .and_then(|data| crate::stats::persist::write_bytes_atomic(path, &data).ok());
+    if persisted.is_none() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"persist failed"})),
+        )
+            .into_response();
+    }
+    drop(rc);
+    Json(client_identity_view(&state)).into_response()
+}
+
+async fn fetch_official_version(
+    client: &reqwest::Client,
+    url: &str,
+    field: &str,
+) -> Result<String, String> {
+    let mut response = client
+        .get(url)
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                "official request timed out"
+            } else {
+                "official request failed"
+            }
+            .to_string()
+        })?;
+    if !response.status().is_success() {
+        return Err(format!("official HTTP {}", response.status()));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "official response read failed".to_string())?
+    {
+        if bytes.len() + chunk.len() > 1024 * 1024 {
+            return Err("official response too large".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| "invalid official JSON".to_string())?;
+    let version = value
+        .get(field)
+        .and_then(|v| v.as_str())
+        .filter(|v| valid_client_version(v))
+        .ok_or_else(|| "invalid official version".to_string())?;
+    Ok(version.to_string())
+}
+
+pub async fn check_client_identity(State(state): State<MessagesState>) -> Response {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(8));
+    if let Some(proxy) = state
+        .cfg
+        .proxy_url
+        .as_deref()
+        .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("direct"))
+    {
+        match reqwest::Proxy::all(proxy) {
+            Ok(p) => builder = builder.proxy(p),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error":"invalid proxy"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let client = match builder.build() {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error":"client initialization failed"})),
+            )
+                .into_response();
+        }
+    };
+    // CLI 的版本清单有两个同内容的官方来源(官方 CLI 自己的更新检查用后一个),前者失败再试后者。
+    let cli_version = async {
+        match fetch_official_version(
+            &client,
+            "https://prod.download.cli.kiro.dev/stable/latest/manifest.json",
+            "version",
+        )
+        .await
+        {
+            Ok(v) => Ok(v),
+            Err(_) => {
+                fetch_official_version(
+                    &client,
+                    "https://desktop-release.q.us-east-1.amazonaws.com/latest/manifest.json",
+                    "version",
+                )
+                .await
+            }
+        }
+    };
+    let (ide, cli) = tokio::join!(
+        fetch_official_version(
+            &client,
+            "https://prod.download.desktop.kiro.dev/stable/metadata-linux-x64-stable.json",
+            "currentRelease"
+        ),
+        cli_version
+    );
+    match (ide, cli) {
+        (Ok(ide), Ok(cli)) => {
+            let mut view = client_identity_view(&state);
+            view["latestIdeVersion"] = ide.into();
+            view["latestCliVersion"] = cli.into();
+            view["checkedAt"] = chrono::Utc::now()
+                .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid offset"))
+                .to_rfc3339()
+                .into();
+            view["checkedAtTimezone"] = "Asia/Shanghai".into();
+            Json(view).into_response()
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            (StatusCode::BAD_GATEWAY, Json(json!({"error":error}))).into_response()
+        }
+    }
+}
+
 /// key 脱敏:保留前半段可见,其余以 `***` 收尾;空串原样返回空串。
 /// 前端设置面板仅用于状态展示(“已设置某值”),不做复制;故半可见即可。
 fn mask_key(key: &str) -> String {
@@ -801,8 +1060,8 @@ pub async fn set_load_balancing(
     }
 
     // 原子落盘。
-    let snapshot = state.runtime_cfg.read().clone();
-    if let Err(e) = snapshot.persist() {
+    let persist_result = state.runtime_cfg.write().persist();
+    if let Err(e) = persist_result {
         tracing::error!("持久化负载均衡模式失败: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -888,8 +1147,8 @@ pub async fn set_auth_keys(
     }
 
     // 原子落盘。
-    let snapshot = state.runtime_cfg.read().clone();
-    if let Err(e) = snapshot.persist() {
+    let persist_result = state.runtime_cfg.write().persist();
+    if let Err(e) = persist_result {
         tracing::error!("持久化 auth key 失败: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -954,7 +1213,11 @@ pub async fn server_info(State(state): State<MessagesState>) -> Json<ServerInfoR
     Json(ServerInfoResponse {
         master_api_key,
         version: env!("CARGO_PKG_VERSION").to_string(),
-        kiro_version: state.cfg.kiro_version.clone(),
+        kiro_version: if state.cfg.upstream_endpoint == "cli" {
+            state.cfg.kiro_cli_version.clone()
+        } else {
+            state.cfg.kiro_version.clone()
+        },
         rust_version: env!("KIRO_RUST_VERSION").to_string(),
         server_time: now_str,
         server_time_unix: now_unix_secs,
@@ -2478,6 +2741,8 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub auth_method: Option<String>,
     #[serde(default)]
+    pub provider: Option<crate::kiro::credential::Provider>,
+    #[serde(default)]
     pub email: Option<String>,
     #[serde(default)]
     pub nickname: Option<String>,
@@ -2528,6 +2793,8 @@ pub struct UpdateCredentialRequest {
     pub refresh_token: Option<String>,
     #[serde(default)]
     pub auth_method: Option<String>,
+    #[serde(default)]
+    pub provider: Option<crate::kiro::credential::Provider>,
     #[serde(default)]
     pub email: Option<String>,
     #[serde(default)]
@@ -2703,6 +2970,8 @@ pub async fn add_credential(
 
     let cred = Credential {
         quota_reset_unix: None,
+        endpoint: None,
+        provider: req.provider,
         id: String::new(), // 池分配
         access_token: String::new(),
         refresh_token: req.refresh_token,
@@ -2776,6 +3045,7 @@ pub async fn update_credential(
     let upd = CredentialUpdate {
         refresh_token: req.refresh_token.filter(|s| !s.is_empty()),
         auth,
+        provider: req.provider,
         email: req.email.filter(|s| !s.is_empty()),
         nickname: req.nickname.filter(|s| !s.is_empty()),
         client_id: req.client_id.filter(|s| !s.is_empty()),
@@ -2976,6 +3246,8 @@ pub async fn refresh_credential_token(
 /// 批量导入的单条规整结果(内部用):从任意受支持形态抽出的凭据字段。
 struct NormalizedImportItem {
     refresh_token: String,
+    provider: Option<crate::kiro::credential::Provider>,
+    profile_arn: Option<String>,
     email: Option<String>,
     nickname: Option<String>,
     client_id: Option<String>,
@@ -3013,6 +3285,9 @@ fn normalize_import_object(
 
     Some(NormalizedImportItem {
         refresh_token,
+        provider: pick("provider")
+            .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok()),
+        profile_arn: pick("profileArn"),
         email: s(obj, "email").or_else(|| s(obj, "nickname")),
         nickname: s(obj, "nickname"),
         client_id: pick("clientId"),
@@ -3191,16 +3466,18 @@ pub async fn import_credentials_batch(
 
         let cred = Credential {
             quota_reset_unix: None,
+            endpoint: None,
             priority: crate::kiro::credential::DEFAULT_PRIORITY,
             id: String::new(),
             access_token: String::new(),
             refresh_token: item.refresh_token,
+            provider: item.provider,
+            profile_arn: item.profile_arn,
             expires_at_unix: 0,
             region,
             auth,
             client_id: item.client_id,
             client_secret: item.client_secret,
-            profile_arn: None,
             machine_id,
             email: item.email.clone(),
             nickname: item.nickname,
@@ -3300,6 +3577,7 @@ fn minted_to_credential(m: MintedCredential, now: u64) -> Credential {
     };
     Credential {
         quota_reset_unix: None,
+        endpoint: None,
         priority: crate::kiro::credential::DEFAULT_PRIORITY,
         id: String::new(),
         access_token: m.access_token,
@@ -3308,6 +3586,7 @@ fn minted_to_credential(m: MintedCredential, now: u64) -> Credential {
         expires_at_unix,
         region: m.region,
         auth: AuthMethod::Idc,
+        provider: Some(m.provider),
         client_id: Some(m.client_id),
         client_secret: Some(m.client_secret),
         profile_arn: None,
@@ -3431,7 +3710,8 @@ pub async fn login_builderid_poll(
         .await
     {
         Ok(minted) => {
-            let cred = minted_to_credential(minted, now);
+            let mut cred = minted_to_credential(minted, now);
+            cred.profile_arn = Some(crate::kiro::credential::BUILDER_ID_DEFAULT_PROFILE.into());
             match add_credential_to_pool_and_persist(&state, cred).await {
                 Ok((id, email, _is_dup)) => {
                     state.builderid_sessions.remove(&req.session_id);
@@ -3680,7 +3960,8 @@ pub async fn login_sso_token(
             .await
         {
             Ok(minted) => {
-                let cred = minted_to_credential(minted, now);
+                let mut cred = minted_to_credential(minted, now);
+                cred.profile_arn = Some(crate::kiro::credential::BUILDER_ID_DEFAULT_PROFILE.into());
                 match add_credential_to_pool_and_persist(&state, cred).await {
                     Ok(_) => added += 1,
                     Err(_) => failed.push(SsoTokenFailure {
@@ -3778,6 +4059,8 @@ mod tests {
     fn cred(id: &str) -> Credential {
         Credential {
             quota_reset_unix: None,
+            endpoint: None,
+            provider: None,
             priority: 999,
             id: id.into(),
             access_token: "SEKRET-AT".into(),
@@ -5470,6 +5753,82 @@ mod tests {
         (admin_api_router(state.clone()), shared)
     }
 
+    #[test]
+    fn client_versions_validate_numeric_triplets() {
+        assert!(valid_client_version("1.4.178"));
+        for v in ["1.2", "1.2.3.4", "v1.2.3", "1..3", "1.2.3 ", ""] {
+            assert!(!valid_client_version(v));
+        }
+    }
+
+    #[tokio::test]
+    async fn client_identity_put_validates_and_preserves_config() {
+        let path = tmp_config_path("client_identity");
+        std::fs::write(&path, r#"{"apiKey":"secret","custom":{"ok":true}}"#).unwrap();
+        let (app, _) = settings_app(Config::default(), &path);
+        let (status, _) = put(
+            &app,
+            "/api/admin/config/client-identity",
+            r#"{"kiroVersion":"1.4","upstreamEndpoint":"cli"}"#,
+        )
+        .await;
+        assert_eq!(status, HttpStatusCode::BAD_REQUEST);
+        let (status, response) = put(
+            &app,
+            "/api/admin/config/client-identity",
+            r#"{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"cli"}"#,
+        )
+        .await;
+        assert_eq!(status, HttpStatusCode::OK);
+        assert_eq!(response["restartRequired"], true);
+        let disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(disk["apiKey"], "secret");
+        assert_eq!(disk["custom"]["ok"], true);
+        assert_eq!(disk["upstreamEndpoint"], "cli");
+    }
+
+    #[tokio::test]
+    async fn official_version_parsing_handles_invalid_and_timeout() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(path("/ok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"version":"3.3.0"})))
+            .mount(&server)
+            .await;
+        Mock::given(path("/bad"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+        Mock::given(path("/slow"))
+            .respond_with(
+                ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(150)),
+            )
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(30))
+            .build()
+            .unwrap();
+        assert_eq!(
+            fetch_official_version(&client, &format!("{}/ok", server.uri()), "version")
+                .await
+                .unwrap(),
+            "3.3.0"
+        );
+        assert!(
+            fetch_official_version(&client, &format!("{}/bad", server.uri()), "version")
+                .await
+                .is_err()
+        );
+        assert!(
+            fetch_official_version(&client, &format!("{}/slow", server.uri()), "version")
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn get_load_balancing_returns_current_mode() {
         let cfg = Config {
@@ -5588,9 +5947,9 @@ mod tests {
         let (st, v) = get(&app, "/api/admin/server-info").await;
         assert_eq!(st, HttpStatusCode::OK);
         assert!(v["masterApiKey"].is_null());
-        // version = 本服务 crate 版本;伪装 Kiro 版本另放 kiroVersion(默认 0.11.107)。
+        // version = 本服务 crate 版本;客户端版本独立展示。
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(v["kiroVersion"], "0.11.107");
+        assert_eq!(v["kiroVersion"], "1.4.178");
         // 系统指标字段(camelCase)存在且形状正确。
         assert!(v["serverTime"].is_string());
         assert!(v["serverTimeUnix"].is_i64());
@@ -5685,6 +6044,98 @@ mod tests {
         )
         .await;
         assert_eq!(status, HttpStatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn administrator_can_override_profile_and_omission_preserves_it() {
+        let cfg = cfg_with_temp_creds();
+        let path = cfg.credentials_path.clone();
+        let state = state_with(vec![cred("7")], cfg);
+        let pool = state.pool.clone();
+        let app = admin_api_router(state);
+        let arn = "arn:aws:codewhisperer:eu-west-1:123:profile/admin";
+        let (status, _) = put(
+            &app,
+            "/api/admin/credentials/7",
+            &serde_json::json!({"profileArn":arn}).to_string(),
+        )
+        .await;
+        assert_eq!(status, HttpStatusCode::OK);
+        let (status, _) = put(&app, "/api/admin/credentials/7", r#"{"nickname":"edited"}"#).await;
+        assert_eq!(status, HttpStatusCode::OK);
+        assert_eq!(
+            pool.lock().await.snapshot_credentials()[0]
+                .profile_arn
+                .as_deref(),
+            Some(arn)
+        );
+        let saved = crate::kiro::credential::load(&path).unwrap();
+        assert_eq!(saved[0].profile_arn.as_deref(), Some(arn));
+        assert_eq!(saved[0].nickname.as_deref(), Some("edited"));
+    }
+
+    #[tokio::test]
+    async fn batch_import_preserves_provider_and_profile_arn() {
+        use crate::kiro::credential::{BUILDER_ID_DEFAULT_PROFILE, Provider};
+        let cfg = cfg_with_temp_creds();
+        let path = cfg.credentials_path.clone();
+        let app = admin_api_router(state_with(vec![], cfg));
+        let (status, body) = send(&app, Method::POST, "/api/admin/credentials/batch-import", Some(r#"{"data":[{"refreshToken":"builder","clientId":"cid","clientSecret":"secret","provider":"builder_id"},{"refreshToken":"enterprise","clientId":"cid","clientSecret":"secret","provider":"idc","profileArn":"arn:explicit"}]}"#)).await;
+        assert_eq!(status, HttpStatusCode::OK);
+        assert_eq!(body["added"], 2);
+        let saved = crate::kiro::credential::load(&path).unwrap();
+        assert_eq!(saved[0].provider, Some(Provider::BuilderId));
+        assert_eq!(
+            saved[0].profile_arn.as_deref(),
+            Some(BUILDER_ID_DEFAULT_PROFILE)
+        );
+        assert_eq!(saved[1].provider, Some(Provider::Idc));
+        assert_eq!(saved[1].profile_arn.as_deref(), Some("arn:explicit"));
+    }
+
+    #[tokio::test]
+    async fn editing_idc_account_preserves_explicit_builder_source() {
+        use crate::kiro::credential::Provider;
+        let cfg = cfg_with_temp_creds();
+        let path = cfg.credentials_path.clone();
+        let mut c = cred("7");
+        c.auth = AuthMethod::Idc;
+        c.provider = Some(Provider::BuilderId);
+        let state = state_with(vec![c], cfg);
+        let app = admin_api_router(state);
+        let (status, _) = put(
+            &app,
+            "/api/admin/credentials/7",
+            r#"{"authMethod":"idc","nickname":"edited"}"#,
+        )
+        .await;
+        assert_eq!(status, HttpStatusCode::OK);
+        let saved = crate::kiro::credential::load(&path).unwrap();
+        assert_eq!(saved[0].provider, Some(Provider::BuilderId));
+    }
+
+    #[test]
+    fn minted_login_provider_survives_conversion_and_serialization() {
+        use crate::kiro::credential::Provider;
+        for provider in [Provider::BuilderId, Provider::Idc] {
+            let c = minted_to_credential(
+                MintedCredential {
+                    provider,
+                    access_token: "AT".into(),
+                    refresh_token: "RT".into(),
+                    expires_in_secs: 3600,
+                    region: "us-east-1".into(),
+                    client_id: "cid".into(),
+                    client_secret: "secret".into(),
+                },
+                1000,
+            );
+            assert_eq!(c.provider, Some(provider));
+            assert_eq!(c.auth, AuthMethod::Idc);
+            let decoded: Credential =
+                serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+            assert_eq!(decoded.provider, Some(provider));
+        }
     }
 
     #[tokio::test]

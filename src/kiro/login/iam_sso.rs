@@ -161,6 +161,7 @@ pub async fn complete(
         ));
     }
     Ok(MintedCredential {
+        provider: crate::kiro::credential::Provider::Idc,
         // 官方客户端与参照实现均保存 accessToken。
         access_token: t.access_token,
         refresh_token: t.refresh_token,
@@ -308,6 +309,7 @@ mod tests {
         let cred = complete(&client, &server.uri(), "us-east-1", &s, "code123")
             .await
             .unwrap();
+        assert_eq!(cred.provider, crate::kiro::credential::Provider::Idc);
         assert_eq!(cred.access_token, "atok");
         // 客户端凭据须带出(auth=Idc 首刷依赖)。
         assert_eq!(cred.client_id, "cid");

@@ -133,6 +133,52 @@ pub async fn fetch_at(
     cred: &Credential,
     imp: &Impersonation,
 ) -> Result<AvailableModelsResponse, ModelsError> {
+    if imp.endpoint == "cli" {
+        let url = format!("{}/", base.trim_end_matches('/'));
+        let mut body = serde_json::json!({"origin":"KIRO_CLI"});
+        if let Some(arn) = cred.profile_arn.as_deref().filter(|s| !s.is_empty()) {
+            body["profileArn"] = arn.into();
+        }
+        let mut all = AvailableModelsResponse::default();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            // 服务与版本依据①,分页及 profileArn 依据②,请求 origin 依据③。
+            let headers = crate::kiro::provider::cli_headers(
+                cred,
+                imp,
+                &url,
+                "KiroControlPlaneBearerService.ListAvailableModels",
+                "kirocontrolplanebearer/0.1.0",
+                false,
+            );
+            let resp = client
+                .post(&url)
+                .headers(headers)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|_| ModelsError::Http)?;
+            if !resp.status().is_success() {
+                let status = resp.status().as_u16();
+                let text = crate::kiro::provider::read_body_capped(resp).await;
+                return Err(ModelsError::Upstream {
+                    status,
+                    message: extract_amz_message(&text),
+                });
+            }
+            let page: AvailableModelsResponse =
+                resp.json().await.map_err(|_| ModelsError::Decode)?;
+            if all.default_model.is_none() {
+                all.default_model = page.default_model;
+            }
+            all.models.extend(page.models);
+            match page.next_token.filter(|s| !s.is_empty()) {
+                Some(token) if seen.insert(token.clone()) => body["nextToken"] = token.into(),
+                Some(_) => return Err(ModelsError::Decode),
+                None => return Ok(all),
+            }
+        }
+    }
     let url = format!("{}/", base.trim_end_matches('/'));
     let body = build_body(cred.profile_arn.as_deref());
     let inv = new_invocation_id();
@@ -202,6 +248,16 @@ pub async fn fetch_available_models(
     // ARN 写 eu-central-1、导入时 region 填了 us-east-1 的账号,请求实打 `q.eu-central-1`
     // 日志却说 us-east-1,排障的人照着日志去查另一个 region 只会白跑。
     let region = crate::kiro::endpoint::effective_region(cred);
+    if imp.endpoint == "cli" {
+        // 新控制面主机依据①,服务 target 依据①。
+        return fetch_at(
+            client,
+            &format!("https://management.{region}.kiro.dev"),
+            cred,
+            &imp,
+        )
+        .await;
+    }
     match fetch_at(client, &region_base(&region), cred, &imp).await {
         // 传输层失败(最常见的是主机在该 region 根本不存在)→ 换备用主机再试一次。
         // 只对传输失败回落:拿到了 HTTP 应答就说明主机是对的,那种失败换主机也没用。
@@ -245,9 +301,15 @@ pub async fn fetch_available_models_fresh(
     })
     .map(|c| crate::http::unary_for(&c));
     let client = per_cred.as_ref().unwrap_or(client);
-    let cred = crate::kiro::ensure_fresh::ensure_fresh(pool, cred_id, client, now_unix, 300, ctx)
+    crate::kiro::ensure_fresh::ensure_fresh(pool, cred_id, client, now_unix, 300, ctx)
         .await
         .map_err(|_| ModelsError::Http)?;
+    let cred = crate::kiro::profiles::ensure_profile(pool, cred_id, client, cfg, now_unix, ctx)
+        .await
+        .map_err(|e| ModelsError::Upstream {
+            status: if e.status == 0 { 502 } else { e.status },
+            message: e.message,
+        })?;
     match fetch_available_models(client, cfg, &cred).await {
         // 401/403:该 access_token 可能已被服务端失效(哪怕尚未过期)。强制刷新令牌后重试一次。
         Err(e) if e.is_auth() => {
@@ -289,9 +351,35 @@ mod tests {
     use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[tokio::test]
+    async fn cli_models_sends_control_plane_request() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header(
+                "x-amz-target",
+                "KiroControlPlaneBearerService.ListAvailableModels",
+            ))
+            .and(body_partial_json(serde_json::json!({"origin":"KIRO_CLI"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"models":[]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut i = imp();
+        i.endpoint = "cli".into();
+        fetch_at(&reqwest::Client::new(), &server.uri(), &cred(), &i)
+            .await
+            .unwrap();
+    }
+
     fn cred() -> Credential {
         Credential {
             quota_reset_unix: None,
+            endpoint: None,
+            provider: None,
             priority: 999,
             proxy_url: None,
             proxy_username: None,
@@ -322,6 +410,8 @@ mod tests {
             agent_mode: "vibe".into(),
             system_version: "win32#10.0.22631".into(),
             node_version: "22.22.0".into(),
+            endpoint: "ide".into(),
+            cli_version: "3.3.0".into(),
         }
     }
 

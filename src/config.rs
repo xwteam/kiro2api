@@ -19,6 +19,10 @@ pub struct Config {
     pub credentials_path: String,
     /// 伪装 UA 里的 Kiro 版本号(契约 §3)。
     pub kiro_version: String,
+    /// 上游客户端身份: ide(默认)或 cli。
+    pub upstream_endpoint: String,
+    /// CLI 客户端版本。
+    pub kiro_cli_version: String,
     /// 伪装 UA 里的 `os/{system_version}`(契约 §3)。
     pub system_version: String,
     /// 伪装 UA 里的 `md/nodejs#{node_version}`(契约 §3)。
@@ -106,9 +110,11 @@ impl Default for Config {
             api_key: None,
             admin_api_key: None,
             credentials_path: "credentials.json".into(),
-            kiro_version: "0.11.107".into(),
+            kiro_version: "1.4.178".into(),
+            upstream_endpoint: "ide".into(),
+            kiro_cli_version: "3.3.0".into(),
             system_version: "win32#10.0.22631".into(),
-            node_version: "22.22.0".into(),
+            node_version: "24.22.1".into(),
             machine_id: None,
             proxy_url: None,
             tls_backend: None,
@@ -396,6 +402,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn client_identity_config_is_backward_compatible() {
+        let old: Config = serde_json::from_str(r#"{"kiroVersion":"1.2.3"}"#).unwrap();
+        assert_eq!(old.upstream_endpoint, "ide");
+        assert_eq!(old.kiro_cli_version, "3.3.0");
+        let cli: Config =
+            serde_json::from_str(r#"{"upstreamEndpoint":"cli","kiroCliVersion":"4.5.6"}"#).unwrap();
+        assert_eq!(cli.upstream_endpoint, "cli");
+        assert_eq!(cli.kiro_cli_version, "4.5.6");
+    }
+
+    #[test]
     fn defaults_are_sane() {
         let c = Config::default();
         assert_eq!(c.host, "127.0.0.1");
@@ -410,9 +427,9 @@ mod tests {
         assert_eq!(c.credentials_path, "credentials.json");
         assert!(!c.credentials_path.starts_with('/'));
         // 伪装版本号默认(契约 §3)。
-        assert_eq!(c.kiro_version, "0.11.107");
+        assert_eq!(c.kiro_version, "1.4.178");
         assert_eq!(c.system_version, "win32#10.0.22631");
-        assert_eq!(c.node_version, "22.22.0");
+        assert_eq!(c.node_version, "24.22.1");
     }
 
     #[test]
