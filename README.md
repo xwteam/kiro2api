@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.19.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.20.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-11-15 | v0.20.0 - 🛠️ **旧客户端版本已被上游停用，必须升级至本版本**。① 默认 IDE 版本改为 1.4.178；若配置中显式设置 `kiroVersion` 为 `0.11.107`，请修改或删除。② 自动补齐并保存 `profileArn`；版本被停用、profile 配置错误都不罚账号，profile 有问题的账号会换号再试。③ 可选 CLI 端点，管理面板支持查询官方版本和修改客户端身份，重启生效。 |
 | 2026-11-06 | v0.19.0 - 🛠️ **修正流式账号状态与用量记录，统一开局换号**。① 流正常结束才记成功，中途出错只记失败，客户端断开不影响账号状态。② 四种协议预读只认内容，计量后报错或半帧断开也换号；全号开局被拒时返回非 200。③ 无输出且无上游计量的失败不写用量；有消耗的失败标记 `failed: true`，客户端断开已有消耗时记录为 `false`；汇总按失败状态去重。 |
 | 2026-11-06 | v0.18.1 - 🛠️ **普通错误事件不再冒充成功；账号令牌保存正确**。① 上游错误事件与异常帧统一处理，四种协议返回错误，限流信号进入账号池。② IAM Identity Center / Builder ID 登录和刷新一律保存 `accessToken`，已有凭据下次刷新自动修正，无需迁移。 |
 | 2026-11-06 | v0.18.0 - 🛡️ **上游拒答不再伪装成空的正常回答**。四种协议的流式和非流式响应均返回各自的拒答结束标记，保留已有正文；客户端应根据结束原因判断，不要执行被拒那一轮的工具调用。 |
@@ -67,7 +68,6 @@
 | 2026-08-10 | v0.16.0 - 🔍 **又跑了一轮独立复核,找出 6 处——好几处是此前的修复只落了一半**。①`amz-sdk-invocation-id` 的 UUID 修复**只落了 3/5 个调用点**:balance 与 models_cache 各自私有一份同名旧生成器被局部遮蔽,搜索时看着像"已统一",实际同一枚 Bearer 在数据面发 UUID、在余额发裸 hex;②**登录流对 oidc 主机一个头都不带、连 UA 都没有**——正是 v0.10.0 在刷新链路修过的同一缺陷,而登录打的是**同一台主机的相邻路径**,且注册裸奔、几分钟后同一 clientId 又用完美 SDK 头去刷新,这种前后矛盾比裸请求更易被关联;③**region 三条链路各算各的**(数据面按 profileArn、余额/模型用裸 cred.region)→ 余额恒查不出,且同一枚 Bearer 同时命中两个 region;④history 里的工具名没走缩短,与 tools 列表的短名对不上;⑤**改优先级不触发重新选号**,粘滞档下等于没改;⑥**全池被判停后无自愈**——上游抖一阵把所有号判停,池子就此彻底不可用直到有人重启。另:README 更新历史只留最近 10 条,完整看 CHANGELOG |
 | 2026-08-10 | v0.15.0 - 🔁 **额度耗尽的账号不再每次重启都要重新学一遍**(用户直接问到:"额度用完的号不是已经禁用了吗,为什么还会请求到已禁用的账号?")。是禁用了,但只在**内存**里——v0.10.2 为免一次抖动把账号永久写死,让运行期停用不落盘;而配额恰恰是**有明确恢复时刻**的那类。于是每次发版重启就把"谁没额度"忘光,再拿**用户的请求**去重新发现(实测 13 个耗尽号:前 2 次 502、第 3 次才成)→ 现按恢复时刻落盘,重启仍记得、到点自动回池;恢复时刻优先取上游 `nextResetAt`,没有才按下月一号估。另:**服务端内置搜索 `web_search` 真正接上了** —— 此前只是"容忍"这个工具声明(不再 400),但从不真的搜索,模型照常回段文本、客户端以为搜过了。现在这类请求在进数据面前被截住,调上游 `/mcp` 端点拿结果再合成 `server_tool_use` + `web_search_tool_result` |
 | 2026-08-10 | v0.14.1 - 🔧 **线上验证时当场发现的两件事**。①响应里 `usage.input_tokens` **恒为 0**:v0.13.0 补的输入估算只喂给了计费、没回写客户端 —— 账单里有、响应里没有,而客户端拿它算成本和上下文占用 → 非流式 `usage` 与流式 `message_start` 现在都带同一个值;②**池里有一批耗尽的号时,用户前几次请求会连续失败**:配额耗尽此前与鉴权失败共用 3 次重试预算,实测 13 个耗尽号要连烧 2 次 502、第 3 次才成 → 配额是**确定性**结论(本周期换谁都一样),现与"模型不可用"同归账号级确定性档、按池大小给预算;瞬态/鉴权仍保持 3 次小上限。全池确实耗尽时回 `429` 并说清是额度问题,而不是语焉不详的 502 |
-| 2026-08-10 | v0.14.0 - 🧩 **对照收尾**。①历史里助手轮 `content` 可能是**空串**,上游据此拒掉整条请求——纯工具调用那一轮(只有 tool_use、没文本)就是空,用户轮早有兜底、助手轮一直漏着,于是"上一轮只调了工具没说话"的对话再发一次就必挂,而那正是工具链里最常见的形态 → 用单个空格占位;②**损坏帧被逐字节重扫,而它的边界本来已知**:prelude CRC 一旦通过 `total_len` 就可信,此前不分情况逐字节再同步,于是一个 message-CRC 失败的帧会把整段 payload 当噪声重扫,既慢又可能从 payload 里凑出假帧头、解出根本不存在的消息 → 边界已知的坏帧整帧跳过;③**`tlsBackend` 改为运行时可切**(此前编译期二选一,换后端要重出镜像)——native-tls 用系统证书库、rustls 用内置根证书,走自签 CA 代理时往往只有一个握得上手,而现象是"刷不出令牌/连不上",与 TLS 毫无字面关系 |
 
 ---
 
@@ -262,7 +262,7 @@ docker compose logs -f
 ```bash
 # 健康检查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.19.0"}
+# {"service":"kiro2api","status":"ok","version":"0.20.0"}
 
 # 查看可用模型
 curl http://localhost:8080/v1/models \
@@ -492,11 +492,15 @@ resp = client.chat.completions.create(
   "loadBalancingMode": "priority",
   "maxRpmPerCredential": 0,
   "logCapacity": 5000,
-  "kiroVersion": "0.11.107",
+  "kiroVersion": "1.4.178",
+  "upstreamEndpoint": "ide",
+  "kiroCliVersion": "3.3.0",
   "systemVersion": "win32#10.0.22631",
-  "nodeVersion": "22.22.0"
+  "nodeVersion": "24.22.1"
 }
 ```
+
+`upstreamEndpoint` 可设为 `ide`（默认）或 `cli`；`kiroCliVersion` 默认 `3.3.0`。仅更新 IDE 版本号不会切换服务，使用新服务须选择 CLI。凭据文件可选 `provider`（`social`、`builder_id`、`idc`、`api_key`）、`profileArn` 和账号级 `endpoint`（`ide` / `cli`，覆盖全局设置）。
 
 - `logCapacity`：实时日志环形缓冲条数，`>0` 启用日志捕获（管理面板日志页回放/SSE），`0` 关闭（日志端点返回 503）；默认 `5000`。
 - `kiroVersion`/`systemVersion`/`nodeVersion`：伪装 UA 版本号，从配置注入。

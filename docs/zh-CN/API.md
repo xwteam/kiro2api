@@ -99,13 +99,21 @@ cat data/config.json | grep apiKey
 
 | 状态码 | 说明 |
 |--------|------|
-| 400 | 四类不同成因、都不重试也不误伤账号：①**模型名在本网关本地映射不上**——体为 `无法识别的模型名: <你传的名字>`，类型 `invalid_request_error`，**不含** `INVALID_MODEL_ID` 字样；②**上游确定性拒绝该模型**（账号档位无权），上游 reason 码即 `INVALID_MODEL_ID`，原样转出。另外，四种协议的对话端点在请求体解析失败时也回 `400`（已改写成各自 SDK 认得的错误形状）；③**请求体超过上游长度上限**——上游 reason 码 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`,体为「Input is too long…」并说明该错误不会自愈(客户端每轮重发完整历史,下一轮只会更长),需缩短上下文或新开会话。**此类同样不重试、不误伤账号**(v0.7.12 前它被误判为瞬时错误,会被跨账号重试一遍并给每个账号记一次失败)；④**消息里有工具调用却没有工具定义**——上游 reason 码 `TOOL_CONFIG_MISSING`。正常情况下不该出现:中枢会从对话历史里把调用过的工具名补成最小规格再发出(见下「工具规格的历史补全」),这一档是兜底,同样不重试、不误伤账号 |
+| 400 | 下列成因都不误伤账号，其中 ①～⑤ 不重试，⑥ 先换号：①**模型名在本网关本地映射不上**——体为 `无法识别的模型名: <你传的名字>`，类型 `invalid_request_error`，**不含** `INVALID_MODEL_ID` 字样；②**上游确定性拒绝该模型**（账号档位无权），上游 reason 码即 `INVALID_MODEL_ID`，原样转出。另外，四种协议的对话端点在请求体解析失败时也回 `400`（已改写成各自 SDK 认得的错误形状）；③**请求体超过上游长度上限**——上游 reason 码 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`,体为「Input is too long…」并说明该错误不会自愈(客户端每轮重发完整历史,下一轮只会更长),需缩短上下文或新开会话。**此类同样不重试、不误伤账号**(v0.7.12 前它被误判为瞬时错误,会被跨账号重试一遍并给每个账号记一次失败)；④**消息里有工具调用却没有工具定义**——上游 reason 码 `TOOL_CONFIG_MISSING`。正常情况下不该出现:中枢会从对话历史里把调用过的工具名补成最小规格再发出(见下「工具规格的历史补全」),这一档是兜底,同样不重试、不误伤账号  ⑤**上游版本不受支持**：全局配置错误，不重试、不换号、不计账号失败，以协议原生错误形状返回。⑥**`profileArn` 缺失、无效或查不到**：只关当前账号，不罚号，先换下一个账号再试，全池都不行才以 400 返回说明。 |
 | 401 | 认证失败，API Key 无效或缺失（已配置 `apiKey` 时）；管理端创建的 API-KEY 被停用 / 过期同样是 `401`。协议路由与 `/api/admin/*` 的 `401` 体恒为 Anthropic 形状的 `authentication_error`（见上方例外说明）；`/api/user/*` 的 `401` 则是 `{"error":"…"}` |
 | 402 | 该 API-KEY 的**消费额度已达或超上限**（体恒为 Anthropic 形状的 `billing_error`，见上方例外说明）。仅对管理端创建、且设了 `spendingLimit` 的 key 生效；用全局 `apiKey` 调用不会命中 |
 | 404 | 管理端点的 `{id}` 不存在：账号回 `{"error":"account not found","id":…}`，API-KEY 回 `{"error":"api key not found","id":…}`，登录会话回 `{"success":false,"error":"login session not found or expired"}` |
 | 422 | 请求体反序列化失败（缺必填字段 / 类型不符），axum 默认拒收，`text/plain` 纯文本。出现在带 body 提取器的端点上：`/api/admin/*` 与 `POST /api/user/login`（四个协议对话端点与 `/v1/messages/count_tokens` 已自行接管拒收、改回各自形状的 `400`）（`/api/user/*` 的其余端点只收 query，参数类型不符是 `400` 而非 `422`） |
 
 
+> **v0.20.0: 客户端身份**
+>
+> - 旧 IDE 客户端版本已被上游停用，必须升级；默认 IDE 为 `1.4.178`、Node 为 `24.22.1`、对话 SDK 为 `1.0.44`。若 `config.json` 显式设置 `"kiroVersion": "0.11.107"`，请修改或删除，否则仍被拒绝。
+> - Social / Builder ID 启动时离线补默认 `profileArn`；企业 IAM Identity Center 缺失时调用 `ListAvailableProfiles`，一个直接使用、多个取第一个并告警、零个报告配置错误；结果写回凭据。管理员可手动设置。
+> - 上游版本不受支持：全局错误，不重试、不换号、不计账号失败，直接以协议原生形状返回 400；记录 error 日志，面板显示本次运行最近一次时间。`profileArn` 缺失、无效或查不到：只关当前账号，不罚号、换下一个账号再试，全池都不行才返回 400；「查不到」的结论缓存 10 分钟、查询网络失败退避 30 秒，账号被修改即失效；查询遇到 401/403 先强制刷新令牌再查一次。
+> - 可选 CLI 身份端点，默认 `ide`；`cli` 时对话、联网搜索、模型列表和余额都按官方 CLI 3.3.0 的方式走新服务（余额为 `management.{region}.kiro.dev` 上的 `POST /?origin=KIRO_CLI&isEmailRequired=false`，请求体带 `profileArn`），请求头含 `x-amz-user-agent`、`x-amzn-kiro-attempt`；令牌刷新不变。真实账号已验证对话、模型列表和余额。
+> - 管理面板可查询官方最新 IDE / CLI 版本、显示落后状态并保存客户端身份；重启生效。接口同时返回运行中的值和已保存待重启的值（`saved`、`restartRequired`），面板编辑已保存的值、只提交改动的字段。仅更新 IDE 版本号不会切换服务。
+>
 > **v0.19.0:流式重试、账号状态与用量记录**
 >
 > - 流式请求仅在上游正常读完且无错误时记账号成功；中途出错只记失败，客户端主动断开既不记成功也不记失败。上游拒答且正常结束仍算成功。
@@ -734,6 +742,50 @@ data: {"candidates":[{"content":{"parts":[{"text":" there"}]}}]}
 > [!WARNING]
 > 管理接口的响应**并非无密**：`GET`/`POST /api/admin/api-keys` 的 `key` 字段是**完整明文**，`GET /api/admin/server-info` 的 `masterApiKey` 也是**完整明文**；只有 `GET /api/admin/config/auth-keys` 与 `GET /api/admin/config` 做了脱敏。本服务没有"只读管理员"角色——拿到管理密钥即可读取、创建、轮换全部 key。请把管理接口的响应当密钥对待：不要贴进 issue、日志或第三方工具。
 
+### GET /api/admin/config/client-identity
+
+CLI 使用 `runtime.{region}.kiro.dev` 和 `management.{region}.kiro.dev`；`GET /api/admin/server-info` 的 `kiroVersion` 显示全局端点选中的版本，不反映账号级覆盖。`GET /api/admin/config` 保持原有字段，IDE 版本为 `kiro_version`。
+
+返回正在运行的值（顶层三个字段）、已保存但要重启才生效的值（`saved`，配置文件里没写的取默认值）、两者是否不同（`restartRequired`），以及本次运行中最近一次上游要求更新的时间（无记录为 `null`）。面板编辑的是 `saved`。
+
+```http
+GET /api/admin/config/client-identity
+Authorization: Bearer <adminApiKey>
+```
+
+```json
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide","saved":{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"cli"},"restartRequired":true,"lastUnsupportedVersionAt":null}
+```
+
+### GET /api/admin/config/client-identity/check
+
+同时查询官方 IDE 和 CLI 最新版本（CLI 先查 `prod.download.cli.kiro.dev`，失败再查同内容的 `desktop-release.q.us-east-1.amazonaws.com`）；任一查询失败返回 502，例如 `{"error":"official request failed"}`。成功时在上一个接口的响应上加 `latestIdeVersion`、`latestCliVersion`、`checkedAt`（UTC+8）和 `checkedAtTimezone`（`Asia/Shanghai`）。
+
+```http
+GET /api/admin/config/client-identity/check
+Authorization: Bearer <adminApiKey>
+```
+
+```json
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide","saved":{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide"},"restartRequired":false,"lastUnsupportedVersionAt":null,"latestIdeVersion":"1.4.178","latestCliVersion":"3.3.0","checkedAt":"2026-11-15T12:00:00+08:00","checkedAtTimezone":"Asia/Shanghai"}
+```
+
+### PUT /api/admin/config/client-identity
+
+三个字段均可省略；版本必须是三段非空 ASCII 数字，以点分隔（例如 `1.4.178`），端点只接受 `ide` / `cli`。校验失败返回 400 `{"error":"invalid client identity"}`；配置读写失败返回 500。只写入请求里给出的字段，其他字段与密钥原样保留；不改变运行中的配置，重启后生效。响应与 `GET` 相同。仅更改 IDE 版本不会切换新服务，需选择 CLI。
+
+```http
+PUT /api/admin/config/client-identity
+Authorization: Bearer <adminApiKey>
+Content-Type: application/json
+
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"cli"}
+```
+
+```json
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide","saved":{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"cli"},"restartRequired":true,"lastUnsupportedVersionAt":null}
+```
+
 ### GET /api/admin/credentials
 
 获取账号池状态（也是隐式"登录校验"面——返回 200 即视为 key 有效）。
@@ -789,6 +841,8 @@ curl http://localhost:8080/api/admin/credentials \
 
 ### POST /api/admin/credentials
 
+新增、修改及批量导入均可选 `provider`（`social`、`builder_id`、`idc`、`api_key`）和 `profileArn`。批量导入的嵌套 `credentials` 字段优先于外层；未知 `provider` 会被忽略。账号级 `endpoint`（`ide` / `cli`）只在凭据文件支持，覆盖全局端点；这些管理接口不接收该字段。账号列表的 `hasProfileArn` 仅显示是否存在，不泄露 ARN。
+
 新增一条凭据入池并落盘。
 
 **必填的只有 `refreshToken`**（`authMethod` 为 `idc` 时还需 `clientId` + `clientSecret`）。本端点**不接受** access token 与到期时间——它们由首次自动刷新时补齐；多余的键会被**静默忽略**（不报错）。可选键：`authMethod`、`email`、`nickname`、`clientId`、`clientSecret`、`profileArn`、`priority`、`weight`、`authRegion`、`apiRegion`、`machineId`、`proxyUrl`、`proxyUsername`、`proxyPassword`。
@@ -826,6 +880,8 @@ curl -X POST http://localhost:8080/api/admin/credentials \
 ```
 
 ### PUT /api/admin/credentials/{id}
+
+新增、修改及批量导入均可选 `provider`（`social`、`builder_id`、`idc`、`api_key`）和 `profileArn`。批量导入的嵌套 `credentials` 字段优先于外层；未知 `provider` 会被忽略。账号级 `endpoint`（`ide` / `cli`）只在凭据文件支持，覆盖全局端点；这些管理接口不接收该字段。账号列表的 `hasProfileArn` 仅显示是否存在，不泄露 ARN。
 
 更新已有凭据。
 
@@ -890,6 +946,8 @@ curl -X POST http://localhost:8080/api/admin/credentials/12345/reset \
 ```
 
 ### POST /api/admin/credentials/batch-import
+
+新增、修改及批量导入均可选 `provider`（`social`、`builder_id`、`idc`、`api_key`）和 `profileArn`。批量导入的嵌套 `credentials` 字段优先于外层；未知 `provider` 会被忽略。账号级 `endpoint`（`ide` / `cli`）只在凭据文件支持，覆盖全局端点；这些管理接口不接收该字段。账号列表的 `hasProfileArn` 仅显示是否存在，不泄露 ARN。
 
 批量导入凭据；逐条规整 / 校验 / 落盘，返回逐项结果与计数。
 
@@ -1250,9 +1308,9 @@ curl http://localhost:8080/api/admin/config \
   "region": "us-east-1",
   "load_balancing_mode": "priority",
   "max_rpm_per_credential": 0,
-  "kiro_version": "0.11.107",
+  "kiro_version": "1.4.178",
   "system_version": "win32#10.0.22631",
-  "node_version": "22.22.0",
+  "node_version": "24.22.1",
   "credentials_path": "/app/data/credentials.json",
   "api_key_set": false,
   "admin_api_key_set": false
@@ -1337,8 +1395,8 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-你的主密钥明文",
-  "version": "0.16.0",
-  "kiroVersion": "0.11.107",
+  "version": "0.20.0",
+  "kiroVersion": "1.4.178",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
   "uptimeSecs": 3600

@@ -190,7 +190,7 @@ curl http://localhost:8080/health
 
 Expected response:
 ```json
-{"service":"kiro2api","status":"ok","version":"0.19.0"}
+{"service":"kiro2api","status":"ok","version":"0.20.0"}
 ```
 
 ### List Available Models
@@ -302,9 +302,9 @@ Precedence: **command-line flags > environment variables > `config.json` > built
   "loadBalancingMode": "priority",
   "maxRpmPerCredential": 0,
   "logCapacity": 5000,
-  "kiroVersion": "0.11.107",
+  "kiroVersion": "1.4.178",
   "systemVersion": "win32#10.0.22631",
-  "nodeVersion": "22.22.0"
+  "nodeVersion": "24.22.1"
 }
 ```
 

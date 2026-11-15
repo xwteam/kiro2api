@@ -637,6 +637,50 @@ data: {"candidates":[{"content":{"parts":[{"text":"夜"}]}}]}
 > [!WARNING]
 > 管理 API のレスポンスは**秘密情報を含まないわけではありません**。`GET`/`POST /api/admin/api-keys` の `key` フィールドは**完全な平文**、`GET /api/admin/server-info` の `masterApiKey` も**完全な平文**です。マスキングされるのは `GET /api/admin/config/auth-keys` と `GET /api/admin/config` だけです。読み取り専用の管理者ロールは存在しないため、管理キーを持つ者はすべての key を閲覧・作成・ローテーションできます。管理 API のレスポンスは秘密情報として扱い、issue やログ、サードパーティのツールに貼り付けないでください。
 
+### GET /api/admin/config/client-identity
+
+CLI は `runtime.{region}.kiro.dev` と `management.{region}.kiro.dev` を使用します。`GET /api/admin/server-info` の `kiroVersion` は全体設定の端点に対応するバージョンで、アカウント単位の上書きは反映しません。`GET /api/admin/config` の既存フィールドは変わらず、IDE 版は `kiro_version` です。
+
+実行中の値（最上位の 3 項目）、再起動後に反映される保存値（`saved`。設定ファイルにない項目は既定値）、両者が異なるか（`restartRequired`）、今回の実行中に上流から更新を要求された直近の時刻（未記録なら `null`）を返します。パネルが編集するのは `saved` です。
+
+```http
+GET /api/admin/config/client-identity
+Authorization: Bearer <adminApiKey>
+```
+
+```json
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide","saved":{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"cli"},"restartRequired":true,"lastUnsupportedVersionAt":null}
+```
+
+### GET /api/admin/config/client-identity/check
+
+公式 IDE と CLI の最新版を同時に取得します（CLI は `prod.download.cli.kiro.dev` を先に、失敗したら同じ内容の `desktop-release.q.us-east-1.amazonaws.com` を照会）。どちらかが失敗すると 502（例 `{"error":"official request failed"}`）。成功時は前の API の応答に `latestIdeVersion`、`latestCliVersion`、`checkedAt`（UTC+8）、`checkedAtTimezone`（`Asia/Shanghai`）を加えて返します。
+
+```http
+GET /api/admin/config/client-identity/check
+Authorization: Bearer <adminApiKey>
+```
+
+```json
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide","saved":{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide"},"restartRequired":false,"lastUnsupportedVersionAt":null,"latestIdeVersion":"1.4.178","latestCliVersion":"3.3.0","checkedAt":"2026-11-15T12:00:00+08:00","checkedAtTimezone":"Asia/Shanghai"}
+```
+
+### PUT /api/admin/config/client-identity
+
+3 フィールドはすべて省略可能です。バージョンは空でない ASCII 数字 3 組をドットで区切り（例 `1.4.178`）、端点は `ide` / `cli` のみ。検証失敗は 400 `{"error":"invalid client identity"}`、設定の読書き失敗は 500。リクエストで指定した項目だけを書き込み、他の項目とキーはそのまま保持します。実行中の設定は変わらず、再起動後に反映されます。応答は `GET` と同じです。IDE の版だけでは新サービスに切り替わらず、CLI の選択が必要です。
+
+```http
+PUT /api/admin/config/client-identity
+Authorization: Bearer <adminApiKey>
+Content-Type: application/json
+
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"cli"}
+```
+
+```json
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide","saved":{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"cli"},"restartRequired":true,"lastUnsupportedVersionAt":null}
+```
+
 ### GET /api/admin/credentials
 
 アカウントプールの状態を取得します（暗黙の「ログイン確認」面でもあり、200 が返れば key は有効とみなされます）。
@@ -684,6 +728,14 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.20.0: クライアント識別情報**
+>
+> - 旧 IDE クライアントは上流で無効化され、更新が必須です。既定値は IDE `1.4.178`、Node `24.22.1`、対話 SDK `1.0.44`。`config.json` に `"kiroVersion": "0.11.107"` を明示している場合は変更または削除してください。
+> - Social / Builder ID は起動時に既定の `profileArn` をオフラインで補完します。企業 IAM Identity Center で欠けている場合は `ListAvailableProfiles` で検索し、1 件なら採用、複数なら警告して先頭を採用、0 件なら設定エラーとします。結果は認証情報に保存され、管理者が手動設定することもできます。
+> - クライアントのバージョン非対応は全体のエラーです。再試行・アカウント切替・失敗加算をせず、各プロトコルの形式で 400 を返し、error ログに記録して今回の実行中の直近時刻をパネルに表示します。`profileArn` の欠落・無効・見つからない場合は、そのアカウントだけの問題として失敗に数えず次のアカウントで再試行し、全アカウントで失敗したときだけ 400 を返します。「見つからない」結果は 10 分間、照会の通信失敗は 30 秒間再利用し（アカウントを変更すると無効化）、照会で 401/403 が返ったらまずトークンを強制更新して 1 回だけ再照会します。
+> - CLI 識別の端点は任意で既定は `ide`。`cli` では対話、Web 検索、モデル一覧、残高が公式 CLI 3.3.0 と同じく新サービスを使います（残高は `management.{region}.kiro.dev` への `POST /?origin=KIRO_CLI&isEmailRequired=false`、本文に `profileArn`）。リクエストヘッダーには `x-amz-user-agent` と `x-amzn-kiro-attempt` が付き、トークン更新は従来どおりです。実アカウントで対話・モデル一覧・残高を確認済みです。
+> - 管理パネルで公式 IDE / CLI 最新版の確認、古い版の強調表示、識別情報の保存が可能です。再起動後に反映されます。API は実行中の値と再起動待ちの保存値（`saved`、`restartRequired`）の両方を返し、パネルは保存値を編集して変更した項目だけを送信します。IDE の版番号だけではサービスは切り替わりません。
+>
 > **v0.19.0:ストリーミングの再試行、アカウント状態と使用量記録**
 >
 > - ストリーミングは上流をエラーなく正常に読み終えた場合のみアカウントの成功に数えます。途中のエラーは失敗のみ、クライアントの自発的な切断は成功にも失敗にも数えません。上流の回答拒否が正常終了した場合は成功です。
@@ -782,6 +834,8 @@ curl http://localhost:8080/api/admin/credentials \
 
 ### POST /api/admin/credentials
 
+追加・変更・一括インポートでは `provider`（`social`、`builder_id`、`idc`、`api_key`）と `profileArn` を任意で指定できます。一括インポートは内部の `credentials` が外側より優先され、未知の `provider` は無視されます。アカウント単位の `endpoint`（`ide` / `cli`）は認証情報ファイルのみで指定でき、全体設定より優先されます。これらの管理 API は受け付けません。一覧の `hasProfileArn` は有無のみを示します。
+
 新しいアカウント認証情報をプールに追加して永続化します。
 
 必須は `refreshToken` だけです（`authMethod` が `idc` の場合は `clientId` + `clientSecret` も必要）。access token と有効期限は**このエンドポイントでは受け付けません**——初回の自動リフレッシュ時に補完されます。未知のキーは拒否されず、黙って無視されます。
@@ -834,6 +888,8 @@ curl -X POST http://localhost:8080/api/admin/credentials \
 `refreshToken` がすでにプールにある場合は新規追加されず、`message` が `"credential already exists"`、`duplicate` が `true`、`credentialId` は**既存アカウントの id** になります（`email` は不明なら省略されます）。
 
 ### PUT /api/admin/credentials/{id}
+
+追加・変更・一括インポートでは `provider`（`social`、`builder_id`、`idc`、`api_key`）と `profileArn` を任意で指定できます。一括インポートは内部の `credentials` が外側より優先され、未知の `provider` は無視されます。アカウント単位の `endpoint`（`ide` / `cli`）は認証情報ファイルのみで指定でき、全体設定より優先されます。これらの管理 API は受け付けません。一覧の `hasProfileArn` は有無のみを示します。
 
 既存のアカウント認証情報を更新します。
 
@@ -890,6 +946,8 @@ curl -X POST http://localhost:8080/api/admin/credentials/12345/priority \
 アカウントの失敗カウント/クールダウンをクリアします。
 
 ### POST /api/admin/credentials/batch-import
+
+追加・変更・一括インポートでは `provider`（`social`、`builder_id`、`idc`、`api_key`）と `profileArn` を任意で指定できます。一括インポートは内部の `credentials` が外側より優先され、未知の `provider` は無視されます。アカウント単位の `endpoint`（`ide` / `cli`）は認証情報ファイルのみで指定でき、全体設定より優先されます。これらの管理 API は受け付けません。一覧の `hasProfileArn` は有無のみを示します。
 
 認証情報を一括インポートします。ボディは必ず `data` キーで包む必要があり、裸の配列を POST すると `422` になります。`data` の中身は配列、KAM 形式の `{accounts: [...]}` オブジェクト、単一オブジェクトのいずれでも構いません。各行を個別に正規化/検証/永続化し、行ごとの結果と件数を返します。各行で有効なのは `refreshToken`（必須。空なら当該行は失敗）、`clientId`/`clientSecret`（`idc` 用。片方だけだとその行は失敗）、`email`（無ければ `nickname` で代替）、`nickname`、`machineId`、`priority`（アカウントの `weight` として保存、1 未満は 1 に丸め）、`region`/`authRegion`/`apiRegion`（`apiRegion` > `authRegion`/`region` の順に採用、いずれも無ければ `us-east-1`）です。KAM 形式の `credentials: {…}` 入れ子があれば、その中の `refreshToken`/`clientId`/`clientSecret`/`region` が最優先されます。`accessToken` / `expiresAt` / `profileArn` は正規化時に無視されます。`authMethod` も読まれません——auth は `clientId` と `clientSecret` が揃っていれば `idc`、そうでなければ `social` と自動判定されます。
 
@@ -1188,9 +1246,9 @@ curl http://localhost:8080/api/admin/config \
   "region": "us-east-1",
   "load_balancing_mode": "priority",
   "max_rpm_per_credential": 0,
-  "kiro_version": "0.11.107",
+  "kiro_version": "1.4.178",
   "system_version": "win32#10.0.22631",
-  "node_version": "22.22.0",
+  "node_version": "24.22.1",
   "credentials_path": "/app/data/credentials.json",
   "api_key_set": true,
   "admin_api_key_set": true
@@ -1302,8 +1360,8 @@ curl -X PUT http://localhost:8080/api/admin/config/auth-keys \
 ```json
 {
   "masterApiKey": "sk-マスターキーの平文",
-  "version": "0.16.0",
-  "kiroVersion": "0.11.107",
+  "version": "0.20.0",
+  "kiroVersion": "1.4.178",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
   "uptimeSecs": 3600
@@ -1561,7 +1619,7 @@ API エラーは以下のコードで返されます。
 
 | コード | 説明 | 対応 |
 |--------|------|------|
-| 400 | パラメータエラー / 中継が解決できないモデル名 / 上流がアカウント階層で提供しないモデル（`INVALID_MODEL_ID`）。管理エンドポイント固有では `POST /api/admin/restart` に `?confirm=true` が無い場合と、`GET /api/admin/usage/summary` に未知の `range` または `hours=0` を渡した場合 | リクエストパラメータとモデル名を確認。③**リクエストボディが上流の長さ上限を超過**——上流の reason コードは `CONTENT_LENGTH_EXCEEDS_THRESHOLD`。「Input is too long…」に加え、この誤りは自然回復しないこと(クライアントは毎ターン全履歴を再送するため次はさらに長くなる)と、コンテキストを削るか会話を新規に始める必要があることを示します。**この種別も再試行せず、アカウントを傷つけません**(v0.7.12 以前は一時的エラーと誤判定し、アカウントを跨いで再試行して触れた全アカウントに失敗を記録していました)。④**メッセージにツール呼び出しがあるのにツール定義が無い**——上流の reason コードは `TOOL_CONFIG_MISSING`。通常は発生しません:中継が会話履歴に現れたツール名から最小限の仕様を補って送信します。この区分は保険であり、同様に再試行せずアカウントも傷つけません |
+| 400 | パラメータエラー / 中継が解決できないモデル名 / 上流がアカウント階層で提供しないモデル（`INVALID_MODEL_ID`）。管理エンドポイント固有では `POST /api/admin/restart` に `?confirm=true` が無い場合と、`GET /api/admin/usage/summary` に未知の `range` または `hours=0` を渡した場合 | リクエストパラメータとモデル名を確認。③**リクエストボディが上流の長さ上限を超過**——上流の reason コードは `CONTENT_LENGTH_EXCEEDS_THRESHOLD`。「Input is too long…」に加え、この誤りは自然回復しないこと(クライアントは毎ターン全履歴を再送するため次はさらに長くなる)と、コンテキストを削るか会話を新規に始める必要があることを示します。**この種別も再試行せず、アカウントを傷つけません**(v0.7.12 以前は一時的エラーと誤判定し、アカウントを跨いで再試行して触れた全アカウントに失敗を記録していました)。④**メッセージにツール呼び出しがあるのにツール定義が無い**——上流の reason コードは `TOOL_CONFIG_MISSING`。通常は発生しません:中継が会話履歴に現れたツール名から最小限の仕様を補って送信します。この区分は保険であり、同様に再試行せずアカウントも傷つけません  ⑤**上流がクライアントのバージョンを非対応とした場合**:全体の設定エラーで、再試行・切替・失敗加算をせず各プロトコルの形式で返します。⑥**`profileArn` の欠落・無効・見つからない場合**:そのアカウントだけの問題でペナルティは科さず、まず次のアカウントで再試行し、全アカウントで失敗したときだけ説明付きの 400 を返します。 |
 | 401 | 未認証（key がない、誤った key、無効化/期限切れのストア key） | API Key を確認 |
 | 402 | ストア管理の API-KEY が消費上限に到達（本体は `{"type":"error","error":{"type":"billing_error","message":"…"}}`）。判定には在途分の予約（USD 単位で `1.0`、`credits` 単位で約 `1.39`）が含まれるため、**残りが 1 回分の見積を下回った時点で**上限を使い切る前に拒否が始まります | key の上限を引き上げるか、使用量をリセット |
 | 403 | 禁止 | 権限がない |

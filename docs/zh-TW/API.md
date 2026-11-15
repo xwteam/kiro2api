@@ -561,6 +561,50 @@ curl http://localhost:8080/v1beta/models \
 > [!WARNING]
 > 管理介面的回應**並非無密**：`GET`/`POST /api/admin/api-keys` 的 `key` 欄位是**完整明文**，`GET /api/admin/server-info` 的 `masterApiKey` 也是**完整明文**；只有 `GET /api/admin/config/auth-keys` 與 `GET /api/admin/config` 有去敏。本服務沒有「唯讀管理員」角色——拿到管理金鑰即可讀取、建立、輪換全部 key。請把管理介面的回應當金鑰對待：別貼進 issue、日誌或第三方工具。
 
+### GET /api/admin/config/client-identity
+
+CLI 使用 `runtime.{region}.kiro.dev` 和 `management.{region}.kiro.dev`；`GET /api/admin/server-info` 的 `kiroVersion` 顯示全域端點選中的版本，不反映帳號級覆蓋。`GET /api/admin/config` 保留原有欄位，IDE 版本為 `kiro_version`。
+
+回傳執行中的值（最上層三個欄位）、已儲存但要重啟才生效的值（`saved`，設定檔沒寫的取預設值）、兩者是否不同（`restartRequired`），以及本次執行中最近一次上游要求更新的時間（沒有記錄為 `null`）。面板編輯的是 `saved`。
+
+```http
+GET /api/admin/config/client-identity
+Authorization: Bearer <adminApiKey>
+```
+
+```json
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide","saved":{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"cli"},"restartRequired":true,"lastUnsupportedVersionAt":null}
+```
+
+### GET /api/admin/config/client-identity/check
+
+同時查詢官方 IDE 與 CLI 最新版本（CLI 先查 `prod.download.cli.kiro.dev`，失敗再查內容相同的 `desktop-release.q.us-east-1.amazonaws.com`）；任一查詢失敗回傳 502，例如 `{"error":"official request failed"}`。成功時在上一個介面的回應上加上 `latestIdeVersion`、`latestCliVersion`、`checkedAt`（UTC+8）和 `checkedAtTimezone`（`Asia/Shanghai`）。
+
+```http
+GET /api/admin/config/client-identity/check
+Authorization: Bearer <adminApiKey>
+```
+
+```json
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide","saved":{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide"},"restartRequired":false,"lastUnsupportedVersionAt":null,"latestIdeVersion":"1.4.178","latestCliVersion":"3.3.0","checkedAt":"2026-11-15T12:00:00+08:00","checkedAtTimezone":"Asia/Shanghai"}
+```
+
+### PUT /api/admin/config/client-identity
+
+三個欄位均可省略；版本必須是以點分隔的三段非空 ASCII 數字（例如 `1.4.178`），端點只接受 `ide` / `cli`。驗證失敗回傳 400 `{"error":"invalid client identity"}`；設定讀寫失敗回傳 500。只寫入請求中提供的欄位，其他欄位與金鑰原樣保留；不改變執行中的設定，重啟後生效。回應與 `GET` 相同。只修改 IDE 版本不會切換新服務，須選擇 CLI。
+
+```http
+PUT /api/admin/config/client-identity
+Authorization: Bearer <adminApiKey>
+Content-Type: application/json
+
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"cli"}
+```
+
+```json
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide","saved":{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"cli"},"restartRequired":true,"lastUnsupportedVersionAt":null}
+```
+
 ### GET /api/admin/credentials
 
 取得帳號池狀態（同時作為隱式「登入校驗」面——回傳 200 即視為 key 有效）。
@@ -606,6 +650,14 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.20.0: 用戶端身分**
+>
+> - 舊 IDE 用戶端版本已被上游停用，必須升級。預設 IDE 為 `1.4.178`、Node 為 `24.22.1`、對話 SDK 為 `1.0.44`；若 `config.json` 明確設定 `"kiroVersion": "0.11.107"`，請修改或刪除，否則仍被拒絕。
+> - Social / Builder ID 在啟動時離線補上預設 `profileArn`；企業 IAM Identity Center 缺失時呼叫 `ListAvailableProfiles`，一個直接使用、多個取第一個並告警、零個回報設定錯誤；結果寫回憑據，管理員也可手動設定。
+> - 上游版本不受支援：全域錯誤，不重試、不換帳號、不計帳號失敗，直接以協定原生格式回傳 400；記錄 error 日誌，面板顯示本次執行中最近一次的時間。`profileArn` 缺失、無效或查不到：只關乎目前帳號，不懲罰帳號、換下一個帳號再試，全池都不行才回傳 400；「查不到」的結論快取 10 分鐘、查詢網路失敗退避 30 秒，帳號被修改即失效；查詢遇到 401/403 先強制刷新令牌再查一次。
+> - 可選 CLI 身分端點，預設為 `ide`；`cli` 時對話、網路搜尋、模型清單和餘額都依官方 CLI 3.3.0 的方式走新服務（餘額為 `management.{region}.kiro.dev` 上的 `POST /?origin=KIRO_CLI&isEmailRequired=false`，請求本文帶 `profileArn`），請求標頭含 `x-amz-user-agent`、`x-amzn-kiro-attempt`；令牌刷新不變。已用真實帳號驗證對話、模型清單及餘額。
+> - 管理面板可查詢官方最新 IDE / CLI 版本、凸顯落後版本並儲存身分設定，重啟後生效。介面同時回傳執行中的值和已儲存待重啟的值（`saved`、`restartRequired`），面板編輯已儲存的值、只送出改動過的欄位。只修改 IDE 版本號不會切換服務。
+>
 > **v0.19.0:串流重試、帳號狀態與用量記錄**
 >
 > - 串流請求僅在上游正常讀完且無錯誤時記帳號成功；中途出錯只記失敗，用戶端主動斷開既不記成功也不記失敗。上游拒答且正常結束仍算成功。
@@ -685,6 +737,8 @@ curl http://localhost:8080/api/admin/credentials \
 
 ### POST /api/admin/credentials
 
+新增、修改及批次匯入可選 `provider`（`social`、`builder_id`、`idc`、`api_key`）和 `profileArn`。批次匯入時巢狀 `credentials` 優先於外層，未知 `provider` 會被忽略。帳號級 `endpoint`（`ide` / `cli`）僅支援憑據檔案，覆蓋全域端點；這些管理介面不接收該欄位。帳號清單的 `hasProfileArn` 只顯示是否存在，不洩露 ARN。
+
 新增一條憑證入池並落盤。
 
 **用 Kiro API Key(`ksk_…`)匯入**是另一條路:傳 `kiroApiKey`(也認別名 `ksk`)**代替** `refreshToken`。這類憑證的 key **本身就是資料面 bearer** —— 不換取令牌、不刷新、不過期,完全不走 OAuth 鏈路,故無需 `refreshToken`/`clientId`/`clientSecret`,也不必給 `expiresAt`。
@@ -708,6 +762,8 @@ curl -X POST http://localhost:8080/api/admin/credentials \
 
 
 ### PUT /api/admin/credentials/{id}
+
+新增、修改及批次匯入可選 `provider`（`social`、`builder_id`、`idc`、`api_key`）和 `profileArn`。批次匯入時巢狀 `credentials` 優先於外層，未知 `provider` 會被忽略。帳號級 `endpoint`（`ide` / `cli`）僅支援憑據檔案，覆蓋全域端點；這些管理介面不接收該欄位。帳號清單的 `hasProfileArn` 只顯示是否存在，不洩露 ARN。
 
 更新既有憑證。
 
@@ -754,6 +810,8 @@ curl -X POST http://localhost:8080/api/admin/credentials/12345/priority \
 清失敗計數 / 冷卻。
 
 ### POST /api/admin/credentials/batch-import
+
+新增、修改及批次匯入可選 `provider`（`social`、`builder_id`、`idc`、`api_key`）和 `profileArn`。批次匯入時巢狀 `credentials` 優先於外層，未知 `provider` 會被忽略。帳號級 `endpoint`（`ide` / `cli`）僅支援憑據檔案，覆蓋全域端點；這些管理介面不接收該欄位。帳號清單的 `hasProfileArn` 只顯示是否存在，不洩露 ARN。
 
 批次匯入憑證。請求體必須是 `{"data": …}` 這層外殼（直接 POST 裸陣列會被拒為 `422`）；`data` 本身可以是陣列、KAM `{accounts}` 物件或單物件。逐條規整 / 校驗 / 落盤，回傳逐項結果與計數。
 
@@ -1312,7 +1370,7 @@ curl http://localhost:8080/health
 
 **回應：**
 ```json
-{"service":"kiro2api","status":"ok","version":"0.19.0"}
+{"service":"kiro2api","status":"ok","version":"0.20.0"}
 ```
 
 ### GET /v1/ping
@@ -1334,7 +1392,7 @@ curl http://localhost:8080/v1/ping
 | 狀態碼 | 說明 |
 |--------|------|
 | 200 | 成功 |
-| 400 | 參數錯誤；模型名在本地未對映到內部模型（訊息為「無法識別的模型名: …」，**不帶** `INVALID_MODEL_ID`）；或上游判定該模型對當前帳號檔位不可用（上游 reason 為 `INVALID_MODEL_ID`，回給客戶端的訊息以 `Invalid model '<m>': not available for the current account.` 開頭）；③**請求體超過上游長度上限**——上游 reason 碼 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`,訊息為「Input is too long…」並說明該錯誤不會自癒(客戶端每輪重發完整歷史,下一輪只會更長),需縮短上下文或新開工作階段。**此類同樣不重試、不誤傷帳號**(v0.7.12 前被誤判為瞬時錯誤,會跨帳號重試並給每個帳號記一次失敗)；④**訊息裡有工具呼叫卻沒有工具定義**——上游 reason 碼 `TOOL_CONFIG_MISSING`。正常情況下不該出現:中樞會從對話歷史把呼叫過的工具名補成最小規格再發出,這一檔是兜底,同樣不重試、不誤傷帳號 |
+| 400 | 參數錯誤；模型名在本地未對映到內部模型（訊息為「無法識別的模型名: …」，**不帶** `INVALID_MODEL_ID`）；或上游判定該模型對當前帳號檔位不可用（上游 reason 為 `INVALID_MODEL_ID`，回給客戶端的訊息以 `Invalid model '<m>': not available for the current account.` 開頭）；③**請求體超過上游長度上限**——上游 reason 碼 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`,訊息為「Input is too long…」並說明該錯誤不會自癒(客戶端每輪重發完整歷史,下一輪只會更長),需縮短上下文或新開工作階段。**此類同樣不重試、不誤傷帳號**(v0.7.12 前被誤判為瞬時錯誤,會跨帳號重試並給每個帳號記一次失敗)；④**訊息裡有工具呼叫卻沒有工具定義**——上游 reason 碼 `TOOL_CONFIG_MISSING`。正常情況下不該出現:中樞會從對話歷史把呼叫過的工具名補成最小規格再發出,這一檔是兜底,同樣不重試、不誤傷帳號  ⑤**上游版本不受支援**：全域設定錯誤，不重試、不換帳號、不計帳號失敗，以協定原生格式回傳。⑥**`profileArn` 缺失、無效或查不到**：只關乎目前帳號，不懲罰帳號，先換下一個帳號再試，全池都不行才以 400 回傳說明。 |
 | 401 | 未認證（驗證閘已收口時：金鑰缺失、無效、已停用或已過期。協議閘的收口條件是設了 `apiKey` **或**已建立任何一條 API-KEY） |
 | 402 | API-KEY 消費已達上限，體為 `{"type":"error","error":{"type":"billing_error","message":"api key spending limit exceeded"}}`。判定含在途預留（USD 單位 `1.0`／credits 單位約 `1.39`），故**剩餘額度不足一次預留時就開始拒**，並非真的花到滿 |
 | 403 | 禁止 |

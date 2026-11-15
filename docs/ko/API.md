@@ -607,6 +607,50 @@ curl -X POST "http://localhost:8080/gemini/v1beta/models/claude-sonnet-4.5:strea
 > [!WARNING]
 > 관리 API 응답이 비밀 정보를 담지 않는 것은 **아닙니다**. `GET`/`POST /api/admin/api-keys`의 `key` 필드는 **완전한 평문**이고, `GET /api/admin/server-info`의 `masterApiKey`도 **완전한 평문**입니다. 마스킹되는 것은 `GET /api/admin/config/auth-keys`와 `GET /api/admin/config`뿐입니다. 읽기 전용 관리자 역할이 없으므로 관리 키를 가진 주체는 모든 key를 조회·생성·교체할 수 있습니다. 관리 API 응답은 비밀 정보로 취급하고 이슈·로그·서드파티 도구에 붙여넣지 마십시오.
 
+### GET /api/admin/config/client-identity
+
+CLI는 `runtime.{region}.kiro.dev`와 `management.{region}.kiro.dev`를 사용합니다. `GET /api/admin/server-info`의 `kiroVersion`은 전역 엔드포인트에 해당하는 버전이며 계정별 재정의는 반영하지 않습니다. `GET /api/admin/config`는 기존 필드를 유지하며 IDE 버전은 `kiro_version`입니다.
+
+실행 중인 값(최상위 세 필드), 재시작 후 적용될 저장값(`saved`, 설정 파일에 없는 키는 기본값), 둘이 다른지 여부(`restartRequired`), 그리고 이번 실행에서 업스트림이 최근 업데이트를 요구한 시각(없으면 `null`)을 반환합니다. 패널은 `saved`를 편집합니다.
+
+```http
+GET /api/admin/config/client-identity
+Authorization: Bearer <adminApiKey>
+```
+
+```json
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide","saved":{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"cli"},"restartRequired":true,"lastUnsupportedVersionAt":null}
+```
+
+### GET /api/admin/config/client-identity/check
+
+공식 IDE와 CLI 최신 버전을 동시에 조회합니다(CLI는 `prod.download.cli.kiro.dev`를 먼저, 실패하면 내용이 같은 `desktop-release.q.us-east-1.amazonaws.com`을 조회). 하나라도 실패하면 502를 반환합니다(예: `{"error":"official request failed"}`). 성공하면 이전 API의 응답에 `latestIdeVersion`, `latestCliVersion`, `checkedAt`(UTC+8), `checkedAtTimezone`(`Asia/Shanghai`)을 더해 반환합니다.
+
+```http
+GET /api/admin/config/client-identity/check
+Authorization: Bearer <adminApiKey>
+```
+
+```json
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide","saved":{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide"},"restartRequired":false,"lastUnsupportedVersionAt":null,"latestIdeVersion":"1.4.178","latestCliVersion":"3.3.0","checkedAt":"2026-11-15T12:00:00+08:00","checkedAtTimezone":"Asia/Shanghai"}
+```
+
+### PUT /api/admin/config/client-identity
+
+세 필드는 모두 선택 사항입니다. 버전은 점으로 구분한 비어 있지 않은 ASCII 숫자 세 부분이어야 하며(예: `1.4.178`) 엔드포인트는 `ide` / `cli`만 허용합니다. 검증 실패는 400 `{"error":"invalid client identity"}`, 설정 읽기·쓰기 실패는 500입니다. 요청에 포함된 필드만 기록하고 다른 필드와 키는 그대로 유지합니다. 실행 중인 설정은 바뀌지 않으며 재시작 후 적용됩니다. 응답은 `GET`과 같습니다. IDE 버전만 바꿔서는 새 서비스로 전환되지 않으며 CLI를 선택해야 합니다.
+
+```http
+PUT /api/admin/config/client-identity
+Authorization: Bearer <adminApiKey>
+Content-Type: application/json
+
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"cli"}
+```
+
+```json
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide","saved":{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"cli"},"restartRequired":true,"lastUnsupportedVersionAt":null}
+```
+
 ### GET /api/admin/credentials
 
 계정 풀 상태 개요 (암묵적 "로그인 확인" 면. 200이면 key 유효로 간주)
@@ -653,6 +697,14 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.20.0: 클라이언트 식별 정보**
+>
+> - 기존 IDE 클라이언트 버전이 업스트림에서 중단되어 업그레이드가 필수입니다. 기본값은 IDE `1.4.178`, Node `24.22.1`, 대화 SDK `1.0.44`입니다. `config.json`에 `"kiroVersion": "0.11.107"`을 명시했다면 수정하거나 삭제하세요.
+> - Social / Builder ID는 시작 시 기본 `profileArn`을 오프라인으로 채웁니다. 기업 IAM Identity Center에 없으면 `ListAvailableProfiles`로 조회해 1개면 사용, 여러 개면 경고 후 첫 번째 사용, 0개면 설정 오류를 반환합니다. 결과는 자격 증명에 저장되며 관리자가 직접 설정할 수 있습니다.
+> - 지원되지 않는 클라이언트 버전은 전역 오류입니다. 재시도·계정 전환·실패 기록 없이 프로토콜별 형식으로 400을 반환하고, error 로그에 기록하며 이번 실행의 최근 시각을 패널에 표시합니다. `profileArn`이 없거나 무효이거나 조회되지 않으면 해당 계정만의 문제로 보고 실패로 기록하지 않은 채 다음 계정으로 재시도하며, 모든 계정이 실패할 때만 400을 반환합니다. 「조회 결과 없음」은 10분, 조회 네트워크 실패는 30초 동안 재사용하고(계정을 수정하면 무효화), 조회 중 401/403이 오면 먼저 토큰을 강제 갱신한 뒤 한 번 더 조회합니다.
+> - 선택적 CLI 식별 엔드포인트의 기본값은 `ide`입니다. `cli`에서는 대화·웹 검색·모델 목록·잔액이 공식 CLI 3.3.0과 같은 방식으로 새 서비스를 사용합니다(잔액은 `management.{region}.kiro.dev`에 `POST /?origin=KIRO_CLI&isEmailRequired=false`, 본문에 `profileArn`). 요청 헤더에는 `x-amz-user-agent`와 `x-amzn-kiro-attempt`가 포함되며 토큰 갱신은 그대로입니다. 실제 계정으로 대화·모델 목록·잔액을 검증했습니다.
+> - 관리 패널에서 공식 IDE / CLI 최신 버전 확인, 구버전 강조, 식별 설정 저장이 가능하며 재시작 후 적용됩니다. API는 실행 중인 값과 재시작 대기 중인 저장값(`saved`, `restartRequired`)을 함께 반환하고, 패널은 저장값을 편집해 바뀐 항목만 전송합니다. IDE 버전만 바꿔서는 서비스가 전환되지 않습니다.
+>
 > **v0.19.0: 스트리밍 재시도, 계정 상태와 사용량 기록**
 >
 > - 스트리밍 요청은 업스트림을 오류 없이 정상적으로 모두 읽었을 때만 계정 성공으로 기록합니다. 중간 오류는 실패로만 기록하고 클라이언트의 자발적 연결 종료는 성공이나 실패로 기록하지 않습니다. 업스트림 응답 거부가 정상 종료되면 성공입니다.
@@ -748,6 +800,8 @@ curl http://localhost:8080/api/admin/credentials \
 
 ### POST /api/admin/credentials
 
+추가·수정·일괄 가져오기는 선택적 `provider`(`social`, `builder_id`, `idc`, `api_key`)와 `profileArn`을 받습니다. 일괄 가져오기는 중첩 `credentials`가 바깥 필드보다 우선하며 알 수 없는 `provider`는 무시합니다. 계정별 `endpoint`(`ide` / `cli`)는 자격 증명 파일에서만 지원하고 전역 설정보다 우선합니다. 이 관리 API들은 해당 필드를 받지 않습니다. 계정 목록의 `hasProfileArn`은 존재 여부만 표시합니다.
+
 자격 증명 1건을 풀에 추가하고 영속화
 
 필수 필드는 `refreshToken` 하나뿐입니다(`authMethod`가 `idc`면 `clientId` + `clientSecret`도 필요). access token과 만료 시각은 **여기서 받지 않습니다** — 첫 자동 갱신 때 채워지며, 그 밖의 알 수 없는 키는 거부되지 않고 조용히 무시됩니다.
@@ -786,6 +840,8 @@ curl -X POST http://localhost:8080/api/admin/credentials \
 ```
 
 ### PUT /api/admin/credentials/{id}
+
+추가·수정·일괄 가져오기는 선택적 `provider`(`social`, `builder_id`, `idc`, `api_key`)와 `profileArn`을 받습니다. 일괄 가져오기는 중첩 `credentials`가 바깥 필드보다 우선하며 알 수 없는 `provider`는 무시합니다. 계정별 `endpoint`(`ide` / `cli`)는 자격 증명 파일에서만 지원하고 전역 설정보다 우선합니다. 이 관리 API들은 해당 필드를 받지 않습니다. 계정 목록의 `hasProfileArn`은 존재 여부만 표시합니다.
 
 기존 자격 증명 업데이트
 
@@ -840,6 +896,8 @@ curl -X POST http://localhost:8080/api/admin/credentials/12345/reset \
 ```
 
 ### POST /api/admin/credentials/batch-import
+
+추가·수정·일괄 가져오기는 선택적 `provider`(`social`, `builder_id`, `idc`, `api_key`)와 `profileArn`을 받습니다. 일괄 가져오기는 중첩 `credentials`가 바깥 필드보다 우선하며 알 수 없는 `provider`는 무시합니다. 계정별 `endpoint`(`ide` / `cli`)는 자격 증명 파일에서만 지원하고 전역 설정보다 우선합니다. 이 관리 API들은 해당 필드를 받지 않습니다. 계정 목록의 `hasProfileArn`은 존재 여부만 표시합니다.
 
 일괄 가져오기. 본문은 반드시 `{"data": <페이로드>}` 형태여야 하며(`data`가 없으면 `422`), `<페이로드>`로는 배열 / KAM `{accounts:[...]}` 객체 / 단일 객체를 모두 받습니다. 행별로 정규화·검증·영속화하며 한 건이 실패해도 나머지는 계속 진행합니다.
 
@@ -1198,9 +1256,9 @@ curl http://localhost:8080/api/admin/config \
   "region": "us-east-1",
   "load_balancing_mode": "priority",
   "max_rpm_per_credential": 0,
-  "kiro_version": "0.11.107",
+  "kiro_version": "1.4.178",
   "system_version": "win32#10.0.22631",
-  "node_version": "22.22.0",
+  "node_version": "24.22.1",
   "credentials_path": "/app/data/credentials.json",
   "api_key_set": true,
   "admin_api_key_set": true
@@ -1568,7 +1626,7 @@ curl http://localhost:8080/health
 **응답**:
 
 ```json
-{"service":"kiro2api","status":"ok","version":"0.19.0"}
+{"service":"kiro2api","status":"ok","version":"0.20.0"}
 ```
 
 ### GET /v1/ping
@@ -1591,7 +1649,7 @@ curl http://localhost:8080/v1/ping
 
 | 코드 | 설명 |
 |------|------|
-| 400 | 파라미터 오류. 성격이 다른 셋이 같은 코드로 옵니다: ①**모델명이 중계의 로컬 매핑에 걸리지 않음** — `message`는 `无法识别的模型名: <보낸 이름>`; ②**업스트림이 그 모델을 확정적으로 거부**(계정 구독 등급에 권한 없음) — `message`는 `Invalid model '<보낸 이름>': not available for the current account. …`이며 재시도도 계정 교체도 하지 않습니다; ③본문 파싱 실패, `previous_response_id` 지정(`previous_response_id is not supported`) 등 형식 오류. **어느 경우에도 응답 본문에 문자열 `INVALID_MODEL_ID`는 실리지 않습니다** — 그것은 중계가 ②를 판정하려고 업스트림 응답에서 찾는 내부 reason 코드일 뿐이며, 이 문서에서 `INVALID_MODEL_ID`라고 쓴 곳은 모두 ②의 상황을 가리키는 약칭입니다; ③**요청 본문이 업스트림 길이 상한을 초과** —— 업스트림 reason 코드는 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`. 「Input is too long…」과 함께, 이 오류가 스스로 회복되지 않으며(클라이언트가 매 턴 전체 대화를 다시 보내므로 다음 턴은 더 길어짐) 컨텍스트를 줄이거나 대화를 새로 시작해야 함을 알립니다. **이 유형 역시 재시도하지 않으며 계정을 손상시키지 않습니다**(v0.7.12 이전에는 일시적 오류로 오분류되어 계정을 넘나들며 재시도하고 거친 모든 계정에 실패를 기록했습니다); ④**메시지에 도구 호출이 있는데 도구 정의가 없음** —— 업스트림 reason 코드는 `TOOL_CONFIG_MISSING`. 정상적으로는 발생하지 않습니다: 중계가 대화 이력에 나타난 도구 이름으로 최소 사양을 보완해 전송합니다. 이 유형은 안전장치이며 마찬가지로 재시도하지 않고 계정을 손상시키지 않습니다 |
+| 400 | 파라미터 오류. 성격이 다른 여러 원인이 같은 코드로 옵니다: ①**모델명이 중계의 로컬 매핑에 걸리지 않음** — `message`는 `无法识别的模型名: <보낸 이름>`; ②**업스트림이 그 모델을 확정적으로 거부**(계정 구독 등급에 권한 없음) — `message`는 `Invalid model '<보낸 이름>': not available for the current account. …`이며 재시도도 계정 교체도 하지 않습니다; ③본문 파싱 실패, `previous_response_id` 지정(`previous_response_id is not supported`) 등 형식 오류. **어느 경우에도 응답 본문에 문자열 `INVALID_MODEL_ID`는 실리지 않습니다** — 그것은 중계가 ②를 판정하려고 업스트림 응답에서 찾는 내부 reason 코드일 뿐이며, 이 문서에서 `INVALID_MODEL_ID`라고 쓴 곳은 모두 ②의 상황을 가리키는 약칭입니다; ③**요청 본문이 업스트림 길이 상한을 초과** —— 업스트림 reason 코드는 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`. 「Input is too long…」과 함께, 이 오류가 스스로 회복되지 않으며(클라이언트가 매 턴 전체 대화를 다시 보내므로 다음 턴은 더 길어짐) 컨텍스트를 줄이거나 대화를 새로 시작해야 함을 알립니다. **이 유형 역시 재시도하지 않으며 계정을 손상시키지 않습니다**(v0.7.12 이전에는 일시적 오류로 오분류되어 계정을 넘나들며 재시도하고 거친 모든 계정에 실패를 기록했습니다); ④**메시지에 도구 호출이 있는데 도구 정의가 없음** —— 업스트림 reason 코드는 `TOOL_CONFIG_MISSING`. 정상적으로는 발생하지 않습니다: 중계가 대화 이력에 나타난 도구 이름으로 최소 사양을 보완해 전송합니다. 이 유형은 안전장치이며 마찬가지로 재시도하지 않고 계정을 손상시키지 않습니다  ⑤**업스트림이 클라이언트 버전을 지원하지 않음**: 전역 설정 오류로 재시도·계정 전환·실패 기록 없이 프로토콜별 형식으로 반환합니다. ⑥**`profileArn` 누락·무효·조회 불가**: 해당 계정만의 문제로 불이익을 주지 않고 먼저 다음 계정으로 재시도하며, 모든 계정이 실패할 때만 설명과 함께 400을 반환합니다. |
 | 401 | 미인증 (API Key 누락 또는 무효, `apiKey`가 설정된 경우) |
 | 402 | 지출 한도 초과 (`{"type":"error","error":{"type":"billing_error",…}}`. 판정은 요청 진입 시점에 1건당 예상 비용(USD 1.0 ≈ 1.39 크레딧)을 예약해 두고 내리므로, 잔여 한도가 그보다 작아지면 한도를 다 쓰기 전에도 거부됩니다) |
 | 403 | 금지 (권한 부족) |

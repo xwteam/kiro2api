@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.19.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.20.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -61,6 +61,7 @@
 
 | 日期 | 更新內容 |
 |------|----------|
+| 2026-11-15 | v0.20.0 - 🛠️ **舊用戶端版本已被上游停用，必須升級至本版本**。① IDE 預設版本改為 1.4.178；若設定中明確指定 `kiroVersion` 為 `0.11.107`，請修改或刪除。② 自動補齊並儲存 `profileArn`；版本被停用、profile 設定錯誤都不懲罰帳號，profile 有問題的帳號會換帳號再試。③ 可選 CLI 端點，管理面板支援查詢官方版本與修改用戶端身分，重啟後生效。 |
 | 2026-11-06 | v0.19.0 - 🛠️ **修正串流帳號狀態與用量記錄，統一開局換號**。① 串流正常結束才記成功，中途出錯只記失敗，用戶端斷開不影響帳號狀態。② 四種協定預讀只認內容，計量後報錯或半幀斷開也換號；全帳號開局被拒時回傳非 200。③ 無輸出且無上游計量的失敗不寫用量；有消耗的失敗標記 `failed: true`，用戶端斷開已有消耗時記錄為 `false`；彙總按失敗狀態去重。 |
 | 2026-11-06 | v0.18.1 - 🛠️ **普通錯誤事件不再冒充成功；帳號令牌保存已修正**。① 上游錯誤事件與例外幀統一處理，四種協定都回傳錯誤，限流訊號也會送至帳號池。② IAM Identity Center / Builder ID 登入與刷新一律保存 `accessToken`，既有憑證無須遷移，下次刷新時會自動修正。 |
 | 2026-11-06 | v0.18.0 - 🛡️ **上游拒答不再被誤認為空白的正常回應**。四種協定的串流與非串流回應都會回傳各自的拒答結束標記，並保留先前的正文。用戶端應依結束原因判斷，不要執行遭拒那一輪的工具呼叫。 |
@@ -70,7 +71,6 @@
 | 2026-08-10 | v0.16.0 - 🔍 **又跑了一輪獨立複核,找出 6 處——好幾處是此前的修復只落了一半**。①`amz-sdk-invocation-id` 的 UUID 修復**只落了 3/5 個呼叫點**:balance 與 models_cache 各自私有一份同名舊產生器被局部遮蔽,搜尋時看著像「已統一」,實際同一枚 Bearer 在資料面發 UUID、在餘額發裸 hex;②**登入流對 oidc 主機一個標頭都不帶、連 UA 都沒有**——正是先前在更新鏈路修過的同一缺陷,而登入打的是**同一台主機的相鄰路徑**,且註冊裸奔、幾分鐘後同一 clientId 又用完美 SDK 標頭去更新,這種前後矛盾比裸請求更易被關聯;③**region 三條鏈路各算各的**(資料面按 profileArn、餘額/模型用裸 cred.region)→ 餘額恆查不出,且同一枚 Bearer 同時命中兩個 region;④history 裡的工具名沒走縮短,與 tools 清單的短名對不上;⑤**改優先級不觸發重新選號**,黏滯檔下等於沒改;⑥**全池被判停後無自癒**——上游抖一陣把所有號判停,池子就此徹底不可用直到有人重啟。另:README 更新歷史只留最近 10 條,完整看 CHANGELOG |
 | 2026-08-10 | v0.15.0 - 🔁 **額度耗盡的帳號不再每次重啟都要重新學一遍**(使用者直接問到:「額度用完的號不是已經停用了嗎,為什麼還會請求到已停用的帳號?」)。是停用了,但只在**記憶體**裡——先前為免一次抖動把帳號永久寫死,讓執行期停用不落盤;而配額恰恰是**有明確恢復時刻**的那類。於是每次發版重啟就把「誰沒額度」忘光,再拿**使用者的請求**去重新發現(實測 13 個耗盡號:前 2 次 502、第 3 次才成)→ 現按恢復時刻落盤,重啟仍記得、到點自動回池;恢復時刻優先取上游 `nextResetAt`,沒有才按下月一號估。另:**伺服器端內建搜尋 `web_search` 真正接上了** —— 此前只是「容忍」這個工具宣告(不再 400),但從不真的搜尋,模型照常回段文字、用戶端以為搜過了。現在這類請求在進資料面前被攔住,呼叫上游 `/mcp` 端點拿結果再合成 `server_tool_use` + `web_search_tool_result` |
 | 2026-08-10 | v0.14.1 - 🔧 **線上驗證時當場發現的兩件事**。①回應裡 `usage.input_tokens` **恆為 0**:先前補的輸入估算只餵給了計費、沒回寫用戶端 —— 帳單裡有、回應裡沒有,而用戶端拿它算成本和上下文佔用 → 非串流 `usage` 與串流 `message_start` 現在都帶同一個值;②**池裡有一批耗盡的號時,使用者前幾次請求會連續失敗**:配額耗盡此前與驗證失敗共用 3 次重試預算,實測 13 個耗盡號要連燒 2 次 502、第 3 次才成 → 配額是**確定性**結論(本週期換誰都一樣),現與「模型不可用」同歸帳號級確定性檔、按池大小給預算;瞬態/驗證仍保持 3 次小上限。全池確實耗盡時回 `429` 並說清是額度問題,而不是語焉不詳的 502 |
-| 2026-08-10 | v0.14.0 - 🧩 **對照收尾**。①歷史裡助手輪 `content` 可能是**空串**,上游據此拒掉整條請求(純工具呼叫那一輪就是空,使用者輪早有兜底、助手輪一直漏著)→ 用單個空格佔位;②**損壞幀被逐位元組重掃,而它的邊界本來已知**(prelude CRC 通過則 `total_len` 可信)→ 整幀跳過;③**`tlsBackend` 改為執行時可切**(此前編譯期二選一)——走自簽 CA 代理時往往只有一個後端握得上手 |
 
 ---
 
@@ -220,7 +220,7 @@ docker compose logs -f
 ```bash
 # 健康檢查
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.19.0"}
+# {"service":"kiro2api","status":"ok","version":"0.20.0"}
 
 # 查看模型清單（固定短清單，不依帳號檔位過濾）
 curl http://localhost:8080/v1/models \
@@ -439,11 +439,15 @@ resp = client.chat.completions.create(
   "loadBalancingMode": "priority",
   "maxRpmPerCredential": 0,
   "logCapacity": 5000,
-  "kiroVersion": "0.11.107",
+  "kiroVersion": "1.4.178",
+  "upstreamEndpoint": "ide",
+  "kiroCliVersion": "3.3.0",
   "systemVersion": "win32#10.0.22631",
-  "nodeVersion": "22.22.0"
+  "nodeVersion": "24.22.1"
 }
 ```
+
+`upstreamEndpoint` 可設為 `ide`（預設）或 `cli`；`kiroCliVersion` 預設為 `3.3.0`。只更新 IDE 版本號不會切換服務，使用新服務須選擇 CLI。憑據檔案可選 `provider`（`social`、`builder_id`、`idc`、`api_key`）、`profileArn` 和帳號級 `endpoint`（`ide` / `cli`，覆蓋全域設定）。
 
 - `logCapacity`：即時日誌環形緩衝條數，`>0` 啟用日誌捕獲（管理面板日誌頁回放/SSE），`0` 關閉（日誌端點傳回 503）；預設 `5000`。
 - `kiroVersion`/`systemVersion`/`nodeVersion`：偽裝 UA 版本號，從配置注入。

@@ -584,6 +584,50 @@ The admin panel at `/admin` (a static SPA embedded via rust-embed) is backed by 
 > **Every paginated admin endpoint shares one convention.** The query keys are `?page=` and `?page_size=` — **snake_case**, matching the request struct; a camelCase `pageSize` in the query string is simply an unknown key and the default applies. Defaults are `page=1` and `page_size=20`. `page_size` is raised to at least `1`, `page` is clamped into `[1, totalPages]`, and the response envelope is camelCase: `{records, total, page, pageSize, totalPages}`. An unknown id or an empty store is **not** a `404` — it answers `records: []` with `total: 0`, `page: 1`, `totalPages: 0`.
 > This applies to `/api/admin/credentials/{id}/usage/records`, `/failure-logs`, `/throttle-logs`, `/api/admin/usage/daily/{date}/records` and `/api/admin/api-keys/{id}/usage/records`. The user-facing `GET /api/user/usage/records` uses the same shape and query keys but defaults to `page_size=50`.
 
+### GET /api/admin/config/client-identity
+
+CLI uses `runtime.{region}.kiro.dev` and `management.{region}.kiro.dev`. The `kiroVersion` in `GET /api/admin/server-info` reflects the globally selected endpoint, not per-account overrides. `GET /api/admin/config` retains its existing fields, including the IDE `kiro_version`.
+
+Returns the running values (the three top-level fields), the saved values that take effect after a restart (`saved`; keys absent from the config file take their defaults), whether the two differ (`restartRequired`), and the most recent upstream update requirement in this run (`null` if none). The panel edits `saved`.
+
+```http
+GET /api/admin/config/client-identity
+Authorization: Bearer <adminApiKey>
+```
+
+```json
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide","saved":{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"cli"},"restartRequired":true,"lastUnsupportedVersionAt":null}
+```
+
+### GET /api/admin/config/client-identity/check
+
+Fetches the latest official IDE and CLI versions together (CLI tries `prod.download.cli.kiro.dev` first, then the identical `desktop-release.q.us-east-1.amazonaws.com`); either failure returns 502, for example `{"error":"official request failed"}`. On success the previous endpoint's response is extended with `latestIdeVersion`, `latestCliVersion`, `checkedAt` (UTC+8) and `checkedAtTimezone` (`Asia/Shanghai`).
+
+```http
+GET /api/admin/config/client-identity/check
+Authorization: Bearer <adminApiKey>
+```
+
+```json
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide","saved":{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide"},"restartRequired":false,"lastUnsupportedVersionAt":null,"latestIdeVersion":"1.4.178","latestCliVersion":"3.3.0","checkedAt":"2026-11-15T12:00:00+08:00","checkedAtTimezone":"Asia/Shanghai"}
+```
+
+### PUT /api/admin/config/client-identity
+
+All three fields are optional. Versions must have three nonempty ASCII-digit components separated by dots (for example `1.4.178`); the endpoint must be `ide` or `cli`. Invalid values return 400 `{"error":"invalid client identity"}`; configuration read/write failures return 500. Only the fields present in the request are written; all other fields and keys are preserved. The running configuration is unchanged: restart to apply. The response is the same as `GET`. Changing only the IDE version does not switch to the new service; select CLI.
+
+```http
+PUT /api/admin/config/client-identity
+Authorization: Bearer <adminApiKey>
+Content-Type: application/json
+
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"cli"}
+```
+
+```json
+{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"ide","saved":{"kiroVersion":"1.4.178","kiroCliVersion":"3.3.0","upstreamEndpoint":"cli"},"restartRequired":true,"lastUnsupportedVersionAt":null}
+```
+
 ### GET /api/admin/credentials
 
 Get the account pool status. This is also the implicit login check — a `200` means the key is valid.
@@ -630,6 +674,14 @@ curl http://localhost:8080/api/admin/credentials \
 
 
 
+> **v0.20.0: Client identity**
+>
+> - The old IDE client version is disabled upstream; upgrading is required. Defaults are IDE `1.4.178`, Node `24.22.1` and conversation SDK `1.0.44`. Change or remove an explicit `"kiroVersion": "0.11.107"` in `config.json` or requests remain rejected.
+> - Social and Builder ID receive the default `profileArn` offline at startup. Missing enterprise IAM Identity Center profiles are looked up with `ListAvailableProfiles`: use the sole result, warn and use the first of several, or report a configuration error for none. The result is persisted; administrators can set it manually.
+> - An unsupported client version is a global error: no retries, no account switching, no failure penalty; 400 is returned in the protocol-native error shape, logged at error level, and the panel shows the latest occurrence in this run. A missing, invalid or undiscoverable `profileArn` only concerns the current account: it is not penalized, the request moves on to the next account, and 400 is returned only when every account fails. A "no profile found" result is cached for 10 minutes and a failed lookup backs off for 30 seconds (both reset when the account is edited); a 401/403 during lookup forces a token refresh and one retry first.
+> - The optional CLI identity endpoint is off by default (`ide`). With `cli`, conversations, web search, model listings and balance follow official CLI 3.3.0 on the new services (balance is `POST /?origin=KIRO_CLI&isEmailRequired=false` on `management.{region}.kiro.dev` with `profileArn` in the body), and requests carry `x-amz-user-agent` and `x-amzn-kiro-attempt`. Token refresh is unchanged. Conversation, model listing and balance were verified with real accounts.
+> - The panel checks current official IDE / CLI versions, highlights outdated versions and saves identity settings for the next restart. The API returns both the running values and the saved values pending restart (`saved`, `restartRequired`); the panel edits the saved values and submits only changed fields. Changing only the IDE version does not switch services.
+>
 > **v0.19.0: streaming retries, account status and usage records**
 >
 > - A streaming request counts as an account success only after the upstream stream ends normally without error. A midstream error counts only as failure; an intentional client disconnect counts as neither. An upstream refusal that ends normally still counts as success.
@@ -770,6 +822,8 @@ curl http://localhost:8080/api/admin/credentials \
 
 ### POST /api/admin/credentials
 
+Add, update and batch import accept optional `provider` (`social`, `builder_id`, `idc`, `api_key`) and `profileArn`. For batch import, nested `credentials` values take precedence; an unknown `provider` is ignored. Per-account `endpoint` (`ide` / `cli`) is supported in credential files only and overrides the global endpoint; these admin APIs do not accept it. Account lists expose `hasProfileArn`, not the ARN itself.
+
 Add one credential to the pool and persist it.
 
 Only `refreshToken` is required (plus `clientId` + `clientSecret` when `authMethod` is `idc`). The access token and its expiry are **not accepted here** — they are left empty and filled in by the first automatic refresh. Unknown keys (including `accessToken` / `expiresAt`) are silently ignored, not rejected, so a request carrying them still returns `200` while those values are dropped. Other optional keys: `authMethod`, `email`, `nickname`, `profileArn`, `priority`, `weight`, `authRegion`, `apiRegion`, `machineId`.
@@ -807,6 +861,8 @@ curl -X POST http://localhost:8080/api/admin/credentials \
 ```
 
 ### PUT /api/admin/credentials/{id}
+
+Add, update and batch import accept optional `provider` (`social`, `builder_id`, `idc`, `api_key`) and `profileArn`. For batch import, nested `credentials` values take precedence; an unknown `provider` is ignored. Per-account `endpoint` (`ide` / `cli`) is supported in credential files only and overrides the global endpoint; these admin APIs do not accept it. Account lists expose `hasProfileArn`, not the ARN itself.
 
 Update an existing credential.
 
@@ -865,6 +921,8 @@ curl -X POST http://localhost:8080/api/admin/credentials/12345/reset \
 ```
 
 ### POST /api/admin/credentials/batch-import
+
+Add, update and batch import accept optional `provider` (`social`, `builder_id`, `idc`, `api_key`) and `profileArn`. For batch import, nested `credentials` values take precedence; an unknown `provider` is ignored. Per-account `endpoint` (`ide` / `cli`) is supported in credential files only and overrides the global endpoint; these admin APIs do not accept it. Account lists expose `hasProfileArn`, not the ARN itself.
 
 Bulk import credentials. The payload is always wrapped in a required `data` key — posting a bare array returns `422`. `data` itself may be an array, a KAM `{accounts: [...]}` object, or a single object; each row is normalized/validated/persisted independently. As with the single-credential endpoint, only `refreshToken` (plus `clientId`/`clientSecret` for `idc`) matters — `accessToken` / `expiresAt` are ignored during normalization.
 
@@ -1216,9 +1274,9 @@ curl http://localhost:8080/api/admin/config \
   "region": "us-east-1",
   "load_balancing_mode": "priority",
   "max_rpm_per_credential": 0,
-  "kiro_version": "0.11.107",
+  "kiro_version": "1.4.178",
   "system_version": "win32#10.0.22631",
-  "node_version": "22.22.0",
+  "node_version": "24.22.1",
   "credentials_path": "/app/data/credentials.json",
   "api_key_set": true,
   "admin_api_key_set": true
@@ -1343,8 +1401,8 @@ curl http://localhost:8080/api/admin/server-info \
 ```json
 {
   "masterApiKey": "sk-your-master-key",
-  "version": "0.16.0",
-  "kiroVersion": "0.11.107",
+  "version": "0.20.0",
+  "kiroVersion": "1.4.178",
   "rustVersion": "1.90.0",
   "runMode": "Docker",
   "uptimeSecs": 3600
@@ -1595,7 +1653,7 @@ The error body shape varies by protocol:
 | Code | Meaning | Description |
 |------|---------|-------------|
 | 200 | OK | Request succeeded |
-| 400 | Bad Request | On the relay endpoints, three causes: a body they cannot deserialize (they answer `400`, never `422`); a model name matching nothing in the internal map — rejected by the gateway itself, message `无法识别的模型名: <name>`; or a mapped model the account's tier cannot serve — refused upstream (reason `INVALID_MODEL_ID`) and reported as `Invalid model '<name>': not available for the current account. …`. Two admin endpoints add their own: `POST /api/admin/restart` without `?confirm=true`, and `GET /api/admin/usage/summary` with an unrecognized `range` or `hours=0`; and a request body exceeding the upstream length limit — upstream reason `CONTENT_LENGTH_EXCEEDS_THRESHOLD`, answered with an "Input is too long…" message that also states the error will not recover on its own (each turn resends the whole conversation, so the next is larger still) and that the context must be trimmed or the conversation restarted. **This cause likewise is not retried and does not damage accounts** — before v0.7.12 it was misclassified as transient, retried across accounts, and charged a failure to every account it touched; and a message carrying tool calls without any tool definitions — upstream reason `TOOL_CONFIG_MISSING`. This should not normally occur: the relay backfills a minimal spec for every tool named in the conversation history before sending (see "Tool specs backfilled from history"). The cause is kept as a backstop and likewise is not retried and does not damage accounts |
+| 400 | Bad Request | On the relay endpoints, several causes: a body they cannot deserialize (they answer `400`, never `422`); a model name matching nothing in the internal map — rejected by the gateway itself, message `无法识别的模型名: <name>`; or a mapped model the account's tier cannot serve — refused upstream (reason `INVALID_MODEL_ID`) and reported as `Invalid model '<name>': not available for the current account. …`. Two admin endpoints add their own: `POST /api/admin/restart` without `?confirm=true`, and `GET /api/admin/usage/summary` with an unrecognized `range` or `hours=0`; and a request body exceeding the upstream length limit — upstream reason `CONTENT_LENGTH_EXCEEDS_THRESHOLD`, answered with an "Input is too long…" message that also states the error will not recover on its own (each turn resends the whole conversation, so the next is larger still) and that the context must be trimmed or the conversation restarted. **This cause likewise is not retried and does not damage accounts** — before v0.7.12 it was misclassified as transient, retried across accounts, and charged a failure to every account it touched; and a message carrying tool calls without any tool definitions — upstream reason `TOOL_CONFIG_MISSING`. This should not normally occur: the relay backfills a minimal spec for every tool named in the conversation history before sending (see "Tool specs backfilled from history"). The cause is kept as a backstop and likewise is not retried and does not damage accounts; ⑤ **unsupported client version**: a global configuration error with no retry, no account switch and no failure penalty, returned in the protocol-native shape. ⑥ **missing, invalid or undiscoverable `profileArn`**: concerns only the current account, which is not penalized; the next account is tried first, and 400 with an explanation is returned only when every account fails. |
 | 401 | Unauthorized | Missing or invalid API Key (when `apiKey` is configured); also a disabled or expired store key |
 | 402 | Payment Required | A store-managed key has reached its spending limit (`{"type":"error","error":{"type":"billing_error",…}}`) |
 | 404 | Not Found | Admin endpoints only: unknown account / API-KEY / login-session id |

@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Docker-20.10+-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-4285F4?style=flat-square&logo=linux&logoColor=white" alt="Arch">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/version-v0.19.0-success?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-v0.20.0-success?style=flat-square" alt="Version">
 </p>
 
 <p>
@@ -58,6 +58,7 @@
 
 | Date | Update |
 |------|--------|
+| 2026-11-15 | v0.20.0 - 🛠️ **The old client version has been disabled upstream; upgrading to this release is required**. ① The default IDE version is now 1.4.178; change or remove an explicit `kiroVersion` of `0.11.107`. ② `profileArn` is filled and saved automatically; neither a disabled version nor a profile configuration error penalizes accounts, and an account with a profile problem is skipped in favor of the next one. ③ An optional CLI endpoint and client identity settings with official version checks are available; changes require a restart. |
 | 2026-11-06 | v0.19.0 - 🛠️ **Correct streaming account status and usage records; retry opening errors across protocols**. ① Count success only after normal stream completion; midstream errors count as failures and client disconnects do not affect account status. ② Pre-read waits for content, retrying errors after metering or partial-frame disconnects; if all accounts reject at the start, return non-200. ③ Failures without output or upstream metering are not recorded; consumed failures are `failed: true`, client disconnects with consumption are recorded as `false`, and summary counts are deduplicated by failure status. |
 | 2026-11-06 | v0.18.1 - 🛠️ **Ordinary error events no longer masquerade as successes; account tokens are saved correctly**. ① Upstream error events now follow the exception-frame path across all four protocols and signal throttling to the account pool. ② IAM Identity Center / Builder ID login and refresh now save `accessToken`; existing credentials need no migration and are corrected on their next refresh. |
 | 2026-11-06 | v0.18.0 - 🛡️ **Upstream refusals are no longer reported as empty successful answers**. All four protocols now report their native refusal markers in streaming and non-streaming responses while preserving prior text. Check the finish reason and do not execute tool calls from a refused turn. |
@@ -67,7 +68,6 @@
 | 2026-08-10 | v0.16.0 - 🔍 **Another independent re-audit turned up six gaps — several of them earlier fixes that had only landed halfway.** ① The `amz-sdk-invocation-id` UUID fix had reached **3 of 5 call sites**: balance and models_cache each kept a private function of the same name, shadowing the shared one, so a repo-wide search made it look unified while the same Bearer sent a UUID on the data plane and bare hex on the balance query. ② **The login flow sent no headers at all to the oidc host — not even a User-Agent** — the very defect fixed for token refresh in v0.10.0, on an adjacent path of the *same host*; worse, registration went bare while the same `clientId` refreshed minutes later with perfect aws-sdk-js headers, and that inconsistency correlates more easily than plain bareness. ③ **Region resolution differed across three links** (data plane used the profileArn, balance and model list used a bare `cred.region`), so balance queries never resolved and one Bearer hit two regions within a minute. ④ Tool names in the history skipped the shortening applied to the tool list. ⑤ **Changing priority did not trigger reselection**, making it a no-op in the sticky default. ⑥ **A fully stopped pool had no path back** — an upstream wobble could stop every account and leave the pool dead until someone restarted it. Also: the README history now keeps only the 10 most recent entries |
 | 2026-08-10 | v0.15.0 - 🔁 **Quota-exhausted accounts no longer have to be relearned after every restart.** The user asked directly: "aren't exhausted accounts already disabled — why do requests still reach them?" They were disabled, but **only in memory**: v0.10.2 deliberately kept runtime verdicts off disk so one permission blip could not write an account off permanently — but quota is precisely the kind that has a **known recovery time**. So every deploy wiped the knowledge and the pool rediscovered it using **the user's requests** (measured: 13 exhausted accounts meant two 502s before the third request succeeded). It is now persisted with its reset time, survives restarts and returns to the pool automatically; the time comes from upstream's `nextResetAt` when available, falling back to the first of next month. Also: **the server-side `web_search` tool actually works now** — it used to be merely tolerated (no longer a 400 since v0.11.0) while never searching, so the model answered with ordinary text and the client believed a search had happened. Such requests are now intercepted before the data plane, sent to the upstream `/mcp` endpoint, and returned as `server_tool_use` + `web_search_tool_result` |
 | 2026-08-10 | v0.14.1 - 🔧 **Two things found while verifying the previous releases in production.** ① `usage.input_tokens` was **always 0** in responses: the estimate added in v0.13.0 only fed billing and was never written back, so the number existed in the invoice but not in the reply the client uses to compute cost and context usage — both the non-streaming `usage` and the streaming `message_start` now carry it. ② **With a batch of quota-exhausted accounts in the pool, a user's first few requests failed in a row**: quota exhaustion shared the 3-attempt budget with auth failures, and with 13 exhausted accounts two requests returned 502 before the third succeeded (each request burned three accounts before disabling them). Quota exhaustion is **deterministic** for the billing period, so it now shares the account-level deterministic class with "model unavailable" and gets an allowance sized to the pool, while transient and auth failures keep their small cap of 3. When the pool really is exhausted the answer is a `429` that says so, instead of an unhelpful 502 |
-| 2026-08-10 | v0.14.0 - 🧩 **Closing the comparison out.** ① An assistant turn in the history could carry an **empty** `content`, which upstream rejects the whole request over — a turn that only called tools carries no text, and while user turns had long had a non-empty fallback, assistant turns never did, so replaying any conversation whose previous turn was a pure tool call failed reliably (the most common shape in a tool chain). A single space is now used as the placeholder. ② **Corrupt frames were rescanned byte by byte even though their boundary was known**: once the prelude CRC passes, `total_len` is trustworthy, but every error kind used to fall back to byte-wise resync, so a message-CRC failure had the decoder rescan the frame's entire payload as noise — slow, and liable to assemble a plausible-looking prelude out of payload bytes and emit a message that never existed. Frames with a known boundary are now skipped whole. ③ **`tlsBackend` is now switchable at runtime** instead of being a compile-time choice that required a new image: native-tls uses the system trust store while rustls carries its own roots, and behind a self-signed-CA proxy typically only one of them completes the handshake — presenting as "cannot refresh tokens" or "cannot connect", with nothing on the surface pointing at TLS |
 
 ---
 
@@ -262,7 +262,7 @@ docker compose logs -f
 ```bash
 # Health check
 curl http://localhost:8080/health
-# {"service":"kiro2api","status":"ok","version":"0.19.0"}
+# {"service":"kiro2api","status":"ok","version":"0.20.0"}
 
 # View available models
 curl http://localhost:8080/v1/models \
@@ -486,11 +486,15 @@ Priority: **command-line flags > environment variables > `config.json` > built-i
   "loadBalancingMode": "priority",
   "maxRpmPerCredential": 0,
   "logCapacity": 5000,
-  "kiroVersion": "0.11.107",
+  "kiroVersion": "1.4.178",
+  "upstreamEndpoint": "ide",
+  "kiroCliVersion": "3.3.0",
   "systemVersion": "win32#10.0.22631",
-  "nodeVersion": "22.22.0"
+  "nodeVersion": "24.22.1"
 }
 ```
+
+`upstreamEndpoint` is `ide` (default) or `cli`; `kiroCliVersion` defaults to `3.3.0`. Updating the IDE version alone does not switch services: select CLI for the new service. Credential files optionally accept `provider` (`social`, `builder_id`, `idc`, `api_key`), `profileArn`, and per-account `endpoint` (`ide` / `cli`, overriding the global setting).
 
 - `logCapacity`: ring-buffer size for live logs; `>0` enables log capture (admin log-page replay/SSE), `0` disables it (the log endpoint returns 503); default `5000`.
 - `kiroVersion`/`systemVersion`/`nodeVersion`: spoofed UA version numbers, injected from config.
